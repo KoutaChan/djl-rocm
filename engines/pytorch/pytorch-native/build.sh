@@ -57,7 +57,7 @@ if [[ ! -d "libtorch" ]]; then
   fi
 fi
 
-if [[ "$VERSION" == "1.13.1" || "$VERSION" == "2.0.1" || "$VERSION" =~ ^(2.1.*)$ ]]; then
+if [[ "$VERSION" == "1.13.1" || "$VERSION" == "2.0.1" || "$VERSION" =~ ^2\.1\.[0-9]+$ ]]; then
   PT_VERSION=V1_13_X
 fi
 
@@ -77,7 +77,7 @@ rm -rf build
 mkdir build && cd build
 mkdir classes
 javac -sourcepath ../../pytorch-engine/src/main/java/ ../../pytorch-engine/src/main/java/ai/djl/pytorch/jni/PyTorchLibrary.java -h include -d classes
-cmake -DCMAKE_PREFIX_PATH=libtorch -DPT_VERSION="${PT_VERSION}" -DUSE_CUDA="$USE_CUDA" ..
+cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" -DPT_VERSION="${PT_VERSION}" -DUSE_CUDA="$USE_CUDA" ..
 cmake --build . --config Release -- -j "${NUM_PROC}"
 if [[ "$FLAVOR" = cu* ]]; then
   # avoid link with libcudart.so.11.0
