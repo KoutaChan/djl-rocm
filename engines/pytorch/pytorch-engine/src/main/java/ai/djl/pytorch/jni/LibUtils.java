@@ -44,6 +44,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /**
  * Utilities for finding the PyTorch Engine binary on the System.
@@ -427,6 +429,15 @@ public final class LibUtils {
             return new LibTorch(dir.toAbsolutePath(), platform, flavor);
         }
 
+        // ROCm libtorch is not mirrored on publish.djl.ai. Fetch the upstream
+        // pytorch.org zip directly and unpack it into the DJL cache dir.
+        String rocmBareFlavor = flavor.endsWith("-precxx11")
+                ? flavor.substring(0, flavor.length() - "-precxx11".length())
+                : flavor;
+        if (rocmBareFlavor.startsWith("rocm")) {
+            return downloadRocmLibTorch(version, rocmBareFlavor, flavor, dir, platform);
+        }
+
         Matcher matcher = VERSION_PATTERN.matcher(version);
         if (!matcher.matches()) {
             throw new AssertionError("Unexpected version: " + version);
@@ -522,6 +533,60 @@ public final class LibUtils {
             return new LibTorch(dir.toAbsolutePath(), platform, flavor);
         } catch (IOException e) {
             throw new EngineException("Failed to download PyTorch native library", e);
+        } finally {
+            if (tmp != null) {
+                Utils.deleteQuietly(tmp);
+            }
+        }
+    }
+
+    /**
+     * Fetch the upstream ROCm libtorch zip from pytorch.org and unpack the
+     * {@code libtorch/lib/} contents into the DJL cache directory.
+     *
+     * @param version        pytorch version (e.g. {@code 2.7.1})
+     * @param rocmUrlFlavor  flavor with the pytorch.org URL format, e.g. {@code rocm6.3}
+     * @param cacheFlavor    flavor string used to key the DJL cache entry (may
+     *                       include {@code -precxx11} etc.)
+     * @param dir            target cache directory
+     * @param platform       DJL platform descriptor
+     */
+    private static LibTorch downloadRocmLibTorch(
+            String version, String rocmUrlFlavor, String cacheFlavor, Path dir, Platform platform) {
+        Path cacheDir = Utils.getEngineCacheDir("pytorch");
+        String url = "https://download.pytorch.org/libtorch/"
+                + rocmUrlFlavor
+                + "/libtorch-cxx11-abi-shared-with-deps-"
+                + version
+                + "%2B"
+                + rocmUrlFlavor
+                + ".zip";
+        Path tmp = null;
+        try {
+            Files.createDirectories(cacheDir);
+            tmp = Files.createTempDirectory(cacheDir, "rocm-libtorch");
+            boolean found = false;
+            logger.info("Downloading {} ...", url);
+            try (ZipInputStream zis = new ZipInputStream(Utils.openUrl(url))) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    String name = entry.getName();
+                    if (entry.isDirectory() || !name.startsWith("libtorch/lib/")) {
+                        continue;
+                    }
+                    found = true;
+                    String fileName = name.substring("libtorch/lib/".length());
+                    Files.copy(zis, tmp.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+            if (!found) {
+                throw new EngineException(
+                        "No libtorch/lib/ entries found in ROCm archive: " + url);
+            }
+            Utils.moveQuietly(tmp, dir);
+            return new LibTorch(dir.toAbsolutePath(), platform, cacheFlavor);
+        } catch (IOException e) {
+            throw new EngineException("Failed to download ROCm libtorch: " + url, e);
         } finally {
             if (tmp != null) {
                 Utils.deleteQuietly(tmp);
