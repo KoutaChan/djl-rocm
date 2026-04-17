@@ -23,7 +23,7 @@ ARCH=$4
 
 if [[ ! -d "libtorch" ]]; then
   if [[ $PLATFORM == 'linux' ]]; then
-    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|rocm6\.[0-9]+)$ ]]; then
+    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|rocm[67]\.[0-9]+)$ ]]; then
       echo "$FLAVOR is not supported."
       exit 1
     fi

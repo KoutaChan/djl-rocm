@@ -46,17 +46,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # PyTorch versions reflect what is actually published under
+          # https://download.pytorch.org/libtorch/<flavor>/ for each ROCm.
+          # Compatibility against DJL 0.37 JNI verified via PyTorch 2.7-2.11
+          # release notes (deprecation warnings only from 2.10 onwards).
           - rocm: rocm6.3
-            pt: "2.7.1"
+            pt: "2.9.1"
             image: rocm/dev-ubuntu-22.04:6.3-complete
           - rocm: rocm6.4
-            pt: "2.8.0"
+            pt: "2.9.1"
             image: rocm/dev-ubuntu-22.04:6.4-complete
           - rocm: rocm7.0
-            pt: "2.9.0"
+            pt: "2.10.0"
             image: rocm/dev-ubuntu-24.04:7.0-complete
           - rocm: rocm7.1
-            pt: "2.10.0"
+            pt: "2.11.0"
             image: rocm/dev-ubuntu-24.04:7.1-complete
           - rocm: rocm7.2
             pt: "2.11.0"
