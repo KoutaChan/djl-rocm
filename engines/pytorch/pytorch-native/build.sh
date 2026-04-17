@@ -88,6 +88,28 @@ if [[ "$FLAVOR" = rocm* ]]; then
   # torch::cuda::* symbols, so keep the JNI USE_CUDA branches (e.g. the
   # CUDACachingAllocator calls) enabled for ROCm as well.
   USE_CUDA=1
+  # libtorch's LoadHIP.cmake requires PYTORCH_ROCM_ARCH at configure time
+  # even when the downstream project has no HIP kernels. DJL JNI contains
+  # zero HIP device code, so the arch list is really a placeholder — the
+  # runtime GPU support is determined by the fat-binary libtorch shipped
+  # by pytorch.org. Still, list every arch that the matching libtorch
+  # actually targets so a future hipified kernel in the JNI covers the
+  # same hardware surface. Rocm 7 drops gfx906 and adds gfx1200/1201.
+  if [[ -z "${PYTORCH_ROCM_ARCH:-}" ]]; then
+    case "$FLAVOR" in
+      rocm6.*)
+        export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102"
+        ;;
+      rocm7.*)
+        export PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+        ;;
+      *)
+        # Unknown rocm flavor — pass the union of every arch the
+        # upstream ROCm 6 & 7 libtorch builds currently target.
+        export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+        ;;
+    esac
+  fi
 fi
 
 pushd .
