@@ -19,6 +19,11 @@ if [[ $3 == "precxx11" ]]; then
   CXX11ABI=""
   AARCH64_CXX11ABI=""
 fi
+# PyTorch 2.9+ Linux binaries are CXX11_ABI=1 only and the filename dropped
+# the "-cxx11-abi-" infix. Strip the suffix so we request the real URL.
+if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 9 )); then
+  CXX11ABI=""
+fi
 ARCH=$4
 
 if [[ ! -d "libtorch" ]]; then
