@@ -83,19 +83,6 @@ tasks {
                         username = findProperty("sonatypeUsername").toString()
                         password = findProperty("sonatypePassword").toString()
                     }
-                } else if (project.hasProperty("github")) {
-                    // Publish to GitHub Packages. Requires GITHUB_ACTOR +
-                    // GITHUB_TOKEN (or githubActor/githubToken gradle props)
-                    // and a -PgithubRepo=<owner>/<repo> override.
-                    name = "github"
-                    val repo = findProperty("githubRepo")?.toString() ?: "KoutaChan/djl-rocm"
-                    url = uri("https://maven.pkg.github.com/${repo}")
-                    credentials {
-                        username = findProperty("githubActor")?.toString()
-                                ?: System.getenv("GITHUB_ACTOR") ?: ""
-                        password = findProperty("githubToken")?.toString()
-                                ?: System.getenv("GITHUB_TOKEN") ?: ""
-                    }
                 } else {
                     name = "local"
                     url = uri("build/repo")
