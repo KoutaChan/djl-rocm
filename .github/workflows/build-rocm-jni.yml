@@ -1,0 +1,97 @@
+name: build-rocm-jni
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to GitHub Packages"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "rocm-*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  engine:
+    name: publish pytorch-engine (patched)
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Publish
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :engines:pytorch:pytorch-engine:publish \
+            -Pgithub -PgithubRepo=${{ github.repository }} -x test
+
+  jni:
+    name: build ${{ matrix.rocm }} (pytorch ${{ matrix.pt }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rocm: rocm6.3
+            pt: "2.7.1"
+            image: rocm/dev-ubuntu-22.04:6.3-complete
+          - rocm: rocm6.4
+            pt: "2.8.0"
+            image: rocm/dev-ubuntu-22.04:6.4-complete
+          - rocm: rocm7.0
+            pt: "2.9.0"
+            image: rocm/dev-ubuntu-24.04:7.0-complete
+          - rocm: rocm7.1
+            pt: "2.10.0"
+            image: rocm/dev-ubuntu-24.04:7.1-complete
+          - rocm: rocm7.2
+            pt: "2.11.0"
+            image: rocm/dev-ubuntu-24.04:7.2-complete
+    container:
+      image: ${{ matrix.image }}
+      options: --user root
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl unzip cmake g++ ca-certificates openjdk-21-jdk-headless
+          update-ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - name: Build libdjl_torch.so
+        working-directory: engines/pytorch/pytorch-native
+        run: ./build.sh ${{ matrix.pt }} ${{ matrix.rocm }} cxx11 amd64
+
+      - name: Verify JNI built
+        run: test -f engines/pytorch/pytorch-native/build/libdjl_torch.so
+
+      - name: Publish pytorch-jni-${{ matrix.rocm }}
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
+            -Ppt_version=${{ matrix.pt }} -Procm_flavor=${{ matrix.rocm }} \
+            -Pgithub -PgithubRepo=${{ github.repository }} -x test
+
+      - name: Upload JNI as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytorch-jni-${{ matrix.rocm }}
+          path: engines/pytorch/pytorch-native/build/libdjl_torch.so
+          retention-days: 14
