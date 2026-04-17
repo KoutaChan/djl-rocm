@@ -65,37 +65,52 @@ jobs:
           - rocm: rocm7.2
             pt: "2.11.0"
             image: rocm/dev-ubuntu-24.04:7.2-complete
-    container:
-      image: ${{ matrix.image }}
-      options: --user root
     steps:
-      - name: Install build tools
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git curl unzip cmake g++ ca-certificates openjdk-21-jdk-headless
-          update-ca-certificates
+      # GitHub's ubuntu-22.04 runner only has ~14GB free on / which is not
+      # enough for the rocm/dev-ubuntu-*-complete images (often >20GB
+      # uncompressed). Free up space BEFORE pulling the image — we cannot
+      # use `container:` here because its image is pulled during job setup
+      # before any step runs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
 
       - uses: actions/checkout@v4
 
-      - name: Build libdjl_torch.so
-        working-directory: engines/pytorch/pytorch-native
-        run: ./build.sh ${{ matrix.pt }} ${{ matrix.rocm }} cxx11 amd64
-
-      - name: Verify JNI built
-        run: test -f engines/pytorch/pytorch-native/build/libdjl_torch.so
-
-      - name: Publish pytorch-jni-${{ matrix.rocm }} to local m2
+      - name: Build libdjl_torch.so + publish to local m2 inside ROCm container
         run: |
-          ./gradlew :engines:pytorch:pytorch-jni-rocm:publishToMavenLocal \
-            -Ppt_version=${{ matrix.pt }} -Procm_flavor=${{ matrix.rocm }} -x test
+          mkdir -p "$HOME/.m2"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/ws" \
+            -v "$HOME/.m2:/root/.m2" \
+            -w /ws \
+            ${{ matrix.image }} \
+            bash -c '
+              set -ex
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                git curl unzip cmake g++ ca-certificates openjdk-21-jdk-headless
+              update-ca-certificates
+              cd engines/pytorch/pytorch-native
+              ./build.sh ${{ matrix.pt }} ${{ matrix.rocm }} cxx11 amd64
+              test -f build/libdjl_torch.so
+              cd /ws
+              ./gradlew :engines:pytorch:pytorch-jni-rocm:publishToMavenLocal \
+                -Ppt_version=${{ matrix.pt }} -Procm_flavor=${{ matrix.rocm }} -x test
+            '
 
       - name: Pack m2 tree
         run: |
           mkdir -p out
-          cd ~/.m2/repository
+          cd "$HOME/.m2/repository"
           tar czf "$GITHUB_WORKSPACE/out/pytorch-jni-${{ matrix.rocm }}.tar.gz" \
-              ai/djl/pytorch/pytorch-jni-${{ matrix.rocm }}
+              "ai/djl/pytorch/pytorch-jni-${{ matrix.rocm }}"
 
       - uses: actions/upload-artifact@v4
         with:
