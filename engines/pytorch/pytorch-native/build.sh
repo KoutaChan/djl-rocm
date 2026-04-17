@@ -30,25 +30,25 @@ if [[ ! -d "libtorch" ]]; then
 
     if [[ $ARCH == 'aarch64' ]]; then
       if [[ "$VERSION" =~ ^(2.[7-9].*)$ ]]; then
-        curl -s "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-linux-aarch64-${VERSION}.zip" | jar xv >/dev/null
+        curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-linux-aarch64-${VERSION}.zip" | jar xv >/dev/null
       else
-        curl -s "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch${AARCH64_CXX11ABI}-shared-with-deps-${VERSION}-aarch64.zip" | jar xv >/dev/null
+        curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch${AARCH64_CXX11ABI}-shared-with-deps-${VERSION}-aarch64.zip" | jar xv >/dev/null
       fi
     else
-      curl -s "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip" | jar xv >/dev/null
+      curl -fsSL "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip" | jar xv >/dev/null
     fi
   elif [[ $PLATFORM == 'darwin' ]]; then
     if [[ "$VERSION" =~ ^(2.[2-9].*)$ ]]; then
       if [[ $ARCH == 'aarch64' ]]; then
-        curl -s "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${VERSION}.zip" | jar xv >/dev/null
+        curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${VERSION}.zip" | jar xv >/dev/null
       else
-        curl -s "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-${VERSION}.zip" | jar xv >/dev/null
+        curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-${VERSION}.zip" | jar xv >/dev/null
       fi
     else
       if [[ $ARCH == 'aarch64' ]]; then
-        curl -s "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-macos-${VERSION}-aarch64.zip" | jar xv >/dev/null
+        curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-macos-${VERSION}-aarch64.zip" | jar xv >/dev/null
       else
-        curl -s "https://download.pytorch.org/libtorch/cpu/libtorch-macos-${VERSION}.zip" | jar xv >/dev/null
+        curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-${VERSION}.zip" | jar xv >/dev/null
       fi
     fi
   else
@@ -56,6 +56,20 @@ if [[ ! -d "libtorch" ]]; then
     exit 1
   fi
 fi
+
+# Verify libtorch was actually extracted and expose the TorchConfig.cmake
+# location for diagnostics — find_package(Torch) looks for it under
+# share/cmake/Torch/ typically, but older / ROCm builds occasionally stage
+# it elsewhere.
+if [[ ! -d "libtorch" ]]; then
+  echo "ERROR: libtorch directory is missing after download." >&2
+  exit 1
+fi
+echo "libtorch top level:"
+ls -1 libtorch | head -20
+echo "Torch cmake config candidates:"
+find libtorch -maxdepth 6 -type f \( -name "TorchConfig.cmake" -o -name "torch-config.cmake" \) \
+    2>/dev/null | head -5 || true
 
 if [[ "$VERSION" == "1.13.1" || "$VERSION" == "2.0.1" || "$VERSION" =~ ^2\.1\.[0-9]+$ ]]; then
   PT_VERSION=V1_13_X
