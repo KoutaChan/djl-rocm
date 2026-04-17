@@ -661,6 +661,43 @@ public interface NDArrayEx {
             int nmsTopK);
 
     /**
+     * Fused root-mean-square layer normalization: {@code x / rms(x) * weight} computed as a single
+     * kernel. The default implementation throws; implement on each engine that can fuse this.
+     *
+     * @param normalizedShape sizes of the trailing dims to normalise over (usually the feature dim)
+     * @param weight          affine scale broadcastable over {@code normalizedShape}, or {@code null}
+     *                        for no affine
+     * @param eps             variance epsilon added before the square root; callers are expected
+     *                        to pass a concrete value (typically {@code 1e-6f})
+     * @return normalised tensor with the same shape as {@code this}
+     */
+    default NDArray rmsNorm(long[] normalizedShape, NDArray weight, double eps) {
+        throw new UnsupportedOperationException("rmsNorm is not supported by this engine");
+    }
+
+    /**
+     * Fused scaled-dot-product attention: roughly
+     * {@code softmax(Q Kᵀ / sqrt(d_k) + attnMask) V} computed in a single fused kernel.
+     *
+     * <p>Engine backends may dispatch to FlashAttention, memory-efficient attention or the
+     * standard math implementation depending on input shapes and hardware. The default
+     * implementation throws; implement on each engine that can fuse this.
+     *
+     * @param key key tensor, shape {@code [..., K, D]}. same leading dims as the query
+     * @param value value tensor, shape {@code [..., K, D_v]}. same leading dims as the query
+     * @param attnMask additive float bias broadcastable over {@code [..., Q, K]}, or {@code null}
+     * @param dropoutP dropout probability (use {@code 0.0} at inference time)
+     * @param isCausal if true, apply a causal upper-triangular mask; mutually exclusive with
+     *                 {@code attnMask}
+     * @return attention output with shape {@code [..., Q, D_v]}
+     */
+    default NDArray scaledDotProductAttention(
+            NDArray key, NDArray value, NDArray attnMask, double dropoutP, boolean isCausal) {
+        throw new UnsupportedOperationException(
+                "scaledDotProductAttention is not supported by this engine");
+    }
+
+    /**
      * Get internal {@link NDArray}.
      *
      * @return a NDArray

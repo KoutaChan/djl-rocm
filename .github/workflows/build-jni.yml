@@ -1,0 +1,264 @@
+name: Build JNI
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "jni-*"
+      - "rocm-*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  JAVA_VERSION: "21"
+  JAVA_DISTRIBUTION: temurin
+
+jobs:
+  engine:
+    name: Publish API + PyTorch Engine
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Publish api + pytorch-engine to GitHub Packages
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :api:publish :engines:pytorch:pytorch-engine:publish \
+              -Pgithub -PgithubRepo=${{ github.repository }} -x test
+
+  # Linux x86_64, ROCm flavors (via rocm/dev-ubuntu-*-complete container).
+  # Each ROCm version is paired with the latest PyTorch libtorch published
+  # for it on pytorch.org: rocm6.4->2.9.1, rocm7.0->2.10.0, rocm7.1/7.2->2.11.0.
+  jni-rocm:
+    name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: rocm6.4
+            pt: "2.9.1"
+            image: rocm/dev-ubuntu-22.04:6.4-complete
+          - flavor: rocm7.0
+            pt: "2.10.0"
+            image: rocm/dev-ubuntu-24.04:7.0-complete
+          - flavor: rocm7.1
+            pt: "2.11.0"
+            image: rocm/dev-ubuntu-24.04:7.1-complete
+          - flavor: rocm7.2
+            pt: "2.11.0"
+            image: rocm/dev-ubuntu-24.04:7.2-complete
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare libtorch mount
+        run: |
+          sudo rm -rf /mnt/libtorch
+          sudo install -d -m 0777 /mnt/libtorch
+
+      - name: Build and publish pytorch-jni-${{ matrix.flavor }}
+        env:
+          PT_VERSION: ${{ matrix.pt }}
+          FLAVOR: ${{ matrix.flavor }}
+          CLASSIFIER: linux-x86_64
+          IMAGE: ${{ matrix.image }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          docker run --rm \
+              -e PT_VERSION -e FLAVOR -e CLASSIFIER \
+              -e GITHUB_ACTOR -e GITHUB_TOKEN -e GITHUB_REPOSITORY \
+              -v "$GITHUB_WORKSPACE:/ws" \
+              -v /mnt/libtorch:/ws/engines/pytorch/pytorch-native/libtorch \
+              -w /ws \
+              "$IMAGE" \
+              bash .github/workflows/scripts/build-in-container.sh
+
+  # Linux x86_64, CPU and CUDA flavors (runner native, Jimver/cuda-toolkit).
+  jni-linux:
+    name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, linux)
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: cpu
+            pt: "2.11.0"
+            cuda: ""
+          - flavor: cu128
+            pt: "2.11.0"
+            cuda: "12.8.1"
+          - flavor: cu129
+            pt: "2.11.0"
+            cuda: "12.9.1"
+          - flavor: cu130
+            pt: "2.11.0"
+            cuda: "13.0.0"
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              git curl unzip cmake g++ ca-certificates
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        if: matrix.cuda != ''
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas-dev", "curand-dev", "cufft-dev", "cusparse-dev", "cusolver-dev"]'
+
+      - name: Build libdjl_torch.so
+        working-directory: engines/pytorch/pytorch-native
+        run: ./build.sh ${{ matrix.pt }} ${{ matrix.flavor }} cxx11 amd64
+
+      - name: Publish pytorch-jni-${{ matrix.flavor }}
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
+              -Ppt_version=${{ matrix.pt }} \
+              -Pflavor=${{ matrix.flavor }} \
+              -Pclassifier=linux-x86_64 \
+              -Pgithub -PgithubRepo=${{ github.repository }} -x test
+
+  # Windows x86_64, CPU and CUDA flavors (windows-latest + build.cmd).
+  jni-windows:
+    name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, win)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: cpu
+            pt: "2.11.0"
+            cuda: ""
+          - flavor: cu128
+            pt: "2.11.0"
+            cuda: "12.8.1"
+          - flavor: cu129
+            pt: "2.11.0"
+            cuda: "12.9.1"
+          - flavor: cu130
+            pt: "2.11.0"
+            cuda: "13.0.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        if: matrix.cuda != ''
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas_dev", "curand_dev", "cufft_dev", "cusparse_dev", "cusolver_dev", "visual_studio_integration"]'
+
+      - name: Build djl_torch.dll
+        working-directory: engines/pytorch/pytorch-native
+        shell: cmd
+        run: build.cmd ${{ matrix.pt }} ${{ matrix.flavor }}
+
+      - name: Publish pytorch-jni-${{ matrix.flavor }}
+        shell: bash
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
+              -Ppt_version=${{ matrix.pt }} \
+              -Pflavor=${{ matrix.flavor }} \
+              -Pclassifier=win-x86_64 \
+              -Pgithub -PgithubRepo=${{ github.repository }} -x test
+
+  # macOS arm64 + x86_64, CPU only (no CUDA/ROCm on either). Each classifier
+  # uses the latest PyTorch libtorch actually published for it on pytorch.org:
+  # osx-aarch64 -> 2.11.0, osx-x86_64 -> 2.2.2 (upstream stopped shipping
+  # macOS x86_64 libtorch after 2.2.x).
+  jni-macos:
+    name: Build cpu (PyTorch ${{ matrix.pt }}, ${{ matrix.classifier }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - classifier: osx-aarch64
+            runner: macos-14
+            pt: "2.11.0"
+            arch: aarch64
+          - classifier: osx-x86_64
+            runner: macos-13
+            pt: "2.2.2"
+            arch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Install build tools
+        run: brew install cmake
+
+      - name: Build libdjl_torch.dylib
+        working-directory: engines/pytorch/pytorch-native
+        run: ./build.sh ${{ matrix.pt }} cpu cxx11 ${{ matrix.arch }}
+
+      - name: Publish pytorch-jni-cpu (${{ matrix.classifier }})
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
+              -Ppt_version=${{ matrix.pt }} \
+              -Pflavor=cpu \
+              -Pclassifier=${{ matrix.classifier }} \
+              -Pgithub -PgithubRepo=${{ github.repository }} -x test

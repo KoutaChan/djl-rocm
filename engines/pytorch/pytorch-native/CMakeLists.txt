@@ -59,6 +59,16 @@ if(USE_CUDA)
     add_compile_definitions(USE_CUDA)
 endif()
 
+# ROCm libtorch keeps the c10/cuda/*.h headers but those transitively pull
+# in <cuda_runtime.h>, which is a CUDA-SDK-only file absent on ROCm build
+# hosts. USE_ROCM lets JNI sources gate the CUDA-specific code paths
+# (CUDACachingAllocator, CUDAStream pool) so the ROCm compile succeeds;
+# torch::cuda::is_available() still works on ROCm libtorch via the
+# hipified dispatch under the same symbol names.
+if(USE_ROCM)
+    add_compile_definitions(USE_ROCM)
+endif()
+
 add_library(djl_torch SHARED ${SOURCE_FILES})
 set_property(TARGET djl_torch PROPERTY CXX_STANDARD 17)
 

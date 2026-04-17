@@ -14,9 +14,30 @@
 #include <torch/script.h>
 
 #ifdef USE_CUDA
+#ifdef USE_ROCM
+#include <torch/version.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
+#include <c10/hip/HIPStream.h>
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#endif
+#endif
+
+// Same rename as the caching allocator: PyTorch 2.11 flipped the HIP stream
+// types in c10/hip/HIPStream.h to live under the cuda namespace for source
+// compatibility. Earlier PyTorch hipified builds still expose them as
+// c10::hip::HIPStream / HIPStreamGuard.
+#if defined(USE_ROCM) && TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 11
+#define DJL_CUDA_STREAM c10::hip::HIPStream
+#define DJL_CUDA_STREAM_GUARD c10::hip::HIPStreamGuard
+#define DJL_CUDA_GET_STREAM_FROM_POOL c10::hip::getStreamFromPool
+#else
+#define DJL_CUDA_STREAM c10::cuda::CUDAStream
+#define DJL_CUDA_STREAM_GUARD c10::cuda::CUDAStreamGuard
+#define DJL_CUDA_GET_STREAM_FROM_POOL c10::cuda::getStreamFromPool
 #endif
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
@@ -237,8 +258,8 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_moduleRunMethod(J
     JITCallGuard guard;
 #ifdef USE_CUDA
     if (jinference_separate_cuda_stream && torch::cuda::is_available()) {
-      c10::cuda::CUDAStream stream = c10::cuda::getStreamFromPool();
-      c10::cuda::CUDAStreamGuard stream_guard(stream);
+      DJL_CUDA_STREAM stream = DJL_CUDA_GET_STREAM_FROM_POOL();
+      DJL_CUDA_STREAM_GUARD stream_guard(stream);
       return module_ptr->get_method(method_name)(std::move(inputs));
     }
 #endif

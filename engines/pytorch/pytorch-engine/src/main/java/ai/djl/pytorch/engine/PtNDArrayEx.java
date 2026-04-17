@@ -856,6 +856,26 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray scaledDotProductAttention(
+            NDArray key, NDArray value, NDArray attnMask, double dropoutP, boolean isCausal) {
+        return JniUtils.scaledDotProductAttention(
+                array,
+                (PtNDArray) key,
+                (PtNDArray) value,
+                attnMask == null ? null : (PtNDArray) attnMask,
+                dropoutP,
+                isCausal);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray rmsNorm(long[] normalizedShape, NDArray weight, double eps) {
+        return JniUtils.rmsNorm(
+                array, normalizedShape, weight == null ? null : (PtNDArray) weight, eps);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public PtNDArray getArray() {
         return array;
     }

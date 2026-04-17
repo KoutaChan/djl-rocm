@@ -19,16 +19,21 @@ if [[ $3 == "precxx11" ]]; then
   CXX11ABI=""
   AARCH64_CXX11ABI=""
 fi
-# PyTorch 2.9+ Linux binaries are CXX11_ABI=1 only and the filename dropped
-# the "-cxx11-abi-" infix. Strip the suffix so we request the real URL.
-if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 9 )); then
+# PyTorch 2.8+ Linux binaries are CXX11_ABI=1 only and the filename dropped
+# the "-cxx11-abi-" infix (last cxx11-abi zip was 2.7.1, first no-cxx11-abi
+# was 2.8.0 per download.pytorch.org). Strip the suffix so we request the
+# real URL.
+if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 8 )); then
   CXX11ABI=""
 fi
 ARCH=$4
 
-if [[ ! -d "libtorch" ]]; then
+# Check for the actual libtorch library, not just the directory — CI bind
+# mounts an empty /mnt/libtorch onto this path so the pure directory check
+# would silently skip the download and leave us with an empty libtorch/.
+if [[ ! -f "libtorch/lib/libtorch.so" && ! -f "libtorch/lib/libtorch.dylib" && ! -f "libtorch/lib/torch.dll" ]]; then
   if [[ $PLATFORM == 'linux' ]]; then
-    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|rocm[67]\.[0-9]+)$ ]]; then
+    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|cu129|cu130|rocm[67]\.[0-9]+)$ ]]; then
       echo "$FLAVOR is not supported."
       exit 1
     fi
@@ -75,6 +80,21 @@ ls -1 libtorch | head -20
 echo "Torch cmake config candidates:"
 find libtorch -maxdepth 6 -type f \( -name "TorchConfig.cmake" -o -name "torch-config.cmake" \) \
     2>/dev/null | head -5 || true
+
+# When building for ROCm, dump the c10/hip tree so we can see where the
+# HIPCachingAllocator symbol (or its replacement) actually lives.
+if [[ "$FLAVOR" = rocm* ]]; then
+  echo "=== c10/hip/ contents ==="
+  ls -1 libtorch/include/c10/hip/ 2>/dev/null | head -40 || echo "(missing)"
+  echo "=== HIPCachingAllocator in hip headers ==="
+  grep -l "HIPCachingAllocator" libtorch/include/c10/hip/*.h 2>/dev/null || echo "(none)"
+  echo "=== HIPCachingAllocator in cuda headers ==="
+  grep -l "HIPCachingAllocator" libtorch/include/c10/cuda/*.h 2>/dev/null || echo "(none)"
+  echo "=== emptyCache in c10/hip/*.h ==="
+  grep -n "emptyCache" libtorch/include/c10/hip/*.h 2>/dev/null | head -20 || echo "(none)"
+  echo "=== namespace declarations in HIPCachingAllocator.h ==="
+  grep -nE "^namespace|^inline|^void emptyCache" libtorch/include/c10/hip/HIPCachingAllocator.h 2>/dev/null | head -20 || echo "(file missing)"
+fi
 
 if [[ "$VERSION" == "1.13.1" || "$VERSION" == "2.0.1" || "$VERSION" =~ ^2\.1\.[0-9]+$ ]]; then
   PT_VERSION=V1_13_X
@@ -130,7 +150,20 @@ rm -rf build
 mkdir build && cd build
 mkdir classes
 javac -sourcepath ../../pytorch-engine/src/main/java/ ../../pytorch-engine/src/main/java/ai/djl/pytorch/jni/PyTorchLibrary.java -h include -d classes
-cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" -DPT_VERSION="${PT_VERSION}" -DUSE_CUDA="$USE_CUDA" ..
+USE_ROCM=0
+if [[ "$FLAVOR" = rocm* ]]; then
+  USE_ROCM=1
+fi
+# Some rocm/dev-ubuntu images (e.g. :6.4-complete) install the JDK under a
+# non-standard path that CMake's FindJNI cannot discover. Derive JAVA_HOME
+# from `javac` so find_package(JNI) can locate the headers + libjvm.
+if [[ -z "${JAVA_HOME:-}" ]] && command -v javac >/dev/null 2>&1; then
+  javac_path=$(readlink -f "$(command -v javac)")
+  export JAVA_HOME=$(dirname "$(dirname "$javac_path")")
+  echo "note: auto-detected JAVA_HOME=${JAVA_HOME}"
+fi
+cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" -DPT_VERSION="${PT_VERSION}" \
+      -DUSE_CUDA="$USE_CUDA" -DUSE_ROCM="$USE_ROCM" ..
 cmake --build . --config Release -- -j "${NUM_PROC}"
 if [[ "$FLAVOR" = cu* ]]; then
   # avoid link with libcudart.so.11.0

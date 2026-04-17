@@ -56,6 +56,49 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNOneHot(
   API_END_RETURN()
 }
 
+// rms_norm — fused RMSNorm (PyTorch 2.4+). Normalises `input` along the
+// trailing dims given by `normalized_shape`, then applies an affine `weight`
+// when provided. `jeps` is always forwarded as the variance epsilon — the
+// caller is expected to supply a sensible value (e.g. 1e-6f).
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(JNIEnv* env, jobject jthis, jlong jinput,
+    jlongArray jnormalized_shape, jlong jweight, jdouble jeps) {
+  API_BEGIN()
+  const auto* input_ptr = reinterpret_cast<torch::Tensor*>(jinput);
+  const auto shape_vec = djl::utils::jni::GetVecFromJLongArray(env, jnormalized_shape);
+  std::optional<torch::Tensor> weight_opt;
+  if (jweight != djl::utils::jni::NULL_PTR) {
+    weight_opt = *reinterpret_cast<torch::Tensor*>(jweight);
+  }
+  auto result = at::rms_norm(*input_ptr, c10::ArrayRef<int64_t>(shape_vec), weight_opt,
+      std::optional<double>(static_cast<double>(jeps)));
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+// scaled_dot_product_attention — fused attention that dispatches to
+// FlashAttention / mem-efficient / math backends via PyTorch internals.
+// query/key/value shape: [B, H, T, D]. attn_mask is an additive float bias
+// broadcastable over [B, H, Q, K] (or 0 for no mask). Scale defaults to
+// 1/sqrt(D) inside libtorch.
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScaledDotProductAttention(
+    JNIEnv* env, jobject jthis, jlong jquery, jlong jkey, jlong jvalue, jlong jmask, jdouble jdropout,
+    jboolean jcausal) {
+  API_BEGIN()
+  const auto* q_ptr = reinterpret_cast<torch::Tensor*>(jquery);
+  const auto* k_ptr = reinterpret_cast<torch::Tensor*>(jkey);
+  const auto* v_ptr = reinterpret_cast<torch::Tensor*>(jvalue);
+  std::optional<torch::Tensor> mask_opt;
+  if (jmask != djl::utils::jni::NULL_PTR) {
+    mask_opt = *reinterpret_cast<torch::Tensor*>(jmask);
+  }
+  auto result = at::scaled_dot_product_attention(*q_ptr, *k_ptr, *v_ptr, mask_opt,
+      static_cast<double>(jdropout), jcausal == JNI_TRUE, std::nullopt);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNInterpolate(
     JNIEnv* env, jobject jthis, jlong jhandle, jlongArray jsize, jint jmode, jboolean jalign_corners) {
   API_BEGIN()

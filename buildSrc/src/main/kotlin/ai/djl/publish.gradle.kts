@@ -83,6 +83,21 @@ tasks {
                         username = findProperty("sonatypeUsername").toString()
                         password = findProperty("sonatypePassword").toString()
                     }
+                } else if (project.hasProperty("github")) {
+                    // Publish to GitHub Packages. Credentials come from the
+                    // `githubActor` / `githubToken` gradle props or the
+                    // GITHUB_ACTOR / GITHUB_TOKEN env vars that GitHub Actions
+                    // injects. The target repo defaults to KoutaChan/djl-rocm
+                    // but -PgithubRepo=<owner>/<repo> can override it.
+                    name = "github"
+                    val repo = findProperty("githubRepo")?.toString() ?: "KoutaChan/djl-rocm"
+                    url = uri("https://maven.pkg.github.com/${repo}")
+                    credentials {
+                        username = findProperty("githubActor")?.toString()
+                                ?: System.getenv("GITHUB_ACTOR") ?: ""
+                        password = findProperty("githubToken")?.toString()
+                                ?: System.getenv("GITHUB_TOKEN") ?: ""
+                    }
                 } else {
                     name = "local"
                     url = uri("build/repo")

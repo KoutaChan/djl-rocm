@@ -29,7 +29,23 @@
 #include "ai_djl_pytorch_jni_cache.h"
 
 #ifdef USE_CUDA
+#ifdef USE_ROCM
+#include <torch/version.h>
+// PyTorch 2.11 renamed the ROCm caching allocator types inside
+// c10/hip/HIPCachingAllocator.h: the file path is still HIP-prefixed but
+// the declared namespace switched from c10::hip::HIPCachingAllocator to
+// c10::cuda::CUDACachingAllocator for source compatibility with CUDA code.
+// 2.10 and earlier keep the HIP-prefixed namespace.
+#include <c10/hip/HIPCachingAllocator.h>
+#else
 #include <c10/cuda/CUDACachingAllocator.h>
+#endif
+#endif
+
+#if defined(USE_ROCM) && TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 11
+#define DJL_CUDA_CACHING_ALLOC c10::hip::HIPCachingAllocator
+#else
+#define DJL_CUDA_CACHING_ALLOC c10::cuda::CUDACachingAllocator
 #endif
 
 #if defined(__ANDROID__)
@@ -336,7 +352,7 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCudaEmptyCach
   API_BEGIN()
 #ifdef USE_CUDA
   if (torch::cuda::is_available()) {
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    DJL_CUDA_CACHING_ALLOC::emptyCache();
   }
 #endif
   API_END()

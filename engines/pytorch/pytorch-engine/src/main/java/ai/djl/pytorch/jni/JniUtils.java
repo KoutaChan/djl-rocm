@@ -654,6 +654,34 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchSoftmax(ndArray.getHandle(), dim, dTpe.ordinal()));
     }
 
+    public static PtNDArray scaledDotProductAttention(
+            PtNDArray query,
+            PtNDArray key,
+            PtNDArray value,
+            PtNDArray attnMask,
+            double dropoutP,
+            boolean isCausal) {
+        long maskHandle = attnMask == null ? 0L : attnMask.getHandle();
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchScaledDotProductAttention(
+                        query.getHandle(),
+                        key.getHandle(),
+                        value.getHandle(),
+                        maskHandle,
+                        dropoutP,
+                        isCausal));
+    }
+
+    public static PtNDArray rmsNorm(
+            PtNDArray input, long[] normalizedShape, PtNDArray weight, double eps) {
+        long weightHandle = weight == null ? 0L : weight.getHandle();
+        return new PtNDArray(
+                input.getManager(),
+                PyTorchLibrary.LIB.torchRmsNorm(
+                        input.getHandle(), normalizedShape, weightHandle, eps));
+    }
+
     public static PtNDArray logSoftmax(PtNDArray ndArray, long dim, DataType dTpe) {
         return new PtNDArray(
                 ndArray.getManager(),

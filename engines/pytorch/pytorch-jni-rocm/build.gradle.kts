@@ -10,11 +10,33 @@ val ptVersion: String = when {
     else -> libs.versions.pytorch.get()
 }
 
-val rocmFlavor: String = when {
+// `flavor` covers everything published under download.pytorch.org/libtorch/:
+// cpu, cu121, cu124, cu128, rocm6.4, rocm7.0, rocm7.1, rocm7.2, ... The
+// legacy `rocm_flavor` property is kept as a fallback for callers still
+// passing the ROCm-specific name.
+val flavor: String = when {
+    project.hasProperty("flavor") && project.property("flavor") != "" ->
+        project.property("flavor").toString()
+
     project.hasProperty("rocm_flavor") && project.property("rocm_flavor") != "" ->
         project.property("rocm_flavor").toString()
 
-    else -> "rocm6.3"
+    else -> "rocm6.4"
+}
+
+// OS+arch classifier matching DJL's native-jar conventions.
+val classifier: String = when {
+    project.hasProperty("classifier") && project.property("classifier") != "" ->
+        project.property("classifier").toString()
+
+    else -> "linux-x86_64"
+}
+
+// pytorch-native's build output file name depends on the target OS.
+val jniLibFileName: String = when {
+    classifier.startsWith("win") -> "djl_torch.dll"
+    classifier.startsWith("osx") -> "libdjl_torch.dylib"
+    else -> "libdjl_torch.so"
 }
 
 group = "ai.djl.pytorch"
@@ -25,7 +47,9 @@ val stageJniLib = tasks.register("stageJniLib") {
     val djlVersion = libs.versions.djl.get()
     val logger = project.logger
     val nativeDir = project.parent!!.projectDir / "pytorch-native"
-    val flavor = rocmFlavor
+    val flavorName = flavor
+    val classifierName = classifier
+    val libName = jniLibFileName
     val publishedVersion = project.version
     val stageDir = layout.buildDirectory.dir("jnilib-stage")
     val injected = project.objects.newInstance<InjectedOps>()
@@ -34,21 +58,20 @@ val stageJniLib = tasks.register("stageJniLib") {
     outputs.upToDateWhen { false }
 
     doLast {
-        val classifier = "linux-x86_64"
-        val entry = "$classifier/$flavor/libdjl_torch.so"
+        val entry = "$classifierName/$flavorName/$libName"
         val targetFile = stageDir.get().asFile / entry
         targetFile.parentFile.mkdirs()
 
-        // Prefer a freshly built .so, fall back to the jnilib tree populated
-        // by pytorch-native:compileJNI.
-        val freshFile = nativeDir / "build/libdjl_torch.so"
+        // Prefer a freshly built library, fall back to the jnilib tree
+        // populated by pytorch-native:compileJNI (CI mode).
+        val freshFile = nativeDir / "build/$libName"
         val cachedFile = nativeDir / "jnilib/${djlVersion}/$entry"
         val source = when {
             freshFile.exists() -> freshFile
             cachedFile.exists() -> cachedFile
             else -> throw GradleException(
-                "libdjl_torch.so not found. Build it first:\n" +
-                        "  cd ${nativeDir} && ./gradlew compileJNI -Pcuda=$flavor"
+                "$libName not found. Build it first:\n" +
+                        "  cd $nativeDir && ./build.sh <pt_version> $flavorName <cxx11|precxx11> <arch>"
             )
         }
         logger.lifecycle("Bundling $source into jnilib/$entry")
@@ -68,7 +91,8 @@ tasks {
         from(stageJniLib.map { it.outputs.files }) {
             into("jnilib")
         }
-        archiveBaseName = "pytorch-jni-$rocmFlavor"
+        archiveBaseName = "pytorch-jni-$flavor"
+        archiveClassifier = classifier
     }
 
     clean {
@@ -82,13 +106,13 @@ tasks {
 publishing {
     publications {
         named<MavenPublication>("maven") {
-            artifactId = "pytorch-jni-$rocmFlavor"
+            artifactId = "pytorch-jni-$flavor"
             pom {
-                name = "DJL Engine Adapter for PyTorch (ROCm JNI)"
+                name = "DJL PyTorch JNI ($flavor / $classifier)"
                 description =
-                        "DJL PyTorch JNI (libdjl_torch.so) built against ROCm libtorch." +
-                                " The libtorch binaries themselves are fetched at runtime" +
-                                " by LibUtils from download.pytorch.org."
+                        "DJL PyTorch JNI ($jniLibFileName) for the $flavor libtorch flavor on" +
+                                " $classifier. The libtorch binaries themselves are fetched at" +
+                                " runtime by LibUtils from download.pytorch.org."
                 url = "http://www.djl.ai/engines/pytorch/${project.name}"
             }
         }

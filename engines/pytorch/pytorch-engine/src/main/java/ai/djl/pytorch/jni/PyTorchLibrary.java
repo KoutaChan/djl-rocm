@@ -173,6 +173,11 @@ final class PyTorchLibrary {
 
     native long torchLogSoftmax(long handle, long dim, int dType);
 
+    native long torchScaledDotProductAttention(
+            long query, long key, long value, long mask, double dropoutP, boolean isCausal);
+
+    native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
+
     native long torchArgMax(long handle);
 
     native long torchArgMax(long handle, long dim, boolean keepDim);
