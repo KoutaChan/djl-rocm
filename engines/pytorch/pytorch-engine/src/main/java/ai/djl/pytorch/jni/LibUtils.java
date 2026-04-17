@@ -121,7 +121,9 @@ public final class LibUtils {
         }
         String libExclusion = Utils.getEnvOrSystemProperty("PYTORCH_LIBRARY_EXCLUSION", "");
         Set<String> exclusion = new HashSet<>(Arrays.asList(libExclusion.split(",")));
-        boolean isCuda = libTorch.flavor.contains("cu");
+        // flavor "cpu" contains "cu", so contains("cu") gives false positives
+        boolean isCuda = libTorch.flavor.startsWith("cu");
+        boolean isRocm = libTorch.flavor.startsWith("rocm");
         List<String> deferred =
                 Arrays.asList(
                         System.mapLibraryName("fbgemm"),
@@ -182,7 +184,19 @@ public final class LibUtils {
                 loadNativeLibrary(libDir.resolve("cudnn64_7.dll").toString());
             }
 
-            if (!isCuda) {
+            if (isRocm) {
+                // ROCm libtorch ships the hipified libs as libtorch_hip.so / libc10_hip.so;
+                // some releases keep the libtorch_cuda.so naming, so try both.
+                deferred =
+                        Arrays.asList(
+                                System.mapLibraryName("fbgemm"),
+                                System.mapLibraryName("torch_cpu"),
+                                System.mapLibraryName("c10_hip"),
+                                System.mapLibraryName("torch_hip"),
+                                System.mapLibraryName("c10_cuda"),
+                                System.mapLibraryName("torch_cuda"),
+                                System.mapLibraryName("torch"));
+            } else if (!isCuda) {
                 deferred =
                         Arrays.asList(
                                 System.mapLibraryName("fbgemm"),
@@ -568,14 +582,59 @@ public final class LibUtils {
             }
             flavor = Utils.getEnvOrSystemProperty("PYTORCH_FLAVOR");
             if (flavor == null || flavor.isEmpty()) {
+                String rocmFlavor = detectRocmFlavor();
                 if (CudaUtils.getGpuCount() > 0) {
                     flavor = "cu" + CudaUtils.getCudaVersionString() + "-precxx11";
+                } else if (rocmFlavor != null) {
+                    flavor = rocmFlavor;
                 } else if ("linux".equals(platform.getOsPrefix())) {
                     flavor = "cpu-precxx11";
                 } else {
                     flavor = "cpu";
                 }
             }
+        }
+
+        /**
+         * Detect a ROCm installation under /opt/rocm* and return a flavor string (e.g.
+         * "rocm6.3"), or {@code null} if none is found. Override with the
+         * {@code DJL_ROCM_VERSION} env var (e.g. {@code DJL_ROCM_VERSION=6.3}).
+         */
+        private static String detectRocmFlavor() {
+            String override = Utils.getEnvOrSystemProperty("DJL_ROCM_VERSION");
+            if (override != null && !override.isEmpty()) {
+                return "rocm" + override;
+            }
+            if (!System.getProperty("os.name", "").toLowerCase().startsWith("linux")) {
+                return null;
+            }
+            File rocmRoot = new File("/opt/rocm");
+            if (!rocmRoot.exists()) {
+                return null;
+            }
+            File versionFile = new File(rocmRoot, ".info/version");
+            if (versionFile.exists()) {
+                try {
+                    String version = new String(Files.readAllBytes(versionFile.toPath())).trim();
+                    Matcher m = Pattern.compile("(\\d+\\.\\d+)").matcher(version);
+                    if (m.find()) {
+                        return "rocm" + m.group(1);
+                    }
+                } catch (IOException ignored) {
+                    // fall through
+                }
+            }
+            // fallback: look for sibling directories like /opt/rocm-6.3
+            File[] siblings = rocmRoot.getParentFile().listFiles();
+            if (siblings != null) {
+                for (File f : siblings) {
+                    Matcher m = Pattern.compile("rocm-(\\d+\\.\\d+)").matcher(f.getName());
+                    if (m.matches()) {
+                        return "rocm" + m.group(1);
+                    }
+                }
+            }
+            return null;
         }
 
         LibTorch(Path dir, Platform platform, String flavor) {

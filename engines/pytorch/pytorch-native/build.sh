@@ -23,7 +23,7 @@ ARCH=$4
 
 if [[ ! -d "libtorch" ]]; then
   if [[ $PLATFORM == 'linux' ]]; then
-    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128)$ ]]; then
+    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|rocm6\.[0-9]+)$ ]]; then
       echo "$FLAVOR is not supported."
       exit 1
     fi
@@ -64,6 +64,12 @@ fi
 if [[ "$FLAVOR" = cu* ]]; then
   USE_CUDA=1
 fi
+if [[ "$FLAVOR" = rocm* ]]; then
+  # ROCm libtorch is hipified and still exposes the c10/cuda/* headers and
+  # torch::cuda::* symbols, so keep the JNI USE_CUDA branches (e.g. the
+  # CUDACachingAllocator calls) enabled for ROCm as well.
+  USE_CUDA=1
+fi
 
 pushd .
 
@@ -77,6 +83,13 @@ if [[ "$FLAVOR" = cu* ]]; then
   # avoid link with libcudart.so.11.0
   sed -i -r "s/\/usr\/local\/cuda(.{5})?\/lib64\/lib(cudart|nvrtc).so//g" CMakeFiles/djl_torch.dir/link.txt
   rm libdjl_torch.so
+  . CMakeFiles/djl_torch.dir/link.txt
+fi
+if [[ "$FLAVOR" = rocm* ]]; then
+  # avoid absolute link to /opt/rocm*/lib stubs so runtime loader picks up
+  # whatever ROCm is present on the target machine
+  sed -i -r "s#/opt/rocm[^ ]*/lib/lib(amdhip64|hsa-runtime64|rocblas|rocfft|rocrand|hiprtc|MIOpen)\.so[^ ]*##g" CMakeFiles/djl_torch.dir/link.txt
+  rm -f libdjl_torch.so
   . CMakeFiles/djl_torch.dir/link.txt
 fi
 
