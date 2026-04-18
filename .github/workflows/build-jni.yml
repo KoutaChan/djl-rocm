@@ -169,6 +169,8 @@ jobs:
               -Pgithub -PgithubRepo=${{ github.repository }} -x test
 
   # Windows x86_64, CPU and CUDA flavors (windows-latest + build.cmd).
+  # pytorch.org stopped publishing Windows libtorch cu129 after 2.8.0, so
+  # the Windows matrix intentionally skips cu129 — Linux still covers it.
   jni-windows:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, win)
     runs-on: windows-latest
@@ -182,9 +184,6 @@ jobs:
           - flavor: cu128
             pt: "2.11.0"
             cuda: "12.8.1"
-          - flavor: cu129
-            pt: "2.11.0"
-            cuda: "12.9.1"
           - flavor: cu130
             pt: "2.11.0"
             cuda: "13.0.0"
