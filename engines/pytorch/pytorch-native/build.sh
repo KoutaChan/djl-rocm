@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build libdjl_torch.<so|dll|dylib> — the JNI bridge between DJL's Java
+# Build libdjl_torch.<so|dll|dylib>, the JNI bridge between DJL's Java
 # PtNDArrayEx layer and libtorch.
 #
 # Usage: build.sh <VERSION> <FLAVOR> [precxx11] <ARCH>
@@ -91,7 +91,7 @@ download_libtorch_darwin() {
   fi
 }
 
-# Check for the actual libtorch library, not just the directory — CI bind
+# Check for the actual libtorch library, not just the directory. CI bind
 # mounts an empty /mnt/libtorch onto this path so the pure directory check
 # would silently skip the download and leave us with an empty libtorch/.
 if [[ ! -f "libtorch/lib/libtorch.so" && ! -f "libtorch/lib/libtorch.dylib" && ! -f "libtorch/lib/torch.dll" ]]; then
@@ -129,7 +129,7 @@ stub_cuda_cmake_macros() {
 set_rocm_arch() {
   # libtorch's LoadHIP.cmake requires PYTORCH_ROCM_ARCH at configure time
   # even when the downstream project has no HIP kernels. DJL JNI contains
-  # zero HIP device code, so the arch list is really a placeholder — the
+  # zero HIP device code, so the arch list is really a placeholder: the
   # runtime GPU support is determined by the fat-binary libtorch shipped
   # by pytorch.org. Still, list every arch that the matching libtorch
   # actually targets so a future hipified kernel in the JNI covers the

@@ -1,5 +1,5 @@
 @echo off
-@rem Build djl_torch.dll — the JNI bridge between DJL's Java PtNDArrayEx
+@rem Build djl_torch.dll, the JNI bridge between DJL's Java PtNDArrayEx
 @rem layer and libtorch on Windows.
 @rem
 @rem Usage: build.cmd <VERSION> <FLAVOR>

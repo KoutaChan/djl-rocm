@@ -56,9 +56,9 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNOneHot(
   API_END_RETURN()
 }
 
-// rms_norm — fused RMSNorm (PyTorch 2.4+). Normalises `input` along the
+// rms_norm: fused RMSNorm (PyTorch 2.4+). Normalises `input` along the
 // trailing dims given by `normalized_shape`, then applies an affine `weight`
-// when provided. `jeps` is always forwarded as the variance epsilon — the
+// when provided. `jeps` is always forwarded as the variance epsilon; the
 // caller is expected to supply a sensible value (e.g. 1e-6f).
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(JNIEnv* env, jobject jthis, jlong jinput,
     jlongArray jnormalized_shape, jlong jweight, jdouble jeps) {
@@ -76,7 +76,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(JNIE
   API_END_RETURN()
 }
 
-// scaled_dot_product_attention — fused attention that dispatches to
+// scaled_dot_product_attention: fused attention that dispatches to
 // FlashAttention / mem-efficient / math backends via PyTorch internals.
 // query/key/value shape: [B, H, T, D]. attn_mask is an additive float bias
 // broadcastable over [B, H, Q, K] (or 0 for no mask). Scale defaults to

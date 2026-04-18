@@ -170,7 +170,7 @@ jobs:
 
   # Windows x86_64, CPU and CUDA flavors (windows-latest + build.cmd).
   # pytorch.org stopped publishing Windows libtorch cu129 after 2.8.0, so
-  # the Windows matrix intentionally skips cu129 — Linux still covers it.
+  # the Windows matrix intentionally skips cu129 (Linux still covers it).
   jni-windows:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, win)
     runs-on: windows-latest
@@ -221,10 +221,10 @@ jobs:
               -Pclassifier=win-x86_64 \
               -Pgithub -PgithubRepo=${{ github.repository }} -x test
 
-  # macOS arm64 + x86_64, CPU only (no CUDA/ROCm on either). Each classifier
-  # uses the latest PyTorch libtorch actually published for it on pytorch.org:
-  # osx-aarch64 -> 2.11.0, osx-x86_64 -> 2.2.2 (upstream stopped shipping
-  # macOS x86_64 libtorch after 2.2.x).
+  # macOS arm64 only, CPU. Intel macOS was dropped from the matrix because
+  # pytorch.org stopped shipping libtorch-macos-x86_64 after 2.2.x and the
+  # GitHub Actions macos-13 runner pool is now heavily queued, so the job
+  # would routinely hang indefinitely waiting for a host.
   jni-macos:
     name: Build cpu (PyTorch ${{ matrix.pt }}, ${{ matrix.classifier }})
     runs-on: ${{ matrix.runner }}
@@ -236,10 +236,6 @@ jobs:
             runner: macos-14
             pt: "2.11.0"
             arch: aarch64
-          - classifier: osx-x86_64
-            runner: macos-13
-            pt: "2.2.2"
-            arch: amd64
     steps:
       - uses: actions/checkout@v4
 
