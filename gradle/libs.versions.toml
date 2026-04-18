@@ -2,8 +2,8 @@
 format.version = "1.1"
 
 [versions]
-djl = "0.37.0"
-pytorch = "2.7.1"
+djl = "0.38.0"
+pytorch = "2.11.0"
 tensorflow = "2.16.1"
 tensorflowCore = "1.0.0-rc.1"
 mxnet = "1.9.1"
