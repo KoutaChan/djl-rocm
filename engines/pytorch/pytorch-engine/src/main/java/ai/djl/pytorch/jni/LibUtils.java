@@ -26,13 +26,10 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
-import java.net.URLDecoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -43,7 +40,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
-import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -400,9 +396,8 @@ public final class LibUtils {
     private static LibTorch downloadPyTorch(Platform platform) {
         String version = platform.getVersion();
         String classifier = platform.getClassifier();
-        String precxx11;
         String flavor = Utils.getEnvOrSystemProperty("PYTORCH_FLAVOR");
-        boolean override;
+        String precxx11;
         if (flavor == null || flavor.isEmpty()) {
             flavor = platform.getFlavor();
             if (System.getProperty("os.name").startsWith("Linux")
@@ -414,11 +409,8 @@ public final class LibUtils {
                 precxx11 = "";
             }
             flavor += precxx11;
-            override = false;
         } else {
             logger.info("Uses override PYTORCH_FLAVOR: {}", flavor);
-            precxx11 = flavor.endsWith("-precxx11") ? "-precxx11" : "";
-            override = true;
         }
 
         Path cacheDir = Utils.getEngineCacheDir("pytorch");
@@ -429,144 +421,22 @@ public final class LibUtils {
             return new LibTorch(dir.toAbsolutePath(), platform, flavor);
         }
 
-        // ROCm libtorch is not mirrored on publish.djl.ai. Fetch the upstream
-        // pytorch.org zip directly and unpack it into the DJL cache dir.
-        String rocmBareFlavor = flavor.endsWith("-precxx11")
+        // Fetch libtorch directly from download.pytorch.org. publish.djl.ai
+        // only mirrors the handful of PyTorch versions that upstream DJL
+        // releases have pinned (currently up to 2.7.1), and this fork
+        // targets newer versions (2.11.0+), so the legacy files.txt path
+        // would 404. The pytorch.org URL is well-defined per flavor and
+        // classifier, so we build it inline and stream the zip.
+        String bareFlavor = flavor.endsWith("-precxx11")
                 ? flavor.substring(0, flavor.length() - "-precxx11".length())
                 : flavor;
-        if (rocmBareFlavor.startsWith("rocm")) {
-            return downloadRocmLibTorch(version, rocmBareFlavor, flavor, dir, platform);
-        }
-
-        Matcher matcher = VERSION_PATTERN.matcher(version);
-        if (!matcher.matches()) {
-            throw new AssertionError("Unexpected version: " + version);
-        }
-        String link = "https://publish.djl.ai/pytorch/" + matcher.group(1);
-        Path tmp = null;
-
-        Path indexFile = cacheDir.resolve(version + ".txt");
-        if (Files.notExists(indexFile)) {
-            Path tempFile = cacheDir.resolve(version + ".tmp");
-            try (InputStream is = Utils.openUrl(link + "/files.txt")) {
-                Files.createDirectories(cacheDir);
-                Files.copy(is, tempFile, StandardCopyOption.REPLACE_EXISTING);
-                Utils.moveQuietly(tempFile, indexFile);
-            } catch (IOException e) {
-                throw new EngineException("Failed to save pytorch index file", e);
-            } finally {
-                Utils.deleteQuietly(tempFile);
-            }
-        }
-
-        try (InputStream is = Files.newInputStream(indexFile)) {
-            // if files not found
-            Files.createDirectories(cacheDir);
-            List<String> lines = Utils.readLines(is);
-            if (flavor.startsWith("cu")) {
-                int cudaVersion = Integer.parseInt(flavor.substring(2, 5));
-                Pattern pattern =
-                        Pattern.compile(
-                                "cu(\\d\\d\\d)"
-                                        + precxx11
-                                        + '/'
-                                        + classifier
-                                        + "/native/lib/"
-                                        + NATIVE_LIB_NAME
-                                        + ".gz");
-                List<Integer> cudaVersions = new ArrayList<>();
-                boolean match = false;
-                for (String line : lines) {
-                    Matcher m = pattern.matcher(line);
-                    if (m.matches()) {
-                        cudaVersions.add(Integer.parseInt(m.group(1)));
-                    }
-                }
-                // find highest matching CUDA version
-                cudaVersions.sort(Collections.reverseOrder());
-                for (int cuda : cudaVersions) {
-                    if (override && cuda == cudaVersion) {
-                        match = true;
-                        break;
-                    } else if (cuda <= cudaVersion) {
-                        flavor = "cu" + cuda + precxx11;
-                        match = true;
-                        break;
-                    }
-                }
-                if (!match) {
-                    logger.warn("No matching cuda flavor for {} found: {}.", classifier, flavor);
-                    // fallback to CPU
-                    flavor = "cpu" + precxx11;
-                }
-
-                // check again
-                dir = cacheDir.resolve(version + '-' + flavor + '-' + classifier);
-                path = dir.resolve(NATIVE_LIB_NAME);
-                if (Files.exists(path)) {
-                    return new LibTorch(dir.toAbsolutePath(), platform, flavor);
-                }
-            }
-
-            logger.debug("Using cache dir: {}", dir);
-
-            tmp = Files.createTempDirectory(cacheDir, "tmp");
-            boolean found = false;
-            for (String line : lines) {
-                if (line.startsWith(flavor + '/' + classifier + '/')) {
-                    found = true;
-                    URL url = new URL(link + '/' + line);
-                    String fileName = line.substring(line.lastIndexOf('/') + 1, line.length() - 3);
-                    fileName = URLDecoder.decode(fileName, "UTF-8");
-                    logger.info("Downloading {} ...", url);
-                    try (InputStream fis = new GZIPInputStream(Utils.openUrl(url))) {
-                        Files.copy(fis, tmp.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
-                    }
-                }
-            }
-            if (!found) {
-                throw new EngineException(
-                        "No PyTorch native library matches your operating system: " + platform);
-            }
-
-            Utils.moveQuietly(tmp, dir);
-            return new LibTorch(dir.toAbsolutePath(), platform, flavor);
-        } catch (IOException e) {
-            throw new EngineException("Failed to download PyTorch native library", e);
-        } finally {
-            if (tmp != null) {
-                Utils.deleteQuietly(tmp);
-            }
-        }
-    }
-
-    /**
-     * Fetch the upstream ROCm libtorch zip from pytorch.org and unpack the
-     * {@code libtorch/lib/} contents into the DJL cache directory.
-     *
-     * @param version        pytorch version (e.g. {@code 2.7.1})
-     * @param rocmUrlFlavor  flavor with the pytorch.org URL format, e.g. {@code rocm6.3}
-     * @param cacheFlavor    flavor string used to key the DJL cache entry (may
-     *                       include {@code -precxx11} etc.)
-     * @param dir            target cache directory
-     * @param platform       DJL platform descriptor
-     */
-    private static LibTorch downloadRocmLibTorch(
-            String version, String rocmUrlFlavor, String cacheFlavor, Path dir, Platform platform) {
-        Path cacheDir = Utils.getEngineCacheDir("pytorch");
-        String url = "https://download.pytorch.org/libtorch/"
-                + rocmUrlFlavor
-                + "/libtorch-cxx11-abi-shared-with-deps-"
-                + version
-                + "%2B"
-                + rocmUrlFlavor
-                + ".zip";
+        String url = buildPytorchOrgUrl(version, bareFlavor, classifier);
+        logger.info("Downloading {} ...", url);
         Path tmp = null;
         try {
             Files.createDirectories(cacheDir);
-            tmp = Files.createTempDirectory(cacheDir, "rocm-libtorch");
+            tmp = Files.createTempDirectory(cacheDir, "libtorch");
             boolean found = false;
-            logger.info("Downloading {} ...", url);
             try (ZipInputStream zis = new ZipInputStream(Utils.openUrl(url))) {
                 ZipEntry entry;
                 while ((entry = zis.getNextEntry()) != null) {
@@ -581,17 +451,53 @@ public final class LibUtils {
             }
             if (!found) {
                 throw new EngineException(
-                        "No libtorch/lib/ entries found in ROCm archive: " + url);
+                        "No libtorch/lib/ entries found in archive: " + url);
             }
             Utils.moveQuietly(tmp, dir);
-            return new LibTorch(dir.toAbsolutePath(), platform, cacheFlavor);
+            return new LibTorch(dir.toAbsolutePath(), platform, flavor);
         } catch (IOException e) {
-            throw new EngineException("Failed to download ROCm libtorch: " + url, e);
+            throw new EngineException("Failed to download libtorch: " + url, e);
         } finally {
             if (tmp != null) {
                 Utils.deleteQuietly(tmp);
             }
         }
+    }
+
+    /**
+     * Build the download.pytorch.org zip URL for a given PyTorch version +
+     * flavor + OS/arch classifier. The fork targets modern PyTorch
+     * (2.11.0+) where the Linux filename dropped the {@code -cxx11-abi-}
+     * infix and upstream macOS x86_64 has been EOL since 2.2.x, so this
+     * helper only has to cover the live URL patterns.
+     *
+     * @param version    PyTorch version (e.g. {@code 2.11.0})
+     * @param bareFlavor flavor without the optional {@code -precxx11}
+     *                   suffix, e.g. {@code cpu} / {@code cu128} /
+     *                   {@code rocm7.1}
+     * @param classifier OS+arch classifier, e.g. {@code linux-x86_64} /
+     *                   {@code win-x86_64} / {@code osx-aarch64}
+     */
+    private static String buildPytorchOrgUrl(
+            String version, String bareFlavor, String classifier) {
+        if (classifier.startsWith("osx")) {
+            // macOS: only cpu, arm64 from 2.2+
+            return "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-"
+                    + version
+                    + ".zip";
+        }
+        String zipPrefix =
+                classifier.startsWith("win")
+                        ? "libtorch-win-shared-with-deps-"
+                        : "libtorch-shared-with-deps-";
+        return "https://download.pytorch.org/libtorch/"
+                + bareFlavor
+                + '/'
+                + zipPrefix
+                + version
+                + "%2B"
+                + bareFlavor
+                + ".zip";
     }
 
     private static void downloadJniLib(
