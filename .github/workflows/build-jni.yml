@@ -130,17 +130,34 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
               git curl unzip cmake g++ ca-certificates
 
-      # method: local grabs the full ~4 GB runfile and installs everything
-      # under /usr/local/cuda-X.Y/, sidestepping the apt package rename
-      # churn (cuda-cublas-dev-X-Y -> libcublas-dev-X-Y in CUDA 12.x, nvrtc
-      # split out in CUDA 13.x, ...) that kept breaking the per-component
-      # network install. Slower but future-proof.
+      # Install CUDA directly via NVIDIA's apt repo. We used to go through
+      # Jimver/cuda-toolkit, but:
+      #   - network install hit the "libcublas-dev-X-Y vs cuda-cublas-dev"
+      #     rename churn and the cuda 13 nvrtc split;
+      #   - local install on cuda 13 hits a runfile bug where the bundled
+      #     cuda_cccl/.../nv/detail/__preprocessor (actually a dir) is
+      #     copied as a file and the installer aborts.
+      # apt sidesteps both; cuda-toolkit-X-Y is a meta-package that pulls
+      # in nvcc + cudart + all the math libs + nvrtc with matching names.
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: ${{ matrix.cuda }}
-          method: local
+        env:
+          CUDA: ${{ matrix.cuda }}
+          FLAVOR: ${{ matrix.flavor }}
+        run: |
+          # Derive apt suffix from flavor: cu128 -> 12-8, cu129 -> 12-9, cu130 -> 13-0.
+          CU=${FLAVOR#cu}
+          MAJOR=$((CU / 10))
+          MINOR=$((CU % 10))
+          SUFFIX="${MAJOR}-${MINOR}"
+          DISTRO=ubuntu2204
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${DISTRO}/x86_64/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          rm -f cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "cuda-toolkit-${SUFFIX}"
+          echo "CUDA_HOME=/usr/local/cuda-${MAJOR}.${MINOR}" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-${MAJOR}.${MINOR}/bin" >> "$GITHUB_PATH"
 
       - name: Build libdjl_torch.so
         working-directory: engines/pytorch/pytorch-native
