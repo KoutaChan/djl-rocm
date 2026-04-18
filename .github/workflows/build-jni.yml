@@ -116,6 +116,20 @@ jobs:
             pt: "2.11.0"
             cuda: "13.0.0"
     steps:
+      # cuda-toolkit-X-Y (~7 GB) + libtorch (~4 GB) + gradle cache overwhelm
+      # ubuntu-22.04's ~29 GB default free space and the runner eventually
+      # aborts with ENOSPC writing its own log. Reclaim ~20 GB before the
+      # cuda install step kicks in.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
