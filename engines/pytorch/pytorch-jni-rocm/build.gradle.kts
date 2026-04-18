@@ -39,6 +39,18 @@ val jniLibFileName: String = when {
     else -> "libdjl_torch.so"
 }
 
+// GitHub Packages Maven registry mangles maven-metadata.xml whenever a
+// Maven classifier containing dashes / digits is uploaded (linux-x86_64
+// -> classifier="linux-x", extension="6_64.jar"; see
+// github.com/orgs/community/discussions/49682). The corrupted metadata
+// makes snapshot resolution fail client-side even though the jar itself
+// is served correctly. Fold the OS classifier into the artifactId and
+// drop the Maven classifier entirely so every publish lands in its own
+// artifactId and never needs metadata classifier parsing. The jar's
+// internal layout (jnilib/<classifier>/<flavor>/<lib>) is unchanged so
+// DJL's runtime LibUtils still finds the native untouched.
+val artifactSlug = "pytorch-jni-$flavor-$classifier"
+
 group = "ai.djl.pytorch"
 val isRelease = project.hasProperty("release") || project.hasProperty("staging")
 version = ptVersion + '-' + libs.versions.djl.get() + if (isRelease) "" else "-SNAPSHOT"
@@ -91,8 +103,8 @@ tasks {
         from(stageJniLib.map { it.outputs.files }) {
             into("jnilib")
         }
-        archiveBaseName = "pytorch-jni-$flavor"
-        archiveClassifier = classifier
+        archiveBaseName = artifactSlug
+        archiveClassifier = ""
     }
 
     clean {
@@ -106,7 +118,7 @@ tasks {
 publishing {
     publications {
         named<MavenPublication>("maven") {
-            artifactId = "pytorch-jni-$flavor"
+            artifactId = artifactSlug
             pom {
                 name = "DJL PyTorch JNI ($flavor / $classifier)"
                 description =
