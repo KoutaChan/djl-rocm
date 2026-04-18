@@ -1,21 +1,43 @@
 #!/usr/bin/env bash
+#
+# Build libdjl_torch.<so|dll|dylib> — the JNI bridge between DJL's Java
+# PtNDArrayEx layer and libtorch.
+#
+# Usage: build.sh <VERSION> <FLAVOR> [precxx11] <ARCH>
+#   VERSION  e.g. 2.11.0
+#   FLAVOR   cpu / cu128 / cu129 / cu130 / rocm6.4 / rocm7.0 / rocm7.1 / rocm7.2
+#   3rd arg  "precxx11" to strip the -cxx11-abi- infix (older PyTorch)
+#   ARCH     amd64 / aarch64 (linux+darwin)
 
 set -ex
+
 WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export WORK_DIR
-NUM_PROC=1
-if [[ -n $(command -v nproc) ]]; then
-  NUM_PROC=$(nproc)
-elif [[ -n $(command -v sysctl) ]]; then
-  NUM_PROC=$(sysctl -n hw.ncpu)
-fi
 
 PLATFORM=$(uname | tr '[:upper:]' '[:lower:]')
 VERSION=$1
 FLAVOR=$2
+CXX11ABI_ARG=$3
+ARCH=$4
+
+# PT_VERSION_MACRO is the value passed to cmake via -DPT_VERSION=<x> so it
+# becomes an #ifdef symbol for version-gated JNI code. The workflow also
+# exports PT_VERSION=<matrix.pt> (e.g. "2.10.0") to Docker; we pick a
+# distinct shell name so that env inheritance cannot pollute the cmake flag
+# (a numeric value like "2.10.0" is not a valid C identifier).
+PT_VERSION_MACRO=""
+
+NUM_PROC=1
+if command -v nproc >/dev/null 2>&1; then
+  NUM_PROC=$(nproc)
+elif command -v sysctl >/dev/null 2>&1; then
+  NUM_PROC=$(sysctl -n hw.ncpu)
+fi
+
+# Derive cxx11-abi suffix used in older libtorch filenames.
 AARCH64_CXX11ABI="-cxx11"
 CXX11ABI="-cxx11-abi"
-if [[ $3 == "precxx11" ]]; then
+if [[ "$CXX11ABI_ARG" == "precxx11" ]]; then
   CXX11ABI=""
   AARCH64_CXX11ABI=""
 fi
@@ -26,123 +48,135 @@ fi
 if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 8 )); then
   CXX11ABI=""
 fi
-ARCH=$4
+
+#
+# libtorch download
+#
+
+download_libtorch_linux() {
+  if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|cu129|cu130|rocm[67]\.[0-9]+)$ ]]; then
+    echo "$FLAVOR is not supported." >&2
+    exit 1
+  fi
+  if [[ $ARCH == 'aarch64' ]]; then
+    if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 7 )); then
+      curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-linux-aarch64-${VERSION}.zip" | jar xv >/dev/null
+    else
+      curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch${AARCH64_CXX11ABI}-shared-with-deps-${VERSION}-aarch64.zip" | jar xv >/dev/null
+    fi
+  else
+    curl -fsSL "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip" | jar xv >/dev/null
+  fi
+}
+
+download_libtorch_darwin() {
+  # PyTorch 2.2+ ships macOS libtorch directly on pytorch.org (arm64 +
+  # x86_64 separately). Older 2.0.x/2.1.x only lived on the DJL mirror.
+  local pytorch_has_macos=false
+  if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 2 )); then
+    pytorch_has_macos=true
+  fi
+  if [[ "$pytorch_has_macos" == "true" ]]; then
+    if [[ $ARCH == 'aarch64' ]]; then
+      curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${VERSION}.zip" | jar xv >/dev/null
+    else
+      curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-${VERSION}.zip" | jar xv >/dev/null
+    fi
+  else
+    if [[ $ARCH == 'aarch64' ]]; then
+      curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-macos-${VERSION}-aarch64.zip" | jar xv >/dev/null
+    else
+      curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-${VERSION}.zip" | jar xv >/dev/null
+    fi
+  fi
+}
 
 # Check for the actual libtorch library, not just the directory — CI bind
 # mounts an empty /mnt/libtorch onto this path so the pure directory check
 # would silently skip the download and leave us with an empty libtorch/.
 if [[ ! -f "libtorch/lib/libtorch.so" && ! -f "libtorch/lib/libtorch.dylib" && ! -f "libtorch/lib/torch.dll" ]]; then
-  if [[ $PLATFORM == 'linux' ]]; then
-    if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|cu129|cu130|rocm[67]\.[0-9]+)$ ]]; then
-      echo "$FLAVOR is not supported."
-      exit 1
-    fi
-
-    if [[ $ARCH == 'aarch64' ]]; then
-      if [[ "$VERSION" =~ ^(2.[7-9].*)$ ]]; then
-        curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-linux-aarch64-${VERSION}.zip" | jar xv >/dev/null
-      else
-        curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch${AARCH64_CXX11ABI}-shared-with-deps-${VERSION}-aarch64.zip" | jar xv >/dev/null
-      fi
-    else
-      curl -fsSL "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip" | jar xv >/dev/null
-    fi
-  elif [[ $PLATFORM == 'darwin' ]]; then
-    if [[ "$VERSION" =~ ^(2.[2-9].*)$ ]]; then
-      if [[ $ARCH == 'aarch64' ]]; then
-        curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${VERSION}.zip" | jar xv >/dev/null
-      else
-        curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-${VERSION}.zip" | jar xv >/dev/null
-      fi
-    else
-      if [[ $ARCH == 'aarch64' ]]; then
-        curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-macos-${VERSION}-aarch64.zip" | jar xv >/dev/null
-      else
-        curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-${VERSION}.zip" | jar xv >/dev/null
-      fi
-    fi
-  else
-    echo "$PLATFORM is not supported."
-    exit 1
-  fi
+  case "$PLATFORM" in
+    linux)  download_libtorch_linux ;;
+    darwin) download_libtorch_darwin ;;
+    *)      echo "$PLATFORM is not supported." >&2; exit 1 ;;
+  esac
 fi
 
-# Verify libtorch was actually extracted and expose the TorchConfig.cmake
-# location for diagnostics — find_package(Torch) looks for it under
-# share/cmake/Torch/ typically, but older / ROCm builds occasionally stage
-# it elsewhere.
 if [[ ! -d "libtorch" ]]; then
   echo "ERROR: libtorch directory is missing after download." >&2
   exit 1
 fi
-echo "libtorch top level:"
-ls -1 libtorch | head -20
-echo "Torch cmake config candidates:"
-find libtorch -maxdepth 6 -type f \( -name "TorchConfig.cmake" -o -name "torch-config.cmake" \) \
-    2>/dev/null | head -5 || true
 
-# When building for ROCm, dump the c10/hip tree so we can see where the
-# HIPCachingAllocator symbol (or its replacement) actually lives.
-if [[ "$FLAVOR" = rocm* ]]; then
-  echo "=== c10/hip/ contents ==="
-  ls -1 libtorch/include/c10/hip/ 2>/dev/null | head -40 || echo "(missing)"
-  echo "=== HIPCachingAllocator in hip headers ==="
-  grep -l "HIPCachingAllocator" libtorch/include/c10/hip/*.h 2>/dev/null || echo "(none)"
-  echo "=== HIPCachingAllocator in cuda headers ==="
-  grep -l "HIPCachingAllocator" libtorch/include/c10/cuda/*.h 2>/dev/null || echo "(none)"
-  echo "=== emptyCache in c10/hip/*.h ==="
-  grep -n "emptyCache" libtorch/include/c10/hip/*.h 2>/dev/null | head -20 || echo "(none)"
-  echo "=== namespace declarations in HIPCachingAllocator.h ==="
-  grep -nE "^namespace|^inline|^void emptyCache" libtorch/include/c10/hip/HIPCachingAllocator.h 2>/dev/null | head -20 || echo "(file missing)"
-fi
+#
+# ROCm-specific libtorch patching
+#
 
-if [[ "$VERSION" == "1.13.1" || "$VERSION" == "2.0.1" || "$VERSION" =~ ^2\.1\.[0-9]+$ ]]; then
-  PT_VERSION=V1_13_X
-fi
-
-if [[ "$FLAVOR" = cu* ]]; then
-  USE_CUDA=1
-fi
-if [[ "$FLAVOR" = rocm* ]]; then
-  # ROCm libtorch is hipified and still exposes the c10/cuda/* headers and
-  # torch::cuda::* symbols, so keep the JNI USE_CUDA branches (e.g. the
-  # CUDACachingAllocator calls) enabled for ROCm as well.
-  USE_CUDA=1
+stub_cuda_cmake_macros() {
   # ROCm libtorch zips ship c10/cuda/CUDAMacros.h which transitively includes
   # <c10/cuda/impl/cuda_cmake_macros.h>, but that header is only generated by
   # the upstream CUDA CMake build and is absent from the ROCm distribution.
   # Drop a stub so consumers that pull in CUDACachingAllocator & friends can
   # compile. The file only defines build-time #defines so an empty one is
   # equivalent to "default everything".
-  stub="libtorch/include/c10/cuda/impl/cuda_cmake_macros.h"
+  local stub="libtorch/include/c10/cuda/impl/cuda_cmake_macros.h"
   if [[ ! -f "$stub" ]]; then
     echo "note: synthesising missing $stub"
     mkdir -p "$(dirname "$stub")"
     printf '#pragma once\n' > "$stub"
   fi
+}
+
+set_rocm_arch() {
   # libtorch's LoadHIP.cmake requires PYTORCH_ROCM_ARCH at configure time
   # even when the downstream project has no HIP kernels. DJL JNI contains
   # zero HIP device code, so the arch list is really a placeholder — the
   # runtime GPU support is determined by the fat-binary libtorch shipped
   # by pytorch.org. Still, list every arch that the matching libtorch
   # actually targets so a future hipified kernel in the JNI covers the
-  # same hardware surface. Rocm 7 drops gfx906 and adds gfx1200/1201.
-  if [[ -z "${PYTORCH_ROCM_ARCH:-}" ]]; then
-    case "$FLAVOR" in
-      rocm6.*)
-        export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102"
-        ;;
-      rocm7.*)
-        export PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
-        ;;
-      *)
-        # Unknown rocm flavor — pass the union of every arch the
-        # upstream ROCm 6 & 7 libtorch builds currently target.
-        export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
-        ;;
-    esac
+  # same hardware surface. ROCm 7 drops gfx906 and adds gfx1200/1201.
+  if [[ -n "${PYTORCH_ROCM_ARCH:-}" ]]; then
+    return
   fi
+  case "$FLAVOR" in
+    rocm6.*)
+      export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102"
+      ;;
+    rocm7.*)
+      export PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+      ;;
+    *)
+      export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+      ;;
+  esac
+}
+
+USE_CUDA=0
+USE_ROCM=0
+case "$FLAVOR" in
+  cu*)
+    USE_CUDA=1
+    ;;
+  rocm*)
+    # ROCm libtorch is hipified and still exposes the c10/cuda/* headers and
+    # torch::cuda::* symbols, so keep the JNI USE_CUDA branches (e.g. the
+    # CUDACachingAllocator calls) enabled for ROCm as well.
+    USE_CUDA=1
+    USE_ROCM=1
+    stub_cuda_cmake_macros
+    set_rocm_arch
+    ;;
+esac
+
+# PT_VERSION macro is only defined for 1.13.x / 2.0.x / 2.1.x branches,
+# which is where JNI code paths gate on #ifdef V1_13_X. Newer versions
+# leave the macro undefined.
+if [[ "$VERSION" == "1.13.1" || "$VERSION" == "2.0.1" || "$VERSION" =~ ^2\.1\.[0-9]+$ ]]; then
+  PT_VERSION_MACRO=V1_13_X
 fi
+
+#
+# Build
+#
 
 pushd .
 
@@ -150,10 +184,7 @@ rm -rf build
 mkdir build && cd build
 mkdir classes
 javac -sourcepath ../../pytorch-engine/src/main/java/ ../../pytorch-engine/src/main/java/ai/djl/pytorch/jni/PyTorchLibrary.java -h include -d classes
-USE_ROCM=0
-if [[ "$FLAVOR" = rocm* ]]; then
-  USE_ROCM=1
-fi
+
 # Some rocm/dev-ubuntu images (e.g. :6.4-complete) install the JDK under a
 # non-standard path that CMake's FindJNI cannot discover. Derive JAVA_HOME
 # from `javac` so find_package(JNI) can locate the headers + libjvm.
@@ -162,22 +193,31 @@ if [[ -z "${JAVA_HOME:-}" ]] && command -v javac >/dev/null 2>&1; then
   export JAVA_HOME=$(dirname "$(dirname "$javac_path")")
   echo "note: auto-detected JAVA_HOME=${JAVA_HOME}"
 fi
-cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" -DPT_VERSION="${PT_VERSION}" \
-      -DUSE_CUDA="$USE_CUDA" -DUSE_ROCM="$USE_ROCM" ..
+
+cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" \
+      -DPT_VERSION="${PT_VERSION_MACRO}" \
+      -DUSE_CUDA="$USE_CUDA" \
+      -DUSE_ROCM="$USE_ROCM" ..
 cmake --build . --config Release -- -j "${NUM_PROC}"
-if [[ "$FLAVOR" = cu* ]]; then
-  # avoid link with libcudart.so.11.0
-  sed -i -r "s/\/usr\/local\/cuda(.{5})?\/lib64\/lib(cudart|nvrtc).so//g" CMakeFiles/djl_torch.dir/link.txt
-  rm libdjl_torch.so
-  . CMakeFiles/djl_torch.dir/link.txt
-fi
-if [[ "$FLAVOR" = rocm* ]]; then
-  # avoid absolute link to /opt/rocm*/lib stubs so runtime loader picks up
-  # whatever ROCm is present on the target machine
-  sed -i -r "s#/opt/rocm[^ ]*/lib/lib(amdhip64|hsa-runtime64|rocblas|rocfft|rocrand|hiprtc|MIOpen)\.so[^ ]*##g" CMakeFiles/djl_torch.dir/link.txt
+
+# Strip absolute CUDA/ROCm library paths from the link line so the runtime
+# loader picks up whatever the target machine has installed rather than a
+# pinned path baked in at build time.
+relink_without_absolute_libs() {
+  local sed_pattern=$1
+  sed -i -r "$sed_pattern" CMakeFiles/djl_torch.dir/link.txt
   rm -f libdjl_torch.so
   . CMakeFiles/djl_torch.dir/link.txt
-fi
+}
+
+case "$FLAVOR" in
+  cu*)
+    relink_without_absolute_libs "s/\/usr\/local\/cuda(.{5})?\/lib64\/lib(cudart|nvrtc).so//g"
+    ;;
+  rocm*)
+    relink_without_absolute_libs "s#/opt/rocm[^ ]*/lib/lib(amdhip64|hsa-runtime64|rocblas|rocfft|rocrand|hiprtc|MIOpen)\.so[^ ]*##g"
+    ;;
+esac
 
 if [[ $PLATFORM == 'darwin' ]]; then
   install_name_tool -add_rpath @loader_path libdjl_torch.dylib
