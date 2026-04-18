@@ -142,7 +142,7 @@ jobs:
 
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda }}
           method: network
@@ -194,7 +194,7 @@ jobs:
 
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda }}
           method: network
