@@ -140,13 +140,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
               git curl unzip cmake g++ ca-certificates
 
+      # sub-packages get a `cuda-` prefix (so "nvcc" -> cuda-nvcc-X-Y), while
+      # non-cuda-sub-packages use their literal name (so "libcublas-dev" ->
+      # libcublas-dev-X-Y). The math libs moved to libcublas-dev-X-Y naming
+      # in CUDA 12.x, so they belong in non-cuda-sub-packages.
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas-dev", "curand-dev", "cufft-dev", "cusparse-dev", "cusolver-dev"]'
+          sub-packages: '["nvcc", "cudart", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev", "libcufft-dev", "libcusparse-dev", "libcusolver-dev"]'
 
       - name: Build libdjl_torch.so
         working-directory: engines/pytorch/pytorch-native
