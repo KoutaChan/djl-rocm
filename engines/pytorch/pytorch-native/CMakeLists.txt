@@ -33,6 +33,7 @@ find_path(UTILS_INCLUDE_DIR NAMES djl/utils.h PATHS ${PROJECT_SOURCE_DIR}/../../
 set(SOURCE_FILES
     "src/main/native/djl_pytorch_utils.h"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
+    "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_autocast.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_inference.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_ivalue.cc"

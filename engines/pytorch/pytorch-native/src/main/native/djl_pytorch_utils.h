@@ -45,6 +45,8 @@ typedef std::variant<torch::enumtype::kNearest, torch::enumtype::kLinear, torch:
 #endif
 #endif
 
+// DJL DataType ordinal <-> torch::ScalarType. The ordinals come from the
+// DataType enum in api/.../types/DataType.java; keep this in sync.
 inline jint GetDTypeFromScalarType(const torch::ScalarType& type) {
   if (torch::kFloat32 == type) {
     return 0;
@@ -64,8 +66,10 @@ inline jint GetDTypeFromScalarType(const torch::ScalarType& type) {
     return 7;
   } else if (torch::kComplexFloat == type) {
     return 8;
+  } else if (torch::kBFloat16 == type) {
+    return 11;
   } else {
-    return 9;
+    return 9;  // UNKNOWN
   }
 }
 
@@ -89,6 +93,8 @@ inline torch::ScalarType GetScalarTypeFromDType(jint dtype) {
       return torch::kBool;
     case 8:
       return torch::kComplexFloat;
+    case 11:
+      return torch::kBFloat16;
     default:
       // TODO improve the error handling
       throw;

@@ -15,6 +15,7 @@ package ai.djl.engine;
 import ai.djl.Device;
 import ai.djl.Model;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
 import ai.djl.training.GradientCollector;
 import ai.djl.training.LocalParameterServer;
@@ -317,6 +318,53 @@ public abstract class Engine {
      */
     public GradientCollector newGradientCollector() {
         throw new UnsupportedOperationException("Not supported.");
+    }
+
+    /**
+     * Returns whether this engine implements automatic mixed-precision
+     * ("autocast") scopes. When {@code false}, {@link #newAutocast} returns a
+     * no-op guard, so callers can still wrap their forward pass in
+     * {@code try-with-resources} without a feature gate.
+     *
+     * @return {@code true} if {@link #newAutocast} performs real autocasting
+     */
+    public boolean supportsAutocast() {
+        return false;
+    }
+
+    /**
+     * Opens an autocast scope on the given {@link Device}. Heavy matmul / conv
+     * / attention ops inside the scope are cast to {@code dtype}; numerically
+     * sensitive ops stay in FP32. The previous autocast state (enabled flag,
+     * dtype, cache flag) is saved on entry and restored on {@link
+     * Autocast#close()}, so scopes nest safely.
+     *
+     * <p>The default implementation is a no-op guard, which lets callers write
+     * engine-agnostic code ({@code try (Autocast ac = engine.newAutocast(...))
+     * { ... }}). Engines that implement autocast must override this method.
+     *
+     * @param device the device to autocast on (typically a GPU)
+     * @param dtype the lower-precision dtype ({@link DataType#BFLOAT16} or
+     *     {@link DataType#FLOAT16})
+     * @param cacheEnabled whether to enable the op-result cache inside the
+     *     scope (matches PyTorch's {@code cache_enabled} flag)
+     * @return an {@link Autocast} guard whose {@code close()} restores state
+     */
+    public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
+        throw new UnsupportedOperationException("Not supported.");
+    }
+
+    /**
+     * Opens an autocast scope with the op-result cache enabled. Shortcut for
+     * {@link #newAutocast(Device, DataType, boolean)} with {@code cacheEnabled
+     * = true}.
+     *
+     * @param device the device to autocast on
+     * @param dtype the lower-precision dtype
+     * @return an {@link Autocast} guard
+     */
+    public Autocast newAutocast(Device device, DataType dtype) {
+        return newAutocast(device, dtype, true);
     }
 
     /**

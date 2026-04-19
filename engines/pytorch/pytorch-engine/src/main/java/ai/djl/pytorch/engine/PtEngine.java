@@ -14,9 +14,11 @@ package ai.djl.pytorch.engine;
 
 import ai.djl.Device;
 import ai.djl.Model;
+import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
 import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.pytorch.jni.LibUtils;
@@ -149,6 +151,18 @@ public final class PtEngine extends Engine {
     @Override
     public GradientCollector newGradientCollector() {
         return new PtGradientCollector();
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean supportsAutocast() {
+        return true;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
+        return new PtAutocast(device, dtype, true, cacheEnabled);
     }
 
     /** {@inheritDoc} */

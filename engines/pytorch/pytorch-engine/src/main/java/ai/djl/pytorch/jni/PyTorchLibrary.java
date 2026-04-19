@@ -28,6 +28,24 @@ final class PyTorchLibrary {
 
     native void torchSetGradMode(boolean enable);
 
+    native boolean torchAutocastIsEnabled(int deviceType);
+
+    native void torchAutocastSetEnabled(int deviceType, boolean enabled);
+
+    native int torchAutocastGetDtype(int deviceType);
+
+    native void torchAutocastSetDtype(int deviceType, int dtype);
+
+    native boolean torchAutocastIsCacheEnabled();
+
+    native void torchAutocastSetCacheEnabled(boolean enabled);
+
+    native void torchAutocastClearCache();
+
+    native int torchAutocastIncrementNesting();
+
+    native int torchAutocastDecrementNesting();
+
     native int torchGetNumInteropThreads();
 
     native int torchGetNumThreads();

@@ -90,6 +90,50 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchSetGradMode(enable);
     }
 
+    // ------------------------------------------------------------------
+    // Autocast (at::autocast) thread-local flags. deviceType uses the same
+    // integer encoding as PtDeviceType.toDeviceType (0=CPU, 1=CUDA/GPU).
+    // ROCm libtorch built with PYTORCH_HIP_AS_CUDA=1 registers autocast
+    // under CUDA, so both NVIDIA and AMD GPUs pass deviceType=1. dtype
+    // uses DataType.ordinal() (0=FLOAT32, 11=BFLOAT16, ...).
+    // ------------------------------------------------------------------
+
+    public static boolean autocastIsEnabled(int deviceType) {
+        return PyTorchLibrary.LIB.torchAutocastIsEnabled(deviceType);
+    }
+
+    public static void autocastSetEnabled(int deviceType, boolean enabled) {
+        PyTorchLibrary.LIB.torchAutocastSetEnabled(deviceType, enabled);
+    }
+
+    public static int autocastGetDtype(int deviceType) {
+        return PyTorchLibrary.LIB.torchAutocastGetDtype(deviceType);
+    }
+
+    public static void autocastSetDtype(int deviceType, int dtype) {
+        PyTorchLibrary.LIB.torchAutocastSetDtype(deviceType, dtype);
+    }
+
+    public static boolean autocastIsCacheEnabled() {
+        return PyTorchLibrary.LIB.torchAutocastIsCacheEnabled();
+    }
+
+    public static void autocastSetCacheEnabled(boolean enabled) {
+        PyTorchLibrary.LIB.torchAutocastSetCacheEnabled(enabled);
+    }
+
+    public static void autocastClearCache() {
+        PyTorchLibrary.LIB.torchAutocastClearCache();
+    }
+
+    public static int autocastIncrementNesting() {
+        return PyTorchLibrary.LIB.torchAutocastIncrementNesting();
+    }
+
+    public static int autocastDecrementNesting() {
+        return PyTorchLibrary.LIB.torchAutocastDecrementNesting();
+    }
+
     public static int getNumInteropThreads() {
         return PyTorchLibrary.LIB.torchGetNumInteropThreads();
     }
