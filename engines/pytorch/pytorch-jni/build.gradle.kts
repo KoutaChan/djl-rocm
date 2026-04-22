@@ -28,75 +28,41 @@ tasks {
         val buildDir = buildDirectory
         val nativeDir = project.parent!!.projectDir / "pytorch-native/jnilib/${djlVersion}/"
         val version = project.version
-        val hasJni = project.hasProperty("jni")
-        val ptVer = ptVersion
         val injected = project.objects.newInstance<InjectedOps>()
 
         doFirst {
-            val url = "https://publish.djl.ai/pytorch/$ptVer/jnilib/${djlVersion}"
-            val files = listOf(
-                "linux-x86_64/cpu/libdjl_torch.so",
-                "osx-aarch64/cpu/libdjl_torch.dylib",
-                "win-x86_64/cpu/djl_torch.dll"
-            ) + when {
-                ptVer.matches(Regex("2.7.\\d")) -> listOf(
-                    "linux-aarch64/cpu/libdjl_torch.so",
-                    "linux-x86_64/cu128/libdjl_torch.so",
-                    "win-x86_64/cu128/djl_torch.dll"
-                )
-
-                ptVer.matches(Regex("2.[4-5].\\d")) -> listOf(
-                    "linux-x86_64/cpu-precxx11/libdjl_torch.so",
-                    "linux-aarch64/cpu-precxx11/libdjl_torch.so",
-                    "linux-x86_64/cu124/libdjl_torch.so",
-                    "linux-x86_64/cu124-precxx11/libdjl_torch.so",
-                    "win-x86_64/cu124/djl_torch.dll"
-                )
-
-                ptVer.matches(Regex("2.[1-3].\\d")) -> listOf(
-                    "linux-x86_64/cpu-precxx11/libdjl_torch.so",
-                    "linux-aarch64/cpu-precxx11/libdjl_torch.so",
-                    "linux-x86_64/cu121/libdjl_torch.so",
-                    "linux-x86_64/cu121-precxx11/libdjl_torch.so",
-                    "win-x86_64/cu121/djl_torch.dll",
-                )
-
-                ptVer.startsWith("1.13.") -> listOf(
-                    "linux-x86_64/cpu-precxx11/libdjl_torch.so",
-                    "linux-aarch64/cpu-precxx11/libdjl_torch.so",
-                    "linux-x86_64/cu117/libdjl_torch.so",
-                    "win-x86_64/cu117/djl_torch.dll",
-                )
-
-                else -> throw GradleException("Unsupported version: $ptVer.")
-            }
             val jnilibDir = dir / "jnilib" / djlVersion
-            for (entry in files) {
-                val file = jnilibDir / entry
-                if (file.exists())
-                    logger.lifecycle("prebuilt or cached file found for $entry")
-                else {
-                    val jnilibFile = nativeDir / entry
-                    if (jnilibFile.exists()) {
-                        logger.lifecycle("Copying $jnilibFile")
-                        injected.fs.copy {
-                            from(jnilibFile)
-                            into(file.parent)
-                        }
-                    } else if (!hasJni) {
-                        logger.lifecycle("Downloading $url/$entry")
-                        file.parentFile.mkdirs()
-                        "$url/$entry".url into file
+            val outputDir = buildDir / "classes/java/main/jnilib"
+
+            injected.fs.delete {
+                delete(outputDir)
+            }
+
+            var found = false
+            listOf(jnilibDir, nativeDir).forEach { sourceDir ->
+                val hasJniLib =
+                    sourceDir.exists() &&
+                            sourceDir.walkTopDown().any {
+                                it.isFile && it.name.contains("djl_torch")
+                            }
+                if (hasJniLib) {
+                    logger.lifecycle("Copying local JNI libraries from $sourceDir")
+                    injected.fs.copy {
+                        from(sourceDir)
+                        into(outputDir)
                     }
+                    found = true
                 }
             }
-            injected.fs.copy {
-                from(jnilibDir)
-                into(buildDir / "classes/java/main/jnilib")
+
+            if (!found) {
+                throw GradleException(
+                    "No local PyTorch JNI libraries found. Build pytorch-native first or place JNI libraries under $jnilibDir."
+                )
             }
 
             // write properties
-            val propFile = buildDir / "classes/java/main/jnilib/pytorch.properties"
+            val propFile = outputDir / "pytorch.properties"
             propFile.text = "jni_version=$version"
         }
     }
