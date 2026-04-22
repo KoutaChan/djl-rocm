@@ -18,6 +18,7 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
 import ai.djl.training.GradientCollector;
+import ai.djl.training.GradientCollectorMode;
 import ai.djl.training.LocalParameterServer;
 import ai.djl.training.ParameterServer;
 import ai.djl.training.optimizer.Optimizer;
@@ -318,6 +319,15 @@ public abstract class Engine {
      */
     public GradientCollector newGradientCollector() {
         throw new UnsupportedOperationException("Not supported.");
+    }
+
+    /**
+     * Returns how this engine scopes {@link GradientCollector} instances.
+     *
+     * @return the {@link GradientCollectorMode}
+     */
+    public GradientCollectorMode getGradientCollectorMode() {
+        return GradientCollectorMode.GLOBAL_SINGLETON;
     }
 
     /**

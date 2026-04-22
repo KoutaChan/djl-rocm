@@ -91,21 +91,20 @@ public final class EasyTrain {
         Batch[] splits = batch.split(trainer.getDevices(), false);
         BatchData batchData =
                 new BatchData(batch, new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
-        try (GradientCollector collector = trainer.newGradientCollector()) {
-
-            if (splits.length > 1 && trainer.getExecutorService().isPresent()) {
-                // multi-threaded
-                ExecutorService executor = trainer.getExecutorService().get();
-                List<CompletableFuture<Boolean>> futures = new ArrayList<>(splits.length);
-                for (Batch split : splits) {
-                    futures.add(
-                            CompletableFuture.supplyAsync(
-                                    () -> trainSplit(trainer, collector, batchData, split),
-                                    executor));
-                }
-                CompletableFuture.allOf(futures.stream().toArray(CompletableFuture[]::new));
-            } else {
-                // sequence
+        if (splits.length > 1
+                && trainer.getExecutorService().isPresent()
+                && trainer.getGradientCollectorMode() == GradientCollectorMode.THREAD_CONFINED) {
+            ExecutorService executor = trainer.getExecutorService().get();
+            List<CompletableFuture<Boolean>> futures = new ArrayList<>(splits.length);
+            for (Batch split : splits) {
+                futures.add(
+                        CompletableFuture.supplyAsync(
+                                () -> trainSplit(trainer, batchData, split),
+                                executor));
+            }
+            waitAll(futures);
+        } else {
+            try (GradientCollector collector = trainer.newGradientCollector()) {
                 for (Batch split : splits) {
                     trainSplit(trainer, collector, batchData, split);
                 }
@@ -113,6 +112,12 @@ public final class EasyTrain {
         }
 
         trainer.notifyListeners(listener -> listener.onTrainingBatch(trainer, batchData));
+    }
+
+    private static boolean trainSplit(Trainer trainer, BatchData batchData, Batch split) {
+        try (GradientCollector collector = trainer.newGradientCollector()) {
+            return trainSplit(trainer, collector, batchData, split);
+        }
     }
 
     private static boolean trainSplit(
@@ -159,7 +164,7 @@ public final class EasyTrain {
                         CompletableFuture.supplyAsync(
                                 () -> validateSplit(trainer, batchData, split), executor));
             }
-            CompletableFuture.allOf(futures.stream().toArray(CompletableFuture[]::new));
+            waitAll(futures);
         } else {
             // sequence
             for (Batch split : splits) {
@@ -177,6 +182,13 @@ public final class EasyTrain {
         batchData.getLabels().put(labels.get(0).getDevice(), labels);
         batchData.getPredictions().put(preds.get(0).getDevice(), preds);
         return true;
+    }
+
+    private static void waitAll(List<CompletableFuture<Boolean>> futures) {
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();
+        for (CompletableFuture<Boolean> future : futures) {
+            future.join();
+        }
     }
 
     /**

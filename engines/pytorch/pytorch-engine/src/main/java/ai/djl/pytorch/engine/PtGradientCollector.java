@@ -18,25 +18,25 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.training.GradientCollector;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-
 /** {@code PtGradientCollector} is the PyTorch implementation of {@link GradientCollector}. */
 public final class PtGradientCollector implements GradientCollector {
 
-    private boolean gradModel;
-    private static AtomicBoolean isCollecting = new AtomicBoolean();
+    private static final ThreadLocal<PtGradientCollector> ACTIVE = new ThreadLocal<>();
+
+    private final Thread ownerThread;
+    private final boolean gradMode;
+    private boolean closed;
 
     /** Constructs a new {@code PtGradientCollector} instance. */
     public PtGradientCollector() {
-        gradModel = JniUtils.isGradMode();
-        JniUtils.setGradMode(true);
-
-        boolean wasCollecting = isCollecting.getAndSet(true);
-        if (wasCollecting) {
-            throw new IllegalStateException(
-                    "A PtGradientCollector is already collecting. Only one can be collecting at a"
-                            + " time");
+        ownerThread = Thread.currentThread();
+        if (ACTIVE.get() != null) {
+            throw new IllegalStateException("Nested PtGradientCollectors are not supported.");
         }
+
+        gradMode = JniUtils.isGradMode();
+        ACTIVE.set(this);
+        JniUtils.setGradMode(true);
 
         // TODO Currently has performance implications and so has been disabled
         // Should fix and re-enable support for PyTorch gradient accumulation
@@ -47,6 +47,8 @@ public final class PtGradientCollector implements GradientCollector {
     /** {@inheritDoc} */
     @Override
     public void backward(NDArray target) {
+        validateThread();
+        validateOpen();
         // TODO manager should create the new NDArray on the same device
         NDArray grad =
                 target.getManager()
@@ -73,6 +75,8 @@ public final class PtGradientCollector implements GradientCollector {
     /** {@inheritDoc} */
     @Override
     public void zeroGradients() {
+        validateThread();
+        validateOpen();
         NDManager systemManager = PtNDManager.getSystemManager();
         for (NDArray array : systemManager.getManagedArrays()) {
             if (array.hasGradient()) {
@@ -84,10 +88,29 @@ public final class PtGradientCollector implements GradientCollector {
     /** {@inheritDoc} */
     @Override
     public void close() {
-        if (!gradModel) {
-            JniUtils.setGradMode(false);
+        validateThread();
+        if (closed) {
+            return;
         }
-        isCollecting.set(false);
+        closed = true;
+        try {
+            JniUtils.setGradMode(gradMode);
+        } finally {
+            ACTIVE.remove();
+        }
         // TODO: do some clean up if necessary
+    }
+
+    private void validateThread() {
+        if (Thread.currentThread() != ownerThread) {
+            throw new IllegalStateException(
+                    "PtGradientCollector can only be used from the thread that created it.");
+        }
+    }
+
+    private void validateOpen() {
+        if (closed) {
+            throw new IllegalStateException("PtGradientCollector has already been closed.");
+        }
     }
 }

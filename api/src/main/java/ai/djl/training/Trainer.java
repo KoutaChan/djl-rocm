@@ -104,6 +104,7 @@ public class Trainer implements AutoCloseable {
 
         parameterStore = new ParameterStore(manager, false);
         parameterStore.setParameterServer(parameterServer, devices);
+        initializeParameterStore(false);
 
         listeners = trainingConfig.getTrainingListeners();
         notifyListeners(listener -> listener.onTrainingBegin(this));
@@ -116,28 +117,16 @@ public class Trainer implements AutoCloseable {
      */
     public void initialize(Shape... shapes) {
         model.getBlock().initialize(model.getNDManager(), model.getDataType(), shapes);
-        // call getValue on all params to initialize on all devices
-        model.getBlock()
-                .getParameters()
-                .forEach(
-                        pair -> {
-                            for (Device device : devices) {
-                                try {
-                                    parameterStore.getValue(pair.getValue(), device, true);
-                                } catch (UninitializedParameterException e) {
-                                    throw new IllegalStateException(
-                                            "Failed to initialize parameter: "
-                                                    + pair.getKey()
-                                                    + ".\n"
-                                                    + "If you are defining a Block extending"
-                                                    + " AbstractBlock, check that you are"
-                                                    + " initializing all child blocks as part of"
-                                                    + " the overload for"
-                                                    + " AbstractBlock.initializeChildBlocks().",
-                                            e);
-                                }
-                            }
-                        });
+        initializeParameterStore(true);
+    }
+
+    /**
+     * Returns how this trainer scopes {@link GradientCollector} instances.
+     *
+     * @return the {@link GradientCollectorMode}
+     */
+    public GradientCollectorMode getGradientCollectorMode() {
+        return manager.getEngine().getGradientCollectorMode();
     }
 
     /**
@@ -150,6 +139,35 @@ public class Trainer implements AutoCloseable {
      */
     public Iterable<Batch> iterateDataset(Dataset dataset) throws IOException, TranslateException {
         return dataset.getData(getManager(), executorService);
+    }
+
+    private void initializeParameterStore(boolean failOnUninitialized) {
+        // Materialize parameter mirrors before the first training split so
+        // multi-threaded training reads a stable set of device-local tensors.
+        model.getBlock()
+                .getParameters()
+                .forEach(
+                        pair -> {
+                            for (Device device : devices) {
+                                try {
+                                    parameterStore.getValue(pair.getValue(), device, true);
+                                } catch (UninitializedParameterException e) {
+                                    if (failOnUninitialized) {
+                                        throw new IllegalStateException(
+                                                "Failed to initialize parameter: "
+                                                        + pair.getKey()
+                                                        + ".\n"
+                                                        + "If you are defining a Block extending"
+                                                        + " AbstractBlock, check that you are"
+                                                        + " initializing all child blocks as part of"
+                                                        + " the overload for"
+                                                        + " AbstractBlock.initializeChildBlocks().",
+                                                e);
+                                    }
+                                    break;
+                                }
+                            }
+                        });
     }
 
     /**
