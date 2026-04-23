@@ -446,8 +446,12 @@ public final class LibUtils {
                     }
                     found = true;
                     String fileName = name.substring("libtorch/lib/".length());
-                    Files.copy(zis, tmp.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
-                }
+                    Path target = tmp.resolve(fileName);
+                    Path parent = target.getParent();
+                    if (parent != null) {
+                        Files.createDirectories(parent);
+                    }
+                    Files.copy(zis, target, StandardCopyOption.REPLACE_EXISTING);                }
             }
             if (!found) {
                 throw new EngineException(
