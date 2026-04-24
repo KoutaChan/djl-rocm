@@ -164,6 +164,10 @@ public final class JniUtils {
         return configs;
     }
 
+    public static int getGpuCount() {
+        return PyTorchLibrary.LIB.torchGetGpuCount();
+    }
+
     public static void setSeed(long seed) {
         PyTorchLibrary.LIB.torchManualSeed(seed);
     }

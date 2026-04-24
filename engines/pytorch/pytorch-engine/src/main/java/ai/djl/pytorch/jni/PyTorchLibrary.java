@@ -60,6 +60,8 @@ final class PyTorchLibrary {
 
     native void torchShowConfig(Set<String> set);
 
+    native int torchGetGpuCount();
+
     native void torchStartProfile(boolean useCuda, boolean recordShape, boolean profileMemory);
 
     native void torchStopProfile(String outputFile);

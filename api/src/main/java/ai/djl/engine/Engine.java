@@ -219,7 +219,7 @@ public abstract class Engine {
      */
     public Device defaultDevice() {
         if (defaultDevice == null) {
-            if (hasCapability(StandardCapabilities.CUDA) && CudaUtils.getGpuCount() > 0) {
+            if (hasCapability(StandardCapabilities.CUDA) && getGpuCount() > 0) {
                 defaultDevice = Device.gpu();
             } else {
                 defaultDevice = Device.cpu();

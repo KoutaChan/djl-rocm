@@ -126,6 +126,12 @@ public final class PtEngine extends Engine {
 
     /** {@inheritDoc} */
     @Override
+    public int getGpuCount() {
+        return JniUtils.getGpuCount();
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public SymbolBlock newSymbolBlock(NDManager manager) {
         return new PtSymbolBlock((PtNDManager) manager);
     }

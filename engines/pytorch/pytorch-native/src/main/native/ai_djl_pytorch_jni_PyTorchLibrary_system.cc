@@ -169,6 +169,16 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchShowConfig(
   API_END()
 }
 
+JNIEXPORT jint JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetGpuCount(JNIEnv* env, jobject jthis) {
+  API_BEGIN()
+#if defined(__ANDROID__)
+  return 0;
+#else
+  return static_cast<jint>(torch::cuda::device_count());
+#endif
+  API_END_RETURN()
+}
+
 std::string ToString(const std::vector<std::vector<int64_t>>& shapes) {
   std::ostringstream oss;
   oss << "[";
