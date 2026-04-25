@@ -196,7 +196,7 @@ public abstract class Optimizer {
                 for (Map.Entry<String, Map<Device, NDArray>> parameterEntry : state.entrySet()) {
                     for (Map.Entry<Device, NDArray> deviceEntry :
                             parameterEntry.getValue().entrySet()) {
-                        NDArray array = deviceEntry.getValue().toDevice(Device.cpu(), true);
+                        NDArray array = ownedCopy(deviceEntry.getValue(), Device.cpu());
                         array.setName(
                                 encodeName(
                                         stateName,
@@ -262,7 +262,7 @@ public abstract class Optimizer {
             try (NDList arrays = NDList.decode(manager, new ByteArrayInputStream(bytes))) {
                 for (NDArray array : arrays) {
                     StateKey key = decodeName(array.getName());
-                    NDArray stateArray = array.toDevice(key.device, true);
+                    NDArray stateArray = ownedCopy(array, key.device);
                     stateArray.detach();
                     states.computeIfAbsent(key.stateName, k -> new ConcurrentHashMap<>())
                             .computeIfAbsent(key.parameterId, k -> new ConcurrentHashMap<>())
@@ -330,6 +330,14 @@ public abstract class Optimizer {
                         });
         return arrayMap.computeIfAbsent(
                 device, k -> arrayMap.values().iterator().next().toDevice(device, true));
+    }
+
+    private static NDArray ownedCopy(NDArray array, Device device) {
+        NDArray copied = array.toDevice(device, true);
+        if (copied == array) {
+            return array.duplicate();
+        }
+        return copied;
     }
 
     private static String encodeName(String stateName, String parameterId, Device device) {
