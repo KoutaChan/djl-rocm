@@ -14,7 +14,10 @@
 package ai.djl.training;
 
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDManager;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Arrays;
 
 /** An interface for a key-value store to store parameters, and their corresponding gradients. */
@@ -48,6 +51,23 @@ public interface ParameterServer extends AutoCloseable {
      * @param params the parameter NDArrays in different devices to be updated.
      */
     void update(String parameterId, NDArray[] grads, NDArray[] params);
+
+    /**
+     * Saves optimizer state.
+     *
+     * @param path the file to save optimizer state to
+     * @throws IOException if failed to save optimizer state
+     */
+    default void saveOptimizerState(Path path) throws IOException {}
+
+    /**
+     * Loads optimizer state.
+     *
+     * @param manager the manager to create state arrays with
+     * @param path the file to load optimizer state from
+     * @throws IOException if failed to load optimizer state
+     */
+    default void loadOptimizerState(NDManager manager, Path path) throws IOException {}
 
     /** {@inheritDoc} */
     @Override

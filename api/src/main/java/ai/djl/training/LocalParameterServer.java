@@ -14,7 +14,11 @@ package ai.djl.training;
 
 import ai.djl.Device;
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDManager;
 import ai.djl.training.optimizer.Optimizer;
+
+import java.io.IOException;
+import java.nio.file.Path;
 
 /** {@code LocalParameterServer} is an implementation of the {@code ParameterServer} interface. */
 public class LocalParameterServer implements ParameterServer {
@@ -59,6 +63,18 @@ public class LocalParameterServer implements ParameterServer {
                 }
             }
         }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void saveOptimizerState(Path path) throws IOException {
+        optimizer.saveState(path);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void loadOptimizerState(NDManager manager, Path path) throws IOException {
+        optimizer.loadState(manager, path);
     }
 
     /** {@inheritDoc} */

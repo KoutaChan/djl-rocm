@@ -18,6 +18,7 @@ import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.internal.NDArrayEx;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -66,6 +67,40 @@ public class Adadelta extends Optimizer {
 
         NDArrayEx ex = weight.getNDArrayInternal();
         ex.adadeltaUpdate(inputs, weights, weightDecay, rescaleGrad, clipGrad, rho, epsilon);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Set<String> getStateNames() {
+        return stateNames("accumG", "accumDelta");
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Map<String, Map<Device, NDArray>> getState(String stateName) {
+        switch (stateName) {
+            case "accumG":
+                return accumG;
+            case "accumDelta":
+                return accumDelta;
+            default:
+                throw new IllegalArgumentException("Unknown Adadelta state: " + stateName);
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected void setState(String stateName, Map<String, Map<Device, NDArray>> state) {
+        switch (stateName) {
+            case "accumG":
+                accumG = new ConcurrentHashMap<>(state);
+                break;
+            case "accumDelta":
+                accumDelta = new ConcurrentHashMap<>(state);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown Adadelta state: " + stateName);
+        }
     }
 
     /** The Builder to construct an {@link Adadelta} object. */

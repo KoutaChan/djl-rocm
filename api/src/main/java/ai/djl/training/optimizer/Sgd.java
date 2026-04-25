@@ -20,6 +20,7 @@ import ai.djl.training.tracker.ParameterTracker;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -76,6 +77,31 @@ public class Sgd extends Optimizer {
         NDArrayEx ex = weight.getNDArrayInternal();
         ex.sgdUpdate(
                 inputs, weights, learningRate, weightDecay, rescaleGrad, clipGrad, momentum, true);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Set<String> getStateNames() {
+        return stateNames("momentumStates");
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Map<String, Map<Device, NDArray>> getState(String stateName) {
+        if ("momentumStates".equals(stateName)) {
+            return momentumStates;
+        }
+        throw new IllegalArgumentException("Unknown SGD state: " + stateName);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected void setState(String stateName, Map<String, Map<Device, NDArray>> state) {
+        if ("momentumStates".equals(stateName)) {
+            momentumStates = new ConcurrentHashMap<>(state);
+            return;
+        }
+        throw new IllegalArgumentException("Unknown SGD state: " + stateName);
     }
 
     /** The Builder to construct an {@link Sgd} object. */

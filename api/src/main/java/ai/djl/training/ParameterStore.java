@@ -19,6 +19,8 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.nn.Parameter;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -84,6 +86,30 @@ public class ParameterStore {
                 NDArray[] params = data.toArray();
                 parameterServer.update(parameterId, params);
             }
+        }
+    }
+
+    /**
+     * Saves optimizer state.
+     *
+     * @param path the file to save optimizer state to
+     * @throws IOException if failed to save optimizer state
+     */
+    public void saveOptimizerState(Path path) throws IOException {
+        if (parameterServer != null) {
+            parameterServer.saveOptimizerState(path);
+        }
+    }
+
+    /**
+     * Loads optimizer state.
+     *
+     * @param path the file to load optimizer state from
+     * @throws IOException if failed to load optimizer state
+     */
+    public void loadOptimizerState(Path path) throws IOException {
+        if (parameterServer != null) {
+            parameterServer.loadOptimizerState(manager, path);
         }
     }
 

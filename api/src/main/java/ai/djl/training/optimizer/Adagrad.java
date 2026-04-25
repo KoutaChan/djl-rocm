@@ -21,6 +21,7 @@ import ai.djl.training.tracker.ParameterTracker;
 import ai.djl.training.tracker.Tracker;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -85,6 +86,31 @@ public class Adagrad extends Optimizer {
         // TODO: change to our own implementation
         ex.adagradUpdate(
                 inputs, weights, newLearningRate, weightDecay, rescaleGrad, clipGrad, epsilon);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Set<String> getStateNames() {
+        return stateNames("history");
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Map<String, Map<Device, NDArray>> getState(String stateName) {
+        if ("history".equals(stateName)) {
+            return history;
+        }
+        throw new IllegalArgumentException("Unknown Adagrad state: " + stateName);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected void setState(String stateName, Map<String, Map<Device, NDArray>> state) {
+        if ("history".equals(stateName)) {
+            history = new ConcurrentHashMap<>(state);
+            return;
+        }
+        throw new IllegalArgumentException("Unknown Adagrad state: " + stateName);
     }
 
     /**

@@ -14,8 +14,24 @@ package ai.djl.training.optimizer;
 
 import ai.djl.Device;
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
+import ai.djl.ndarray.NDManager;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
@@ -27,6 +43,9 @@ import java.util.function.Function;
  *     optimization algorithms</a>
  */
 public abstract class Optimizer {
+
+    private static final String STATE_MAGIC = "DJL_OPTIMIZER_STATE";
+    private static final int STATE_VERSION = 1;
 
     protected float rescaleGrad;
     protected float clipGrad;
@@ -144,6 +163,149 @@ public abstract class Optimizer {
      */
     public abstract void update(String parameterId, NDArray weight, NDArray grad);
 
+    /**
+     * Saves this optimizer's state.
+     *
+     * <p>The saved state includes update counters and optimizer-specific tensor state such as Adam
+     * moments. Hyperparameters are not saved and should be restored by constructing the same
+     * optimizer configuration before loading the state.
+     *
+     * @param path the file to save the optimizer state to
+     * @throws IOException if failed to save optimizer state
+     */
+    public void saveState(Path path) throws IOException {
+        Path parent = path.toAbsolutePath().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        try (DataOutputStream os = new DataOutputStream(Files.newOutputStream(path));
+                NDList arrays = new NDList()) {
+            os.writeUTF(STATE_MAGIC);
+            os.writeInt(STATE_VERSION);
+            os.writeUTF(getClass().getName());
+            os.writeInt(beginNumUpdate);
+            os.writeInt(numUpdate);
+            os.writeInt(updateCounts.size());
+            for (Map.Entry<String, Integer> entry : updateCounts.entrySet()) {
+                os.writeUTF(entry.getKey());
+                os.writeInt(entry.getValue());
+            }
+
+            for (String stateName : getStateNames()) {
+                Map<String, Map<Device, NDArray>> state = getState(stateName);
+                for (Map.Entry<String, Map<Device, NDArray>> parameterEntry : state.entrySet()) {
+                    for (Map.Entry<Device, NDArray> deviceEntry :
+                            parameterEntry.getValue().entrySet()) {
+                        NDArray array = deviceEntry.getValue().toDevice(Device.cpu(), true);
+                        array.setName(
+                                encodeName(
+                                        stateName,
+                                        parameterEntry.getKey(),
+                                        deviceEntry.getKey()));
+                        arrays.add(array);
+                    }
+                }
+            }
+
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                arrays.encode(baos, NDList.Encoding.NPZ);
+                byte[] bytes = baos.toByteArray();
+                os.writeInt(bytes.length);
+                os.write(bytes);
+            }
+        }
+    }
+
+    /**
+     * Loads this optimizer's state.
+     *
+     * @param manager the manager to create state arrays with
+     * @param path the file to load the optimizer state from
+     * @throws IOException if failed to load optimizer state
+     */
+    public void loadState(NDManager manager, Path path) throws IOException {
+        if (!Files.exists(path)) {
+            return;
+        }
+        try (DataInputStream is = new DataInputStream(Files.newInputStream(path))) {
+            String magic = is.readUTF();
+            if (!STATE_MAGIC.equals(magic)) {
+                throw new IOException("Invalid optimizer state file: " + path);
+            }
+            int version = is.readInt();
+            if (version != STATE_VERSION) {
+                throw new IOException("Unsupported optimizer state version: " + version);
+            }
+            String optimizerClass = is.readUTF();
+            if (!getClass().getName().equals(optimizerClass)) {
+                throw new IOException(
+                        "Optimizer state was saved for "
+                                + optimizerClass
+                                + " but current optimizer is "
+                                + getClass().getName());
+            }
+            beginNumUpdate = is.readInt();
+            numUpdate = is.readInt();
+            int updateCountSize = is.readInt();
+            updateCounts = new ConcurrentHashMap<>();
+            for (int i = 0; i < updateCountSize; i++) {
+                updateCounts.put(is.readUTF(), is.readInt());
+            }
+
+            int byteLength = is.readInt();
+            if (byteLength < 0) {
+                throw new IOException("Invalid optimizer state byte length: " + byteLength);
+            }
+            byte[] bytes = new byte[byteLength];
+            is.readFully(bytes);
+            Map<String, Map<String, Map<Device, NDArray>>> states = new HashMap<>();
+            try (NDList arrays = NDList.decode(manager, new ByteArrayInputStream(bytes))) {
+                for (NDArray array : arrays) {
+                    StateKey key = decodeName(array.getName());
+                    NDArray stateArray = array.toDevice(key.device, true);
+                    stateArray.detach();
+                    states.computeIfAbsent(key.stateName, k -> new ConcurrentHashMap<>())
+                            .computeIfAbsent(key.parameterId, k -> new ConcurrentHashMap<>())
+                            .put(key.device, stateArray);
+                }
+            }
+            for (String stateName : getStateNames()) {
+                setState(stateName, states.getOrDefault(stateName, new ConcurrentHashMap<>()));
+            }
+        }
+    }
+
+    /**
+     * Returns optimizer-specific state names.
+     *
+     * @return optimizer-specific state names
+     */
+    protected Set<String> getStateNames() {
+        return Collections.emptySet();
+    }
+
+    /**
+     * Returns optimizer-specific state arrays.
+     *
+     * @param stateName the state name
+     * @return optimizer-specific state arrays
+     */
+    protected Map<String, Map<Device, NDArray>> getState(String stateName) {
+        return Collections.emptyMap();
+    }
+
+    /**
+     * Sets optimizer-specific state arrays.
+     *
+     * @param stateName the state name
+     * @param state optimizer-specific state arrays
+     */
+    protected void setState(String stateName, Map<String, Map<Device, NDArray>> state) {}
+
+    protected static Set<String> stateNames(String... names) {
+        return new HashSet<>(Arrays.asList(names));
+    }
+
     protected NDArray withDefaultState(
             Map<String, Map<Device, NDArray>> state,
             String key,
@@ -168,6 +330,59 @@ public abstract class Optimizer {
                         });
         return arrayMap.computeIfAbsent(
                 device, k -> arrayMap.values().iterator().next().toDevice(device, true));
+    }
+
+    private static String encodeName(String stateName, String parameterId, Device device) {
+        return encode(stateName)
+                + '.'
+                + encode(parameterId)
+                + '.'
+                + encode(device.getDeviceType())
+                + '.'
+                + device.getDeviceId();
+    }
+
+    private static StateKey decodeName(String name) throws IOException {
+        String[] tokens = name.split("\\.", 4);
+        if (tokens.length != 4) {
+            throw new IOException("Invalid optimizer state array name: " + name);
+        }
+        return new StateKey(
+                decode(tokens[0]),
+                decode(tokens[1]),
+                decodeDevice(decode(tokens[2]), Integer.parseInt(tokens[3])));
+    }
+
+    private static Device decodeDevice(String deviceType, int deviceId) {
+        if ("cpu".equals(deviceType)) {
+            return Device.cpu();
+        }
+        if ("gpu".equals(deviceType)) {
+            return Device.gpu(deviceId);
+        }
+        return Device.of(deviceType, deviceId);
+    }
+
+    private static String encode(String value) {
+        return Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String decode(String value) {
+        return new String(Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8);
+    }
+
+    private static final class StateKey {
+        String stateName;
+        String parameterId;
+        Device device;
+
+        StateKey(String stateName, String parameterId, Device device) {
+            this.stateName = stateName;
+            this.parameterId = parameterId;
+            this.device = device;
+        }
     }
 
     /** The Builder to construct an {@link Optimizer}. */

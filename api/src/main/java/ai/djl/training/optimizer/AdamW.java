@@ -21,6 +21,7 @@ import ai.djl.training.tracker.Tracker;
 import ai.djl.util.Preconditions;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -109,6 +110,40 @@ public class AdamW extends Optimizer {
                 epsilon,
                 true,
                 true);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Set<String> getStateNames() {
+        return stateNames("means", "variances");
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected Map<String, Map<Device, NDArray>> getState(String stateName) {
+        switch (stateName) {
+            case "means":
+                return means;
+            case "variances":
+                return variances;
+            default:
+                throw new IllegalArgumentException("Unknown AdamW state: " + stateName);
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected void setState(String stateName, Map<String, Map<Device, NDArray>> state) {
+        switch (stateName) {
+            case "means":
+                means = new ConcurrentHashMap<>(state);
+                break;
+            case "variances":
+                variances = new ConcurrentHashMap<>(state);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown AdamW state: " + stateName);
+        }
     }
 
     /**

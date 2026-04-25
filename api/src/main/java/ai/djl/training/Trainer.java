@@ -35,6 +35,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -229,6 +230,26 @@ public class Trainer implements AutoCloseable {
         long begin = System.nanoTime();
         parameterStore.updateAllParameters();
         addMetric("step", begin);
+    }
+
+    /**
+     * Saves optimizer state.
+     *
+     * @param path the file to save optimizer state to
+     * @throws IOException if failed to save optimizer state
+     */
+    public void saveOptimizerState(Path path) throws IOException {
+        parameterStore.saveOptimizerState(path);
+    }
+
+    /**
+     * Loads optimizer state.
+     *
+     * @param path the file to load optimizer state from
+     * @throws IOException if failed to load optimizer state
+     */
+    public void loadOptimizerState(Path path) throws IOException {
+        parameterStore.loadOptimizerState(path);
     }
 
     /**
