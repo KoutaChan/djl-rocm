@@ -230,6 +230,16 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSet(
   API_END()
 }
 
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyTo(
+    JNIEnv* env, jobject jthis, jlong jsource_handle, jlong jtarget_handle) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  const auto* source_ptr = reinterpret_cast<torch::Tensor*>(jsource_handle);
+  auto* target_ptr = reinterpret_cast<torch::Tensor*>(jtarget_handle);
+  target_ptr->copy_(*source_ptr);
+  API_END()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSlice(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jdim, jlong jstart, jlong jend, jlong jstep) {
   API_BEGIN()

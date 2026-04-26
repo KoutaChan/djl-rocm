@@ -269,6 +269,22 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
 
     /** {@inheritDoc} */
     @Override
+    public void copyTo(NDArray array) {
+        if (array instanceof PtNDArray) {
+            PtNDArray target = (PtNDArray) array;
+            if (getDataType() == target.getDataType()
+                    && getShape().equals(target.getShape())
+                    && !isSparse()
+                    && !target.isSparse()) {
+                JniUtils.copyTo(this, target);
+                return;
+            }
+        }
+        NDArray.super.copyTo(array);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray get(NDManager manager, long... indices) {
         return JniUtils.getItem(this, indices, (PtNDManager) manager);
     }

@@ -561,6 +561,10 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchSet(self.getHandle(), data);
     }
 
+    public static void copyTo(PtNDArray source, PtNDArray target) {
+        PyTorchLibrary.LIB.torchCopyTo(source.getHandle(), target.getHandle());
+    }
+
     public static PtNDArray gather(PtNDArray ndArray, PtNDArray index, long dim) {
         if (index.getDataType() != DataType.INT64) {
             index = index.toType(DataType.INT64, true);
@@ -1799,26 +1803,31 @@ public final class JniUtils {
     }
 
     public static ByteBuffer getByteBuffer(PtNDArray ndArray, boolean tryDirect) {
-        // Operation is CPU only
-        if (!ndArray.getDevice().equals(Device.cpu())) {
-            ndArray = ndArray.toDevice(Device.cpu(), false);
-        }
-        if (tryDirect) {
-            if (ndArray.isSparse()
-                    || getLayout(ndArray) == 2
-                    || !PyTorchLibrary.LIB.torchIsContiguous(ndArray.getHandle())) {
-                // keep the same lifecycle as origin NDArray
-                ndArray =
-                        new PtNDArray(
-                                ndArray.getManager(),
-                                PyTorchLibrary.LIB.torchToContiguous(ndArray.getHandle()));
+        if (ndArray.getDevice().equals(Device.cpu())) {
+            if (tryDirect
+                    && !ndArray.isSparse()
+                    && getLayout(ndArray) != 2
+                    && PyTorchLibrary.LIB.torchIsContiguous(ndArray.getHandle())) {
+                return PyTorchLibrary.LIB
+                        .torchDirectByteBuffer(ndArray.getHandle())
+                        .order(ByteOrder.nativeOrder());
             }
-            return PyTorchLibrary.LIB
-                    .torchDirectByteBuffer(ndArray.getHandle())
+            return ByteBuffer.wrap(PyTorchLibrary.LIB.torchDataPtr(ndArray.getHandle()))
                     .order(ByteOrder.nativeOrder());
         }
-        return ByteBuffer.wrap(PyTorchLibrary.LIB.torchDataPtr(ndArray.getHandle()))
-                .order(ByteOrder.nativeOrder());
+
+        PtNDArray cpuArray = ndArray.toDevice(Device.cpu(), false);
+        try {
+            return ByteBuffer.wrap(PyTorchLibrary.LIB.torchDataPtr(cpuArray.getHandle()))
+                    .order(ByteOrder.nativeOrder());
+        } finally {
+            PtNDManager manager = cpuArray.getManager();
+            if (manager == ndArray.getManager()) {
+                cpuArray.close();
+            } else {
+                manager.close();
+            }
+        }
     }
 
     public static void deleteNDArray(long handle) {

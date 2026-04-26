@@ -243,6 +243,8 @@ final class PyTorchLibrary {
 
     native void torchSet(long handle, ByteBuffer data);
 
+    native void torchCopyTo(long sourceHandle, long targetHandle);
+
     native long torchSlice(long handle, long dim, long start, long end, long step);
 
     native long torchGather(long handle, long index, long dim, boolean sparseGrad);
