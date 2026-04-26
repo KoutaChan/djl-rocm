@@ -25,11 +25,13 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -178,8 +180,7 @@ public abstract class Optimizer {
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        try (DataOutputStream os = new DataOutputStream(Files.newOutputStream(path));
-                NDList arrays = new NDList()) {
+        try (DataOutputStream os = new DataOutputStream(Files.newOutputStream(path))) {
             os.writeUTF(STATE_MAGIC);
             os.writeInt(STATE_VERSION);
             os.writeUTF(getClass().getName());
@@ -191,27 +192,37 @@ public abstract class Optimizer {
                 os.writeInt(entry.getValue());
             }
 
-            for (String stateName : getStateNames()) {
-                Map<String, Map<Device, NDArray>> state = getState(stateName);
-                for (Map.Entry<String, Map<Device, NDArray>> parameterEntry : state.entrySet()) {
-                    for (Map.Entry<Device, NDArray> deviceEntry :
-                            parameterEntry.getValue().entrySet()) {
-                        NDArray array = ownedCopy(deviceEntry.getValue(), Device.cpu());
-                        array.setName(
-                                encodeName(
-                                        stateName,
-                                        parameterEntry.getKey(),
-                                        deviceEntry.getKey()));
-                        arrays.add(array);
+            NDList arrays = new NDList();
+            List<StateArrayName> stateArrayNames = new ArrayList<>();
+            try {
+                for (String stateName : getStateNames()) {
+                    Map<String, Map<Device, NDArray>> state = getState(stateName);
+                    for (Map.Entry<String, Map<Device, NDArray>> parameterEntry :
+                            state.entrySet()) {
+                        for (Map.Entry<Device, NDArray> deviceEntry :
+                                parameterEntry.getValue().entrySet()) {
+                            NDArray array = deviceEntry.getValue();
+                            stateArrayNames.add(new StateArrayName(array, array.getName()));
+                            array.setName(
+                                    encodeName(
+                                            stateName,
+                                            parameterEntry.getKey(),
+                                            deviceEntry.getKey()));
+                            arrays.add(array);
+                        }
                     }
                 }
-            }
 
-            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-                arrays.encode(baos, NDList.Encoding.NPZ);
-                byte[] bytes = baos.toByteArray();
-                os.writeInt(bytes.length);
-                os.write(bytes);
+                try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                    arrays.encode(baos, NDList.Encoding.NPZ);
+                    byte[] bytes = baos.toByteArray();
+                    os.writeInt(bytes.length);
+                    os.write(bytes);
+                }
+            } finally {
+                for (StateArrayName stateArrayName : stateArrayNames) {
+                    stateArrayName.restore();
+                }
             }
         }
     }
@@ -262,8 +273,18 @@ public abstract class Optimizer {
             try (NDList arrays = NDList.decode(manager, new ByteArrayInputStream(bytes))) {
                 for (NDArray array : arrays) {
                     StateKey key = decodeName(array.getName());
-                    NDArray stateArray = ownedCopy(array, key.device);
+                    NDManager source = array.getManager();
+                    NDArray stateArray = array.toDevice(key.device, true);
+                    if (stateArray == array) {
+                        stateArray = array.duplicate();
+                    }
+                    NDManager owner = stateArray.getManager();
                     stateArray.detach();
+                    // toDevice may allocate the copy in a temporary sub-manager
+                    // close it after detaching so it doesn't leak.
+                    if (owner.getParentManager() == source) {
+                        owner.close();
+                    }
                     states.computeIfAbsent(key.stateName, k -> new ConcurrentHashMap<>())
                             .computeIfAbsent(key.parameterId, k -> new ConcurrentHashMap<>())
                             .put(key.device, stateArray);
@@ -332,14 +353,6 @@ public abstract class Optimizer {
                 device, k -> arrayMap.values().iterator().next().toDevice(device, true));
     }
 
-    private static NDArray ownedCopy(NDArray array, Device device) {
-        NDArray copied = array.toDevice(device, true);
-        if (copied == array) {
-            return array.duplicate();
-        }
-        return copied;
-    }
-
     private static String encodeName(String stateName, String parameterId, Device device) {
         return encode(stateName)
                 + '.'
@@ -379,6 +392,20 @@ public abstract class Optimizer {
 
     private static String decode(String value) {
         return new String(Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8);
+    }
+
+    private static final class StateArrayName {
+        NDArray array;
+        String originalName;
+
+        StateArrayName(NDArray array, String originalName) {
+            this.array = array;
+            this.originalName = originalName;
+        }
+
+        void restore() {
+            array.setName(originalName);
+        }
     }
 
     private static final class StateKey {
