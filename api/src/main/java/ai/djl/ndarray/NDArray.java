@@ -1726,7 +1726,8 @@ public interface NDArray extends NDResource, BytesSupplier {
      * @return this array
      */
     default NDArray fillI(Number value) {
-        return set(new NDIndex("..."), value);
+        set(new NDIndex("..."), value);
+        return this;
     }
 
     /**
