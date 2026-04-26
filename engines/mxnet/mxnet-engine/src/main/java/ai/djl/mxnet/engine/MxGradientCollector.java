@@ -123,7 +123,13 @@ public final class MxGradientCollector implements GradientCollector {
         NDManager systemManager = MxNDManager.getSystemManager();
         for (NDArray array : systemManager.getManagedArrays()) {
             if (array.hasGradient()) {
-                array.getGradient().subi(array.getGradient());
+                // getGradient() allocates a new NDArray wrapper around the same native
+                // tensor on every call, so the wrapper must be closed to avoid leaking
+                // it. fillI(0) writes without reading, so it also recovers from NaN/Inf
+                // (MXNet uses the default slice-assignment fallback).
+                try (NDArray gradient = array.getGradient()) {
+                    gradient.fillI(0);
+                }
             }
         }
     }

@@ -649,6 +649,13 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
 
     /** {@inheritDoc} */
     @Override
+    public PtNDArray fillI(Number value) {
+        JniUtils.fill(this, value.doubleValue());
+        return this;
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public PtNDArray muli(Number n) {
         try (NDArray number = manager.create(n)) {
             return muli(number);

@@ -147,6 +147,8 @@ final class PyTorchLibrary {
 
     native void torchSubi(long self, long other);
 
+    native void torchFill(long self, double value);
+
     native long torchMul(long self, long other);
 
     native void torchMuli(long self, long other);

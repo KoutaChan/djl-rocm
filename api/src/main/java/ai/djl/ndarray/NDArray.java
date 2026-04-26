@@ -1714,6 +1714,22 @@ public interface NDArray extends NDResource, BytesSupplier {
     NDArray subi(NDArray other);
 
     /**
+     * In-place fills this {@code NDArray} with the given value, overwriting the buffer
+     * without reading existing values.
+     *
+     * <p>Unlike clearing via {@code subi(this)} or {@code muli(0)}, this recovers
+     * cleanly when the array currently holds NaN or Infinity. The default
+     * implementation uses ellipsis-based slice assignment, which engines that
+     * need a faster or more universal path (notably PyTorch) override.
+     *
+     * @param value the value to write into every element
+     * @return this array
+     */
+    default NDArray fillI(Number value) {
+        return set(new NDIndex("..."), value);
+    }
+
+    /**
      * Multiplies this {@code NDArray} by a number element-wise in place.
      *
      * <p>Examples

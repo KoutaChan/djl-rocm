@@ -55,6 +55,17 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSubi(
   API_END()
 }
 
+// fill_ overwrites the buffer without reading existing values, so it is the
+// only safe way to clear a tensor that may currently hold NaN or Inf. It also
+// works for 0-dim scalars where slice-based set() does not.
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFill(
+    JNIEnv* env, jobject jthis, jlong jself, jdouble jvalue) {
+  API_BEGIN()
+  auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  self_ptr->fill_(jvalue);
+  API_END()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMul(
     JNIEnv* env, jobject jthis, jlong jself, jlong jother) {
   API_BEGIN()

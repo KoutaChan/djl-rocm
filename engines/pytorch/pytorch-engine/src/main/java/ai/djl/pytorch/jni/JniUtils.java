@@ -822,6 +822,10 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchSubi(ndArray1.getHandle(), ndArray2.getHandle());
     }
 
+    public static void fill(PtNDArray ndArray, double value) {
+        PyTorchLibrary.LIB.torchFill(ndArray.getHandle(), value);
+    }
+
     public static PtNDArray mul(PtNDArray ndArray1, PtNDArray ndArray2) {
         return new PtNDArray(
                 ndArray1.getManager(),

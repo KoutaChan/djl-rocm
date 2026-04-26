@@ -80,7 +80,13 @@ public final class PtGradientCollector implements GradientCollector {
         NDManager systemManager = PtNDManager.getSystemManager();
         for (NDArray array : systemManager.getManagedArrays()) {
             if (array.hasGradient()) {
-                array.getGradient().subi(array.getGradient());
+                // getGradient() allocates a new NDArray wrapper around the same native
+                // tensor on every call, so the wrapper must be closed to avoid leaking
+                // PtNDArray handles. fillI(0) overwrites the buffer without reading it,
+                // so the gradient recovers cleanly even if it currently holds NaN/Inf.
+                try (NDArray gradient = array.getGradient()) {
+                    gradient.fillI(0);
+                }
             }
         }
     }
