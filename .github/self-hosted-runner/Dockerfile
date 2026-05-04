@@ -34,7 +34,8 @@ RUN useradd --create-home --uid 1001 --shell /bin/bash runner \
     && chown -R runner:runner "${RUNNER_HOME}" /runner
 
 COPY entrypoint.sh /usr/local/bin/runner-entrypoint
-RUN chmod +x /usr/local/bin/runner-entrypoint
+COPY workdir-permissions.sh /usr/local/bin/runner-workdir-permissions
+RUN chmod +x /usr/local/bin/runner-entrypoint /usr/local/bin/runner-workdir-permissions
 
 WORKDIR /actions-runner
 ENTRYPOINT ["runner-entrypoint"]

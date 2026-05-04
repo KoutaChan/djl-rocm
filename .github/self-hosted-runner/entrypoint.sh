@@ -8,6 +8,8 @@ RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
 RUNNER_WORKDIR="${RUNNER_WORKDIR:-/runner/${RUNNER_NAME}/_work}"
 RUNNER_LABELS="${RUNNER_LABELS:-djl-linux-docker,docker}"
 RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-false}"
+export ACTIONS_RUNNER_HOOK_JOB_STARTED="${ACTIONS_RUNNER_HOOK_JOB_STARTED:-/usr/local/bin/runner-workdir-permissions}"
+export ACTIONS_RUNNER_HOOK_JOB_COMPLETED="${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-/usr/local/bin/runner-workdir-permissions}"
 
 case "$(uname -m)" in
     x86_64)
