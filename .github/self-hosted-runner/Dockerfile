@@ -2,6 +2,8 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV RUNNER_HOME=/actions-runner
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/runner-workdir-permissions
+ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/runner-workdir-permissions
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
