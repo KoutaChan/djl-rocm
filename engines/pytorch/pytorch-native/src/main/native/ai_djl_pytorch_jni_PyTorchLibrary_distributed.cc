@@ -82,6 +82,16 @@ class NativeDistributedProcessGroup {
     process_group_ = c10::make_intrusive<c10d::ProcessGroupNCCL>(store_, key_.rank, key_.world_size, options);
   }
 
+  ~NativeDistributedProcessGroup() {
+    try {
+      if (process_group_ != nullptr) {
+        process_group_->shutdown();
+      }
+    } catch (...) {
+      // Destructors must not throw during JVM shutdown.
+    }
+  }
+
   int world_size() const {
     return key_.world_size;
   }
