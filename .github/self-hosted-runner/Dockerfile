@@ -6,6 +6,8 @@ ENV RUNNER_HOME=/actions-runner
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        build-essential \
+        cmake \
         curl \
         docker.io \
         git \

@@ -18,7 +18,7 @@ set -euxo pipefail
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    git curl unzip cmake g++ ca-certificates openjdk-21-jdk-headless
+    git curl unzip cmake g++ make ca-certificates openjdk-21-jdk-headless
 if [[ "$FLAVOR" == rocm* ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rccl-dev
     export REQUIRE_DISTRIBUTED_NCCL=ON

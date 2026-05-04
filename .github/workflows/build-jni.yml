@@ -146,7 +146,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              git curl unzip cmake g++ ca-certificates
+              git curl unzip cmake g++ make ca-certificates
 
       # Install CUDA directly via NVIDIA's apt repo. We used to go through
       # Jimver/cuda-toolkit, but:
