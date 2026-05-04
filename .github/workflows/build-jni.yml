@@ -206,9 +206,11 @@ jobs:
           - flavor: cu128
             pt: "2.11.0"
             cuda: "12.8.1"
+            cuda_packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "cufft", "cufft_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "nvjitlink", "nvrtc", "nvrtc_dev", "nvtx", "thrust", "visual_studio_integration"]'
           - flavor: cu130
             pt: "2.11.0"
             cuda: "13.0.0"
+            cuda_packages: '["nvcc", "crt", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "cufft", "cufft_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "nvjitlink", "nvptxcompiler", "nvrtc", "nvrtc_dev", "nvtx", "nvvm", "thrust", "visual_studio_integration"]'
     steps:
       - uses: actions/checkout@v4
 
@@ -218,17 +220,18 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      # method: local grabs the full ~3 GB installer and runs it silently,
-      # which guarantees every header (crt/, thrust/, ...) and every dev
-      # lib is present. The network installer's per-component naming shifted
-      # in CUDA 13 (e.g. cudart on Windows no longer pulls in crt/ headers)
-      # so cherry-picking sub-packages was proving brittle.
+      # method: local still downloads the full installer, but on Windows it
+      # can install selected subpackages. Keep the driver and profiling tools
+      # out of the hosted runner while retaining nvcc, headers, CMake's CUDA
+      # libraries, and Visual Studio integration.
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda }}
           method: local
+          sub-packages: ${{ matrix.cuda_packages }}
+          log-file-suffix: ${{ matrix.flavor }}-win-log.txt
 
       - name: Build djl_torch.dll
         working-directory: engines/pytorch/pytorch-native
