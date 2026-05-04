@@ -147,6 +147,12 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchShowConfig(
     env->CallBooleanMethod(jset, add_method_id, jfeature);
     env->DeleteLocalRef(jfeature);
   }
+#ifdef USE_DISTRIBUTED_NCCL
+  feature = "NATIVE_DISTRIBUTED_NCCL";
+  jfeature = env->NewStringUTF(feature.c_str());
+  env->CallBooleanMethod(jset, add_method_id, jfeature);
+  env->DeleteLocalRef(jfeature);
+#endif
 #endif
   if (torch::hasMKL()) {
     feature = "MKL";

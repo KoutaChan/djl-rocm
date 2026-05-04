@@ -15,7 +15,7 @@
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
 
-#if !defined(__ANDROID__) && defined(USE_CUDA)
+#if !defined(__ANDROID__) && defined(USE_DISTRIBUTED_NCCL)
 #include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
@@ -338,7 +338,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedCreate
     jint jlocal_rank, jint jbucket_cap_mb, jboolean jstatic_graph, jboolean jfind_unused_parameters,
     jboolean javerage_gradients) {
   API_BEGIN()
-#if !defined(__ANDROID__) && defined(USE_CUDA)
+#if !defined(__ANDROID__) && defined(USE_DISTRIBUTED_NCCL)
   if (jfind_unused_parameters == JNI_TRUE) {
     throw std::runtime_error("findUnusedParameters is not supported by the PyTorch native reducer yet.");
   }
@@ -371,7 +371,9 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedCreate
   (void) jstatic_graph;
   (void) jfind_unused_parameters;
   (void) javerage_gradients;
-  throw std::runtime_error("Native distributed training requires a CUDA or ROCm PyTorch build.");
+  throw std::runtime_error(
+      "Native distributed training requires NCCL/RCCL development headers at build time. "
+      "Rebuild djl_torch with nccl.h available.");
 #endif
   API_END_RETURN()
 }
@@ -379,13 +381,15 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedCreate
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedPrepareForBackward(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-#if !defined(__ANDROID__) && defined(USE_CUDA)
+#if !defined(__ANDROID__) && defined(USE_DISTRIBUTED_NCCL)
   (void) jthis;
   GetReducer(jhandle)->PrepareForBackward();
 #else
   (void) jthis;
   (void) jhandle;
-  throw std::runtime_error("Native distributed training requires a CUDA or ROCm PyTorch build.");
+  throw std::runtime_error(
+      "Native distributed training requires NCCL/RCCL development headers at build time. "
+      "Rebuild djl_torch with nccl.h available.");
 #endif
   API_END()
 }
@@ -393,13 +397,15 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedPrepare
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedFinalizeBackward(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-#if !defined(__ANDROID__) && defined(USE_CUDA)
+#if !defined(__ANDROID__) && defined(USE_DISTRIBUTED_NCCL)
   (void) jthis;
   GetReducer(jhandle)->FinalizeBackward();
 #else
   (void) jthis;
   (void) jhandle;
-  throw std::runtime_error("Native distributed training requires a CUDA or ROCm PyTorch build.");
+  throw std::runtime_error(
+      "Native distributed training requires NCCL/RCCL development headers at build time. "
+      "Rebuild djl_torch with nccl.h available.");
 #endif
   API_END()
 }
@@ -407,14 +413,16 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedFinaliz
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedDeleteReducer(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-#if !defined(__ANDROID__) && defined(USE_CUDA)
+#if !defined(__ANDROID__) && defined(USE_DISTRIBUTED_NCCL)
   (void) jthis;
   auto* handle = reinterpret_cast<ReducerHandle*>(jhandle);
   delete handle;
 #else
   (void) jthis;
   (void) jhandle;
-  throw std::runtime_error("Native distributed training requires a CUDA or ROCm PyTorch build.");
+  throw std::runtime_error(
+      "Native distributed training requires NCCL/RCCL development headers at build time. "
+      "Rebuild djl_torch with nccl.h available.");
 #endif
   API_END()
 }

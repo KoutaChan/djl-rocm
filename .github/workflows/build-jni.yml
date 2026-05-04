@@ -170,6 +170,8 @@ jobs:
           rm -f cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "cuda-toolkit-${SUFFIX}"
+          sudo apt-get install -y --no-install-recommends libnccl-dev \
+              || echo "libnccl-dev is unavailable; native distributed training will use fallback stubs"
           echo "CUDA_HOME=/usr/local/cuda-${MAJOR}.${MINOR}" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-${MAJOR}.${MINOR}/bin" >> "$GITHUB_PATH"
 

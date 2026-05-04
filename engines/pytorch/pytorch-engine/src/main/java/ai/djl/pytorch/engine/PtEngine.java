@@ -178,6 +178,12 @@ public final class PtEngine extends Engine {
         Optional<DistributedTrainingConfig> config =
                 trainingConfig.getDistributedTrainingConfig();
         if (config.isPresent() && config.get().getWorldSize() > 1) {
+            if (!hasCapability("NATIVE_DISTRIBUTED_NCCL")) {
+                throw new EngineException(
+                        "Native distributed training is not available in this PyTorch JNI build. "
+                                + "Rebuild djl_torch with NCCL/RCCL development headers, or remove "
+                                + "DistributedTrainingConfig to use the local parameter server.");
+            }
             return new PtDistributedParameterServer(optimizer, config.get());
         }
         return super.newParameterServer(optimizer, trainingConfig);

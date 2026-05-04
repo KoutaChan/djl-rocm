@@ -61,6 +61,29 @@ if(USE_CUDA)
     add_compile_definitions(USE_CUDA)
 endif()
 
+set(DISTRIBUTED_NCCL_INCLUDE_DIR "")
+if(USE_CUDA AND NOT BUILD_ANDROID)
+    find_path(DISTRIBUTED_NCCL_INCLUDE_DIR NAMES nccl.h HINTS $ENV{NCCL_INCLUDE_DIR})
+    if(NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
+        find_path(DISTRIBUTED_NCCL_INCLUDE_DIR
+            NAMES nccl.h
+            HINTS
+                $ENV{NCCL_ROOT}
+                $ENV{CUDA_HOME}
+                $ENV{CUDA_PATH}
+                $ENV{ROCM_HOME}
+                /usr/local/cuda
+                /opt/rocm
+            PATH_SUFFIXES include include/rccl)
+    endif()
+    if(DISTRIBUTED_NCCL_INCLUDE_DIR)
+        add_compile_definitions(USE_DISTRIBUTED_NCCL)
+        message(STATUS "Native distributed NCCL/RCCL support enabled: ${DISTRIBUTED_NCCL_INCLUDE_DIR}")
+    else()
+        message(WARNING "nccl.h not found; native distributed training will use JNI fallback stubs")
+    endif()
+endif()
+
 # ROCm libtorch keeps the c10/cuda/*.h headers but those transitively pull
 # in <cuda_runtime.h>, which is a CUDA-SDK-only file absent on ROCm build
 # hosts. USE_ROCM lets JNI sources gate the CUDA-specific code paths
@@ -78,6 +101,9 @@ set_property(TARGET djl_torch PROPERTY CXX_STANDARD 17)
 if(NOT BUILD_ANDROID)
     target_link_libraries(djl_torch "${TORCH_LIBRARIES}")
     target_include_directories(djl_torch PUBLIC build/include ${JNI_INCLUDE_DIRS} ${UTILS_INCLUDE_DIR})
+    if(DISTRIBUTED_NCCL_INCLUDE_DIR)
+        target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_NCCL_INCLUDE_DIR})
+    endif()
     # We have to kill the default rpath and use current dir
     set(CMAKE_SKIP_RPATH TRUE)
     if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")

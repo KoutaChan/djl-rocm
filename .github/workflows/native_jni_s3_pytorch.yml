@@ -40,6 +40,8 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y locales curl unzip software-properties-common
           apt-get install -y python3-pip python3-distutils
+          apt-get install -y --no-install-recommends libnccl-dev \
+              || echo "libnccl-dev is unavailable; native distributed training will use fallback stubs"
           pip3 install awscli cmake
           ln -s /usr/local/bin/cmake /usr/bin/cmake
       - name: Release JNI prep
