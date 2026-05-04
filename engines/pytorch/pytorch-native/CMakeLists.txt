@@ -62,6 +62,7 @@ if(USE_CUDA)
 endif()
 
 set(DISTRIBUTED_NCCL_INCLUDE_DIR "")
+set(DISTRIBUTED_RCCL_INCLUDE_DIR "")
 if(USE_CUDA AND NOT BUILD_ANDROID)
     find_path(DISTRIBUTED_NCCL_INCLUDE_DIR NAMES nccl.h HINTS $ENV{NCCL_INCLUDE_DIR})
     if(NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
@@ -76,9 +77,31 @@ if(USE_CUDA AND NOT BUILD_ANDROID)
                 /opt/rocm
             PATH_SUFFIXES include include/rccl)
     endif()
+    if(USE_ROCM AND NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
+        find_path(DISTRIBUTED_RCCL_INCLUDE_DIR
+            NAMES rccl/rccl.h
+            HINTS
+                $ENV{RCCL_INCLUDE_DIR}
+                $ENV{RCCL_ROOT}
+                $ENV{ROCM_HOME}
+                /opt/rocm
+                /opt/rocm-7.2.0
+                /opt/rocm-7.1.0
+                /opt/rocm-7.0.0
+                /opt/rocm-6.4.0
+            PATH_SUFFIXES include)
+        if(DISTRIBUTED_RCCL_INCLUDE_DIR)
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include")
+            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/nccl.h" "#pragma once\n#include <rccl/rccl.h>\n")
+            set(DISTRIBUTED_NCCL_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include")
+        endif()
+    endif()
     if(DISTRIBUTED_NCCL_INCLUDE_DIR)
         add_compile_definitions(USE_DISTRIBUTED_NCCL)
         message(STATUS "Native distributed NCCL/RCCL support enabled: ${DISTRIBUTED_NCCL_INCLUDE_DIR}")
+        if(DISTRIBUTED_RCCL_INCLUDE_DIR)
+            message(STATUS "Using RCCL headers: ${DISTRIBUTED_RCCL_INCLUDE_DIR}")
+        endif()
     else()
         message(WARNING "nccl.h not found; native distributed training will use JNI fallback stubs")
     endif()
@@ -103,6 +126,9 @@ if(NOT BUILD_ANDROID)
     target_include_directories(djl_torch PUBLIC build/include ${JNI_INCLUDE_DIRS} ${UTILS_INCLUDE_DIR})
     if(DISTRIBUTED_NCCL_INCLUDE_DIR)
         target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_NCCL_INCLUDE_DIR})
+    endif()
+    if(DISTRIBUTED_RCCL_INCLUDE_DIR)
+        target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_RCCL_INCLUDE_DIR})
     endif()
     # We have to kill the default rpath and use current dir
     set(CMAKE_SKIP_RPATH TRUE)
