@@ -62,3 +62,37 @@ docker compose exec docker docker system prune -af
 This runner has access to a privileged Docker daemon. Use it only for trusted
 workflows and trusted branches/tags. Do not route untrusted pull request code
 from forks to this runner.
+
+## Windows Runner
+
+Windows JNI builds use a normal Windows self-hosted runner, not Docker. A
+physical NVIDIA GPU is not required because the workflow only compiles against
+the CUDA toolkit and does not run GPU runtime tests.
+
+Host requirements:
+
+- Git for Windows
+- Visual Studio 2022 Build Tools with the x64 C++ toolchain
+- enough free disk for CUDA installers and libtorch archives
+
+Register the runner with the `djl-windows` label:
+
+```powershell
+.\config.cmd --unattended `
+  --url https://github.com/<owner>/<repo> `
+  --token <registration token> `
+  --name djl-rocm-win-$env:COMPUTERNAME `
+  --labels djl-windows,windows `
+  --work _work `
+  --replace
+```
+
+Start it interactively:
+
+```powershell
+.\run.cmd
+```
+
+For durable operation, configure it as a Windows service with
+`config.cmd --runasservice` from an elevated shell and use an appropriate service
+account.

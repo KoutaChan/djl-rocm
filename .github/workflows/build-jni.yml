@@ -197,9 +197,11 @@ jobs:
   # Windows x86_64, CPU and CUDA flavors (windows-latest + build.cmd).
   # pytorch.org stopped publishing Windows libtorch cu129 after 2.8.0, so
   # the Windows matrix intentionally skips cu129 (Linux still covers it).
+  # A physical NVIDIA GPU is not required; these jobs compile the JNI library
+  # against the CUDA toolkit and do not run GPU runtime tests.
   jni-windows:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, win)
-    runs-on: windows-latest
+    runs-on: [self-hosted, djl-windows]
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +226,8 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
+      - uses: lukka/get-cmake@latest
+
       # method: local still downloads the full installer, but on Windows it
       # can install selected subpackages. Keep the driver and profiling tools
       # out of the hosted runner while retaining nvcc, headers, CMake's CUDA
@@ -240,7 +244,9 @@ jobs:
       - name: Build djl_torch.dll
         working-directory: engines/pytorch/pytorch-native
         shell: cmd
-        run: build.cmd ${{ matrix.pt }} ${{ matrix.flavor }}
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          build.cmd ${{ matrix.pt }} ${{ matrix.flavor }}
 
       - name: Publish pytorch-jni-${{ matrix.flavor }}
         shell: bash
