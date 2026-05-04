@@ -249,15 +249,15 @@ jobs:
           build.cmd ${{ matrix.pt }} ${{ matrix.flavor }}
 
       - name: Publish pytorch-jni-${{ matrix.flavor }}
-        shell: bash
+        shell: cmd
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
-              -Ppt_version=${{ matrix.pt }} \
-              -Pflavor=${{ matrix.flavor }} \
-              -Pclassifier=win-x86_64 \
+          call gradlew.bat :engines:pytorch:pytorch-jni-rocm:publish ^
+              -Ppt_version=${{ matrix.pt }} ^
+              -Pflavor=${{ matrix.flavor }} ^
+              -Pclassifier=win-x86_64 ^
               -Pgithub -PgithubRepo=${{ github.repository }} -x test
 
   # macOS arm64 only, CPU. Intel macOS was dropped from the matrix because
