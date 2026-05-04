@@ -98,7 +98,7 @@ jobs:
               "$IMAGE" \
               bash .github/workflows/scripts/build-in-container.sh
 
-  # Linux x86_64, CPU and CUDA flavors (runner native, Jimver/cuda-toolkit).
+  # Linux x86_64, CPU and CUDA flavors (runner native, CUDA apt packages).
   jni-linux:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, linux)
     runs-on: [self-hosted, djl-linux-docker]
@@ -212,11 +212,11 @@ jobs:
           - flavor: cu128
             pt: "2.11.0"
             cuda: "12.8.1"
-            cuda_packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "cufft", "cufft_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "nvjitlink", "nvrtc", "nvrtc_dev", "nvtx", "thrust", "visual_studio_integration"]'
+            cuda_components: '["cuda_cccl", "cuda_cudart", "cuda_nvcc", "cuda_nvrtc", "cuda_nvtx", "libcublas", "libcurand", "libcufft", "libcusparse", "libcusolver", "libnvjitlink"]'
           - flavor: cu130
             pt: "2.11.0"
             cuda: "13.0.0"
-            cuda_packages: '["nvcc", "crt", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "cufft", "cufft_dev", "cusparse", "cusparse_dev", "cusolver", "cusolver_dev", "nvjitlink", "nvptxcompiler", "nvrtc", "nvrtc_dev", "nvtx", "nvvm", "thrust", "visual_studio_integration"]'
+            cuda_components: '["cuda_cccl", "cuda_crt", "cuda_cudart", "cuda_nvcc", "cuda_nvrtc", "cuda_nvtx", "libcublas", "libcurand", "libcufft", "libcusparse", "libcusolver", "libnvjitlink", "libnvptxcompiler", "libnvvm"]'
     steps:
       - uses: actions/checkout@v4
 
@@ -228,17 +228,19 @@ jobs:
 
       - uses: lukka/get-cmake@latest
 
-      # Use the network installer on Windows. The local installer is several
-      # GB and can fail to spawn with EACCES on this self-hosted runner's tool
-      # cache path, while network still honors sub-packages.
+      # Use NVIDIA's redistrib zip archives instead of the Windows installer.
+      # The installer needs to execute a downloaded .exe from the runner tool
+      # cache, which fails with EACCES on this self-hosted runner. The zip
+      # archives extract into a normal CUDA root and do not require admin.
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: ${{ matrix.cuda }}
-          method: network
-          sub-packages: ${{ matrix.cuda_packages }}
-          log-file-suffix: ${{ matrix.flavor }}-win-log.txt
+        shell: pwsh
+        env:
+          CUDA_COMPONENTS: ${{ matrix.cuda_components }}
+        run: |
+          .\.github\workflows\scripts\install-cuda-redist.ps1 `
+              -CudaVersion "${{ matrix.cuda }}" `
+              -ComponentsJson "$env:CUDA_COMPONENTS"
 
       - name: Build djl_torch.dll
         working-directory: engines/pytorch/pytorch-native
