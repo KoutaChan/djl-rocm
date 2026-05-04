@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.6 FATAL_ERROR)
 project(djl_torch)
 
 option(BUILD_ANDROID "Build the static djl_torch jni linked with libtorch statically" OFF)
+option(REQUIRE_DISTRIBUTED_NCCL "Fail if native distributed NCCL/RCCL support cannot be built" OFF)
 
 if(BUILD_ANDROID AND NOT DEFINED ANDROID_ABI)
     message(FATAL_ERROR "Please specify ANDROID_ABI!")
@@ -62,55 +63,58 @@ if(USE_CUDA)
 endif()
 
 set(DISTRIBUTED_NCCL_INCLUDE_DIR "")
-set(DISTRIBUTED_RCCL_INCLUDE_DIR "")
-set(DISTRIBUTED_RCCL_INCLUDE_HEADER "")
+set(DISTRIBUTED_RCCL_INCLUDE_DIRS "")
 if(USE_CUDA AND NOT BUILD_ANDROID)
-    find_path(DISTRIBUTED_NCCL_INCLUDE_DIR NAMES nccl.h HINTS $ENV{NCCL_INCLUDE_DIR})
-    if(NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
-        find_path(DISTRIBUTED_NCCL_INCLUDE_DIR
-            NAMES nccl.h
-            HINTS
-                $ENV{NCCL_ROOT}
-                $ENV{CUDA_HOME}
-                $ENV{CUDA_PATH}
-                $ENV{ROCM_HOME}
-                /usr/local/cuda
-                /opt/rocm
-            PATH_SUFFIXES include include/rccl)
-    endif()
-    if(USE_ROCM AND NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
-        find_path(DISTRIBUTED_RCCL_INCLUDE_DIR
-            NAMES rccl/rccl.h rccl.h
-            HINTS
-                $ENV{RCCL_INCLUDE_DIR}
-                $ENV{RCCL_ROOT}
-                $ENV{ROCM_HOME}
-                /opt/rocm
-                /opt/rocm-7.2.0
-                /opt/rocm-7.1.0
-                /opt/rocm-7.0.0
-                /opt/rocm-6.4.0
-            PATH_SUFFIXES include include/rccl)
-        if(DISTRIBUTED_RCCL_INCLUDE_DIR)
-            if(EXISTS "${DISTRIBUTED_RCCL_INCLUDE_DIR}/rccl/rccl.h")
-                set(DISTRIBUTED_RCCL_INCLUDE_HEADER "rccl/rccl.h")
-            else()
-                set(DISTRIBUTED_RCCL_INCLUDE_HEADER "rccl.h")
+    if(USE_ROCM)
+        find_package(rccl CONFIG QUIET)
+        if(rccl_FOUND)
+            if(TARGET rccl)
+                get_target_property(DISTRIBUTED_RCCL_INCLUDE_DIRS rccl INTERFACE_INCLUDE_DIRECTORIES)
+                if(NOT DISTRIBUTED_RCCL_INCLUDE_DIRS)
+                    set(DISTRIBUTED_RCCL_INCLUDE_DIRS "")
+                endif()
             endif()
-            file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include")
-            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/nccl.h"
-                "#pragma once\n#include <${DISTRIBUTED_RCCL_INCLUDE_HEADER}>\n")
-            set(DISTRIBUTED_NCCL_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include")
+            if(rccl_INCLUDE_DIR)
+                list(APPEND DISTRIBUTED_RCCL_INCLUDE_DIRS ${rccl_INCLUDE_DIR})
+            endif()
+            if(rccl_INCLUDE_DIRS)
+                list(APPEND DISTRIBUTED_RCCL_INCLUDE_DIRS ${rccl_INCLUDE_DIRS})
+            endif()
+            if(DISTRIBUTED_RCCL_INCLUDE_DIRS)
+                list(REMOVE_DUPLICATES DISTRIBUTED_RCCL_INCLUDE_DIRS)
+                find_path(DISTRIBUTED_NCCL_INCLUDE_DIR
+                    NAMES nccl.h
+                    HINTS ${DISTRIBUTED_RCCL_INCLUDE_DIRS}
+                    NO_DEFAULT_PATH)
+            endif()
+        else()
+            message(WARNING "rccl CMake package not found; native distributed training will use JNI fallback stubs")
+        endif()
+    else()
+        find_path(DISTRIBUTED_NCCL_INCLUDE_DIR NAMES nccl.h HINTS $ENV{NCCL_INCLUDE_DIR})
+        if(NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
+            find_path(DISTRIBUTED_NCCL_INCLUDE_DIR
+                NAMES nccl.h
+                HINTS
+                    $ENV{NCCL_ROOT}
+                    $ENV{CUDA_HOME}
+                    $ENV{CUDA_PATH}
+                    /usr/local/cuda
+                PATH_SUFFIXES include)
         endif()
     endif()
     if(DISTRIBUTED_NCCL_INCLUDE_DIR)
         add_compile_definitions(USE_DISTRIBUTED_NCCL)
         message(STATUS "Native distributed NCCL/RCCL support enabled: ${DISTRIBUTED_NCCL_INCLUDE_DIR}")
-        if(DISTRIBUTED_RCCL_INCLUDE_DIR)
-            message(STATUS "Using RCCL headers: ${DISTRIBUTED_RCCL_INCLUDE_DIR}")
+        if(DISTRIBUTED_RCCL_INCLUDE_DIRS)
+            message(STATUS "Using RCCL include directories: ${DISTRIBUTED_RCCL_INCLUDE_DIRS}")
         endif()
     else()
-        message(WARNING "nccl.h not found; native distributed training will use JNI fallback stubs")
+        if(REQUIRE_DISTRIBUTED_NCCL)
+            message(FATAL_ERROR "Native distributed NCCL/RCCL support was requested, but nccl.h was not found.")
+        else()
+            message(WARNING "nccl.h not found; native distributed training will use JNI fallback stubs")
+        endif()
     endif()
 endif()
 
@@ -134,8 +138,8 @@ if(NOT BUILD_ANDROID)
     if(DISTRIBUTED_NCCL_INCLUDE_DIR)
         target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_NCCL_INCLUDE_DIR})
     endif()
-    if(DISTRIBUTED_RCCL_INCLUDE_DIR)
-        target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_RCCL_INCLUDE_DIR})
+    if(DISTRIBUTED_RCCL_INCLUDE_DIRS)
+        target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_RCCL_INCLUDE_DIRS})
     endif()
     # We have to kill the default rpath and use current dir
     set(CMAKE_SKIP_RPATH TRUE)

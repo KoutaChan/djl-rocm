@@ -197,7 +197,8 @@ fi
 cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" \
       -DPT_VERSION="${PT_VERSION_MACRO}" \
       -DUSE_CUDA="$USE_CUDA" \
-      -DUSE_ROCM="$USE_ROCM" ..
+      -DUSE_ROCM="$USE_ROCM" \
+      -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" ..
 cmake --build . --config Release -- -j "${NUM_PROC}"
 
 # Strip absolute CUDA/ROCm library paths from the link line so the runtime
