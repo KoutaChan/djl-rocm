@@ -16,6 +16,13 @@
 # not crowd the runner's tight root filesystem.
 set -euxo pipefail
 
+restore_workspace_owner() {
+    if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+        chown -R "${HOST_UID}:${HOST_GID}" /ws || true
+    fi
+}
+trap restore_workspace_owner EXIT
+
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     git curl unzip cmake g++ make ca-certificates openjdk-21-jdk-headless

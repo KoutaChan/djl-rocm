@@ -89,8 +89,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
+          HOST_UID="$(id -u)"
+          HOST_GID="$(id -g)"
           docker run --rm \
               -e PT_VERSION -e FLAVOR -e CLASSIFIER \
+              -e HOST_UID -e HOST_GID \
               -e GITHUB_ACTOR -e GITHUB_TOKEN -e GITHUB_REPOSITORY \
               -v "$GITHUB_WORKSPACE:/ws" \
               -v "$LIBTORCH_MOUNT:/ws/engines/pytorch/pytorch-native/libtorch" \
