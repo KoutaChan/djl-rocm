@@ -583,6 +583,24 @@ final class PyTorchLibrary {
     native void torchBackward(
             long inputHandle, long gradHandle, boolean keepGraph, boolean createGraph);
 
+    native long distributedCreateReducer(
+            long[] parameterHandles,
+            String masterHost,
+            int masterPort,
+            int rank,
+            int worldSize,
+            int localRank,
+            int bucketCapMb,
+            boolean staticGraph,
+            boolean findUnusedParameters,
+            boolean averageGradients);
+
+    native void distributedPrepareForBackward(long reducerHandle);
+
+    native void distributedFinalizeBackward(long reducerHandle);
+
+    native void distributedDeleteReducer(long reducerHandle);
+
     native long moduleLoad(
             String path,
             int[] device,

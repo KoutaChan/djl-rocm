@@ -13,7 +13,9 @@
 
 package ai.djl.training;
 
+import ai.djl.Device;
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 
 import java.io.IOException;
@@ -22,6 +24,13 @@ import java.util.Arrays;
 
 /** An interface for a key-value store to store parameters, and their corresponding gradients. */
 public interface ParameterServer extends AutoCloseable {
+
+    /**
+     * Validates devices that will be used by the {@link ParameterStore}.
+     *
+     * @param devices the devices to create mirrored parameters on
+     */
+    default void validateDevices(Device[] devices) {}
 
     /**
      * Initializes the {@code ParameterStore} for the given parameter.
@@ -51,6 +60,13 @@ public interface ParameterServer extends AutoCloseable {
      * @param params the parameter NDArrays in different devices to be updated.
      */
     void update(String parameterId, NDArray[] grads, NDArray[] params);
+
+    /**
+     * Prepares the parameter server for a backward pass.
+     *
+     * @param outputs the training forward outputs
+     */
+    default void prepareForBackward(NDList outputs) {}
 
     /**
      * Saves optimizer state.

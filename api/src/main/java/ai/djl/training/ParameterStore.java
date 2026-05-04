@@ -16,6 +16,7 @@ package ai.djl.training;
 import ai.djl.Device;
 import ai.djl.Device.MultiDevice;
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.nn.Parameter;
 
@@ -65,6 +66,7 @@ public class ParameterStore {
      */
     public void setParameterServer(ParameterServer parameterServer, Device[] devices) {
         this.parameterServer = parameterServer;
+        parameterServer.validateDevices(devices);
         deviceMap.clear();
         for (int i = 0; i < devices.length; ++i) {
             if (devices[i] instanceof MultiDevice) {
@@ -86,6 +88,17 @@ public class ParameterStore {
                 NDArray[] params = data.toArray();
                 parameterServer.update(parameterId, params);
             }
+        }
+    }
+
+    /**
+     * Prepares the parameter server for a backward pass.
+     *
+     * @param outputs the training forward outputs
+     */
+    public void prepareForBackward(NDList outputs) {
+        if (parameterServer != null) {
+            parameterServer.prepareForBackward(outputs);
         }
     }
 
@@ -184,6 +197,13 @@ public class ParameterStore {
     public void sync() {
         for (ParameterData data : parameterMap.values()) {
             data.sync();
+        }
+    }
+
+    /** Closes the associated parameter server. */
+    public void close() {
+        if (parameterServer != null) {
+            parameterServer.close();
         }
     }
 

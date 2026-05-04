@@ -1866,6 +1866,42 @@ public final class JniUtils {
                 ndArray.getHandle(), gradNd.getHandle(), keepGraph, createGraph);
     }
 
+    public static long distributedCreateReducer(
+            long[] parameterHandles,
+            String masterHost,
+            int masterPort,
+            int rank,
+            int worldSize,
+            int localRank,
+            int bucketCapMb,
+            boolean staticGraph,
+            boolean findUnusedParameters,
+            boolean averageGradients) {
+        return PyTorchLibrary.LIB.distributedCreateReducer(
+                parameterHandles,
+                masterHost,
+                masterPort,
+                rank,
+                worldSize,
+                localRank,
+                bucketCapMb,
+                staticGraph,
+                findUnusedParameters,
+                averageGradients);
+    }
+
+    public static void distributedPrepareForBackward(long reducerHandle) {
+        PyTorchLibrary.LIB.distributedPrepareForBackward(reducerHandle);
+    }
+
+    public static void distributedFinalizeBackward(long reducerHandle) {
+        PyTorchLibrary.LIB.distributedFinalizeBackward(reducerHandle);
+    }
+
+    public static void distributedDeleteReducer(long reducerHandle) {
+        PyTorchLibrary.LIB.distributedDeleteReducer(reducerHandle);
+    }
+
     public static void deleteModule(long pointer) {
         PyTorchLibrary.LIB.torchDeleteModule(pointer);
     }

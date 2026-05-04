@@ -21,6 +21,7 @@ import ai.djl.training.GradientCollector;
 import ai.djl.training.GradientCollectorMode;
 import ai.djl.training.LocalParameterServer;
 import ai.djl.training.ParameterServer;
+import ai.djl.training.TrainingConfig;
 import ai.djl.training.optimizer.Optimizer;
 import ai.djl.util.Ec2Utils;
 import ai.djl.util.RandomUtils;
@@ -385,6 +386,18 @@ public abstract class Engine {
      */
     public ParameterServer newParameterServer(Optimizer optimizer) {
         return new LocalParameterServer(optimizer);
+    }
+
+    /**
+     * Returns a new instance of {@link ParameterServer}.
+     *
+     * @param optimizer the optimizer to update
+     * @param trainingConfig the training configuration
+     * @return a new instance of {@link ParameterServer}
+     */
+    public ParameterServer newParameterServer(
+            Optimizer optimizer, TrainingConfig trainingConfig) {
+        return newParameterServer(optimizer);
     }
 
     /**

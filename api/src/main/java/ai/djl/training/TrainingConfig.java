@@ -22,6 +22,7 @@ import ai.djl.training.optimizer.Optimizer;
 import ai.djl.util.PairList;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Predicate;
 
@@ -112,4 +113,13 @@ public interface TrainingConfig {
      * @return a list of {@link TrainingListener}s
      */
     List<TrainingListener> getTrainingListeners();
+
+    /**
+     * Returns native distributed training configuration, if enabled.
+     *
+     * @return the native distributed training configuration
+     */
+    default Optional<DistributedTrainingConfig> getDistributedTrainingConfig() {
+        return Optional.empty();
+    }
 }

@@ -22,8 +22,12 @@ import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
 import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.pytorch.jni.LibUtils;
+import ai.djl.training.DistributedTrainingConfig;
 import ai.djl.training.GradientCollector;
 import ai.djl.training.GradientCollectorMode;
+import ai.djl.training.ParameterServer;
+import ai.djl.training.TrainingConfig;
+import ai.djl.training.optimizer.Optimizer;
 import ai.djl.util.Utils;
 
 import org.slf4j.Logger;
@@ -33,6 +37,7 @@ import java.io.FileNotFoundException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Optional;
 
 /**
  * The {@code PtEngine} is an implementation of the {@link Engine} based on the <a
@@ -164,6 +169,18 @@ public final class PtEngine extends Engine {
     @Override
     public GradientCollectorMode getGradientCollectorMode() {
         return GradientCollectorMode.THREAD_CONFINED;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public ParameterServer newParameterServer(
+            Optimizer optimizer, TrainingConfig trainingConfig) {
+        Optional<DistributedTrainingConfig> config =
+                trainingConfig.getDistributedTrainingConfig();
+        if (config.isPresent() && config.get().getWorldSize() > 1) {
+            return new PtDistributedParameterServer(optimizer, config.get());
+        }
+        return super.newParameterServer(optimizer, trainingConfig);
     }
 
     /** {@inheritDoc} */

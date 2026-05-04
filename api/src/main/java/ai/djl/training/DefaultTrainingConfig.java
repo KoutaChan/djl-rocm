@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
 import java.util.function.Predicate;
@@ -41,6 +42,7 @@ public class DefaultTrainingConfig implements TrainingConfig {
     private ExecutorService executorService;
     private List<Evaluator> evaluators;
     private List<TrainingListener> listeners;
+    private DistributedTrainingConfig distributedTrainingConfig;
 
     /**
      * Creates an instance of {@code DefaultTrainingConfig} with the given {@link Loss}. {@code
@@ -115,6 +117,18 @@ public class DefaultTrainingConfig implements TrainingConfig {
      */
     public DefaultTrainingConfig optOptimizer(Optimizer optimizer) {
         this.optimizer = optimizer;
+        return this;
+    }
+
+    /**
+     * Sets the native distributed training configuration.
+     *
+     * @param distributedTrainingConfig the native distributed training configuration
+     * @return this {@code DefaultTrainingConfig}
+     */
+    public DefaultTrainingConfig optDistributedTrainingConfig(
+            DistributedTrainingConfig distributedTrainingConfig) {
+        this.distributedTrainingConfig = distributedTrainingConfig;
         return this;
     }
 
@@ -215,5 +229,11 @@ public class DefaultTrainingConfig implements TrainingConfig {
     @Override
     public List<TrainingListener> getTrainingListeners() {
         return listeners;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Optional<DistributedTrainingConfig> getDistributedTrainingConfig() {
+        return Optional.ofNullable(distributedTrainingConfig);
     }
 }

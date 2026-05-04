@@ -38,6 +38,7 @@ set(SOURCE_FILES
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_inference.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_ivalue.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_optim.cc"
+    "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_distributed.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_torch_comparison.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_tensor.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_torch_creation.cc"

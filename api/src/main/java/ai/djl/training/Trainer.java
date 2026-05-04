@@ -101,7 +101,8 @@ public class Trainer implements AutoCloseable {
         executorService = trainingConfig.getExecutorService();
 
         ParameterServer parameterServer =
-                manager.getEngine().newParameterServer(trainingConfig.getOptimizer());
+                manager.getEngine()
+                        .newParameterServer(trainingConfig.getOptimizer(), trainingConfig);
 
         parameterStore = new ParameterStore(manager, false);
         parameterStore.setParameterServer(parameterServer, devices);
@@ -189,7 +190,9 @@ public class Trainer implements AutoCloseable {
     public NDList forward(NDList input) {
         long begin = System.nanoTime();
         try {
-            return model.getBlock().forward(parameterStore, input, true);
+            NDList output = model.getBlock().forward(parameterStore, input, true);
+            parameterStore.prepareForBackward(output);
+            return output;
         } finally {
             addMetric("forward", begin);
         }
@@ -205,7 +208,9 @@ public class Trainer implements AutoCloseable {
     public NDList forward(NDList data, NDList labels) {
         long begin = System.nanoTime();
         try {
-            return model.getBlock().forward(parameterStore, data, labels, null);
+            NDList output = model.getBlock().forward(parameterStore, data, labels, null);
+            parameterStore.prepareForBackward(output);
+            return output;
         } finally {
             addMetric("forward", begin);
         }
@@ -369,8 +374,15 @@ public class Trainer implements AutoCloseable {
     public void close() {
         notifyListeners(listener -> listener.onTrainingEnd(this));
 
-        parameterStore.sync();
-        manager.close();
+        try {
+            parameterStore.sync();
+        } finally {
+            try {
+                parameterStore.close();
+            } finally {
+                manager.close();
+            }
+        }
     }
 
     /**
