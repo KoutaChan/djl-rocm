@@ -25,11 +25,13 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -52,22 +54,83 @@ struct ParameterLocation {
   size_t view_index{0};
 };
 
+struct ProcessGroupKey {
+  std::string master_host;
+  int master_port{0};
+  int rank{0};
+  int world_size{0};
+  int local_rank{0};
+
+  bool operator<(const ProcessGroupKey& other) const {
+    return std::tie(master_host, master_port, rank, world_size, local_rank)
+        < std::tie(other.master_host, other.master_port, other.rank, other.world_size, other.local_rank);
+  }
+};
+
+class NativeDistributedProcessGroup {
+ public:
+  explicit NativeDistributedProcessGroup(ProcessGroupKey key) : key_(std::move(key)) {
+    c10d::TCPStoreOptions store_options;
+    store_options.port = static_cast<std::uint16_t>(key_.master_port);
+    store_options.isServer = key_.rank == 0;
+    store_options.numWorkers = static_cast<size_t>(key_.world_size);
+    store_options.waitWorkers = true;
+    store_options.timeout = std::chrono::milliseconds(300000);
+
+    store_ = c10::make_intrusive<c10d::TCPStore>(key_.master_host, store_options);
+    auto options = c10d::ProcessGroupNCCL::Options::create();
+    process_group_ = c10::make_intrusive<c10d::ProcessGroupNCCL>(store_, key_.rank, key_.world_size, options);
+  }
+
+  int world_size() const {
+    return key_.world_size;
+  }
+
+  const c10::intrusive_ptr<c10d::ProcessGroupNCCL>& process_group() const {
+    return process_group_;
+  }
+
+ private:
+  ProcessGroupKey key_;
+  c10::intrusive_ptr<c10d::Store> store_;
+  c10::intrusive_ptr<c10d::ProcessGroupNCCL> process_group_;
+};
+
+std::shared_ptr<NativeDistributedProcessGroup> GetProcessGroup(ProcessGroupKey key) {
+  static std::mutex mutex;
+  static std::map<ProcessGroupKey, std::weak_ptr<NativeDistributedProcessGroup>> process_groups;
+
+  // Multiple Trainers in one JVM can create separate reducers for the same
+  // rank. Reuse the c10d store/process group so rank 0 does not bind the
+  // master port once per reducer.
+  std::lock_guard<std::mutex> guard(mutex);
+  auto it = process_groups.find(key);
+  if (it != process_groups.end()) {
+    if (auto process_group = it->second.lock()) {
+      return process_group;
+    }
+    process_groups.erase(it);
+  }
+
+  auto process_group = std::make_shared<NativeDistributedProcessGroup>(key);
+  process_groups[std::move(key)] = process_group;
+  return process_group;
+}
+
 class NativeDistributedReducer : public std::enable_shared_from_this<NativeDistributedReducer> {
  public:
-  NativeDistributedReducer(std::vector<at::Tensor> parameters, std::string master_host, int master_port, int rank,
-      int world_size, int bucket_cap_mb, bool static_graph, bool average_gradients)
+  NativeDistributedReducer(std::vector<at::Tensor> parameters,
+      std::shared_ptr<NativeDistributedProcessGroup> process_group, int bucket_cap_mb, bool static_graph,
+      bool average_gradients)
       : parameters_(std::move(parameters)),
-        master_host_(std::move(master_host)),
-        master_port_(master_port),
-        rank_(rank),
-        world_size_(world_size),
+        process_group_(std::move(process_group)),
+        world_size_(process_group_->world_size()),
         bucket_cap_mb_(bucket_cap_mb),
         static_graph_(static_graph),
         average_gradients_(average_gradients) {}
 
   void Initialize() {
     (void) static_graph_;
-    InitializeProcessGroup();
     BroadcastParameters();
     SelectTrainableParameters();
     parameter_locations_.resize(parameters_.size());
@@ -160,19 +223,6 @@ class NativeDistributedReducer : public std::enable_shared_from_this<NativeDistr
   }
 
  private:
-  void InitializeProcessGroup() {
-    c10d::TCPStoreOptions store_options;
-    store_options.port = static_cast<std::uint16_t>(master_port_);
-    store_options.isServer = rank_ == 0;
-    store_options.numWorkers = static_cast<size_t>(world_size_);
-    store_options.waitWorkers = true;
-    store_options.timeout = std::chrono::milliseconds(300000);
-
-    store_ = c10::make_intrusive<c10d::TCPStore>(master_host_, store_options);
-    auto options = c10d::ProcessGroupNCCL::Options::create();
-    process_group_ = c10::make_intrusive<c10d::ProcessGroupNCCL>(store_, rank_, world_size_, options);
-  }
-
   void BroadcastParameters() {
     c10d::BroadcastOptions options;
     options.rootRank = 0;
@@ -185,7 +235,7 @@ class NativeDistributedReducer : public std::enable_shared_from_this<NativeDistr
         throw std::runtime_error("Native distributed training does not support sparse parameters.");
       }
       std::vector<at::Tensor> tensors{parameter};
-      process_group_->broadcast(tensors, options)->wait();
+      process_group_->process_group()->broadcast(tensors, options)->wait();
     }
   }
 
@@ -297,22 +347,18 @@ class NativeDistributedReducer : public std::enable_shared_from_this<NativeDistr
       if (!bucket.ready) {
         return;
       }
-      bucket.work = process_group_->allreduce(bucket.tensors, options);
+      bucket.work = process_group_->process_group()->allreduce(bucket.tensors, options);
       bucket.launched = true;
       ++next_bucket_to_launch_;
     }
   }
 
   std::vector<at::Tensor> parameters_;
-  std::string master_host_;
-  int master_port_;
-  int rank_;
+  std::shared_ptr<NativeDistributedProcessGroup> process_group_;
   int world_size_;
   int bucket_cap_mb_;
   bool static_graph_;
   bool average_gradients_;
-  c10::intrusive_ptr<c10d::Store> store_;
-  c10::intrusive_ptr<c10d::ProcessGroupNCCL> process_group_;
   std::vector<Bucket> buckets_;
   std::vector<ParameterLocation> parameter_locations_;
   size_t next_bucket_to_launch_{0};
@@ -354,8 +400,10 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_distributedCreate
   std::string master_host(master_host_chars);
   env->ReleaseStringUTFChars(jmaster_host, master_host_chars);
 
-  auto reducer = std::make_shared<NativeDistributedReducer>(std::move(parameters), std::move(master_host), jmaster_port,
-      jrank, jworld_size, jbucket_cap_mb, jstatic_graph == JNI_TRUE, javerage_gradients == JNI_TRUE);
+  ProcessGroupKey key{std::move(master_host), jmaster_port, jrank, jworld_size, jlocal_rank};
+  auto process_group = GetProcessGroup(std::move(key));
+  auto reducer = std::make_shared<NativeDistributedReducer>(std::move(parameters), std::move(process_group),
+      jbucket_cap_mb, jstatic_graph == JNI_TRUE, javerage_gradients == JNI_TRUE);
   reducer->Initialize();
   auto* handle = new ReducerHandle(std::move(reducer));
   return reinterpret_cast<uintptr_t>(handle);
