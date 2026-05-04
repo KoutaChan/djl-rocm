@@ -2,8 +2,6 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV RUNNER_HOME=/actions-runner
-ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/runner-workdir-permissions.sh
-ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/runner-workdir-permissions.sh
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -34,6 +32,9 @@ RUN useradd --create-home --uid 1001 --shell /bin/bash runner \
     && chmod 0440 /etc/sudoers.d/runner \
     && mkdir -p "${RUNNER_HOME}" /runner \
     && chown -R runner:runner "${RUNNER_HOME}" /runner
+
+ENV ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/runner-workdir-permissions.sh
+ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/bin/runner-workdir-permissions.sh
 
 COPY entrypoint.sh /usr/local/bin/runner-entrypoint
 COPY workdir-permissions-hook.sh /usr/local/bin/runner-workdir-permissions.sh
