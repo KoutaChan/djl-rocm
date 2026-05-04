@@ -1,0 +1,35 @@
+services:
+  docker:
+    image: docker:27-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - runner-work:/runner/_work
+      - docker-data:/var/lib/docker
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: .
+    depends_on:
+      - docker
+    environment:
+      GITHUB_URL: ${GITHUB_URL:-}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      RUNNER_NAME: ${RUNNER_NAME:-}
+      RUNNER_LABELS: ${RUNNER_LABELS:-djl-linux-docker,docker}
+      RUNNER_GROUP: ${RUNNER_GROUP:-}
+      RUNNER_VERSION: ${RUNNER_VERSION:-}
+      RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-false}
+      RUNNER_WORKDIR: /runner/_work
+      DOCKER_HOST: tcp://docker:2375
+    volumes:
+      - runner-state:/actions-runner
+      - runner-work:/runner/_work
+    restart: unless-stopped
+
+volumes:
+  runner-state:
+  runner-work:
+  docker-data:

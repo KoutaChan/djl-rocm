@@ -18,7 +18,7 @@ env:
 jobs:
   engine:
     name: Publish API + PyTorch Engine
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, djl-linux-docker]
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,7 @@ jobs:
   # for it on pytorch.org: rocm6.4->2.9.1, rocm7.0->2.10.0, rocm7.1/7.2->2.11.0.
   jni-rocm:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }})
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, djl-linux-docker]
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +60,7 @@ jobs:
             image: rocm/dev-ubuntu-24.04:7.2-complete
     steps:
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -73,8 +74,10 @@ jobs:
 
       - name: Prepare libtorch mount
         run: |
-          sudo rm -rf /mnt/libtorch
-          sudo install -d -m 0777 /mnt/libtorch
+          LIBTORCH_MOUNT="${RUNNER_TEMP}/libtorch-${{ matrix.flavor }}"
+          rm -rf "${LIBTORCH_MOUNT}"
+          install -d -m 0777 "${LIBTORCH_MOUNT}"
+          echo "LIBTORCH_MOUNT=${LIBTORCH_MOUNT}" >> "${GITHUB_ENV}"
 
       - name: Build and publish pytorch-jni-${{ matrix.flavor }}
         env:
@@ -90,7 +93,7 @@ jobs:
               -e PT_VERSION -e FLAVOR -e CLASSIFIER \
               -e GITHUB_ACTOR -e GITHUB_TOKEN -e GITHUB_REPOSITORY \
               -v "$GITHUB_WORKSPACE:/ws" \
-              -v /mnt/libtorch:/ws/engines/pytorch/pytorch-native/libtorch \
+              -v "$LIBTORCH_MOUNT:/ws/engines/pytorch/pytorch-native/libtorch" \
               -w /ws \
               "$IMAGE" \
               bash .github/workflows/scripts/build-in-container.sh
@@ -98,7 +101,7 @@ jobs:
   # Linux x86_64, CPU and CUDA flavors (runner native, Jimver/cuda-toolkit).
   jni-linux:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, linux)
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, djl-linux-docker]
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +124,7 @@ jobs:
       # aborts with ENOSPC writing its own log. Reclaim ~20 GB before the
       # cuda install step kicks in.
       - name: Free disk space
+        if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
