@@ -75,7 +75,7 @@ if exist build rd /q /s build
 md build\classes
 pushd build
 javac -sourcepath ..\..\pytorch-engine\src\main\java\ ..\..\pytorch-engine\src\main\java\ai\djl\pytorch\jni\PyTorchLibrary.java -h include -d classes || goto :fail
-cmake -DCMAKE_PREFIX_PATH=libtorch -DPT_VERSION="%PT_VERSION%" -DUSE_CUDA=%USE_CUDA% .. || goto :fail
+cmake -DCMAKE_PREFIX_PATH=libtorch -DPT_VERSION="%PT_VERSION%" -DUSE_CUDA=%USE_CUDA% -DCMAKE_BUILD_TYPE=Release .. || goto :fail
 cmake --build . --config Release || goto :fail
 
 @rem MSBuild puts djl_torch.dll under build\Release\, but the gradle

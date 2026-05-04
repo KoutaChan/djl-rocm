@@ -231,6 +231,9 @@ jobs:
           cache: gradle
 
       - uses: lukka/get-cmake@latest
+        with:
+          ninjaVersion: latest
+          useLocalCache: true
 
       # Use NVIDIA's redistrib zip archives instead of the Windows installer.
       # The installer needs to execute a downloaded .exe from the runner tool
@@ -251,6 +254,10 @@ jobs:
         shell: cmd
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if not "${{ matrix.cuda }}" == "" (
+            set "CMAKE_GENERATOR=Ninja"
+            set "CUDACXX=%CUDA_PATH%\bin\nvcc.exe"
+          )
           build.cmd ${{ matrix.pt }} ${{ matrix.flavor }}
 
       - name: Publish pytorch-jni-${{ matrix.flavor }}
