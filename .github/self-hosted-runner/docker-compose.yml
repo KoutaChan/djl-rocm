@@ -22,6 +22,7 @@ services:
       RUNNER_GROUP: ${RUNNER_GROUP:-}
       RUNNER_VERSION: ${RUNNER_VERSION:-}
       RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-false}
+      RUNNER_CONFIG_ONLY: ${RUNNER_CONFIG_ONLY:-false}
       RUNNER_WORKDIR: /runner/_work
       DOCKER_HOST: tcp://docker:2375
     volumes:

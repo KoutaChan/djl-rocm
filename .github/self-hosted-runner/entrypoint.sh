@@ -99,4 +99,9 @@ download_runner
 wait_for_docker
 configure_runner
 
+if [[ "${RUNNER_CONFIG_ONLY:-false}" == "true" ]]; then
+    echo "Runner configured. Exiting because RUNNER_CONFIG_ONLY=true."
+    exit 0
+fi
+
 exec gosu runner ./run.sh

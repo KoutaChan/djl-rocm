@@ -11,8 +11,14 @@ build can bind-mount `$GITHUB_WORKSPACE` safely.
 2. Copy `.env.example` to `.env`.
 3. Set:
    - `GITHUB_URL=https://github.com/<owner>/<repo>`
-   - `RUNNER_TOKEN=<registration token>`
-4. Start the runner:
+   - optionally `RUNNER_VERSION=2.334.0`
+4. Configure the runner with a short-lived token:
+
+```bash
+RUNNER_TOKEN=<registration token> RUNNER_CONFIG_ONLY=true docker compose run --rm runner
+```
+
+5. Start the runner without keeping the token in the long-running container:
 
 ```bash
 docker compose up -d --build
