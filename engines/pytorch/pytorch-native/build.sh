@@ -216,7 +216,7 @@ case "$FLAVOR" in
     relink_without_absolute_libs "s/\/usr\/local\/cuda(.{5})?\/lib64\/lib(cudart|nvrtc).so//g"
     ;;
   rocm*)
-    relink_without_absolute_libs "s#/opt/rocm[^ ]*/lib/lib(amdhip64|hsa-runtime64|rocblas|rocfft|rocrand|hiprtc|MIOpen)\.so[^ ]*##g"
+    relink_without_absolute_libs "s#/opt/rocm[^ ]*/lib/lib(amdhip64|hsa-runtime64|rocblas|rocfft|rocrand|hiprtc|MIOpen|rccl)\.so[^ ]*##g"
     ;;
 esac
 
