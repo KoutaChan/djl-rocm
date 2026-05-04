@@ -172,7 +172,8 @@ jobs:
           MINOR=$((CU % 10))
           SUFFIX="${MAJOR}-${MINOR}"
           DISTRO=ubuntu2204
-          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${DISTRO}/x86_64/cuda-keyring_1.1-1_all.deb"
+          curl -fsSLo cuda-keyring_1.1-1_all.deb \
+              "https://developer.download.nvidia.com/compute/cuda/repos/${DISTRO}/x86_64/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           rm -f cuda-keyring_1.1-1_all.deb
           sudo apt-get update
