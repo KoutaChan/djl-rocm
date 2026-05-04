@@ -228,16 +228,15 @@ jobs:
 
       - uses: lukka/get-cmake@latest
 
-      # method: local still downloads the full installer, but on Windows it
-      # can install selected subpackages. Keep the driver and profiling tools
-      # out of the hosted runner while retaining nvcc, headers, CMake's CUDA
-      # libraries, and Visual Studio integration.
+      # Use the network installer on Windows. The local installer is several
+      # GB and can fail to spawn with EACCES on this self-hosted runner's tool
+      # cache path, while network still honors sub-packages.
       - name: Install CUDA ${{ matrix.cuda }}
         if: matrix.cuda != ''
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: ${{ matrix.cuda }}
-          method: local
+          method: network
           sub-packages: ${{ matrix.cuda_packages }}
           log-file-suffix: ${{ matrix.flavor }}-win-log.txt
 
