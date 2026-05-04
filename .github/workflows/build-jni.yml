@@ -18,7 +18,7 @@ env:
 jobs:
   engine:
     name: Publish API + PyTorch Engine
-    runs-on: [self-hosted, djl-linux-docker]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,7 @@ jobs:
   # for it on pytorch.org: rocm6.4->2.9.1, rocm7.0->2.10.0, rocm7.1/7.2->2.11.0.
   jni-rocm:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }})
-    runs-on: [self-hosted, djl-linux-docker]
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +104,7 @@ jobs:
   # Linux x86_64, CPU and CUDA flavors (runner native, CUDA apt packages).
   jni-linux:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }}, linux)
-    runs-on: [self-hosted, djl-linux-docker]
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
