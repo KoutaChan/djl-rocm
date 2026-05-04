@@ -1,8 +1,8 @@
 # Docker self-hosted runner
 
-This runs one Linux GitHub Actions self-hosted runner in Docker. The runner talks
-to a Docker-in-Docker daemon, so workflow steps such as the ROCm `docker run`
-build can bind-mount `$GITHUB_WORKSPACE` safely.
+This runs Linux GitHub Actions self-hosted runners in Docker. The runners talk
+to a shared Docker-in-Docker daemon, so workflow steps such as the ROCm
+`docker run` build can bind-mount `$GITHUB_WORKSPACE` safely.
 
 ## Start
 
@@ -15,7 +15,9 @@ build can bind-mount `$GITHUB_WORKSPACE` safely.
 4. Configure the runner with a short-lived token:
 
 ```bash
-RUNNER_TOKEN=<registration token> RUNNER_CONFIG_ONLY=true docker compose run --rm runner
+RUNNER_TOKEN=<registration token> RUNNER_CONFIG_ONLY=true docker compose run --rm runner1
+RUNNER_TOKEN=<registration token> RUNNER_CONFIG_ONLY=true docker compose run --rm runner2
+RUNNER_TOKEN=<registration token> RUNNER_CONFIG_ONLY=true docker compose run --rm runner3
 ```
 
 5. Start the runner without keeping the token in the long-running container:
@@ -24,15 +26,20 @@ RUNNER_TOKEN=<registration token> RUNNER_CONFIG_ONLY=true docker compose run --r
 docker compose up -d --build
 ```
 
-The runner registers with the `djl-linux-docker` label. The `Build JNI` workflow
-uses that label for Linux jobs.
+The Linux runners register with the `djl-linux-docker` label. The `Build JNI`
+workflow uses that label for Linux jobs. `runner1`, `runner2`, and `runner3`
+use independent runner state and work directories under
+`/runner/runner1/_work`, `/runner/runner2/_work`, and `/runner/runner3/_work`,
+while sharing one Docker image cache.
 
 ## Operations
 
 Check logs:
 
 ```bash
-docker compose logs -f runner
+docker compose logs -f runner1
+docker compose logs -f runner2
+docker compose logs -f runner3
 ```
 
 Stop without deleting runner state or Docker image cache:

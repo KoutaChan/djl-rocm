@@ -2,7 +2,6 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV RUNNER_HOME=/actions-runner
-ENV RUNNER_WORKDIR=/runner/_work
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -29,7 +28,7 @@ RUN useradd --create-home --uid 1001 --shell /bin/bash runner \
     && usermod -aG docker runner \
     && echo "runner ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/runner \
     && chmod 0440 /etc/sudoers.d/runner \
-    && mkdir -p "${RUNNER_HOME}" "${RUNNER_WORKDIR}" \
+    && mkdir -p "${RUNNER_HOME}" /runner \
     && chown -R runner:runner "${RUNNER_HOME}" /runner
 
 COPY entrypoint.sh /usr/local/bin/runner-entrypoint

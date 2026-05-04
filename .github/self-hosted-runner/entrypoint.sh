@@ -4,8 +4,8 @@ set -euo pipefail
 : "${GITHUB_URL:?GITHUB_URL is required, for example https://github.com/OWNER/REPO}"
 
 RUNNER_HOME="${RUNNER_HOME:-/actions-runner}"
-RUNNER_WORKDIR="${RUNNER_WORKDIR:-/runner/_work}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
+RUNNER_WORKDIR="${RUNNER_WORKDIR:-/runner/${RUNNER_NAME}/_work}"
 RUNNER_LABELS="${RUNNER_LABELS:-djl-linux-docker,docker}"
 RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-false}"
 

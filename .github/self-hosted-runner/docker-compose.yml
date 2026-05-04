@@ -5,11 +5,14 @@ services:
     environment:
       DOCKER_TLS_CERTDIR: ""
     volumes:
-      - runner-work:/runner/_work
+      - runner1-work:/runner/runner1/_work
+      - runner2-work:/runner/runner2/_work
+      - runner3-work:/runner/runner3/_work
       - docker-data:/var/lib/docker
     restart: unless-stopped
 
-  runner:
+  runner1:
+    image: djl-actions-runner:local
     build:
       context: .
     depends_on:
@@ -17,20 +20,68 @@ services:
     environment:
       GITHUB_URL: ${GITHUB_URL:-}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-}
-      RUNNER_NAME: ${RUNNER_NAME:-}
+      RUNNER_NAME: ${RUNNER1_NAME:-djl-linux-docker-1}
       RUNNER_LABELS: ${RUNNER_LABELS:-djl-linux-docker,docker}
       RUNNER_GROUP: ${RUNNER_GROUP:-}
       RUNNER_VERSION: ${RUNNER_VERSION:-}
       RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-false}
       RUNNER_CONFIG_ONLY: ${RUNNER_CONFIG_ONLY:-false}
-      RUNNER_WORKDIR: /runner/_work
+      RUNNER_WORKDIR: /runner/runner1/_work
       DOCKER_HOST: tcp://docker:2375
     volumes:
-      - runner-state:/actions-runner
-      - runner-work:/runner/_work
+      - runner1-state:/actions-runner
+      - runner1-work:/runner/runner1/_work
+    restart: unless-stopped
+
+  runner2:
+    image: djl-actions-runner:local
+    build:
+      context: .
+    depends_on:
+      - docker
+    environment:
+      GITHUB_URL: ${GITHUB_URL:-}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      RUNNER_NAME: ${RUNNER2_NAME:-djl-linux-docker-2}
+      RUNNER_LABELS: ${RUNNER_LABELS:-djl-linux-docker,docker}
+      RUNNER_GROUP: ${RUNNER_GROUP:-}
+      RUNNER_VERSION: ${RUNNER_VERSION:-}
+      RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-false}
+      RUNNER_CONFIG_ONLY: ${RUNNER_CONFIG_ONLY:-false}
+      RUNNER_WORKDIR: /runner/runner2/_work
+      DOCKER_HOST: tcp://docker:2375
+    volumes:
+      - runner2-state:/actions-runner
+      - runner2-work:/runner/runner2/_work
+    restart: unless-stopped
+
+  runner3:
+    image: djl-actions-runner:local
+    build:
+      context: .
+    depends_on:
+      - docker
+    environment:
+      GITHUB_URL: ${GITHUB_URL:-}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      RUNNER_NAME: ${RUNNER3_NAME:-djl-linux-docker-3}
+      RUNNER_LABELS: ${RUNNER_LABELS:-djl-linux-docker,docker}
+      RUNNER_GROUP: ${RUNNER_GROUP:-}
+      RUNNER_VERSION: ${RUNNER_VERSION:-}
+      RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-false}
+      RUNNER_CONFIG_ONLY: ${RUNNER_CONFIG_ONLY:-false}
+      RUNNER_WORKDIR: /runner/runner3/_work
+      DOCKER_HOST: tcp://docker:2375
+    volumes:
+      - runner3-state:/actions-runner
+      - runner3-work:/runner/runner3/_work
     restart: unless-stopped
 
 volumes:
-  runner-state:
-  runner-work:
+  runner1-state:
+  runner2-state:
+  runner3-state:
+  runner1-work:
+  runner2-work:
+  runner3-work:
   docker-data:
