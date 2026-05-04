@@ -19,6 +19,9 @@ set -euxo pipefail
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     git curl unzip cmake g++ ca-certificates openjdk-21-jdk-headless
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rccl-dev \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "rccl-dev${FLAVOR#rocm}.0" \
+    || echo "rccl-dev is unavailable; native distributed training will use fallback stubs"
 update-ca-certificates
 
 cd engines/pytorch/pytorch-native

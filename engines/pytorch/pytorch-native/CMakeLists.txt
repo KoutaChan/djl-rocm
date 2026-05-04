@@ -63,6 +63,7 @@ endif()
 
 set(DISTRIBUTED_NCCL_INCLUDE_DIR "")
 set(DISTRIBUTED_RCCL_INCLUDE_DIR "")
+set(DISTRIBUTED_RCCL_INCLUDE_HEADER "")
 if(USE_CUDA AND NOT BUILD_ANDROID)
     find_path(DISTRIBUTED_NCCL_INCLUDE_DIR NAMES nccl.h HINTS $ENV{NCCL_INCLUDE_DIR})
     if(NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
@@ -79,7 +80,7 @@ if(USE_CUDA AND NOT BUILD_ANDROID)
     endif()
     if(USE_ROCM AND NOT DISTRIBUTED_NCCL_INCLUDE_DIR)
         find_path(DISTRIBUTED_RCCL_INCLUDE_DIR
-            NAMES rccl/rccl.h
+            NAMES rccl/rccl.h rccl.h
             HINTS
                 $ENV{RCCL_INCLUDE_DIR}
                 $ENV{RCCL_ROOT}
@@ -89,10 +90,16 @@ if(USE_CUDA AND NOT BUILD_ANDROID)
                 /opt/rocm-7.1.0
                 /opt/rocm-7.0.0
                 /opt/rocm-6.4.0
-            PATH_SUFFIXES include)
+            PATH_SUFFIXES include include/rccl)
         if(DISTRIBUTED_RCCL_INCLUDE_DIR)
+            if(EXISTS "${DISTRIBUTED_RCCL_INCLUDE_DIR}/rccl/rccl.h")
+                set(DISTRIBUTED_RCCL_INCLUDE_HEADER "rccl/rccl.h")
+            else()
+                set(DISTRIBUTED_RCCL_INCLUDE_HEADER "rccl.h")
+            endif()
             file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include")
-            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/nccl.h" "#pragma once\n#include <rccl/rccl.h>\n")
+            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/nccl.h"
+                "#pragma once\n#include <${DISTRIBUTED_RCCL_INCLUDE_HEADER}>\n")
             set(DISTRIBUTED_NCCL_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/include")
         endif()
     endif()
