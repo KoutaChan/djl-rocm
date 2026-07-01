@@ -118,6 +118,7 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
   c10::Stream stream = guard_impl.getStreamFromGlobalPool(target.device());
   c10::StreamGuard stream_guard(stream);
   CopyFromHost(target, buffer, true);
+  guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
   auto* event = new CopyEvent(target.device().type());
   event->event.record(stream);
   return event;
