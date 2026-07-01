@@ -75,11 +75,10 @@ bool IsAcceleratorDevice(c10::Device device) {
 #endif
 }
 
-HostBuffer* AllocateHostBuffer(int64_t capacity) {
-  bool pinned = IsAvailable();
-  auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(pinned);
-  torch::Tensor storage = torch::empty({capacity}, options);
-  return new HostBuffer{storage, pinned};
+HostBuffer* AllocateHostBuffer(int64_t size, torch::ScalarType dtype) {
+  auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(IsAvailable());
+  torch::Tensor storage = torch::empty({size}, options);
+  return new HostBuffer{storage, storage.is_pinned()};
 }
 
 void* GetHostBufferData(HostBuffer* buffer) {
@@ -87,7 +86,7 @@ void* GetHostBufferData(HostBuffer* buffer) {
 }
 
 int64_t GetHostBufferSize(HostBuffer* buffer) {
-  return buffer->storage.numel();
+  return buffer->storage.numel() * buffer->storage.dtype().itemsize();
 }
 
 bool IsHostBufferPinned(HostBuffer* buffer) {
@@ -104,16 +103,21 @@ void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking) {
   target.copy_(source, non_blocking);
 }
 
-CopyEvent* CopyFromHostAsync(torch::Tensor& target, void* data) {
-  if (!IsAcceleratorDevice(target.device())) {
-    CopyFromHost(target, data);
+void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
+  torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
+  target.copy_(source, non_blocking);
+}
+
+CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
+  if (!IsAcceleratorDevice(target.device()) || !buffer->pinned) {
+    CopyFromHost(target, buffer);
     return nullptr;
   }
   c10::DeviceGuard device_guard(target.device());
   c10::impl::VirtualGuardImpl guard_impl(target.device().type());
   c10::Stream stream = guard_impl.getStreamFromGlobalPool(target.device());
   c10::StreamGuard stream_guard(stream);
-  CopyFromHost(target, data, true);
+  CopyFromHost(target, buffer, true);
   auto* event = new CopyEvent(target.device().type());
   event->event.record(stream);
   return event;

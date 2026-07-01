@@ -26,6 +26,7 @@ import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.Charset;
+import java.util.Objects;
 
 /** {@code PtNDManager} is the PyTorch implementation of {@link NDManager}. */
 public class PtNDManager extends BaseNDManager {
@@ -47,25 +48,27 @@ public class PtNDManager extends BaseNDManager {
     }
 
     /**
-     * Allocates a host transfer buffer.
+     * Allocates a typed host transfer buffer.
      *
      * <p>When the native PyTorch build has an available CUDA/ROCm accelerator, the returned buffer
      * uses pinned host memory. Otherwise it falls back to regular CPU host memory while preserving
      * the same API. The buffer must be closed when no longer needed, or attached manager close will
      * release it.
      *
-     * @param capacity the number of bytes to allocate
-     * @return a host transfer buffer
+     * @param size the number of typed elements to allocate
+     * @param dataType the element type stored in the buffer
+     * @return a typed host transfer buffer
      */
-    public PtPinnedBuffer allocatePinned(int capacity) {
-        if (capacity <= 0) {
-            throw new IllegalArgumentException("capacity must be greater than zero.");
+    public PtPinnedBuffer allocatePinned(int size, DataType dataType) {
+        Objects.requireNonNull(dataType, "dataType");
+        if (size <= 0) {
+            throw new IllegalArgumentException("size must be greater than zero.");
         }
-        long handle = JniUtils.allocatePinnedBuffer(capacity);
+        long handle = JniUtils.allocatePinnedBuffer(size, dataType);
         try {
             ByteBuffer buffer = JniUtils.getPinnedBuffer(handle);
             boolean pinned = JniUtils.isPinnedBuffer(handle);
-            return new PtPinnedBuffer(this, handle, buffer, capacity, pinned);
+            return new PtPinnedBuffer(this, handle, buffer, size, dataType, pinned);
         } catch (RuntimeException e) {
             JniUtils.deletePinnedBuffer(handle);
             throw e;

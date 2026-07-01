@@ -561,8 +561,8 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchSet(self.getHandle(), data);
     }
 
-    public static long allocatePinnedBuffer(int capacity) {
-        return PyTorchLibrary.LIB.torchAllocatePinnedBuffer(capacity);
+    public static long allocatePinnedBuffer(int size, DataType dataType) {
+        return PyTorchLibrary.LIB.torchAllocatePinnedBuffer(size, dataType.ordinal());
     }
 
     public static ByteBuffer getPinnedBuffer(long handle) {

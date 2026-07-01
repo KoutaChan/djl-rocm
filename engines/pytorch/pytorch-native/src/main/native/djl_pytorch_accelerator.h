@@ -26,14 +26,15 @@ struct StreamScope;
 
 bool IsAvailable();
 
-HostBuffer* AllocateHostBuffer(int64_t capacity);
+HostBuffer* AllocateHostBuffer(int64_t size, torch::ScalarType dtype);
 void* GetHostBufferData(HostBuffer* buffer);
 int64_t GetHostBufferSize(HostBuffer* buffer);
 bool IsHostBufferPinned(HostBuffer* buffer);
 void DeleteHostBuffer(HostBuffer* buffer);
 
 void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking = false);
-CopyEvent* CopyFromHostAsync(torch::Tensor& target, void* data);
+void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking = false);
+CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer);
 void SynchronizeCopyEvent(CopyEvent* event);
 void DeleteCopyEvent(CopyEvent* event);
 

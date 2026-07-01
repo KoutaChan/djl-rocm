@@ -323,14 +323,21 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     private void validatePinnedCopyBuffer(PtPinnedBuffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         buffer.getHandle();
-        int expectedBytes =
-                Math.multiplyExact(Math.toIntExact(size()), getDataType().getNumOfBytes());
-        if (buffer.capacity() < expectedBytes) {
+        DataType arrayDataType = getDataType();
+        if (buffer.getDataType() != arrayDataType) {
+            throw new IllegalArgumentException(
+                    "The NDArray data type is: "
+                            + arrayDataType
+                            + ", but transfer buffer data type is: "
+                            + buffer.getDataType());
+        }
+        int expectedSize = Math.toIntExact(size());
+        if (buffer.size() < expectedSize) {
             throw new IllegalArgumentException(
                     "The NDArray size is: "
-                            + expectedBytes
-                            + " bytes, but transfer buffer size is: "
-                            + buffer.capacity());
+                            + expectedSize
+                            + " elements, but transfer buffer size is: "
+                            + buffer.size());
         }
     }
 

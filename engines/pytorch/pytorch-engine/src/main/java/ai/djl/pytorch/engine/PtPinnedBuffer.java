@@ -12,6 +12,7 @@
  */
 package ai.djl.pytorch.engine;
 
+import ai.djl.ndarray.types.DataType;
 import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.util.NativeResource;
 
@@ -30,16 +31,25 @@ public final class PtPinnedBuffer extends NativeResource<Long> {
 
     private final PtNDManager manager;
     private final ByteBuffer buffer;
+    private final int size;
+    private final DataType dataType;
     private final int capacity;
     private final boolean pinned;
 
     @SuppressWarnings("this-escape")
     PtPinnedBuffer(
-            PtNDManager manager, long handle, ByteBuffer buffer, int capacity, boolean pinned) {
+            PtNDManager manager,
+            long handle,
+            ByteBuffer buffer,
+            int size,
+            DataType dataType,
+            boolean pinned) {
         super(handle);
         this.manager = manager;
         this.buffer = buffer.order(ByteOrder.nativeOrder());
-        this.capacity = capacity;
+        this.size = size;
+        this.dataType = dataType;
+        this.capacity = Math.multiplyExact(size, dataType.getNumOfBytes());
         this.pinned = pinned;
         manager.attachInternal(getUid(), this);
     }
@@ -66,6 +76,24 @@ public final class PtPinnedBuffer extends NativeResource<Long> {
      */
     public int capacity() {
         return capacity;
+    }
+
+    /**
+     * Returns the number of typed elements allocated in this buffer.
+     *
+     * @return the number of elements
+     */
+    public int size() {
+        return size;
+    }
+
+    /**
+     * Returns the element type stored in this buffer.
+     *
+     * @return the buffer data type
+     */
+    public DataType getDataType() {
+        return dataType;
     }
 
     /**

@@ -243,7 +243,7 @@ final class PyTorchLibrary {
 
     native void torchSet(long handle, ByteBuffer data);
 
-    native long torchAllocatePinnedBuffer(long capacity);
+    native long torchAllocatePinnedBuffer(long size, int dtype);
 
     native ByteBuffer torchGetPinnedBuffer(long handle);
 

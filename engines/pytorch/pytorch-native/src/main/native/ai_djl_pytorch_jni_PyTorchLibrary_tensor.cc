@@ -240,9 +240,10 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSet(
 }
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAllocatePinnedBuffer(
-    JNIEnv* env, jobject jthis, jlong jcapacity) {
+    JNIEnv* env, jobject jthis, jlong jsize, jint jdtype) {
   API_BEGIN()
-  auto* buffer = djl_pytorch::accel::AllocateHostBuffer(static_cast<int64_t>(jcapacity));
+  auto* buffer = djl_pytorch::accel::AllocateHostBuffer(
+      static_cast<int64_t>(jsize), utils::GetScalarTypeFromDType(jdtype));
   return reinterpret_cast<uintptr_t>(buffer);
   API_END_RETURN()
 }
@@ -291,7 +292,7 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinne
   torch::NoGradGuard guard;
   auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
   auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
-  djl_pytorch::accel::CopyFromHost(*target_ptr, djl_pytorch::accel::GetHostBufferData(buffer));
+  djl_pytorch::accel::CopyFromHost(*target_ptr, buffer);
   API_END()
 }
 
@@ -301,7 +302,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinn
   torch::NoGradGuard guard;
   auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
   auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
-  auto* event = djl_pytorch::accel::CopyFromHostAsync(*target_ptr, djl_pytorch::accel::GetHostBufferData(buffer));
+  auto* event = djl_pytorch::accel::CopyFromHostAsync(*target_ptr, buffer);
   return reinterpret_cast<uintptr_t>(event);
   API_END_RETURN()
 }
