@@ -132,6 +132,17 @@ void DeleteCopyEvent(CopyEvent* event) {
   delete event;
 }
 
+void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor) {
+  if (!tensor.defined() || tensor.numel() == 0 || tensor.layout() != c10::kStrided ||
+      !IsAcceleratorDevice(tensor.device())) {
+    return;
+  }
+  c10::DeviceGuard device_guard(tensor.device());
+  c10::impl::VirtualGuardImpl guard_impl(tensor.device().type());
+  c10::Stream stream = guard_impl.getStream(tensor.device());
+  guard_impl.recordDataPtrOnStream(tensor.storage().data_ptr(), stream);
+}
+
 StreamScope* NewStreamScope() {
   if (!IsAvailable()) {
     return nullptr;

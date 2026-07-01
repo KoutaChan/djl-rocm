@@ -37,6 +37,7 @@ void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking =
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer);
 void SynchronizeCopyEvent(CopyEvent* event);
 void DeleteCopyEvent(CopyEvent* event);
+void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor);
 
 StreamScope* NewStreamScope();
 void DeleteStreamScope(StreamScope* scope);

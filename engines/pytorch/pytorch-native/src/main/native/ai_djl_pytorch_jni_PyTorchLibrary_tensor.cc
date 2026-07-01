@@ -479,6 +479,7 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteTensor(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  djl_pytorch::accel::RecordTensorUseOnCurrentStream(*tensor_ptr);
   delete tensor_ptr;
   API_END()
 }
