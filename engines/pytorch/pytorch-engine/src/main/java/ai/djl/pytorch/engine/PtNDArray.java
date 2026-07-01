@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -265,6 +266,72 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
             dataRef = buf;
         }
         JniUtils.set(this, buf);
+    }
+
+    /**
+     * Copies data from a direct byte buffer into this array without replacing the array storage.
+     *
+     * <p>For GPU arrays this performs a host-to-device copy into the existing tensor. Unlike {@link
+     * #set(Buffer)}, this method does not allocate a new GPU tensor and does not replace the native
+     * storage backing this {@code PtNDArray}.
+     *
+     * @param buffer the source direct byte buffer
+     */
+    public void copyFromDirectBuffer(ByteBuffer buffer) {
+        JniUtils.copyFromDirectBuffer(this, validateDirectCopyBuffer(buffer));
+    }
+
+    /**
+     * Copies data from a host transfer buffer into this array without replacing the array storage.
+     *
+     * <p>This method is synchronous. Use {@link #copyFromPinnedBufferAsync(PtPinnedBuffer)} to
+     * schedule a non-blocking host-to-device copy.
+     *
+     * @param buffer the source host transfer buffer
+     */
+    public void copyFromPinnedBuffer(PtPinnedBuffer buffer) {
+        validatePinnedCopyBuffer(buffer);
+        JniUtils.copyFromPinnedBuffer(this, buffer.getHandle());
+    }
+
+    /**
+     * Schedules an asynchronous copy from a host transfer buffer into this array.
+     *
+     * <p>The returned event must be synchronized or closed before the source buffer is overwritten
+     * or closed. For CPU arrays, the copy is performed synchronously and the returned event is
+     * already complete.
+     *
+     * @param buffer the source host transfer buffer
+     * @return an event that completes when the copy is visible to this array
+     */
+    public PtCopyEvent copyFromPinnedBufferAsync(PtPinnedBuffer buffer) {
+        validatePinnedCopyBuffer(buffer);
+        long event = JniUtils.copyFromPinnedBufferAsync(this, buffer.getHandle());
+        return new PtCopyEvent(manager, event, buffer);
+    }
+
+    private ByteBuffer validateDirectCopyBuffer(ByteBuffer buffer) {
+        Objects.requireNonNull(buffer, "buffer");
+        if (!buffer.isDirect()) {
+            throw new IllegalArgumentException("buffer must be direct.");
+        }
+        ByteBuffer view = buffer.slice();
+        BaseNDManager.validateBuffer(view, getDataType(), Math.toIntExact(size()));
+        return view;
+    }
+
+    private void validatePinnedCopyBuffer(PtPinnedBuffer buffer) {
+        Objects.requireNonNull(buffer, "buffer");
+        buffer.getHandle();
+        int expectedBytes =
+                Math.multiplyExact(Math.toIntExact(size()), getDataType().getNumOfBytes());
+        if (buffer.capacity() < expectedBytes) {
+            throw new IllegalArgumentException(
+                    "The NDArray size is: "
+                            + expectedBytes
+                            + " bytes, but transfer buffer size is: "
+                            + buffer.capacity());
+        }
     }
 
     /** {@inheritDoc} */

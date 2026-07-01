@@ -12,10 +12,19 @@
  */
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "ai_djl_pytorch_jni_cache.h"
+#include "djl_pytorch_accelerator.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
 
 // The file is the implementation for PyTorch tensor core functionality operation
+
+namespace {
+
+int64_t GetTensorNbytes(const torch::Tensor& tensor) {
+  return tensor.numel() * tensor.dtype().itemsize();
+}
+
+}  // namespace
 
 JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSizes(
     JNIEnv* env, jobject jthis, jlong jhandle) {
@@ -227,6 +236,95 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSet(
       /*allocator=*/nullptr,
       /*resizable=*/false);
   tensor_ptr->set_(storage, 0, sizes, strides);
+  API_END()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAllocatePinnedBuffer(
+    JNIEnv* env, jobject jthis, jlong jcapacity) {
+  API_BEGIN()
+  auto* buffer = djl_pytorch::accel::AllocateHostBuffer(static_cast<int64_t>(jcapacity));
+  return reinterpret_cast<uintptr_t>(buffer);
+  API_END_RETURN()
+}
+
+JNIEXPORT jobject JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetPinnedBuffer(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jhandle);
+  return env->NewDirectByteBuffer(djl_pytorch::accel::GetHostBufferData(buffer),
+      djl_pytorch::accel::GetHostBufferSize(buffer));
+  API_END_RETURN()
+}
+
+JNIEXPORT jboolean JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIsPinnedBuffer(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jhandle);
+  return djl_pytorch::accel::IsHostBufferPinned(buffer);
+  API_END_RETURN()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeletePinnedBuffer(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  if (jhandle == 0) {
+    return;
+  }
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jhandle);
+  djl_pytorch::accel::DeleteHostBuffer(buffer);
+  API_END()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromDirectBuffer(
+    JNIEnv* env, jobject jthis, jlong jhandle, jobject jbuffer) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  void* data = env->GetDirectBufferAddress(jbuffer);
+  djl_pytorch::accel::CopyFromHost(*target_ptr, data);
+  API_END()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinnedBuffer(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
+  djl_pytorch::accel::CopyFromHost(*target_ptr, djl_pytorch::accel::GetHostBufferData(buffer));
+  API_END()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinnedBufferAsync(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
+  auto* event = djl_pytorch::accel::CopyFromHostAsync(*target_ptr, djl_pytorch::accel::GetHostBufferData(buffer));
+  return reinterpret_cast<uintptr_t>(event);
+  API_END_RETURN()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSynchronizeCopyEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  if (jhandle == 0) {
+    return;
+  }
+  auto* event = reinterpret_cast<djl_pytorch::accel::CopyEvent*>(jhandle);
+  djl_pytorch::accel::SynchronizeCopyEvent(event);
+  API_END()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteCopyEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  if (jhandle == 0) {
+    return;
+  }
+  auto* event = reinterpret_cast<djl_pytorch::accel::CopyEvent*>(jhandle);
+  djl_pytorch::accel::DeleteCopyEvent(event);
   API_END()
 }
 

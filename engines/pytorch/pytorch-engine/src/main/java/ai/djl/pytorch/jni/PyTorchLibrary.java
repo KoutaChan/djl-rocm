@@ -243,6 +243,24 @@ final class PyTorchLibrary {
 
     native void torchSet(long handle, ByteBuffer data);
 
+    native long torchAllocatePinnedBuffer(long capacity);
+
+    native ByteBuffer torchGetPinnedBuffer(long handle);
+
+    native boolean torchIsPinnedBuffer(long handle);
+
+    native void torchDeletePinnedBuffer(long handle);
+
+    native void torchCopyFromDirectBuffer(long handle, ByteBuffer data);
+
+    native void torchCopyFromPinnedBuffer(long handle, long pinnedBufferHandle);
+
+    native long torchCopyFromPinnedBufferAsync(long handle, long pinnedBufferHandle);
+
+    native void torchSynchronizeCopyEvent(long handle);
+
+    native void torchDeleteCopyEvent(long handle);
+
     native void torchCopyTo(long sourceHandle, long targetHandle);
 
     native long torchSlice(long handle, long dim, long start, long end, long step);

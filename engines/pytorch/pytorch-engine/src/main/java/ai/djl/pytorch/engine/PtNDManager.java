@@ -46,6 +46,32 @@ public class PtNDManager extends BaseNDManager {
         return ByteBuffer.allocateDirect(capacity).order(ByteOrder.nativeOrder());
     }
 
+    /**
+     * Allocates a host transfer buffer.
+     *
+     * <p>When the native PyTorch build has an available CUDA/ROCm accelerator, the returned buffer
+     * uses pinned host memory. Otherwise it falls back to regular CPU host memory while preserving
+     * the same API. The buffer must be closed when no longer needed, or attached manager close will
+     * release it.
+     *
+     * @param capacity the number of bytes to allocate
+     * @return a host transfer buffer
+     */
+    public PtPinnedBuffer allocatePinned(int capacity) {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("capacity must be greater than zero.");
+        }
+        long handle = JniUtils.allocatePinnedBuffer(capacity);
+        try {
+            ByteBuffer buffer = JniUtils.getPinnedBuffer(handle);
+            boolean pinned = JniUtils.isPinnedBuffer(handle);
+            return new PtPinnedBuffer(this, handle, buffer, capacity, pinned);
+        } catch (RuntimeException e) {
+            JniUtils.deletePinnedBuffer(handle);
+            throw e;
+        }
+    }
+
     /** {@inheritDoc} */
     @Override
     public PtNDArray from(NDArray array) {

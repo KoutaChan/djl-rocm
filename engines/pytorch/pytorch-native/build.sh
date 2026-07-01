@@ -157,9 +157,9 @@ case "$FLAVOR" in
     USE_CUDA=1
     ;;
   rocm*)
-    # ROCm libtorch is hipified and still exposes the c10/cuda/* headers and
-    # torch::cuda::* symbols, so keep the JNI USE_CUDA branches (e.g. the
-    # CUDACachingAllocator calls) enabled for ROCm as well.
+    # ROCm libtorch is hipified and still exposes torch::cuda::* symbols.
+    # USE_CUDA selects accelerator support and USE_ROCM selects the ROCm
+    # stream/allocator source file.
     USE_CUDA=1
     USE_ROCM=1
     stub_cuda_cmake_macros

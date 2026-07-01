@@ -561,6 +561,42 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchSet(self.getHandle(), data);
     }
 
+    public static long allocatePinnedBuffer(int capacity) {
+        return PyTorchLibrary.LIB.torchAllocatePinnedBuffer(capacity);
+    }
+
+    public static ByteBuffer getPinnedBuffer(long handle) {
+        return PyTorchLibrary.LIB.torchGetPinnedBuffer(handle);
+    }
+
+    public static boolean isPinnedBuffer(long handle) {
+        return PyTorchLibrary.LIB.torchIsPinnedBuffer(handle);
+    }
+
+    public static void deletePinnedBuffer(long handle) {
+        PyTorchLibrary.LIB.torchDeletePinnedBuffer(handle);
+    }
+
+    public static void copyFromDirectBuffer(PtNDArray self, ByteBuffer data) {
+        PyTorchLibrary.LIB.torchCopyFromDirectBuffer(self.getHandle(), data);
+    }
+
+    public static void copyFromPinnedBuffer(PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchCopyFromPinnedBuffer(self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static long copyFromPinnedBufferAsync(PtNDArray self, long pinnedBufferHandle) {
+        return PyTorchLibrary.LIB.torchCopyFromPinnedBufferAsync(self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static void synchronizeCopyEvent(long handle) {
+        PyTorchLibrary.LIB.torchSynchronizeCopyEvent(handle);
+    }
+
+    public static void deleteCopyEvent(long handle) {
+        PyTorchLibrary.LIB.torchDeleteCopyEvent(handle);
+    }
+
     public static void copyTo(PtNDArray source, PtNDArray target) {
         PyTorchLibrary.LIB.torchCopyTo(source.getHandle(), target.getHandle());
     }

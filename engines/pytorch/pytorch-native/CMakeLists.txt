@@ -33,6 +33,8 @@ find_path(UTILS_INCLUDE_DIR NAMES djl/utils.h PATHS ${PROJECT_SOURCE_DIR}/../../
 
 set(SOURCE_FILES
     "src/main/native/djl_pytorch_utils.h"
+    "src/main/native/djl_pytorch_accelerator.h"
+    "src/main/native/djl_pytorch_accelerator.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_autocast.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc"
@@ -56,10 +58,6 @@ set(SOURCE_FILES
 
 if(PT_VERSION)
     add_compile_definitions(${PT_VERSION})
-endif()
-
-if(USE_CUDA)
-    add_compile_definitions(USE_CUDA)
 endif()
 
 set(DISTRIBUTED_NCCL_INCLUDE_DIR "")
@@ -109,16 +107,6 @@ if(USE_CUDA AND NOT BUILD_ANDROID)
             endif()
         endif()
     endif()
-endif()
-
-# ROCm libtorch keeps the c10/cuda/*.h headers but those transitively pull
-# in <cuda_runtime.h>, which is a CUDA-SDK-only file absent on ROCm build
-# hosts. USE_ROCM lets JNI sources gate the CUDA-specific code paths
-# (CUDACachingAllocator, CUDAStream pool) so the ROCm compile succeeds;
-# torch::cuda::is_available() still works on ROCm libtorch via the
-# hipified dispatch under the same symbol names.
-if(USE_ROCM)
-    add_compile_definitions(USE_ROCM)
 endif()
 
 add_library(djl_torch SHARED ${SOURCE_FILES})
