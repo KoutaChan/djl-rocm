@@ -115,7 +115,18 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
   }
   c10::DeviceGuard device_guard(target.device());
   c10::impl::VirtualGuardImpl guard_impl(target.device().type());
+  c10::Stream alloc_stream = guard_impl.getStream(target.device());
   c10::Stream stream = guard_impl.getStreamFromGlobalPool(target.device());
+  // The caching allocator may hand `target` a block that was freed while kernels
+  // previously enqueued on the allocation (compute) stream still read or write it.
+  // That reuse is only implicitly safe for work enqueued on the same stream, so the
+  // pool-stream copy must wait for everything already queued on the allocation
+  // stream before writing into the block.
+  if (stream != alloc_stream) {
+    c10::Event dependency(target.device().type());
+    dependency.record(alloc_stream);
+    dependency.block(stream);
+  }
   c10::StreamGuard stream_guard(stream);
   CopyFromHost(target, buffer, true);
   guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
