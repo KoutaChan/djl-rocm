@@ -332,6 +332,19 @@ public abstract class Engine {
     }
 
     /**
+     * Opens a thread-local inference scope that disables automatic-gradient recording.
+     *
+     * <p>The default implementation is a no-op so engine-agnostic inference code may always use
+     * try-with-resources. Engines with thread-local gradient recording should override this method
+     * and restore the previous state when the returned scope is closed.
+     *
+     * @return an {@link InferenceMode} scope
+     */
+    public InferenceMode newInferenceMode() {
+        return NoOpInferenceMode.INSTANCE;
+    }
+
+    /**
      * Returns whether this engine implements automatic mixed-precision
      * ("autocast") scopes. When {@code false}, {@link #newAutocast} returns a
      * no-op guard, so callers can still wrap their forward pass in
@@ -376,6 +389,13 @@ public abstract class Engine {
      */
     public Autocast newAutocast(Device device, DataType dtype) {
         return newAutocast(device, dtype, true);
+    }
+
+    private enum NoOpInferenceMode implements InferenceMode {
+        INSTANCE;
+
+        @Override
+        public void close() {}
     }
 
     /**

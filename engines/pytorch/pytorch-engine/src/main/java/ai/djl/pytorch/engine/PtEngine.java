@@ -17,6 +17,7 @@ import ai.djl.Model;
 import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
+import ai.djl.engine.InferenceMode;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
@@ -53,7 +54,11 @@ public final class PtEngine extends Engine {
     public static final String ENGINE_NAME = "PyTorch";
     static final int RANK = 2;
 
-    private PtEngine() {}
+    private final boolean useNativeInferenceMode;
+
+    private PtEngine() {
+        useNativeInferenceMode = JniUtils.getGpuCount() > 0;
+    }
 
     @SuppressWarnings("PMD.AvoidRethrowingException")
     static Engine newInstance() {
@@ -169,6 +174,12 @@ public final class PtEngine extends Engine {
     @Override
     public GradientCollectorMode getGradientCollectorMode() {
         return GradientCollectorMode.THREAD_CONFINED;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public InferenceMode newInferenceMode() {
+        return new PtInferenceMode(useNativeInferenceMode);
     }
 
     /** {@inheritDoc} */

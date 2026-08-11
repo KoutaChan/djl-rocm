@@ -132,6 +132,11 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
   guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
   auto* event = new CopyEvent(target.device().type());
   event->event.record(stream);
+  if (stream != alloc_stream) {
+    // The consumer continues on the allocation stream. Queue its dependency on
+    // the asynchronous host copy without synchronizing the CPU.
+    event->event.block(alloc_stream);
+  }
   return event;
 }
 

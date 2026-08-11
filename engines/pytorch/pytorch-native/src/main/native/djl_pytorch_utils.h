@@ -20,6 +20,8 @@
 #include <torch/script.h>
 
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #ifdef V1_13_X
 #include <c10/util/variant.h>
 #else
@@ -68,6 +70,8 @@ inline jint GetDTypeFromScalarType(const torch::ScalarType& type) {
     return 8;
   } else if (torch::kBFloat16 == type) {
     return 11;
+  } else if (torch::kInt16 == type) {
+    return 15;
   } else {
     return 9;  // UNKNOWN
   }
@@ -95,9 +99,10 @@ inline torch::ScalarType GetScalarTypeFromDType(jint dtype) {
       return torch::kComplexFloat;
     case 11:
       return torch::kBFloat16;
+    case 15:
+      return torch::kInt16;
     default:
-      // TODO improve the error handling
-      throw;
+      throw std::invalid_argument("Unsupported DJL data type ordinal: " + std::to_string(dtype));
   }
 }
 

@@ -61,6 +61,7 @@ public final class LibUtils {
 
     private static final String NATIVE_LIB_NAME = System.mapLibraryName("torch");
     private static final String JNI_LIB_NAME = System.mapLibraryName("djl_torch");
+    private static final String JNI_CACHE_REVISION = "r3";
 
     private static final Pattern VERSION_PATTERN =
             Pattern.compile("(\\d+\\.\\d+\\.\\d+(-[a-z]+)?)(-SNAPSHOT)?(-\\d+)?");
@@ -247,9 +248,28 @@ public final class LibUtils {
         String djlVersion = libTorch.apiVersion;
         String flavor = libTorch.flavor;
 
+        String jniVersion = null;
+        String jniCacheKey = djlVersion + '-' + JNI_CACHE_REVISION;
+        try {
+            URL url = ClassLoaderUtils.getResource("jnilib/pytorch.properties");
+            if (url != null) {
+                Properties prop = new Properties();
+                try (InputStream is = Utils.openUrl(url)) {
+                    prop.load(is);
+                }
+                jniVersion = prop.getProperty("jni_version");
+                if (jniVersion == null) {
+                    throw new AssertionError("No PyTorch jni version found.");
+                }
+                jniCacheKey = prop.getProperty("jni_cache_key", jniCacheKey);
+            }
+        } catch (IOException e) {
+            throw new AssertionError("Failed to read PyTorch jni properties file.", e);
+        }
+
         // Looking for JNI in libTorch.dir first
         Path libDir = libTorch.dir.toAbsolutePath();
-        Path path = libDir.resolve(djlVersion + '-' + JNI_LIB_NAME);
+        Path path = libDir.resolve(jniCacheKey + '-' + JNI_LIB_NAME);
         if (Files.exists(path)) {
             return path;
         }
@@ -261,7 +281,7 @@ public final class LibUtils {
         // always use cache dir, cache dir might be different from libTorch.dir
         Path cacheDir = Utils.getEngineCacheDir("pytorch");
         Path dir = cacheDir.resolve(version + '-' + flavor + '-' + classifier);
-        path = dir.resolve(djlVersion + '-' + JNI_LIB_NAME);
+        path = dir.resolve(jniCacheKey + '-' + JNI_LIB_NAME);
         if (Files.exists(path)) {
             return path;
         }
@@ -272,29 +292,13 @@ public final class LibUtils {
         }
         version = matcher.group(1);
 
-        try {
-            URL url = ClassLoaderUtils.getResource("jnilib/pytorch.properties");
-            String jniVersion = null;
-            if (url != null) {
-                Properties prop = new Properties();
-                try (InputStream is = Utils.openUrl(url)) {
-                    prop.load(is);
-                }
-                jniVersion = prop.getProperty("jni_version");
-                if (jniVersion == null) {
-                    throw new AssertionError("No PyTorch jni version found.");
-                }
-            }
-            if (jniVersion == null) {
-                downloadJniLib(dir, path, djlVersion, version, classifier, flavor);
-                return path;
-            } else if (!jniVersion.startsWith(version + '-' + djlVersion)) {
-                logger.warn("Found mismatch PyTorch jni: {}", jniVersion);
-                downloadJniLib(dir, path, djlVersion, version, classifier, flavor);
-                return path;
-            }
-        } catch (IOException e) {
-            throw new AssertionError("Failed to read PyTorch jni properties file.", e);
+        if (jniVersion == null) {
+            downloadJniLib(dir, path, djlVersion, version, classifier, flavor);
+            return path;
+        } else if (!jniVersion.startsWith(version + '-' + djlVersion)) {
+            logger.warn("Found mismatch PyTorch jni: {}", jniVersion);
+            downloadJniLib(dir, path, djlVersion, version, classifier, flavor);
+            return path;
         }
 
         Path tmp = null;

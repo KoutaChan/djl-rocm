@@ -90,6 +90,14 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchSetGradMode(enable);
     }
 
+    public static long openInferenceMode() {
+        return PyTorchLibrary.LIB.torchOpenInferenceMode();
+    }
+
+    public static void closeInferenceMode(long handle) {
+        PyTorchLibrary.LIB.torchCloseInferenceMode(handle);
+    }
+
     // ------------------------------------------------------------------
     // Autocast (at::autocast) thread-local flags. deviceType uses the same
     // integer encoding as PtDeviceType.toDeviceType (0=CPU, 1=CUDA/GPU).

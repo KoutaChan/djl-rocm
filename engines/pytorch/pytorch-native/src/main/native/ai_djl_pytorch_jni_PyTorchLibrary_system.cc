@@ -40,6 +40,14 @@ using namespace torch::autograd::profiler;
 
 // The file is the implementation for PyTorch system-wide operations
 
+struct ThreadInferenceMode {
+#if defined(V1_10_X)
+  torch::NoGradGuard guard;
+#else
+  c10::InferenceMode guard;
+#endif
+};
+
 JNIEXPORT jboolean JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIsGradMode(JNIEnv* env, jobject jthis) {
   API_BEGIN()
 #if defined(__ANDROID__)
@@ -153,6 +161,20 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchShowConfig(
     env->CallBooleanMethod(jset, add_method_id, jfeature);
     env->DeleteLocalRef(jfeature);
   }
+  API_END()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchOpenInferenceMode(JNIEnv* env, jobject jthis) {
+  API_BEGIN()
+  return reinterpret_cast<uintptr_t>(new ThreadInferenceMode());
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCloseInferenceMode(JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  delete reinterpret_cast<ThreadInferenceMode*>(jhandle);
   API_END()
 }
 

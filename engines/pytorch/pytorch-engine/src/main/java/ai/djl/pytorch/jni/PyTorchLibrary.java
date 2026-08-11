@@ -28,6 +28,10 @@ final class PyTorchLibrary {
 
     native void torchSetGradMode(boolean enable);
 
+    native long torchOpenInferenceMode();
+
+    native void torchCloseInferenceMode(long handle);
+
     native boolean torchAutocastIsEnabled(int deviceType);
 
     native void torchAutocastSetEnabled(int deviceType, boolean enabled);
