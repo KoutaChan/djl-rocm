@@ -115,7 +115,7 @@ __global__ void grouped_indexed_attention_kernel(const scalar_t* query, const sc
     local_maximum = fmaxf(local_maximum, __shfl_down(local_maximum, offset));
   }
   const float maximum = __shfl(local_maximum, 0);
-  __syncwarp();
+  __syncthreads();
 
   float local_sum = 0.0f;
   for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
@@ -128,7 +128,7 @@ __global__ void grouped_indexed_attention_kernel(const scalar_t* query, const sc
     local_sum += __shfl_down(local_sum, offset);
   }
   const float inverse_sum = 1.0f / __shfl(local_sum, 0);
-  __syncwarp();
+  __syncthreads();
 
   for (int64_t feature = lane; feature < value_features; feature += warpSize) {
     const int64_t packed_feature = value_offset + feature;
