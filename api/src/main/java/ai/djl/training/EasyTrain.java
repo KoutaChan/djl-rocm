@@ -99,8 +99,7 @@ public final class EasyTrain {
             for (Batch split : splits) {
                 futures.add(
                         CompletableFuture.supplyAsync(
-                                () -> trainSplit(trainer, batchData, split),
-                                executor));
+                                () -> trainSplit(trainer, batchData, split), executor));
             }
             waitAll(futures);
         } else {

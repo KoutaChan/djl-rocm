@@ -161,8 +161,8 @@ public class Trainer implements AutoCloseable {
                                                         + ".\n"
                                                         + "If you are defining a Block extending"
                                                         + " AbstractBlock, check that you are"
-                                                        + " initializing all child blocks as part of"
-                                                        + " the overload for"
+                                                        + " initializing all child blocks as part"
+                                                        + " of the overload for"
                                                         + " AbstractBlock.initializeChildBlocks().",
                                                 e);
                                     }
