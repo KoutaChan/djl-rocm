@@ -61,7 +61,6 @@ public final class LibUtils {
 
     private static final String NATIVE_LIB_NAME = System.mapLibraryName("torch");
     private static final String JNI_LIB_NAME = System.mapLibraryName("djl_torch");
-    private static final String JNI_CACHE_REVISION = "r6";
 
     private static final Pattern VERSION_PATTERN =
             Pattern.compile("(\\d+\\.\\d+\\.\\d+(-[a-z]+)?)(-SNAPSHOT)?(-\\d+)?");
@@ -249,7 +248,7 @@ public final class LibUtils {
         String flavor = libTorch.flavor;
 
         String jniVersion = null;
-        String jniCacheKey = djlVersion + '-' + JNI_CACHE_REVISION;
+        String jniCacheKey = djlVersion;
         try {
             URL url = ClassLoaderUtils.getResource("jnilib/pytorch.properties");
             if (url != null) {

@@ -1,3 +1,5 @@
+import java.security.MessageDigest
+
 plugins {
     ai.djl.javaProject
     ai.djl.publish
@@ -50,7 +52,6 @@ val jniLibFileName: String = when {
 // internal layout (jnilib/<classifier>/<flavor>/<lib>) is unchanged so
 // DJL's runtime LibUtils still finds the native untouched.
 val artifactSlug = "pytorch-jni-$flavor-$classifier"
-val jniCacheRevision = "r3"
 
 group = "ai.djl.pytorch"
 val isRelease = project.hasProperty("release") || project.hasProperty("staging")
@@ -93,9 +94,22 @@ val stageJniLib = tasks.register("stageJniLib") {
             into(targetFile.parent)
         }
 
+        val digest = MessageDigest.getInstance("SHA-256")
+        targetFile.inputStream().buffered().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) {
+                    break
+                }
+                digest.update(buffer, 0, read)
+            }
+        }
+        val contentHash = digest.digest().joinToString("") { "%02x".format(it) }
+
         (stageDir.get().asFile / "pytorch.properties").text =
                 "jni_version=$publishedVersion\n" +
-                        "jni_cache_key=$djlVersion-$jniCacheRevision\n"
+                        "jni_cache_key=$djlVersion-$contentHash\n"
     }
 }
 
