@@ -212,25 +212,6 @@ cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" \
       -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" ..
 cmake --build . --config Release -- -j "${NUM_PROC}"
 
-# Strip absolute CUDA/ROCm library paths from the link line so the runtime
-# loader picks up whatever the target machine has installed rather than a
-# pinned path baked in at build time.
-relink_without_absolute_libs() {
-  local sed_pattern=$1
-  sed -i -r "$sed_pattern" CMakeFiles/djl_torch.dir/link.txt
-  rm -f libdjl_torch.so
-  . CMakeFiles/djl_torch.dir/link.txt
-}
-
-case "$FLAVOR" in
-  cu*)
-    relink_without_absolute_libs "s/\/usr\/local\/cuda(.{5})?\/lib64\/lib(cudart|nvrtc).so//g"
-    ;;
-  rocm*)
-    relink_without_absolute_libs "s#/opt/rocm[^ ]*/lib/lib(amdhip64|hsa-runtime64|rocblas|rocfft|rocrand|hiprtc|MIOpen|rccl)\.so[^ ]*##g"
-    ;;
-esac
-
 if [[ $PLATFORM == 'darwin' ]]; then
   install_name_tool -add_rpath @loader_path libdjl_torch.dylib
 fi

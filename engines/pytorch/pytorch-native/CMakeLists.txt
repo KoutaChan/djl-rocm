@@ -138,10 +138,11 @@ if(NOT BUILD_ANDROID)
     if(DISTRIBUTED_NCCL_INCLUDE_DIR)
         target_include_directories(djl_torch PUBLIC ${DISTRIBUTED_NCCL_INCLUDE_DIR})
     endif()
-    # We have to kill the default rpath and use current dir
-    set(CMAKE_SKIP_RPATH TRUE)
-    if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-        set_target_properties(djl_torch PROPERTIES LINK_FLAGS "-Wl,-rpath,$ORIGIN")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Search beside the JNI library first for the packaged libtorch files.
+        set_target_properties(djl_torch PROPERTIES
+                BUILD_WITH_INSTALL_RPATH TRUE
+                INSTALL_RPATH "$ORIGIN")
     endif()
     # The following code block is suggested to be used on Windows.
     # According to https://github.com/pytorch/pytorch/issues/25457,
