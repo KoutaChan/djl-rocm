@@ -1,6 +1,5 @@
 #include <ATen/Dispatch.h>
-#include <c10/hip/HIPException.h>
-#include <c10/hip/HIPGuard.h>
+#include <c10/core/DeviceGuard.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
 
@@ -15,6 +14,11 @@ namespace {
 
 constexpr int kElementwiseThreads = 256;
 constexpr int kResidualNormThreads = 256;
+
+void check_hip_kernel_launch(const char* kernel_name) {
+  const hipError_t error = hipGetLastError();
+  TORCH_CHECK(error == hipSuccess, kernel_name, " launch failed: ", hipGetErrorString(error));
+}
 
 bool is_fused_floating(const torch::Tensor& tensor) {
   return tensor.scalar_type() == torch::kFloat32 || tensor.scalar_type() == torch::kFloat16 ||
@@ -243,7 +247,7 @@ torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const 
   TORCH_CHECK(relation_bias.device() == relation_logits.device() && relation_ids.device() == relation_logits.device(),
       "indexed relation bias inputs must be on the same device");
 
-  c10::hip::HIPGuard device_guard(relation_logits.get_device());
+  c10::DeviceGuard device_guard(relation_logits.device());
   torch::Tensor expanded_bias = relation_bias.expand({batch, heads, query_tokens, key_tokens});
   torch::Tensor output = torch::empty({batch, heads, query_tokens, key_tokens},
       relation_logits.options().memory_format(torch::MemoryFormat::Contiguous));
@@ -277,7 +281,7 @@ torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const 
               id_query_stride, id_key_stride, scale);
         }
       });
-  C10_HIP_KERNEL_LAUNCH_CHECK();
+  check_hip_kernel_launch("indexed_relation_bias");
   return output;
 }
 
@@ -323,7 +327,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
                   indexed_deltas.device() == query.device() && indexed_shared_ids.device() == query.device(),
       "grouped indexed attention inputs must be on the same device");
 
-  c10::hip::HIPGuard device_guard(query.get_device());
+  c10::DeviceGuard device_guard(query.device());
   torch::Tensor output = torch::empty(
       {query_count, heads, value_features}, query.options().memory_format(torch::MemoryFormat::Contiguous));
   if (query_count == 0) {
@@ -362,7 +366,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
               indexed_shared_ids.stride(0), indexed_shared_ids.stride(1), scale);
         }
       });
-  C10_HIP_KERNEL_LAUNCH_CHECK();
+  check_hip_kernel_launch("grouped_indexed_attention");
   return output;
 }
 
@@ -385,7 +389,7 @@ torch::Tensor residual_add_layer_norm_in_place(torch::Tensor& residual, const to
                   bias.device() == residual.device(),
       "residual add LayerNorm inputs must be on the same device");
 
-  c10::hip::HIPGuard device_guard(residual.get_device());
+  c10::DeviceGuard device_guard(residual.device());
   torch::Tensor output = torch::empty_like(residual, residual.options().memory_format(torch::MemoryFormat::Contiguous));
   const int64_t row_count = residual.numel() / width;
   if (row_count == 0) {
@@ -415,7 +419,7 @@ torch::Tensor residual_add_layer_norm_in_place(torch::Tensor& residual, const to
               }
             });
       });
-  C10_HIP_KERNEL_LAUNCH_CHECK();
+  check_hip_kernel_launch("residual_add_layer_norm");
   return output;
 }
 

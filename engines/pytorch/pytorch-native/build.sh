@@ -53,6 +53,17 @@ fi
 # libtorch download
 #
 
+download_and_extract_zip() (
+  local url=$1
+  local archive
+
+  archive=$(mktemp "${WORK_DIR}/libtorch.XXXXXX.zip")
+  trap 'rm -f "$archive"' EXIT
+
+  curl -fsSL --retry 3 --output "$archive" "$url"
+  jar xf "$archive"
+)
+
 download_libtorch_linux() {
   if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|cu129|cu130|rocm[67]\.[0-9]+)$ ]]; then
     echo "$FLAVOR is not supported." >&2
@@ -60,12 +71,12 @@ download_libtorch_linux() {
   fi
   if [[ $ARCH == 'aarch64' ]]; then
     if [[ "$VERSION" =~ ^2\.([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} >= 7 )); then
-      curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-linux-aarch64-${VERSION}.zip" | jar xv >/dev/null
+      download_and_extract_zip "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-linux-aarch64-${VERSION}.zip"
     else
-      curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch${AARCH64_CXX11ABI}-shared-with-deps-${VERSION}-aarch64.zip" | jar xv >/dev/null
+      download_and_extract_zip "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch${AARCH64_CXX11ABI}-shared-with-deps-${VERSION}-aarch64.zip"
     fi
   else
-    curl -fsSL "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip" | jar xv >/dev/null
+    download_and_extract_zip "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip"
   fi
 }
 
@@ -78,15 +89,15 @@ download_libtorch_darwin() {
   fi
   if [[ "$pytorch_has_macos" == "true" ]]; then
     if [[ $ARCH == 'aarch64' ]]; then
-      curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${VERSION}.zip" | jar xv >/dev/null
+      download_and_extract_zip "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${VERSION}.zip"
     else
-      curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-${VERSION}.zip" | jar xv >/dev/null
+      download_and_extract_zip "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-${VERSION}.zip"
     fi
   else
     if [[ $ARCH == 'aarch64' ]]; then
-      curl -fsSL "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-macos-${VERSION}-aarch64.zip" | jar xv >/dev/null
+      download_and_extract_zip "https://djl-ai.s3.amazonaws.com/publish/pytorch/${VERSION}/libtorch-macos-${VERSION}-aarch64.zip"
     else
-      curl -fsSL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-${VERSION}.zip" | jar xv >/dev/null
+      download_and_extract_zip "https://download.pytorch.org/libtorch/cpu/libtorch-macos-${VERSION}.zip"
     fi
   fi
 }

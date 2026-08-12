@@ -57,6 +57,10 @@ set(SOURCE_FILES
     "src/main/native/ai_djl_pytorch_jni_cache.cc")
 
 if(USE_ROCM AND NOT BUILD_ANDROID)
+    if(DEFINED ENV{PYTORCH_ROCM_ARCH} AND NOT "$ENV{PYTORCH_ROCM_ARCH}" STREQUAL "")
+        set(CMAKE_HIP_ARCHITECTURES "$ENV{PYTORCH_ROCM_ARCH}")
+        message(STATUS "Building DJL ROCm kernels for GPU arch: ${CMAKE_HIP_ARCHITECTURES}")
+    endif()
     enable_language(HIP)
     list(APPEND SOURCE_FILES "src/main/native/djl_pytorch_rocm_kernels.hip")
     set_source_files_properties(
