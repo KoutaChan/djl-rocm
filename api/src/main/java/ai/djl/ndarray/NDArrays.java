@@ -22,6 +22,99 @@ public final class NDArrays {
 
     private NDArrays() {}
 
+    /**
+     * Applies relation-biased scaled-dot-product attention.
+     *
+     * <p>The engine automatically selects a supported fused inference implementation and otherwise
+     * uses the differentiable portable decomposition.
+     *
+     * @param query query tensor shaped {@code [batch, heads, queryTokens, keyFeatures]}
+     * @param key key tensor shaped {@code [batch, heads, keyTokens, keyFeatures]}
+     * @param value value tensor shaped {@code [batch, heads, keyTokens, valueFeatures]}
+     * @param relationKeys relation keys shaped {@code [1|batch, heads, keyFeatures, relations]}
+     * @param relationBias pairwise bias broadcastable to {@code [batch, heads, queryTokens,
+     *     keyTokens]}
+     * @param relationIds relation IDs shaped {@code [queryTokens, keyTokens]} or {@code [batch,
+     *     queryTokens, keyTokens]}
+     * @param scale score scale
+     * @param training whether gradients must be preserved
+     * @return attended values shaped {@code [batch, heads, queryTokens, valueFeatures]}
+     */
+    public static NDArray relationBiasedScaledDotProductAttention(
+            NDArray query,
+            NDArray key,
+            NDArray value,
+            NDArray relationKeys,
+            NDArray relationBias,
+            NDArray relationIds,
+            double scale,
+            boolean training) {
+        return query.getNDArrayInternal()
+                .relationBiasedScaledDotProductAttention(
+                        key, value, relationKeys, relationBias, relationIds, scale, training);
+    }
+
+    /**
+     * Applies grouped attention with shared tokens and indexed auxiliary tokens.
+     *
+     * <p>Packed key/value tensors store all head keys followed by all head values in the last
+     * dimension. Its width is {@code heads * (keyFeatures + valueFeatures)}. Positive auxiliary
+     * indices are one-based shared-token indices and zero denotes padding. The engine automatically
+     * selects a supported fused inference implementation and otherwise uses the differentiable
+     * portable decomposition.
+     *
+     * @param query query tensor shaped {@code [query, heads, keyFeatures]}
+     * @param sharedKeyValues packed shared data shaped {@code [group, sharedTokens, packedWidth]}
+     * @param sharedDeltas query-specific shared-token deltas shaped {@code [query, sharedTokens,
+     *     packedWidth]}
+     * @param indexedDeltas query-specific indexed-token deltas shaped {@code [query, indexedTokens,
+     *     packedWidth]}
+     * @param indexedSharedIds one-based shared-token indices shaped {@code [query, indexedTokens]};
+     *     zero denotes padding
+     * @param queriesPerGroup consecutive query count sharing one group; {@code query} must equal
+     *     {@code group * queriesPerGroup}
+     * @param scale score scale
+     * @param training whether gradients must be preserved
+     * @return attended values shaped {@code [query, heads, valueFeatures]}
+     */
+    public static NDArray groupedIndexedScaledDotProductAttention(
+            NDArray query,
+            NDArray sharedKeyValues,
+            NDArray sharedDeltas,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            long queriesPerGroup,
+            double scale,
+            boolean training) {
+        return query.getNDArrayInternal()
+                .groupedIndexedScaledDotProductAttention(
+                        sharedKeyValues,
+                        sharedDeltas,
+                        indexedDeltas,
+                        indexedSharedIds,
+                        queriesPerGroup,
+                        scale,
+                        training);
+    }
+
+    /**
+     * Adds an inference residual in place and returns its affine LayerNorm.
+     *
+     * <p>The residual buffer is left as the unnormalized sum. This operation is intended for
+     * inference graphs with explicit buffer ownership.
+     *
+     * @param residual residual buffer to update
+     * @param update value added to the residual, with the same shape and device
+     * @param weight LayerNorm affine scale shaped like the residual's trailing dimension
+     * @param bias LayerNorm affine bias shaped like the residual's trailing dimension
+     * @param eps normalization epsilon
+     * @return normalized updated residual
+     */
+    public static NDArray residualAddLayerNormInPlace(
+            NDArray residual, NDArray update, NDArray weight, NDArray bias, float eps) {
+        return residual.getNDArrayInternal().residualAddLayerNormInPlace(update, weight, bias, eps);
+    }
+
     private static void checkInputs(NDArray[] arrays) {
         if (arrays == null || arrays.length < 2) {
             throw new IllegalArgumentException("Passed in arrays must have at least one element");

@@ -665,10 +665,10 @@ public interface NDArrayEx {
      * kernel. The default implementation throws; implement on each engine that can fuse this.
      *
      * @param normalizedShape sizes of the trailing dims to normalise over (usually the feature dim)
-     * @param weight          affine scale broadcastable over {@code normalizedShape}, or {@code null}
-     *                        for no affine
-     * @param eps             variance epsilon added before the square root; callers are expected
-     *                        to pass a concrete value (typically {@code 1e-6f})
+     * @param weight affine scale broadcastable over {@code normalizedShape}, or {@code null} for no
+     *     affine
+     * @param eps variance epsilon added before the square root; callers are expected to pass a
+     *     concrete value (typically {@code 1e-6f})
      * @return normalised tensor with the same shape as {@code this}
      */
     default NDArray rmsNorm(long[] normalizedShape, NDArray weight, double eps) {
@@ -676,19 +676,294 @@ public interface NDArrayEx {
     }
 
     /**
-     * Fused scaled-dot-product attention: roughly
-     * {@code softmax(Q Kᵀ / sqrt(d_k) + attnMask) V} computed in a single fused kernel.
+     * Applies relation-biased scaled-dot-product attention.
      *
-     * <p>Engine backends may dispatch to FlashAttention, memory-efficient attention or the
-     * standard math implementation depending on input shapes and hardware. The default
-     * implementation throws; implement on each engine that can fuse this.
+     * <p>The operation evaluates {@code softmax((Q K^T + gather(Q R, relationIds)) * scale +
+     * relationBias) V}. Query, key, and value use {@code [batch, heads, tokens, features]}.
+     * Relation keys use {@code [1|batch, heads, queryFeatures, relations]}, relation IDs use {@code
+     * [queryTokens, keyTokens]} or {@code [batch, queryTokens, keyTokens]}, and relation bias is
+     * broadcastable to {@code [batch, heads, queryTokens, keyTokens]}.
+     *
+     * <p>Engines may use a fused inference implementation. The default implementation is a
+     * differentiable decomposition and therefore also defines the portable fallback semantics.
+     *
+     * @param key key tensor
+     * @param value value tensor
+     * @param relationKeys relation-key projections
+     * @param relationBias additive pairwise relation bias
+     * @param relationIds relation ID for each query-key pair
+     * @param scale scale applied to content and relation-key dot products
+     * @param training whether gradients must be preserved
+     * @return attended values shaped {@code [batch, heads, queryTokens, valueFeatures]}
+     */
+    default NDArray relationBiasedScaledDotProductAttention(
+            NDArray key,
+            NDArray value,
+            NDArray relationKeys,
+            NDArray relationBias,
+            NDArray relationIds,
+            double scale,
+            boolean training) {
+        NDArray query = getArray();
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(query, key, value, relationKeys, relationBias, relationIds);
+            Shape queryShape = query.getShape();
+            Shape keyShape = key.getShape();
+            Shape valueShape = value.getShape();
+            if (queryShape.dimension() != 4
+                    || keyShape.dimension() != 4
+                    || valueShape.dimension() != 4) {
+                throw new IllegalArgumentException("query, key, and value must be rank 4");
+            }
+            long batch = queryShape.get(0);
+            long heads = queryShape.get(1);
+            long queryTokens = queryShape.get(2);
+            long keyTokens = keyShape.get(2);
+            if (keyShape.get(0) != batch
+                    || valueShape.get(0) != batch
+                    || keyShape.get(1) != heads
+                    || valueShape.get(1) != heads
+                    || keyShape.get(3) != queryShape.get(3)
+                    || valueShape.get(2) != keyTokens) {
+                throw new IllegalArgumentException("query, key, and value shapes are incompatible");
+            }
+
+            NDArray storedRelationIds = relationIds.toType(DataType.INT64, false);
+            NDArray relationIndices;
+            if (storedRelationIds.getShape().dimension() == 2) {
+                relationIndices =
+                        storedRelationIds
+                                .reshape(1, 1, queryTokens, keyTokens)
+                                .broadcast(batch, heads, queryTokens, keyTokens);
+            } else if (storedRelationIds.getShape().dimension() == 3) {
+                relationIndices =
+                        storedRelationIds
+                                .reshape(batch, 1, queryTokens, keyTokens)
+                                .broadcast(batch, heads, queryTokens, keyTokens);
+            } else {
+                throw new IllegalArgumentException("relation IDs must be rank 2 or 3");
+            }
+
+            NDArray relationScores = query.matMul(relationKeys).gather(relationIndices, 3);
+            NDArray contentScores = query.matMul(key.swapAxes(2, 3));
+            NDArray result =
+                    contentScores
+                            .add(relationScores)
+                            .mul(scale)
+                            .add(relationBias)
+                            .softmax(3)
+                            .matMul(value);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
+     * Applies grouped attention with shared tokens and indexed auxiliary tokens.
+     *
+     * <p>Consecutive queries share one packed key/value table. Query-specific packed deltas are
+     * added to every shared token. Each auxiliary token adds a query-specific delta to one indexed
+     * shared token. Index zero means that the auxiliary token is absent; positive indices are
+     * one-based shared-token indices. Packed tensors store all head keys followed by all head
+     * values in their last dimension.
+     *
+     * <p>This representation avoids materializing a complete key/value table for every query. It is
+     * useful for candidate sets, graph neighborhoods, beam states, and other workloads in which
+     * many queries read mostly shared memory.
+     *
+     * @param sharedKeyValues packed shared data shaped {@code [group, sharedTokens, packedWidth]}
+     * @param sharedDeltas query-specific shared-token deltas shaped {@code [query, sharedTokens,
+     *     packedWidth]}
+     * @param indexedDeltas auxiliary-token deltas shaped {@code [query, indexedTokens,
+     *     packedWidth]}
+     * @param indexedSharedIds one-based shared-token IDs shaped {@code [query, indexedTokens]};
+     *     zero denotes padding
+     * @param queriesPerGroup consecutive query count sharing one group
+     * @param scale attention score scale
+     * @param training whether gradients must be preserved
+     * @return attended values shaped {@code [query, heads, valueFeatures]}
+     */
+    default NDArray groupedIndexedScaledDotProductAttention(
+            NDArray sharedKeyValues,
+            NDArray sharedDeltas,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            long queriesPerGroup,
+            double scale,
+            boolean training) {
+        NDArray query = getArray();
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(
+                    query, sharedKeyValues, sharedDeltas, indexedDeltas, indexedSharedIds);
+            Shape queryShape = query.getShape();
+            Shape sharedShape = sharedKeyValues.getShape();
+            Shape sharedDeltaShape = sharedDeltas.getShape();
+            Shape indexedDeltaShape = indexedDeltas.getShape();
+            Shape indexedIdShape = indexedSharedIds.getShape();
+            if (queryShape.dimension() != 3
+                    || sharedShape.dimension() != 3
+                    || sharedDeltaShape.dimension() != 3
+                    || indexedDeltaShape.dimension() != 3
+                    || indexedIdShape.dimension() != 2) {
+                throw new IllegalArgumentException(
+                        "grouped indexed attention inputs have invalid rank");
+            }
+
+            long queryCount = queryShape.get(0);
+            long heads = queryShape.get(1);
+            long keyFeatures = queryShape.get(2);
+            long groupCount = sharedShape.get(0);
+            long sharedTokens = sharedShape.get(1);
+            long packedWidth = sharedShape.get(2);
+            long indexedTokens = indexedDeltaShape.get(1);
+            long keyWidth = heads * keyFeatures;
+            if (queriesPerGroup <= 0
+                    || queryCount != groupCount * queriesPerGroup
+                    || sharedDeltaShape.get(0) != queryCount
+                    || sharedDeltaShape.get(1) != sharedTokens
+                    || sharedDeltaShape.get(2) != packedWidth
+                    || indexedDeltaShape.get(0) != queryCount
+                    || indexedDeltaShape.get(2) != packedWidth
+                    || indexedIdShape.get(0) != queryCount
+                    || indexedIdShape.get(1) != indexedTokens
+                    || packedWidth <= keyWidth
+                    || (packedWidth - keyWidth) % heads != 0) {
+                throw new IllegalArgumentException(
+                        "grouped indexed attention shapes are incompatible");
+            }
+            long valueFeatures = (packedWidth - keyWidth) / heads;
+
+            NDArray querySharedKeyValues =
+                    sharedKeyValues
+                            .reshape(groupCount, 1, sharedTokens, packedWidth)
+                            .broadcast(groupCount, queriesPerGroup, sharedTokens, packedWidth)
+                            .reshape(queryCount, sharedTokens, packedWidth);
+            NDArray storedIds = indexedSharedIds.toType(DataType.INT64, false);
+            NDArray gatherIndices =
+                    storedIds
+                            .sub(1)
+                            .maximum(0)
+                            .expandDims(2)
+                            .broadcast(queryCount, indexedTokens, packedWidth);
+            NDArray indexedSharedKeyValues = querySharedKeyValues.gather(gatherIndices, 1);
+
+            NDArray sharedKeys =
+                    querySharedKeyValues
+                            .get("...,0:" + keyWidth)
+                            .reshape(queryCount, sharedTokens, heads, keyFeatures)
+                            .swapAxes(1, 2);
+            NDArray sharedDeltaKeys =
+                    sharedDeltas
+                            .get("...,0:" + keyWidth)
+                            .reshape(queryCount, sharedTokens, heads, keyFeatures)
+                            .swapAxes(1, 2);
+            NDArray indexedKeys =
+                    indexedSharedKeyValues
+                            .get("...,0:" + keyWidth)
+                            .reshape(queryCount, indexedTokens, heads, keyFeatures)
+                            .swapAxes(1, 2);
+            NDArray indexedDeltaKeys =
+                    indexedDeltas
+                            .get("...,0:" + keyWidth)
+                            .reshape(queryCount, indexedTokens, heads, keyFeatures)
+                            .swapAxes(1, 2);
+            NDArray keys =
+                    sharedKeys.add(sharedDeltaKeys).concat(indexedKeys.add(indexedDeltaKeys), 2);
+            NDArray scores = query.expandDims(2).mul(keys).sum(new int[] {3}).mul(scale);
+            NDArray indexedMask =
+                    storedIds
+                            .neq(0)
+                            .toType(scores.getDataType(), false)
+                            .expandDims(1)
+                            .broadcast(queryCount, heads, indexedTokens)
+                            .neg()
+                            .add(1)
+                            .mul(-1.0e9f);
+            scores =
+                    scores.get("...,0:" + sharedTokens)
+                            .concat(scores.get("...," + sharedTokens + ":").add(indexedMask), 2);
+            NDArray weights = scores.softmax(2);
+
+            NDArray sharedValues =
+                    querySharedKeyValues
+                            .get("...," + keyWidth + ":")
+                            .reshape(queryCount, sharedTokens, heads, valueFeatures)
+                            .swapAxes(1, 2);
+            NDArray sharedDeltaValues =
+                    sharedDeltas
+                            .get("...," + keyWidth + ":")
+                            .reshape(queryCount, sharedTokens, heads, valueFeatures)
+                            .swapAxes(1, 2);
+            NDArray indexedValues =
+                    indexedSharedKeyValues
+                            .get("...," + keyWidth + ":")
+                            .reshape(queryCount, indexedTokens, heads, valueFeatures)
+                            .swapAxes(1, 2);
+            NDArray indexedDeltaValues =
+                    indexedDeltas
+                            .get("...," + keyWidth + ":")
+                            .reshape(queryCount, indexedTokens, heads, valueFeatures)
+                            .swapAxes(1, 2);
+            NDArray values =
+                    sharedValues
+                            .add(sharedDeltaValues)
+                            .concat(indexedValues.add(indexedDeltaValues), 2);
+            NDArray result = weights.expandDims(3).mul(values).sum(new int[] {2});
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
+     * Adds an inference residual in place and applies affine LayerNorm to the updated value.
+     *
+     * <p>The returned array is normalized while {@code this} retains the unnormalized sum. Engines
+     * may fuse the addition and normalization for supported layouts. This operation mutates its
+     * receiver and is intended for inference graphs with explicit buffer ownership.
+     *
+     * @param update value added to the residual
+     * @param weight LayerNorm affine scale
+     * @param bias LayerNorm affine bias
+     * @param eps normalization epsilon
+     * @return normalized updated residual
+     */
+    default NDArray residualAddLayerNormInPlace(
+            NDArray update, NDArray weight, NDArray bias, float eps) {
+        NDArray residual = getArray();
+        NDManager outputManager = residual.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(residual, update, weight, bias);
+            residual.addi(update);
+            Shape shape = residual.getShape();
+            NDArray result =
+                    layerNorm(
+                                    residual,
+                                    new Shape(shape.get(shape.dimension() - 1)),
+                                    weight,
+                                    bias,
+                                    eps)
+                            .get(0);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
+     * Fused scaled-dot-product attention: roughly {@code softmax(Q Kᵀ / sqrt(d_k) + attnMask) V}
+     * computed in a single fused kernel.
+     *
+     * <p>Engine backends may dispatch to FlashAttention, memory-efficient attention or the standard
+     * math implementation depending on input shapes and hardware. The default implementation
+     * throws; implement on each engine that can fuse this.
      *
      * @param key key tensor, shape {@code [..., K, D]}. same leading dims as the query
      * @param value value tensor, shape {@code [..., K, D_v]}. same leading dims as the query
      * @param attnMask additive float bias broadcastable over {@code [..., Q, K]}, or {@code null}
      * @param dropoutP dropout probability (use {@code 0.0} at inference time)
-     * @param isCausal if true, apply a causal upper-triangular mask; mutually exclusive with
-     *                 {@code attnMask}
+     * @param isCausal if true, apply a causal upper-triangular mask; mutually exclusive with {@code
+     *     attnMask}
      * @return attention output with shape {@code [..., Q, D_v]}
      */
     default NDArray scaledDotProductAttention(

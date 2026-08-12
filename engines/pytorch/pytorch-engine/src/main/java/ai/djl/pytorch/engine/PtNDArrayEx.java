@@ -16,6 +16,7 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.NDScope;
 import ai.djl.ndarray.NDUtils;
 import ai.djl.ndarray.index.NDArrayIndexer;
 import ai.djl.ndarray.internal.NDArrayEx;
@@ -861,6 +862,201 @@ public class PtNDArrayEx implements NDArrayEx {
         float i = w * h;
         float u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i;
         return u <= 0.f ? 0f : (i / u);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray relationBiasedScaledDotProductAttention(
+            NDArray key,
+            NDArray value,
+            NDArray relationKeys,
+            NDArray relationBias,
+            NDArray relationIds,
+            double scale,
+            boolean training) {
+        Shape queryShape = array.getShape();
+        Shape keyShape = key.getShape();
+        Shape valueShape = value.getShape();
+        Shape relationKeyShape = relationKeys.getShape();
+        Shape relationBiasShape = relationBias.getShape();
+        Shape relationIdShape = relationIds.getShape();
+        DataType queryType = array.getDataType();
+        boolean supportedFloatType =
+                queryType == DataType.FLOAT32
+                        || queryType == DataType.FLOAT16
+                        || queryType == DataType.BFLOAT16;
+        double defaultScale =
+                queryShape.dimension() == 4
+                        ? 1.0 / Math.sqrt(queryShape.get(queryShape.dimension() - 1))
+                        : Double.NaN;
+        boolean nativeMaskSupported =
+                !training
+                        && array.getDevice().isGpu()
+                        && Math.abs(scale - defaultScale) <= 1.0e-12
+                        && queryShape.dimension() == 4
+                        && keyShape.dimension() == 4
+                        && valueShape.dimension() == 4
+                        && relationKeyShape.dimension() == 4
+                        && relationBiasShape.dimension() <= 4
+                        && (relationIdShape.dimension() == 2 || relationIdShape.dimension() == 3)
+                        && (relationIds.getDataType() == DataType.INT32
+                                || relationIds.getDataType() == DataType.INT64)
+                        && supportedFloatType
+                        && key.getDataType() == queryType
+                        && value.getDataType() == queryType
+                        && relationKeys.getDataType() == queryType
+                        && relationBias.getDataType() == queryType;
+        if (nativeMaskSupported) {
+            try (NDScope scope = new NDScope()) {
+                scope.suppressNotUsedWarning();
+                PtNDArray relationScores = (PtNDArray) array.matMul((PtNDArray) relationKeys);
+                PtNDArray attentionMask =
+                        JniUtils.indexedRelationBias(
+                                relationScores,
+                                (PtNDArray) relationBias,
+                                (PtNDArray) relationIds,
+                                (float) scale);
+                PtNDArray result =
+                        JniUtils.scaledDotProductAttention(
+                                array,
+                                (PtNDArray) key,
+                                (PtNDArray) value,
+                                attentionMask,
+                                0.0,
+                                false);
+                NDScope.unregister(result);
+                return result;
+            }
+        }
+        if (queryShape.dimension() == 4
+                && key.getShape().dimension() == 4
+                && value.getShape().dimension() == 4
+                && (relationIdShape.dimension() == 2 || relationIdShape.dimension() == 3)
+                && Math.abs(scale - defaultScale) <= 1.0e-12) {
+            try (NDScope scope = new NDScope()) {
+                scope.suppressNotUsedWarning();
+                long batch = queryShape.get(0);
+                long heads = queryShape.get(1);
+                long queryTokens = queryShape.get(2);
+                long keyTokens = key.getShape().get(2);
+                NDArray storedRelationIds = relationIds.toType(DataType.INT64, false);
+                NDArray relationIndices;
+                if (storedRelationIds.getShape().dimension() == 2) {
+                    relationIndices =
+                            storedRelationIds
+                                    .reshape(1, 1, queryTokens, keyTokens)
+                                    .broadcast(batch, heads, queryTokens, keyTokens);
+                } else {
+                    relationIndices =
+                            storedRelationIds
+                                    .reshape(batch, 1, queryTokens, keyTokens)
+                                    .broadcast(batch, heads, queryTokens, keyTokens);
+                }
+                NDArray attentionMask =
+                        array.matMul(relationKeys)
+                                .gather(relationIndices, 3)
+                                .mul(scale)
+                                .add(relationBias);
+                PtNDArray result =
+                        JniUtils.scaledDotProductAttention(
+                                array,
+                                (PtNDArray) key,
+                                (PtNDArray) value,
+                                (PtNDArray) attentionMask,
+                                0.0,
+                                false);
+                NDScope.unregister(result);
+                return result;
+            }
+        }
+        return NDArrayEx.super.relationBiasedScaledDotProductAttention(
+                key, value, relationKeys, relationBias, relationIds, scale, training);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray groupedIndexedScaledDotProductAttention(
+            NDArray sharedKeyValues,
+            NDArray sharedDeltas,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            long queriesPerGroup,
+            double scale,
+            boolean training) {
+        Shape queryShape = array.getShape();
+        Shape sharedShape = sharedKeyValues.getShape();
+        Shape sharedDeltaShape = sharedDeltas.getShape();
+        Shape indexedDeltaShape = indexedDeltas.getShape();
+        Shape indexedIdShape = indexedSharedIds.getShape();
+        DataType indexType = indexedSharedIds.getDataType();
+        DataType queryType = array.getDataType();
+        boolean supportedFloatType =
+                queryType == DataType.FLOAT32
+                        || queryType == DataType.FLOAT16
+                        || queryType == DataType.BFLOAT16;
+        boolean validRanks =
+                queryShape.dimension() == 3
+                        && sharedShape.dimension() == 3
+                        && sharedDeltaShape.dimension() == 3
+                        && indexedDeltaShape.dimension() == 3
+                        && indexedIdShape.dimension() == 2;
+        long queryCount = validRanks ? queryShape.get(0) : 0;
+        long heads = validRanks ? queryShape.get(1) : 0;
+        long keyFeatures = validRanks ? queryShape.get(2) : 0;
+        long sharedTokens = validRanks ? sharedShape.get(1) : 0;
+        long packedWidth = validRanks ? sharedShape.get(2) : 0;
+        long indexedTokens = validRanks ? indexedDeltaShape.get(1) : 0;
+        long keyWidth = heads * keyFeatures;
+        boolean nativeKernelSupported =
+                !training
+                        && array.getDevice().isGpu()
+                        && validRanks
+                        && heads > 0
+                        && keyFeatures > 0
+                        && sharedTokens > 0
+                        && sharedTokens + indexedTokens <= 4096
+                        && packedWidth > keyWidth
+                        && (packedWidth - keyWidth) % heads == 0
+                        && sharedDeltaShape.equals(new Shape(queryCount, sharedTokens, packedWidth))
+                        && indexedDeltaShape.equals(
+                                new Shape(queryCount, indexedTokens, packedWidth))
+                        && indexedIdShape.equals(new Shape(queryCount, indexedTokens))
+                        && (indexType == DataType.INT32 || indexType == DataType.INT64)
+                        && supportedFloatType
+                        && sharedKeyValues.getDataType() == queryType
+                        && sharedDeltas.getDataType() == queryType
+                        && indexedDeltas.getDataType() == queryType
+                        && queriesPerGroup > 0
+                        && queryCount == sharedShape.get(0) * queriesPerGroup;
+        if (nativeKernelSupported) {
+            return JniUtils.groupedIndexedScaledDotProductAttention(
+                    array,
+                    (PtNDArray) sharedKeyValues,
+                    (PtNDArray) sharedDeltas,
+                    (PtNDArray) indexedDeltas,
+                    (PtNDArray) indexedSharedIds,
+                    queriesPerGroup,
+                    (float) scale);
+        }
+        return NDArrayEx.super.groupedIndexedScaledDotProductAttention(
+                sharedKeyValues,
+                sharedDeltas,
+                indexedDeltas,
+                indexedSharedIds,
+                queriesPerGroup,
+                scale,
+                training);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray residualAddLayerNormInPlace(
+            NDArray update, NDArray weight, NDArray bias, float eps) {
+        if (array.getDevice().isGpu()) {
+            return JniUtils.residualAddLayerNormInPlace(
+                    array, (PtNDArray) update, (PtNDArray) weight, (PtNDArray) bias, eps);
+        }
+        return NDArrayEx.super.residualAddLayerNormInPlace(update, weight, bias, eps);
     }
 
     /** {@inheritDoc} */

@@ -61,8 +61,8 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNOneHot(
 // trailing dims given by `normalized_shape`, then applies an affine `weight`
 // when provided. `jeps` is always forwarded as the variance epsilon; the
 // caller is expected to supply a sensible value (e.g. 1e-6f).
-JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(JNIEnv* env, jobject jthis, jlong jinput,
-    jlongArray jnormalized_shape, jlong jweight, jdouble jeps) {
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(
+    JNIEnv* env, jobject jthis, jlong jinput, jlongArray jnormalized_shape, jlong jweight, jdouble jeps) {
   API_BEGIN()
   const auto* input_ptr = reinterpret_cast<torch::Tensor*>(jinput);
   const auto shape_vec = djl::utils::jni::GetVecFromJLongArray(env, jnormalized_shape);
@@ -70,8 +70,8 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(JNIE
   if (jweight != djl::utils::jni::NULL_PTR) {
     weight_opt = *reinterpret_cast<torch::Tensor*>(jweight);
   }
-  auto result = at::rms_norm(*input_ptr, c10::ArrayRef<int64_t>(shape_vec), weight_opt,
-      std::optional<double>(static_cast<double>(jeps)));
+  auto result = at::rms_norm(
+      *input_ptr, c10::ArrayRef<int64_t>(shape_vec), weight_opt, std::optional<double>(static_cast<double>(jeps)));
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
@@ -82,9 +82,8 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRmsNorm(JNIE
 // query/key/value shape: [B, H, T, D]. attn_mask is an additive float bias
 // broadcastable over [B, H, Q, K] (or 0 for no mask). Scale defaults to
 // 1/sqrt(D) inside libtorch.
-JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScaledDotProductAttention(
-    JNIEnv* env, jobject jthis, jlong jquery, jlong jkey, jlong jvalue, jlong jmask, jdouble jdropout,
-    jboolean jcausal) {
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScaledDotProductAttention(JNIEnv* env,
+    jobject jthis, jlong jquery, jlong jkey, jlong jvalue, jlong jmask, jdouble jdropout, jboolean jcausal) {
   API_BEGIN()
   const auto* q_ptr = reinterpret_cast<torch::Tensor*>(jquery);
   const auto* k_ptr = reinterpret_cast<torch::Tensor*>(jkey);
@@ -93,130 +92,98 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScaledDotPro
   if (jmask != djl::utils::jni::NULL_PTR) {
     mask_opt = *reinterpret_cast<torch::Tensor*>(jmask);
   }
-  auto result = at::scaled_dot_product_attention(*q_ptr, *k_ptr, *v_ptr, mask_opt,
-      static_cast<double>(jdropout), jcausal == JNI_TRUE, std::nullopt);
-  const auto* result_ptr = new torch::Tensor(std::move(result));
-  return reinterpret_cast<uintptr_t>(result_ptr);
-  API_END_RETURN()
-}
-
-JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTileRelationAttention(
-    JNIEnv* env, jobject jthis, jlong jquery, jlong jkey, jlong jvalue, jlong jrelation_key,
-    jlong jrelation_bias, jlong jrelation_ids, jfloat jscale) {
-  API_BEGIN()
-  const auto* query_ptr = reinterpret_cast<torch::Tensor*>(jquery);
-  const auto* key_ptr = reinterpret_cast<torch::Tensor*>(jkey);
-  const auto* value_ptr = reinterpret_cast<torch::Tensor*>(jvalue);
-  const auto* relation_key_ptr = reinterpret_cast<torch::Tensor*>(jrelation_key);
-  const auto* relation_bias_ptr = reinterpret_cast<torch::Tensor*>(jrelation_bias);
-  const auto* relation_ids_ptr = reinterpret_cast<torch::Tensor*>(jrelation_ids);
-#if defined(DJL_USE_ROCM_KERNELS)
-  auto result = djl::pytorch::rocm::tile_relation_attention(
-      *query_ptr, *key_ptr, *value_ptr, *relation_key_ptr, *relation_bias_ptr, *relation_ids_ptr,
-      static_cast<float>(jscale));
-#else
-  const auto batch = query_ptr->size(0);
-  const auto heads = query_ptr->size(1);
-  const auto tiles = query_ptr->size(2);
-  auto relation_logits = torch::matmul(*query_ptr, *relation_key_ptr);
-  auto relation_indices = relation_ids_ptr->reshape({1, 1, tiles, tiles}).expand({batch, heads, tiles, tiles});
-  auto attention_mask = relation_logits.gather(3, relation_indices).mul(jscale).add(*relation_bias_ptr);
   auto result = at::scaled_dot_product_attention(
-      *query_ptr, *key_ptr, *value_ptr, attention_mask, 0.0, false, std::nullopt);
-#endif
+      *q_ptr, *k_ptr, *v_ptr, mask_opt, static_cast<double>(jdropout), jcausal == JNI_TRUE, std::nullopt);
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTileRelationMask(
-    JNIEnv* env, jobject jthis, jlong jrelation_logits, jlong jrelation_bias,
-    jlong jrelation_ids, jfloat jscale) {
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIndexedRelationBias(
+    JNIEnv* env, jobject jthis, jlong jrelation_logits, jlong jrelation_bias, jlong jrelation_ids, jfloat jscale) {
   API_BEGIN()
   const auto* relation_logits_ptr = reinterpret_cast<torch::Tensor*>(jrelation_logits);
   const auto* relation_bias_ptr = reinterpret_cast<torch::Tensor*>(jrelation_bias);
   const auto* relation_ids_ptr = reinterpret_cast<torch::Tensor*>(jrelation_ids);
 #if defined(DJL_USE_ROCM_KERNELS)
-  auto result = djl::pytorch::rocm::tile_relation_mask(
-      *relation_logits_ptr, *relation_bias_ptr, *relation_ids_ptr,
-      static_cast<float>(jscale));
+  auto result = djl::pytorch::rocm::indexed_relation_bias(
+      *relation_logits_ptr, *relation_bias_ptr, *relation_ids_ptr, static_cast<float>(jscale));
 #else
   const auto batch = relation_logits_ptr->size(0);
   const auto heads = relation_logits_ptr->size(1);
-  const auto tiles = relation_ids_ptr->size(0);
+  const auto query_tokens = relation_logits_ptr->size(2);
+  const auto key_tokens = relation_ids_ptr->size(-1);
+  auto stored_ids = relation_ids_ptr->to(torch::kLong);
   auto relation_indices =
-      relation_ids_ptr->reshape({1, 1, tiles, tiles}).expand({batch, heads, tiles, tiles});
-  auto result =
-      relation_logits_ptr->gather(3, relation_indices).mul(jscale).add(*relation_bias_ptr);
+      relation_ids_ptr->dim() == 2
+          ? stored_ids.reshape({1, 1, query_tokens, key_tokens}).expand({batch, heads, query_tokens, key_tokens})
+          : stored_ids.reshape({batch, 1, query_tokens, key_tokens}).expand({batch, heads, query_tokens, key_tokens});
+  auto result = relation_logits_ptr->gather(3, relation_indices).mul(jscale).add(*relation_bias_ptr);
 #endif
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTransitionTileAttention(
-    JNIEnv* env, jobject jthis, jlong jquery, jlong jtile_key_value,
-    jlong jrelation_key_value, jlong jwait_key_value, jlong jwait_tile_ids,
-    jlong jcandidates_per_state, jfloat jscale) {
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGroupedIndexedScaledDotProductAttention(
+    JNIEnv* env, jobject jthis, jlong jquery, jlong jshared_key_values, jlong jshared_deltas, jlong jindexed_deltas,
+    jlong jindexed_shared_ids, jlong jqueries_per_group, jfloat jscale) {
   API_BEGIN()
   const auto* query_ptr = reinterpret_cast<torch::Tensor*>(jquery);
-  const auto* tile_key_value_ptr = reinterpret_cast<torch::Tensor*>(jtile_key_value);
-  const auto* relation_key_value_ptr = reinterpret_cast<torch::Tensor*>(jrelation_key_value);
-  const auto* wait_key_value_ptr = reinterpret_cast<torch::Tensor*>(jwait_key_value);
-  const auto* wait_tile_ids_ptr = reinterpret_cast<torch::Tensor*>(jwait_tile_ids);
+  const auto* shared_key_values_ptr = reinterpret_cast<torch::Tensor*>(jshared_key_values);
+  const auto* shared_deltas_ptr = reinterpret_cast<torch::Tensor*>(jshared_deltas);
+  const auto* indexed_deltas_ptr = reinterpret_cast<torch::Tensor*>(jindexed_deltas);
+  const auto* indexed_shared_ids_ptr = reinterpret_cast<torch::Tensor*>(jindexed_shared_ids);
 #if defined(DJL_USE_ROCM_KERNELS)
-  auto result = djl::pytorch::rocm::transition_tile_attention(
-      *query_ptr, *tile_key_value_ptr, *relation_key_value_ptr, *wait_key_value_ptr,
-      *wait_tile_ids_ptr, static_cast<int64_t>(jcandidates_per_state),
+  auto result = djl::pytorch::rocm::grouped_indexed_scaled_dot_product_attention(*query_ptr, *shared_key_values_ptr,
+      *shared_deltas_ptr, *indexed_deltas_ptr, *indexed_shared_ids_ptr, static_cast<int64_t>(jqueries_per_group),
       static_cast<float>(jscale));
 #else
-  const auto candidate_count = query_ptr->size(0);
+  const auto query_count = query_ptr->size(0);
   const auto heads = query_ptr->size(1);
   const auto key_size = query_ptr->size(2);
   const auto key_width = heads * key_size;
-  const auto value_size = (tile_key_value_ptr->size(2) - key_width) / heads;
-  auto state_indices = torch::arange(
-                           tile_key_value_ptr->size(0),
-                           torch::TensorOptions().device(query_ptr->device()).dtype(torch::kLong))
-                           .repeat_interleave(jcandidates_per_state);
-  auto candidate_tile_key_value = tile_key_value_ptr->index_select(0, state_indices);
-  auto stored_wait_ids = wait_tile_ids_ptr->to(torch::kLong);
-  auto wait_indices = stored_wait_ids.sub(1).clamp_min(0).unsqueeze(2).expand(
-      {candidate_count, stored_wait_ids.size(1), tile_key_value_ptr->size(2)});
-  auto wait_tile_key_value = candidate_tile_key_value.gather(1, wait_indices);
-  auto tile_keys = candidate_tile_key_value.slice(2, 0, key_width)
-                       .reshape({candidate_count, 34, heads, key_size})
-                       .permute({0, 2, 1, 3});
-  auto relation_keys = relation_key_value_ptr->slice(2, 0, key_width)
-                           .reshape({candidate_count, 34, heads, key_size})
-                           .permute({0, 2, 1, 3});
-  auto wait_keys = wait_key_value_ptr->slice(2, 0, key_width)
-                       .reshape({candidate_count, 13, heads, key_size})
-                       .permute({0, 2, 1, 3});
-  auto wait_tile_keys = wait_tile_key_value.slice(2, 0, key_width)
-                            .reshape({candidate_count, 13, heads, key_size})
-                            .permute({0, 2, 1, 3});
-  auto keys = torch::cat({tile_keys.add(relation_keys), wait_keys.add(wait_tile_keys)}, 2);
+  const auto packed_width = shared_key_values_ptr->size(2);
+  const auto value_size = (packed_width - key_width) / heads;
+  const auto shared_tokens = shared_key_values_ptr->size(1);
+  const auto indexed_tokens = indexed_deltas_ptr->size(1);
+  auto group_indices = torch::arange(
+      shared_key_values_ptr->size(0), torch::TensorOptions().device(query_ptr->device()).dtype(torch::kLong))
+                           .repeat_interleave(jqueries_per_group);
+  auto query_shared_key_values = shared_key_values_ptr->index_select(0, group_indices);
+  auto stored_ids = indexed_shared_ids_ptr->to(torch::kLong);
+  auto gather_indices = stored_ids.sub(1).clamp_min(0).unsqueeze(2).expand({query_count, indexed_tokens, packed_width});
+  auto indexed_shared_key_values = query_shared_key_values.gather(1, gather_indices);
+  auto shared_keys = query_shared_key_values.slice(2, 0, key_width)
+                         .reshape({query_count, shared_tokens, heads, key_size})
+                         .permute({0, 2, 1, 3});
+  auto shared_delta_keys = shared_deltas_ptr->slice(2, 0, key_width)
+                               .reshape({query_count, shared_tokens, heads, key_size})
+                               .permute({0, 2, 1, 3});
+  auto indexed_keys = indexed_shared_key_values.slice(2, 0, key_width)
+                          .reshape({query_count, indexed_tokens, heads, key_size})
+                          .permute({0, 2, 1, 3});
+  auto indexed_delta_keys = indexed_deltas_ptr->slice(2, 0, key_width)
+                                .reshape({query_count, indexed_tokens, heads, key_size})
+                                .permute({0, 2, 1, 3});
+  auto keys = torch::cat({shared_keys.add(shared_delta_keys), indexed_keys.add(indexed_delta_keys)}, 2);
   auto scores = query_ptr->unsqueeze(2).mul(keys).sum(3).mul(jscale);
-  auto wait_present = stored_wait_ids.ne(0).unsqueeze(1).expand({candidate_count, heads, 13});
-  scores.slice(2, 34, 47).masked_fill_(wait_present.logical_not(), -1.0e9);
+  auto indexed_present = stored_ids.ne(0).unsqueeze(1).expand({query_count, heads, indexed_tokens});
+  scores.slice(2, shared_tokens, shared_tokens + indexed_tokens).masked_fill_(indexed_present.logical_not(), -1.0e9);
   auto weights = scores.softmax(2);
-  auto tile_values = candidate_tile_key_value.slice(2, key_width)
-                         .reshape({candidate_count, 34, heads, value_size})
-                         .permute({0, 2, 1, 3});
-  auto relation_values = relation_key_value_ptr->slice(2, key_width)
-                             .reshape({candidate_count, 34, heads, value_size})
-                             .permute({0, 2, 1, 3});
-  auto wait_values = wait_key_value_ptr->slice(2, key_width)
-                         .reshape({candidate_count, 13, heads, value_size})
-                         .permute({0, 2, 1, 3});
-  auto wait_tile_values = wait_tile_key_value.slice(2, key_width)
-                              .reshape({candidate_count, 13, heads, value_size})
-                              .permute({0, 2, 1, 3});
-  auto values = torch::cat(
-      {tile_values.add(relation_values), wait_values.add(wait_tile_values)}, 2);
+  auto shared_values = query_shared_key_values.slice(2, key_width)
+                           .reshape({query_count, shared_tokens, heads, value_size})
+                           .permute({0, 2, 1, 3});
+  auto shared_delta_values = shared_deltas_ptr->slice(2, key_width)
+                                 .reshape({query_count, shared_tokens, heads, value_size})
+                                 .permute({0, 2, 1, 3});
+  auto indexed_values = indexed_shared_key_values.slice(2, key_width)
+                            .reshape({query_count, indexed_tokens, heads, value_size})
+                            .permute({0, 2, 1, 3});
+  auto indexed_delta_values = indexed_deltas_ptr->slice(2, key_width)
+                                  .reshape({query_count, indexed_tokens, heads, value_size})
+                                  .permute({0, 2, 1, 3});
+  auto values = torch::cat({shared_values.add(shared_delta_values), indexed_values.add(indexed_delta_values)}, 2);
   auto result = weights.unsqueeze(3).mul(values).sum(2);
 #endif
   const auto* result_ptr = new torch::Tensor(std::move(result));
@@ -224,26 +191,47 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTransitionTileAttention(
   API_END_RETURN()
 }
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchResidualLayerNormInPlace(
-    JNIEnv* env, jobject jthis, jlong jresidual, jlong jupdate, jlong jweight,
-    jlong jbias, jfloat jepsilon) {
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchResidualAddLayerNormInPlace(
+    JNIEnv* env, jobject jthis, jlong jresidual, jlong jupdate, jlong jweight, jlong jbias, jfloat jepsilon) {
   API_BEGIN()
   auto* residual_ptr = reinterpret_cast<torch::Tensor*>(jresidual);
   const auto* update_ptr = reinterpret_cast<torch::Tensor*>(jupdate);
   const auto* weight_ptr = reinterpret_cast<torch::Tensor*>(jweight);
   const auto* bias_ptr = reinterpret_cast<torch::Tensor*>(jbias);
 #if defined(DJL_USE_ROCM_KERNELS)
-  auto result = djl::pytorch::rocm::residual_layer_norm_in_place(
-      *residual_ptr, *update_ptr, *weight_ptr, *bias_ptr, static_cast<float>(jepsilon));
+  const auto is_fused_floating = [](const torch::Tensor& tensor) {
+    return tensor.scalar_type() == torch::kFloat32 || tensor.scalar_type() == torch::kFloat16 ||
+           tensor.scalar_type() == torch::kBFloat16;
+  };
+  const bool fused_supported =
+      residual_ptr->is_cuda() && residual_ptr->is_contiguous() && update_ptr->is_contiguous() &&
+      residual_ptr->sizes() == update_ptr->sizes() && weight_ptr->is_contiguous() && bias_ptr->is_contiguous() &&
+      residual_ptr->dim() >= 1 && residual_ptr->size(-1) > 0 && weight_ptr->dim() == 1 &&
+      weight_ptr->size(0) == residual_ptr->size(-1) && bias_ptr->sizes() == weight_ptr->sizes() &&
+      is_fused_floating(*residual_ptr) && is_fused_floating(*update_ptr) &&
+      weight_ptr->scalar_type() == bias_ptr->scalar_type() &&
+      (weight_ptr->scalar_type() == torch::kFloat32 || weight_ptr->scalar_type() == residual_ptr->scalar_type()) &&
+      update_ptr->device() == residual_ptr->device() && weight_ptr->device() == residual_ptr->device() &&
+      bias_ptr->device() == residual_ptr->device();
+  torch::Tensor result;
+  if (fused_supported) {
+    result = djl::pytorch::rocm::residual_add_layer_norm_in_place(
+        *residual_ptr, *update_ptr, *weight_ptr, *bias_ptr, static_cast<float>(jepsilon));
+  } else {
+    residual_ptr->add_(*update_ptr);
+    result = torch::nn::functional::layer_norm(
+        *residual_ptr, torch::nn::functional::LayerNormFuncOptions({residual_ptr->size(-1)})
+                           .weight(*weight_ptr)
+                           .bias(*bias_ptr)
+                           .eps(jepsilon));
+  }
 #else
   residual_ptr->add_(*update_ptr);
   auto result = torch::nn::functional::layer_norm(
-      *residual_ptr,
-      torch::nn::functional::LayerNormFuncOptions({residual_ptr->size(-1)})
-          .weight(*weight_ptr)
-          .bias(*bias_ptr)
-          .eps(jepsilon));
+      *residual_ptr, torch::nn::functional::LayerNormFuncOptions({residual_ptr->size(-1)})
+                         .weight(*weight_ptr)
+                         .bias(*bias_ptr)
+                         .eps(jepsilon));
 #endif
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);

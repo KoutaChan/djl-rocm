@@ -828,32 +828,12 @@ public final class JniUtils {
                         isCausal));
     }
 
-    public static PtNDArray tileRelationAttention(
-            PtNDArray query,
-            PtNDArray key,
-            PtNDArray value,
-            PtNDArray relationKey,
-            PtNDArray relationBias,
-            PtNDArray relationIds,
-            float scale) {
-        return new PtNDArray(
-                query.getManager(),
-                PyTorchLibrary.LIB.torchTileRelationAttention(
-                        query.getHandle(),
-                        key.getHandle(),
-                        value.getHandle(),
-                        relationKey.getHandle(),
-                        relationBias.getHandle(),
-                        relationIds.getHandle(),
-                        scale));
-    }
-
-    /** Builds the additive tile-relation attention mask with one ROCm kernel. */
-    public static PtNDArray tileRelationMask(
+    /** Gathers relation logits into a pairwise additive attention bias. */
+    public static PtNDArray indexedRelationBias(
             PtNDArray relationLogits, PtNDArray relationBias, PtNDArray relationIds, float scale) {
         return new PtNDArray(
                 relationLogits.getManager(),
-                PyTorchLibrary.LIB.torchTileRelationMask(
+                PyTorchLibrary.LIB.torchIndexedRelationBias(
                         relationLogits.getHandle(),
                         relationBias.getHandle(),
                         relationIds.getHandle(),
@@ -861,58 +841,51 @@ public final class JniUtils {
     }
 
     /**
-     * Computes transition-to-tile attention without materializing per-head key, value, score, or
-     * probability tensors.
+     * Applies grouped indexed attention without materializing a complete key/value table per query.
      *
-     * <p>The operation preserves the ordinary attention equation. Tile keys and values are shared
-     * by every candidate belonging to the same state; relation key/value terms are added to the 34
-     * tile tokens, while each present wait token adds the key/value of its referenced tile.
+     * <p>Packed key/value tensors store all head keys followed by all head values. Positive indexed
+     * IDs are one-based shared-token indices and zero denotes padding.
      *
-     * @param query candidate queries shaped {@code [candidate,4,8]}
-     * @param tileKeyValue state tile key/value data shaped {@code [state,34,96]}
-     * @param relationKeyValue candidate relation key/value data shaped {@code [candidate,34,96]}
-     * @param waitKeyValue candidate wait key/value data shaped {@code [candidate,13,96]}
-     * @param waitTileIds stored tile IDs shaped {@code [candidate,13]}; zero denotes padding
-     * @param candidatesPerState number of consecutive candidates sharing one state tile table
+     * @param query queries shaped {@code [query,heads,keyFeatures]}
+     * @param sharedKeyValues shared packed data shaped {@code [group,sharedTokens,packedWidth]}
+     * @param sharedDeltas query-specific shared-token deltas
+     * @param indexedDeltas query-specific indexed-token deltas
+     * @param indexedSharedIds one-based shared-token IDs; zero denotes padding
+     * @param queriesPerGroup number of consecutive queries sharing one packed table
      * @param scale attention score scale
-     * @return attended values shaped {@code [candidate,4,16]}
+     * @return attended values shaped {@code [query,heads,valueFeatures]}
      */
-    public static PtNDArray transitionTileAttention(
+    public static PtNDArray groupedIndexedScaledDotProductAttention(
             PtNDArray query,
-            PtNDArray tileKeyValue,
-            PtNDArray relationKeyValue,
-            PtNDArray waitKeyValue,
-            PtNDArray waitTileIds,
-            long candidatesPerState,
+            PtNDArray sharedKeyValues,
+            PtNDArray sharedDeltas,
+            PtNDArray indexedDeltas,
+            PtNDArray indexedSharedIds,
+            long queriesPerGroup,
             float scale) {
         return new PtNDArray(
                 query.getManager(),
-                PyTorchLibrary.LIB.torchTransitionTileAttention(
+                PyTorchLibrary.LIB.torchGroupedIndexedScaledDotProductAttention(
                         query.getHandle(),
-                        tileKeyValue.getHandle(),
-                        relationKeyValue.getHandle(),
-                        waitKeyValue.getHandle(),
-                        waitTileIds.getHandle(),
-                        candidatesPerState,
+                        sharedKeyValues.getHandle(),
+                        sharedDeltas.getHandle(),
+                        indexedDeltas.getHandle(),
+                        indexedSharedIds.getHandle(),
+                        queriesPerGroup,
                         scale));
     }
 
     /**
-     * Adds an inference residual in place and returns its affine LayerNorm in one ROCm kernel.
+     * Adds an inference residual in place and returns its affine LayerNorm.
      *
-     * <p>The residual and update must be contiguous and end in 256 features. The residual remains
-     * the unnormalized sum so the following residual branch observes the same value as the ordinary
-     * {@code addi} followed by LayerNorm path.
+     * <p>The residual remains the unnormalized sum so the following residual branch observes the
+     * same value as the ordinary {@code addi} followed by LayerNorm path.
      */
-    public static PtNDArray residualLayerNormInPlace(
-            PtNDArray residual,
-            PtNDArray update,
-            PtNDArray weight,
-            PtNDArray bias,
-            float epsilon) {
+    public static PtNDArray residualAddLayerNormInPlace(
+            PtNDArray residual, PtNDArray update, PtNDArray weight, PtNDArray bias, float epsilon) {
         return new PtNDArray(
                 residual.getManager(),
-                PyTorchLibrary.LIB.torchResidualLayerNormInPlace(
+                PyTorchLibrary.LIB.torchResidualAddLayerNormInPlace(
                         residual.getHandle(),
                         update.getHandle(),
                         weight.getHandle(),

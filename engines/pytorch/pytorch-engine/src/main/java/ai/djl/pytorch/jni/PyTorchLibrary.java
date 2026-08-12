@@ -252,28 +252,19 @@ final class PyTorchLibrary {
     native long torchScaledDotProductAttention(
             long query, long key, long value, long mask, double dropoutP, boolean isCausal);
 
-    native long torchTileRelationAttention(
-            long query,
-            long key,
-            long value,
-            long relationKey,
-            long relationBias,
-            long relationIds,
-            float scale);
-
-    native long torchTileRelationMask(
+    native long torchIndexedRelationBias(
             long relationLogits, long relationBias, long relationIds, float scale);
 
-    native long torchTransitionTileAttention(
+    native long torchGroupedIndexedScaledDotProductAttention(
             long query,
-            long tileKeyValue,
-            long relationKeyValue,
-            long waitKeyValue,
-            long waitTileIds,
-            long candidatesPerState,
+            long sharedKeyValues,
+            long sharedDeltas,
+            long indexedDeltas,
+            long indexedSharedIds,
+            long queriesPerGroup,
             float scale);
 
-    native long torchResidualLayerNormInPlace(
+    native long torchResidualAddLayerNormInPlace(
             long residual, long update, long weight, long bias, float epsilon);
 
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
