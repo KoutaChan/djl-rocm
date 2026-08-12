@@ -243,7 +243,7 @@ torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const 
   TORCH_CHECK(relation_bias.device() == relation_logits.device() && relation_ids.device() == relation_logits.device(),
       "indexed relation bias inputs must be on the same device");
 
-  c10::cuda::CUDAGuard device_guard(relation_logits.device());
+  c10::hip::HIPGuard device_guard(relation_logits.get_device());
   torch::Tensor expanded_bias = relation_bias.expand({batch, heads, query_tokens, key_tokens});
   torch::Tensor output = torch::empty({batch, heads, query_tokens, key_tokens},
       relation_logits.options().memory_format(torch::MemoryFormat::Contiguous));
@@ -256,7 +256,7 @@ torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const 
   const int64_t id_batch_stride = relation_ids.dim() == 2 ? 0 : relation_ids.stride(0);
   const int64_t id_query_stride = relation_ids.dim() == 2 ? relation_ids.stride(0) : relation_ids.stride(1);
   const int64_t id_key_stride = relation_ids.dim() == 2 ? relation_ids.stride(1) : relation_ids.stride(2);
-  const hipStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(relation_logits.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, relation_logits.scalar_type(), "indexed_relation_bias", [&] {
         if (relation_ids.scalar_type() == torch::kInt32) {
@@ -277,7 +277,7 @@ torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const 
               id_query_stride, id_key_stride, scale);
         }
       });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
   return output;
 }
 
@@ -323,7 +323,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
                   indexed_deltas.device() == query.device() && indexed_shared_ids.device() == query.device(),
       "grouped indexed attention inputs must be on the same device");
 
-  c10::cuda::CUDAGuard device_guard(query.device());
+  c10::hip::HIPGuard device_guard(query.get_device());
   torch::Tensor output = torch::empty(
       {query_count, heads, value_features}, query.options().memory_format(torch::MemoryFormat::Contiguous));
   if (query_count == 0) {
@@ -337,7 +337,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
   const int64_t grid_size = query_count * heads;
   TORCH_CHECK(
       grid_size <= static_cast<int64_t>(properties.maxGridSize[0]), "grouped indexed attention grid is too large");
-  const hipStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(query.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, query.scalar_type(), "grouped_indexed_attention", [&] {
         if (indexed_shared_ids.scalar_type() == torch::kInt32) {
@@ -362,7 +362,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
               indexed_shared_ids.stride(0), indexed_shared_ids.stride(1), scale);
         }
       });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
   return output;
 }
 
@@ -385,7 +385,7 @@ torch::Tensor residual_add_layer_norm_in_place(torch::Tensor& residual, const to
                   bias.device() == residual.device(),
       "residual add LayerNorm inputs must be on the same device");
 
-  c10::cuda::CUDAGuard device_guard(residual.device());
+  c10::hip::HIPGuard device_guard(residual.get_device());
   torch::Tensor output = torch::empty_like(residual, residual.options().memory_format(torch::MemoryFormat::Contiguous));
   const int64_t row_count = residual.numel() / width;
   if (row_count == 0) {
@@ -394,7 +394,7 @@ torch::Tensor residual_add_layer_norm_in_place(torch::Tensor& residual, const to
   const int waves_per_block = residual_norm_waves_per_block(residual.get_device());
   const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
   const dim3 block(kResidualNormThreads);
-  const hipStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(residual.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, residual.scalar_type(), "residual_add_layer_norm", [&] {
         using residual_t = scalar_t;
@@ -415,7 +415,7 @@ torch::Tensor residual_add_layer_norm_in_place(torch::Tensor& residual, const to
               }
             });
       });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
   return output;
 }
 
