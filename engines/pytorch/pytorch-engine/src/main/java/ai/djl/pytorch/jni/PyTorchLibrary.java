@@ -32,6 +32,20 @@ final class PyTorchLibrary {
 
     native void torchCloseInferenceMode(long handle);
 
+    native long torchOpenStreamScope(int[] device);
+
+    native void torchCloseStreamScope(long handle);
+
+    native long torchCreateInferenceGraph(int[] device);
+
+    native void torchBeginInferenceGraphCapture(long handle);
+
+    native void torchEndInferenceGraphCapture(long handle);
+
+    native void torchReplayInferenceGraph(long handle);
+
+    native void torchDeleteInferenceGraph(long handle);
+
     native boolean torchAutocastIsEnabled(int deviceType);
 
     native void torchAutocastSetEnabled(int deviceType, boolean enabled);
@@ -143,33 +157,69 @@ final class PyTorchLibrary {
 
     native long torchAdd(long self, long other);
 
+    native long torchAddScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchAddi(long self, long other);
+
+    native void torchAddiScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchExpand(long self, long[] shape);
 
     native long torchSub(long self, long other);
 
+    native long torchSubScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchSubi(long self, long other);
+
+    native void torchSubiScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native void torchFill(long self, double value);
 
     native long torchMul(long self, long other);
 
+    native long torchMulScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchMuli(long self, long other);
+
+    native void torchMuliScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchTrueDivide(long self, long other);
 
+    native long torchTrueDivideScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchTrueDividei(long self, long other);
+
+    native void torchTrueDivideiScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchRemainder(long self, long other);
 
+    native long torchRemainderScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchRemainderi(long self, long other);
+
+    native void torchRemainderiScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchRot90(long self, long k, long[] axes);
 
     native long torchPow(long self, long exponent);
 
+    native long torchPowScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchPowi(long self, long exponent);
+
+    native void torchPowiScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchSign(long self);
 
@@ -201,6 +251,30 @@ final class PyTorchLibrary {
 
     native long torchScaledDotProductAttention(
             long query, long key, long value, long mask, double dropoutP, boolean isCausal);
+
+    native long torchTileRelationAttention(
+            long query,
+            long key,
+            long value,
+            long relationKey,
+            long relationBias,
+            long relationIds,
+            float scale);
+
+    native long torchTileRelationMask(
+            long relationLogits, long relationBias, long relationIds, float scale);
+
+    native long torchTransitionTileAttention(
+            long query,
+            long tileKeyValue,
+            long relationKeyValue,
+            long waitKeyValue,
+            long waitTileIds,
+            long candidatesPerState,
+            float scale);
+
+    native long torchResidualLayerNormInPlace(
+            long residual, long update, long weight, long bias, float epsilon);
 
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
 
@@ -261,6 +335,8 @@ final class PyTorchLibrary {
 
     native long torchCopyFromPinnedBufferAsync(long handle, long pinnedBufferHandle);
 
+    native long torchCopyToPinnedBufferAsync(long handle, long pinnedBufferHandle);
+
     native void torchSynchronizeCopyEvent(long handle);
 
     native void torchDeleteCopyEvent(long handle);
@@ -277,6 +353,8 @@ final class PyTorchLibrary {
 
     native long torchScatter(long handle, long index, long value, int axis);
 
+    native long torchIndexAdd(long handle, long index, long value, int axis);
+
     native long torchMaskedSelect(long handle, long maskHandle);
 
     native void torchMaskedPut(long handle, long valueHandle, long maskHandle);
@@ -291,11 +369,17 @@ final class PyTorchLibrary {
 
     native long torchMaximum(long self, long other);
 
+    native long torchMaximumScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native long torchMax(long handle);
 
     native long torchMax(long handle, long dim, boolean keepDim);
 
     native long torchMinimum(long self, long other);
+
+    native long torchMinimumScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long[] torchMedian(long self, long dim, boolean keepDim);
 
@@ -421,6 +505,8 @@ final class PyTorchLibrary {
 
     native long torchSigmoid(long handle);
 
+    native long torchSilu(long handle);
+
     native long torchWhere(long handle, long x, long y);
 
     native long torchAll(long self);
@@ -431,15 +517,30 @@ final class PyTorchLibrary {
 
     native long torchEq(long self, long other);
 
+    native long torchEqScalar(long self, long integerValue, double floatingValue, boolean floating);
+
     native long torchNeq(long self, long other);
+
+    native long torchNeqScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchGt(long self, long other);
 
+    native long torchGtScalar(long self, long integerValue, double floatingValue, boolean floating);
+
     native long torchGte(long self, long other);
+
+    native long torchGteScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchLt(long self, long other);
 
+    native long torchLtScalar(long self, long integerValue, double floatingValue, boolean floating);
+
     native long torchLte(long self, long other);
+
+    native long torchLteScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
 
     native long torchNeg(long self);
 

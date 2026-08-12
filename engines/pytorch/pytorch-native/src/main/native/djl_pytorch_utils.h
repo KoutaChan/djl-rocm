@@ -106,6 +106,13 @@ inline torch::ScalarType GetScalarTypeFromDType(jint dtype) {
   }
 }
 
+inline c10::Scalar GetScalarFromJNumber(jlong integer_value, jdouble floating_value, jboolean floating) {
+  if (floating == JNI_TRUE) {
+    return c10::Scalar(static_cast<double>(floating_value));
+  }
+  return c10::Scalar(static_cast<int64_t>(integer_value));
+}
+
 inline torch::Device GetDeviceFromJDevice(JNIEnv* env, jintArray jdevice) {
   jint* device = env->GetIntArrayElements(jdevice, JNI_FALSE);
   auto device_type = static_cast<torch::DeviceType>(*device);

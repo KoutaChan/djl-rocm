@@ -310,6 +310,23 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         return new PtCopyEvent(manager, event, buffer);
     }
 
+    /**
+     * Schedules an asynchronous copy from this array into a host transfer buffer.
+     *
+     * <p>The returned event must be synchronized before reading or closing the destination buffer.
+     * The event retains the buffer and is owned by the buffer manager, so the source array may be
+     * released after the copy has been enqueued. For CPU arrays, the copy is performed
+     * synchronously and the returned event is already complete.
+     *
+     * @param buffer the destination host transfer buffer
+     * @return an event that completes when this array has been copied into the buffer
+     */
+    public PtCopyEvent copyToPinnedBufferAsync(PtPinnedBuffer buffer) {
+        validatePinnedCopyBuffer(buffer);
+        long event = JniUtils.copyToPinnedBufferAsync(this, buffer.getHandle());
+        return new PtCopyEvent(buffer.getManager(), event, buffer);
+    }
+
     private ByteBuffer validateDirectCopyBuffer(ByteBuffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         if (!buffer.isDirect()) {
@@ -533,9 +550,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray eq(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return eq(number);
-        }
+        return JniUtils.eq(this, n);
     }
 
     /** {@inheritDoc} */
@@ -547,9 +562,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray neq(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return neq(number);
-        }
+        return JniUtils.neq(this, n);
     }
 
     /** {@inheritDoc} */
@@ -561,9 +574,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray gt(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return gt(number);
-        }
+        return JniUtils.gt(this, n);
     }
 
     /** {@inheritDoc} */
@@ -575,9 +586,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray gte(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return gte(number);
-        }
+        return JniUtils.gte(this, n);
     }
 
     /** {@inheritDoc} */
@@ -589,9 +598,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray lt(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return lt(number);
-        }
+        return JniUtils.lt(this, n);
     }
 
     /** {@inheritDoc} */
@@ -603,9 +610,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray lte(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return lte(number);
-        }
+        return JniUtils.lte(this, n);
     }
 
     /** {@inheritDoc} */
@@ -617,9 +622,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray add(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return add(number);
-        }
+        return JniUtils.add(this, n);
     }
 
     /** {@inheritDoc} */
@@ -631,9 +634,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray sub(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return sub(number);
-        }
+        return JniUtils.sub(this, n);
     }
 
     /** {@inheritDoc} */
@@ -645,9 +646,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray mul(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return mul(number);
-        }
+        return JniUtils.mul(this, n);
     }
 
     /** {@inheritDoc} */
@@ -659,9 +658,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray div(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return div(number);
-        }
+        return JniUtils.div(this, n);
     }
 
     /** {@inheritDoc} */
@@ -673,9 +670,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray mod(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return mod(number);
-        }
+        return JniUtils.remainder(this, n);
     }
 
     /** {@inheritDoc} */
@@ -687,9 +682,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray pow(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return pow(number);
-        }
+        return JniUtils.pow(this, n);
     }
 
     /** {@inheritDoc} */
@@ -710,9 +703,8 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray addi(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return addi(number);
-        }
+        JniUtils.addi(this, n);
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -725,9 +717,8 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray subi(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return subi(number);
-        }
+        JniUtils.subi(this, n);
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -747,9 +738,8 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray muli(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return muli(number);
-        }
+        JniUtils.muli(this, n);
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -762,9 +752,8 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray divi(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return divi(number);
-        }
+        JniUtils.divi(this, n);
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -777,9 +766,8 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray modi(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return modi(number);
-        }
+        JniUtils.remainderi(this, n);
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -792,9 +780,8 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray powi(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return powi(number);
-        }
+        JniUtils.powi(this, n);
+        return this;
     }
 
     /** {@inheritDoc} */
@@ -820,9 +807,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray maximum(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return maximum(number);
-        }
+        return JniUtils.max(this, n);
     }
 
     /** {@inheritDoc} */
@@ -834,9 +819,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public PtNDArray minimum(Number n) {
-        try (NDArray number = manager.create(n)) {
-            return minimum(number);
-        }
+        return JniUtils.min(this, n);
     }
 
     /** {@inheritDoc} */

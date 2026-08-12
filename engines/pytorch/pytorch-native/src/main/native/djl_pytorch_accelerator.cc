@@ -12,6 +12,10 @@
  */
 #include "djl_pytorch_accelerator.h"
 
+#if defined(DJL_USE_ROCM_KERNELS)
+#include <ATen/hip/HIPGraph.h>
+#endif
+
 #if __has_include(<ATen/DeviceAccelerator.h>)
 #include <ATen/DeviceAccelerator.h>
 #define DJL_HAS_DEVICE_ACCELERATOR 1
@@ -26,6 +30,7 @@
 #include <c10/core/impl/VirtualGuardImpl.h>
 
 #include <optional>
+#include <memory>
 
 namespace djl_pytorch {
 namespace accel {
@@ -47,6 +52,20 @@ struct StreamScope {
 
   explicit StreamScope(c10::Stream stream) : stream(stream), guard(this->stream) {}
 };
+
+#if defined(DJL_USE_ROCM_KERNELS)
+struct InferenceGraph {
+  c10::Device device;
+  c10::Stream stream;
+  at::cuda::CUDAGraph graph;
+  std::unique_ptr<c10::StreamGuard> capture_guard;
+
+  InferenceGraph(c10::Device device, c10::Stream stream)
+      : device(device), stream(stream), graph(false) {}
+};
+#else
+struct InferenceGraph {};
+#endif
 
 std::optional<c10::DeviceType> GetAcceleratorType() {
 #if DJL_HAS_DEVICE_ACCELERATOR
@@ -140,6 +159,34 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
   return event;
 }
 
+CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer) {
+  TORCH_CHECK(source.scalar_type() == buffer->storage.scalar_type(),
+      "tensor and host buffer data types must match");
+  TORCH_CHECK(source.numel() <= buffer->storage.numel(),
+      "host buffer is smaller than the source tensor");
+  torch::Tensor target = buffer->storage.narrow(0, 0, source.numel()).view(source.sizes());
+  if (!IsAcceleratorDevice(source.device()) || !buffer->pinned) {
+    target.copy_(source);
+    return nullptr;
+  }
+
+  c10::DeviceGuard device_guard(source.device());
+  c10::impl::VirtualGuardImpl guard_impl(source.device().type());
+  c10::Stream producer_stream = guard_impl.getStream(source.device());
+  c10::Stream copy_stream = guard_impl.getStreamFromGlobalPool(source.device());
+  if (copy_stream != producer_stream) {
+    c10::Event dependency(source.device().type());
+    dependency.record(producer_stream);
+    dependency.block(copy_stream);
+  }
+  c10::StreamGuard stream_guard(copy_stream);
+  target.copy_(source, true);
+  guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), copy_stream);
+  auto* event = new CopyEvent(source.device().type());
+  event->event.record(copy_stream);
+  return event;
+}
+
 void SynchronizeCopyEvent(CopyEvent* event) {
   event->event.synchronize();
 }
@@ -165,13 +212,93 @@ StreamScope* NewStreamScope() {
   }
   std::optional<c10::DeviceType> device_type = GetAcceleratorType();
   c10::impl::VirtualGuardImpl guard_impl(device_type.value());
-  c10::Device device = guard_impl.getDevice();
+  return NewStreamScope(guard_impl.getDevice());
+}
+
+StreamScope* NewStreamScope(c10::Device device) {
+  if (!IsAcceleratorDevice(device)) {
+    return nullptr;
+  }
+  c10::impl::VirtualGuardImpl guard_impl(device.type());
   c10::Stream stream = guard_impl.getStreamFromGlobalPool(device);
   return new StreamScope(stream);
 }
 
 void DeleteStreamScope(StreamScope* scope) {
   delete scope;
+}
+
+InferenceGraph* NewInferenceGraph(c10::Device device) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  TORCH_CHECK(IsAcceleratorDevice(device), "inference graph requires an accelerator device");
+  c10::DeviceGuard device_guard(device);
+  c10::impl::VirtualGuardImpl guard_impl(device.type());
+  return new InferenceGraph(device, guard_impl.getStreamFromGlobalPool(device));
+#else
+  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+#endif
+}
+
+void BeginInferenceGraphCapture(InferenceGraph* graph) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  c10::DeviceGuard device_guard(graph->device);
+  c10::impl::VirtualGuardImpl guard_impl(graph->device.type());
+  c10::Stream caller_stream = guard_impl.getStream(graph->device);
+  if (caller_stream != graph->stream) {
+    c10::Event ready(graph->device.type());
+    ready.record(caller_stream);
+    ready.block(graph->stream);
+  }
+  graph->capture_guard = std::make_unique<c10::StreamGuard>(graph->stream);
+  graph->graph.capture_begin({0, 0}, hipStreamCaptureModeThreadLocal);
+#else
+  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+#endif
+}
+
+void EndInferenceGraphCapture(InferenceGraph* graph) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  c10::DeviceGuard device_guard(graph->device);
+  graph->graph.capture_end();
+  graph->capture_guard.reset();
+#else
+  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+#endif
+}
+
+void ReplayInferenceGraph(InferenceGraph* graph) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  c10::DeviceGuard device_guard(graph->device);
+  c10::impl::VirtualGuardImpl guard_impl(graph->device.type());
+  c10::Stream caller_stream = guard_impl.getStream(graph->device);
+  if (caller_stream != graph->stream) {
+    c10::Event ready(graph->device.type());
+    ready.record(caller_stream);
+    ready.block(graph->stream);
+  }
+  {
+    c10::StreamGuard graph_guard(graph->stream);
+    graph->graph.replay();
+    if (caller_stream != graph->stream) {
+      c10::Event complete(graph->device.type());
+      complete.record(graph->stream);
+      complete.block(caller_stream);
+    }
+  }
+#else
+  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+#endif
+}
+
+void DeleteInferenceGraph(InferenceGraph* graph) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (graph != nullptr) {
+    c10::DeviceGuard device_guard(graph->device);
+    delete graph;
+  }
+#else
+  delete graph;
+#endif
 }
 
 void EmptyCache() {

@@ -15,10 +15,12 @@ package ai.djl.pytorch.engine;
 import ai.djl.engine.Engine;
 import ai.djl.engine.InferenceMode;
 import ai.djl.pytorch.jni.JniUtils;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+
 import org.testng.Assert;
 import org.testng.annotations.Test;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @SuppressWarnings("try") // InferenceMode resources affect thread-local state until close().
 public class PtInferenceModeTest {
@@ -29,8 +31,7 @@ public class PtInferenceModeTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             boolean restored =
-                    executor
-                            .submit(
+                    executor.submit(
                                     () -> {
                                         Assert.assertTrue(JniUtils.isGradMode());
                                         try (InferenceMode ignored = engine.newInferenceMode()) {

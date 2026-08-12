@@ -75,6 +75,15 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public PtNDArray swish(float beta) {
+        if (beta == 1.0f) {
+            return JniUtils.silu(array);
+        }
+        return (PtNDArray) NDArrayEx.super.swish(beta);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public PtNDArray tanh() {
         return JniUtils.tanh(array);
     }

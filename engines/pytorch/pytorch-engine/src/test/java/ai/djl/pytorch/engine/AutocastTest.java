@@ -17,10 +17,9 @@ import org.testng.annotations.AfterMethod;
 import org.testng.annotations.Test;
 
 /**
- * Exercises the {@link Autocast} scope guard (libtorch's {@code at::autocast}
- * backend) end-to-end: matmul / SDPA / rmsNorm results should come out in the
- * autocast dtype, nested scopes should compose, and the previous state must be
- * restored on {@code close()}.
+ * Exercises the {@link Autocast} scope guard (libtorch's {@code at::autocast} backend) end-to-end:
+ * matmul / SDPA / rmsNorm results should come out in the autocast dtype, nested scopes should
+ * compose, and the previous state must be restored on {@code close()}.
  */
 @SuppressWarnings("try") // Autocast resource var is used for side effects via close()
 public class AutocastTest {
@@ -91,9 +90,12 @@ public class AutocastTest {
         // BF16 autocast scope must produce a BF16 output on CUDA/ROCm.
         runOnGpuIfAvailable(
                 (engine, manager, device) -> {
-                    NDArray q = manager.randomNormal(new Shape(1, 4, 8, 16)).toDevice(device, false);
-                    NDArray k = manager.randomNormal(new Shape(1, 4, 8, 16)).toDevice(device, false);
-                    NDArray v = manager.randomNormal(new Shape(1, 4, 8, 16)).toDevice(device, false);
+                    NDArray q =
+                            manager.randomNormal(new Shape(1, 4, 8, 16)).toDevice(device, false);
+                    NDArray k =
+                            manager.randomNormal(new Shape(1, 4, 8, 16)).toDevice(device, false);
+                    NDArray v =
+                            manager.randomNormal(new Shape(1, 4, 8, 16)).toDevice(device, false);
                     Assert.assertEquals(q.getDataType(), DataType.FLOAT32);
 
                     try (Autocast ac = engine.newAutocast(device, DataType.BFLOAT16)) {

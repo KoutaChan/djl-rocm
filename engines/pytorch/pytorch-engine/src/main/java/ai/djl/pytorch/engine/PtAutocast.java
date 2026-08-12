@@ -9,17 +9,15 @@ import ai.djl.ndarray.types.DataType;
 import ai.djl.pytorch.jni.JniUtils;
 
 /**
- * PyTorch-backed {@link Autocast} guard. Wraps libtorch's {@code at::autocast}
- * thread-local flags: on construction, saves the previous (enabled, dtype,
- * cache_enabled) triple + bumps the nesting counter, then flips the flags to
- * the requested values. On {@link #close()} it decrements the nesting
- * counter, clears the op-result cache when nesting reaches zero, and restores
- * the saved previous state.
+ * PyTorch-backed {@link Autocast} guard. Wraps libtorch's {@code at::autocast} thread-local flags:
+ * on construction, saves the previous (enabled, dtype, cache_enabled) triple + bumps the nesting
+ * counter, then flips the flags to the requested values. On {@link #close()} it decrements the
+ * nesting counter, clears the op-result cache when nesting reaches zero, and restores the saved
+ * previous state.
  *
- * <p>Mirrors the {@code __enter__} / {@code __exit__} semantics of PyTorch's
- * Python-level {@code torch.autocast} context manager, so nested scopes and
- * {@code enabled=false} sub-regions behave identically to the reference
- * implementation.
+ * <p>Mirrors the {@code __enter__} / {@code __exit__} semantics of PyTorch's Python-level {@code
+ * torch.autocast} context manager, so nested scopes and {@code enabled=false} sub-regions behave
+ * identically to the reference implementation.
  */
 final class PtAutocast implements Autocast {
 

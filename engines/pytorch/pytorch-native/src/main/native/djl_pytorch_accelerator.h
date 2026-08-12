@@ -22,6 +22,7 @@ namespace accel {
 
 struct CopyEvent;
 struct HostBuffer;
+struct InferenceGraph;
 struct StreamScope;
 
 bool IsAvailable();
@@ -35,12 +36,20 @@ void DeleteHostBuffer(HostBuffer* buffer);
 void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking = false);
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking = false);
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer);
+CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer);
 void SynchronizeCopyEvent(CopyEvent* event);
 void DeleteCopyEvent(CopyEvent* event);
 void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor);
 
 StreamScope* NewStreamScope();
+StreamScope* NewStreamScope(c10::Device device);
 void DeleteStreamScope(StreamScope* scope);
+
+InferenceGraph* NewInferenceGraph(c10::Device device);
+void BeginInferenceGraphCapture(InferenceGraph* graph);
+void EndInferenceGraphCapture(InferenceGraph* graph);
+void ReplayInferenceGraph(InferenceGraph* graph);
+void DeleteInferenceGraph(InferenceGraph* graph);
 
 void EmptyCache();
 

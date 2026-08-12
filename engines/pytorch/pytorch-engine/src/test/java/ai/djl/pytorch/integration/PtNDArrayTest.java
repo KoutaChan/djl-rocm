@@ -17,6 +17,7 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.nn.Activation;
 import ai.djl.testing.TestRequirements;
 
 import org.testng.Assert;
@@ -48,6 +49,39 @@ public class PtNDArrayTest {
         try (NDManager manager = NDManager.newBaseManager()) {
             NDArray array = manager.zeros(new Shape(10 * 2850, 18944), DataType.FLOAT32);
             Assert.assertThrows(EngineException.class, array::toByteArray);
+        }
+    }
+
+    @Test
+    public void testScalarOperations() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray values = manager.create(new float[] {-2.0f, 0.0f, 3.0f});
+
+            Assert.assertEquals(values.add(2.0f).toFloatArray(), new float[] {0.0f, 2.0f, 5.0f});
+            Assert.assertEquals(values.sub(1).toFloatArray(), new float[] {-3.0f, -1.0f, 2.0f});
+            Assert.assertEquals(values.mul(2).toFloatArray(), new float[] {-4.0f, 0.0f, 6.0f});
+            Assert.assertEquals(values.div(2.0f).toFloatArray(), new float[] {-1.0f, 0.0f, 1.5f});
+            Assert.assertEquals(
+                    values.maximum(0.0f).toFloatArray(), new float[] {0.0f, 0.0f, 3.0f});
+            Assert.assertEquals(
+                    values.minimum(0.0f).toFloatArray(), new float[] {-2.0f, 0.0f, 0.0f});
+            Assert.assertEquals(values.eq(0).toBooleanArray(), new boolean[] {false, true, false});
+            Assert.assertEquals(
+                    values.gte(0.0f).toBooleanArray(), new boolean[] {false, true, true});
+
+            NDArray mutable = values.duplicate();
+            mutable.addi(1.0f).muli(2).subi(2.0f).divi(2);
+            Assert.assertEquals(mutable.toFloatArray(), values.toFloatArray());
+        }
+    }
+
+    @Test
+    public void testSwish() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray values = manager.create(new float[] {-2.0f, 0.0f, 3.0f});
+            float[] expected = values.mul(Activation.sigmoid(values)).toFloatArray();
+
+            Assert.assertEquals(Activation.swish(values, 1.0f).toFloatArray(), expected, 1e-6f);
         }
     }
 }

@@ -61,7 +61,7 @@ public final class LibUtils {
 
     private static final String NATIVE_LIB_NAME = System.mapLibraryName("torch");
     private static final String JNI_LIB_NAME = System.mapLibraryName("djl_torch");
-    private static final String JNI_CACHE_REVISION = "r3";
+    private static final String JNI_CACHE_REVISION = "r6";
 
     private static final Pattern VERSION_PATTERN =
             Pattern.compile("(\\d+\\.\\d+\\.\\d+(-[a-z]+)?)(-SNAPSHOT)?(-\\d+)?");
@@ -431,9 +431,10 @@ public final class LibUtils {
         // targets newer versions (2.11.0+), so the legacy files.txt path
         // would 404. The pytorch.org URL is well-defined per flavor and
         // classifier, so we build it inline and stream the zip.
-        String bareFlavor = flavor.endsWith("-precxx11")
-                ? flavor.substring(0, flavor.length() - "-precxx11".length())
-                : flavor;
+        String bareFlavor =
+                flavor.endsWith("-precxx11")
+                        ? flavor.substring(0, flavor.length() - "-precxx11".length())
+                        : flavor;
         String url = buildPytorchOrgUrl(version, bareFlavor, classifier);
         logger.info("Downloading {} ...", url);
         Path tmp = null;
@@ -455,11 +456,11 @@ public final class LibUtils {
                     if (parent != null) {
                         Files.createDirectories(parent);
                     }
-                    Files.copy(zis, target, StandardCopyOption.REPLACE_EXISTING);                }
+                    Files.copy(zis, target, StandardCopyOption.REPLACE_EXISTING);
+                }
             }
             if (!found) {
-                throw new EngineException(
-                        "No libtorch/lib/ entries found in archive: " + url);
+                throw new EngineException("No libtorch/lib/ entries found in archive: " + url);
             }
             Utils.moveQuietly(tmp, dir);
             return new LibTorch(dir.toAbsolutePath(), platform, flavor);
@@ -473,21 +474,18 @@ public final class LibUtils {
     }
 
     /**
-     * Build the download.pytorch.org zip URL for a given PyTorch version +
-     * flavor + OS/arch classifier. The fork targets modern PyTorch
-     * (2.11.0+) where the Linux filename dropped the {@code -cxx11-abi-}
-     * infix and upstream macOS x86_64 has been EOL since 2.2.x, so this
-     * helper only has to cover the live URL patterns.
+     * Build the download.pytorch.org zip URL for a given PyTorch version + flavor + OS/arch
+     * classifier. The fork targets modern PyTorch (2.11.0+) where the Linux filename dropped the
+     * {@code -cxx11-abi-} infix and upstream macOS x86_64 has been EOL since 2.2.x, so this helper
+     * only has to cover the live URL patterns.
      *
-     * @param version    PyTorch version (e.g. {@code 2.11.0})
-     * @param bareFlavor flavor without the optional {@code -precxx11}
-     *                   suffix, e.g. {@code cpu} / {@code cu128} /
-     *                   {@code rocm7.1}
-     * @param classifier OS+arch classifier, e.g. {@code linux-x86_64} /
-     *                   {@code win-x86_64} / {@code osx-aarch64}
+     * @param version PyTorch version (e.g. {@code 2.11.0})
+     * @param bareFlavor flavor without the optional {@code -precxx11} suffix, e.g. {@code cpu} /
+     *     {@code cu128} / {@code rocm7.1}
+     * @param classifier OS+arch classifier, e.g. {@code linux-x86_64} / {@code win-x86_64} / {@code
+     *     osx-aarch64}
      */
-    private static String buildPytorchOrgUrl(
-            String version, String bareFlavor, String classifier) {
+    private static String buildPytorchOrgUrl(String version, String bareFlavor, String classifier) {
         if (classifier.startsWith("osx")) {
             // macOS: only cpu, arm64 from 2.2+
             return "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-"
@@ -575,9 +573,9 @@ public final class LibUtils {
         }
 
         /**
-         * Detect a ROCm installation under /opt/rocm* and return a flavor string (e.g.
-         * "rocm6.3"), or {@code null} if none is found. Override with the
-         * {@code DJL_ROCM_VERSION} env var (e.g. {@code DJL_ROCM_VERSION=6.3}).
+         * Detect a ROCm installation under /opt/rocm* and return a flavor string (e.g. "rocm6.3"),
+         * or {@code null} if none is found. Override with the {@code DJL_ROCM_VERSION} env var
+         * (e.g. {@code DJL_ROCM_VERSION=6.3}).
          */
         private static String detectRocmFlavor() {
             String override = Utils.getEnvOrSystemProperty("DJL_ROCM_VERSION");

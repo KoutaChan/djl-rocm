@@ -24,8 +24,9 @@ import java.nio.ByteOrder;
  *
  * <p>The buffer is backed by pinned host memory when the native PyTorch build has an available
  * CUDA/ROCm accelerator. CPU-only builds fall back to regular CPU host memory so the same API can
- * still be used for CPU tensors. When this buffer is used with an asynchronous copy, the caller must
- * not overwrite or close it until the returned {@link PtCopyEvent} has been synchronized or closed.
+ * still be used for CPU tensors. When this buffer is used with an asynchronous copy, the caller
+ * must not overwrite or close it until the returned {@link PtCopyEvent} has been synchronized or
+ * closed.
  */
 public final class PtPinnedBuffer extends NativeResource<Long> {
 
@@ -103,6 +104,10 @@ public final class PtPinnedBuffer extends NativeResource<Long> {
      */
     public boolean isPinned() {
         return pinned;
+    }
+
+    PtNDManager getManager() {
+        return manager;
     }
 
     /** {@inheritDoc} */

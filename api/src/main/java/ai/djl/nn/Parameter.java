@@ -135,6 +135,29 @@ public class Parameter implements AutoCloseable {
     }
 
     /**
+     * Replaces the initialized parameter array with an equivalent array of the requested data type.
+     *
+     * <p>This operation is intended for frozen inference replicas. It keeps the parameter name,
+     * shape, and gradient requirement while releasing the previous array, so a model loaded from a
+     * full-precision checkpoint can own a lower-precision inference copy without retaining both
+     * parameter sets.
+     *
+     * @param dataType the target data type
+     */
+    public void castArray(DataType dataType) {
+        NDArray previous = getArray();
+        if (previous.getDataType() == dataType) {
+            return;
+        }
+        NDArray converted = previous.toType(dataType, false);
+        converted.setName(name);
+        converted.setRequiresGradient(requiresGrad);
+        array = converted;
+        shape = converted.getShape();
+        previous.close();
+    }
+
+    /**
      * Returns whether this parameter needs gradients to be computed.
      *
      * @return whether this parameter needs gradients to be computed

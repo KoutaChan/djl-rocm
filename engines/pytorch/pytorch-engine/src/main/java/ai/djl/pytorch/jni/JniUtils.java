@@ -66,6 +66,17 @@ public final class JniUtils {
 
     private JniUtils() {}
 
+    private static boolean isFloatingScalar(Number value) {
+        if (value instanceof Float || value instanceof Double) {
+            return true;
+        }
+        if (value instanceof Integer || value instanceof Long || value instanceof Byte) {
+            return false;
+        }
+        throw new IllegalArgumentException(
+                "Conversion of " + value.getClass().getName() + " not supported!");
+    }
+
     private static int layoutMapper(SparseFormat fmt, Device device) {
         if (fmt == SparseFormat.DENSE) {
             // Enable MKLDNN with environment variable
@@ -96,6 +107,36 @@ public final class JniUtils {
 
     public static void closeInferenceMode(long handle) {
         PyTorchLibrary.LIB.torchCloseInferenceMode(handle);
+    }
+
+    public static long openStreamScope(Device device) {
+        return PyTorchLibrary.LIB.torchOpenStreamScope(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+    }
+
+    public static void closeStreamScope(long handle) {
+        PyTorchLibrary.LIB.torchCloseStreamScope(handle);
+    }
+
+    public static long createInferenceGraph(Device device) {
+        return PyTorchLibrary.LIB.torchCreateInferenceGraph(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+    }
+
+    public static void beginInferenceGraphCapture(long handle) {
+        PyTorchLibrary.LIB.torchBeginInferenceGraphCapture(handle);
+    }
+
+    public static void endInferenceGraphCapture(long handle) {
+        PyTorchLibrary.LIB.torchEndInferenceGraphCapture(handle);
+    }
+
+    public static void replayInferenceGraph(long handle) {
+        PyTorchLibrary.LIB.torchReplayInferenceGraph(handle);
+    }
+
+    public static void deleteInferenceGraph(long handle) {
+        PyTorchLibrary.LIB.torchDeleteInferenceGraph(handle);
     }
 
     // ------------------------------------------------------------------
@@ -594,7 +635,13 @@ public final class JniUtils {
     }
 
     public static long copyFromPinnedBufferAsync(PtNDArray self, long pinnedBufferHandle) {
-        return PyTorchLibrary.LIB.torchCopyFromPinnedBufferAsync(self.getHandle(), pinnedBufferHandle);
+        return PyTorchLibrary.LIB.torchCopyFromPinnedBufferAsync(
+                self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static long copyToPinnedBufferAsync(PtNDArray self, long pinnedBufferHandle) {
+        return PyTorchLibrary.LIB.torchCopyToPinnedBufferAsync(
+                self.getHandle(), pinnedBufferHandle);
     }
 
     public static void synchronizeCopyEvent(long handle) {
@@ -643,6 +690,18 @@ public final class JniUtils {
         return new PtNDArray(
                 ndArray.getManager(),
                 PyTorchLibrary.LIB.torchScatter(
+                        ndArray.getHandle(), index.getHandle(), value.getHandle(), axis));
+    }
+
+    /** Returns {@code ndArray.index_add(axis, index, value)} without mutating the input tensor. */
+    public static PtNDArray indexAdd(
+            PtNDArray ndArray, PtNDArray index, PtNDArray value, int axis) {
+        if (index.getDataType() != DataType.INT64) {
+            index = index.toType(DataType.INT64, true);
+        }
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchIndexAdd(
                         ndArray.getHandle(), index.getHandle(), value.getHandle(), axis));
     }
 
@@ -769,6 +828,98 @@ public final class JniUtils {
                         isCausal));
     }
 
+    public static PtNDArray tileRelationAttention(
+            PtNDArray query,
+            PtNDArray key,
+            PtNDArray value,
+            PtNDArray relationKey,
+            PtNDArray relationBias,
+            PtNDArray relationIds,
+            float scale) {
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchTileRelationAttention(
+                        query.getHandle(),
+                        key.getHandle(),
+                        value.getHandle(),
+                        relationKey.getHandle(),
+                        relationBias.getHandle(),
+                        relationIds.getHandle(),
+                        scale));
+    }
+
+    /** Builds the additive tile-relation attention mask with one ROCm kernel. */
+    public static PtNDArray tileRelationMask(
+            PtNDArray relationLogits, PtNDArray relationBias, PtNDArray relationIds, float scale) {
+        return new PtNDArray(
+                relationLogits.getManager(),
+                PyTorchLibrary.LIB.torchTileRelationMask(
+                        relationLogits.getHandle(),
+                        relationBias.getHandle(),
+                        relationIds.getHandle(),
+                        scale));
+    }
+
+    /**
+     * Computes transition-to-tile attention without materializing per-head key, value, score, or
+     * probability tensors.
+     *
+     * <p>The operation preserves the ordinary attention equation. Tile keys and values are shared
+     * by every candidate belonging to the same state; relation key/value terms are added to the 34
+     * tile tokens, while each present wait token adds the key/value of its referenced tile.
+     *
+     * @param query candidate queries shaped {@code [candidate,4,8]}
+     * @param tileKeyValue state tile key/value data shaped {@code [state,34,96]}
+     * @param relationKeyValue candidate relation key/value data shaped {@code [candidate,34,96]}
+     * @param waitKeyValue candidate wait key/value data shaped {@code [candidate,13,96]}
+     * @param waitTileIds stored tile IDs shaped {@code [candidate,13]}; zero denotes padding
+     * @param candidatesPerState number of consecutive candidates sharing one state tile table
+     * @param scale attention score scale
+     * @return attended values shaped {@code [candidate,4,16]}
+     */
+    public static PtNDArray transitionTileAttention(
+            PtNDArray query,
+            PtNDArray tileKeyValue,
+            PtNDArray relationKeyValue,
+            PtNDArray waitKeyValue,
+            PtNDArray waitTileIds,
+            long candidatesPerState,
+            float scale) {
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchTransitionTileAttention(
+                        query.getHandle(),
+                        tileKeyValue.getHandle(),
+                        relationKeyValue.getHandle(),
+                        waitKeyValue.getHandle(),
+                        waitTileIds.getHandle(),
+                        candidatesPerState,
+                        scale));
+    }
+
+    /**
+     * Adds an inference residual in place and returns its affine LayerNorm in one ROCm kernel.
+     *
+     * <p>The residual and update must be contiguous and end in 256 features. The residual remains
+     * the unnormalized sum so the following residual branch observes the same value as the ordinary
+     * {@code addi} followed by LayerNorm path.
+     */
+    public static PtNDArray residualLayerNormInPlace(
+            PtNDArray residual,
+            PtNDArray update,
+            PtNDArray weight,
+            PtNDArray bias,
+            float epsilon) {
+        return new PtNDArray(
+                residual.getManager(),
+                PyTorchLibrary.LIB.torchResidualLayerNormInPlace(
+                        residual.getHandle(),
+                        update.getHandle(),
+                        weight.getHandle(),
+                        bias.getHandle(),
+                        epsilon));
+    }
+
     public static PtNDArray rmsNorm(
             PtNDArray input, long[] normalizedShape, PtNDArray weight, double eps) {
         long weightHandle = weight == null ? 0L : weight.getHandle();
@@ -856,8 +1007,26 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchAdd(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray add(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchAddScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static void addi(PtNDArray ndArray1, PtNDArray ndArray2) {
         PyTorchLibrary.LIB.torchAddi(ndArray1.getHandle(), ndArray2.getHandle());
+    }
+
+    public static void addi(PtNDArray ndArray, Number value) {
+        PyTorchLibrary.LIB.torchAddiScalar(
+                ndArray.getHandle(),
+                value.longValue(),
+                value.doubleValue(),
+                isFloatingScalar(value));
     }
 
     public static PtNDArray sub(PtNDArray ndArray1, PtNDArray ndArray2) {
@@ -866,8 +1035,26 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchSub(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray sub(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchSubScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static void subi(PtNDArray ndArray1, PtNDArray ndArray2) {
         PyTorchLibrary.LIB.torchSubi(ndArray1.getHandle(), ndArray2.getHandle());
+    }
+
+    public static void subi(PtNDArray ndArray, Number value) {
+        PyTorchLibrary.LIB.torchSubiScalar(
+                ndArray.getHandle(),
+                value.longValue(),
+                value.doubleValue(),
+                isFloatingScalar(value));
     }
 
     public static void fill(PtNDArray ndArray, double value) {
@@ -880,8 +1067,26 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchMul(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray mul(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchMulScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static void muli(PtNDArray ndArray1, PtNDArray ndArray2) {
         PyTorchLibrary.LIB.torchMuli(ndArray1.getHandle(), ndArray2.getHandle());
+    }
+
+    public static void muli(PtNDArray ndArray, Number value) {
+        PyTorchLibrary.LIB.torchMuliScalar(
+                ndArray.getHandle(),
+                value.longValue(),
+                value.doubleValue(),
+                isFloatingScalar(value));
     }
 
     public static PtNDArray div(PtNDArray ndArray1, PtNDArray ndArray2) {
@@ -890,8 +1095,26 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchTrueDivide(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray div(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchTrueDivideScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static void divi(PtNDArray ndArray1, PtNDArray ndArray2) {
         PyTorchLibrary.LIB.torchTrueDividei(ndArray1.getHandle(), ndArray2.getHandle());
+    }
+
+    public static void divi(PtNDArray ndArray, Number value) {
+        PyTorchLibrary.LIB.torchTrueDivideiScalar(
+                ndArray.getHandle(),
+                value.longValue(),
+                value.doubleValue(),
+                isFloatingScalar(value));
     }
 
     public static PtNDArray remainder(PtNDArray ndArray1, PtNDArray ndArray2) {
@@ -900,8 +1123,26 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchRemainder(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray remainder(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchRemainderScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static void remainderi(PtNDArray ndArray1, PtNDArray ndArray2) {
         PyTorchLibrary.LIB.torchRemainderi(ndArray1.getHandle(), ndArray2.getHandle());
+    }
+
+    public static void remainderi(PtNDArray ndArray, Number value) {
+        PyTorchLibrary.LIB.torchRemainderiScalar(
+                ndArray.getHandle(),
+                value.longValue(),
+                value.doubleValue(),
+                isFloatingScalar(value));
     }
 
     public static PtNDArray pow(PtNDArray ndArray1, PtNDArray ndArray2) {
@@ -910,8 +1151,26 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchPow(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray pow(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchPowScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static void powi(PtNDArray ndArray1, PtNDArray ndArray2) {
         PyTorchLibrary.LIB.torchPowi(ndArray1.getHandle(), ndArray2.getHandle());
+    }
+
+    public static void powi(PtNDArray ndArray, Number value) {
+        PyTorchLibrary.LIB.torchPowiScalar(
+                ndArray.getHandle(),
+                value.longValue(),
+                value.doubleValue(),
+                isFloatingScalar(value));
     }
 
     public static PtNDArray sign(PtNDArray ndArray) {
@@ -981,6 +1240,16 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchMaximum(ndArray1.getHandle(), ndArray2.getHandle()));
     }
 
+    public static PtNDArray max(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchMaximumScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static PtNDArray max(PtNDArray ndArray) {
         return new PtNDArray(
                 ndArray.getManager(), PyTorchLibrary.LIB.torchMax(ndArray.getHandle()));
@@ -996,6 +1265,16 @@ public final class JniUtils {
         return new PtNDArray(
                 ndArray1.getManager(),
                 PyTorchLibrary.LIB.torchMinimum(ndArray1.getHandle(), ndArray2.getHandle()));
+    }
+
+    public static PtNDArray min(PtNDArray ndArray, Number value) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchMinimumScalar(
+                        ndArray.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
     }
 
     public static PtNDArray min(PtNDArray ndArray) {
@@ -1363,6 +1642,11 @@ public final class JniUtils {
                 ndArray.getManager(), PyTorchLibrary.LIB.torchSigmoid(ndArray.getHandle()));
     }
 
+    public static PtNDArray silu(PtNDArray ndArray) {
+        return new PtNDArray(
+                ndArray.getManager(), PyTorchLibrary.LIB.torchSilu(ndArray.getHandle()));
+    }
+
     public static PtNDArray all(PtNDArray ndArray) {
         return new PtNDArray(
                 ndArray.getManager(), PyTorchLibrary.LIB.torchAll(ndArray.getHandle()));
@@ -1383,15 +1667,45 @@ public final class JniUtils {
                 self.getManager(), PyTorchLibrary.LIB.torchEq(self.getHandle(), other.getHandle()));
     }
 
+    public static PtNDArray eq(PtNDArray self, Number value) {
+        return new PtNDArray(
+                self.getManager(),
+                PyTorchLibrary.LIB.torchEqScalar(
+                        self.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static PtNDArray neq(PtNDArray self, PtNDArray other) {
         return new PtNDArray(
                 self.getManager(),
                 PyTorchLibrary.LIB.torchNeq(self.getHandle(), other.getHandle()));
     }
 
+    public static PtNDArray neq(PtNDArray self, Number value) {
+        return new PtNDArray(
+                self.getManager(),
+                PyTorchLibrary.LIB.torchNeqScalar(
+                        self.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static PtNDArray gt(PtNDArray self, PtNDArray other) {
         return new PtNDArray(
                 self.getManager(), PyTorchLibrary.LIB.torchGt(self.getHandle(), other.getHandle()));
+    }
+
+    public static PtNDArray gt(PtNDArray self, Number value) {
+        return new PtNDArray(
+                self.getManager(),
+                PyTorchLibrary.LIB.torchGtScalar(
+                        self.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
     }
 
     public static PtNDArray gte(PtNDArray self, PtNDArray other) {
@@ -1400,15 +1714,45 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchGte(self.getHandle(), other.getHandle()));
     }
 
+    public static PtNDArray gte(PtNDArray self, Number value) {
+        return new PtNDArray(
+                self.getManager(),
+                PyTorchLibrary.LIB.torchGteScalar(
+                        self.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
+    }
+
     public static PtNDArray lt(PtNDArray self, PtNDArray other) {
         return new PtNDArray(
                 self.getManager(), PyTorchLibrary.LIB.torchLt(self.getHandle(), other.getHandle()));
+    }
+
+    public static PtNDArray lt(PtNDArray self, Number value) {
+        return new PtNDArray(
+                self.getManager(),
+                PyTorchLibrary.LIB.torchLtScalar(
+                        self.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
     }
 
     public static PtNDArray lte(PtNDArray self, PtNDArray other) {
         return new PtNDArray(
                 self.getManager(),
                 PyTorchLibrary.LIB.torchLte(self.getHandle(), other.getHandle()));
+    }
+
+    public static PtNDArray lte(PtNDArray self, Number value) {
+        return new PtNDArray(
+                self.getManager(),
+                PyTorchLibrary.LIB.torchLteScalar(
+                        self.getHandle(),
+                        value.longValue(),
+                        value.doubleValue(),
+                        isFloatingScalar(value)));
     }
 
     public static PtNDArray neg(PtNDArray ndArray) {

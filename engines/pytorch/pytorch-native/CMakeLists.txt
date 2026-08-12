@@ -56,6 +56,14 @@ set(SOURCE_FILES
     "src/main/native/ai_djl_pytorch_jni_cache.h"
     "src/main/native/ai_djl_pytorch_jni_cache.cc")
 
+if(USE_ROCM AND NOT BUILD_ANDROID)
+    enable_language(HIP)
+    list(APPEND SOURCE_FILES "src/main/native/djl_pytorch_rocm_kernels.hip")
+    set_source_files_properties(
+        "src/main/native/djl_pytorch_rocm_kernels.hip"
+        PROPERTIES LANGUAGE HIP)
+endif()
+
 if(PT_VERSION)
     add_compile_definitions(${PT_VERSION})
 endif()
@@ -111,6 +119,10 @@ endif()
 
 add_library(djl_torch SHARED ${SOURCE_FILES})
 set_property(TARGET djl_torch PROPERTY CXX_STANDARD 17)
+if(USE_ROCM AND NOT BUILD_ANDROID)
+    target_compile_definitions(djl_torch PRIVATE DJL_USE_ROCM_KERNELS)
+    set_property(TARGET djl_torch PROPERTY HIP_STANDARD 17)
+endif()
 
 # build host
 if(NOT BUILD_ANDROID)

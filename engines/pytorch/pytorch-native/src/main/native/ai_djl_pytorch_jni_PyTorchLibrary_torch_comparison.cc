@@ -35,12 +35,32 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEq(
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEqScalar(JNIEnv* env, jobject jthis, jlong jself,
+    jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->eq(scalar));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNeq(
     JNIEnv* env, jobject jthis, jlong jself, jlong jother) {
   API_BEGIN()
   auto tensor_ptr1 = reinterpret_cast<torch::Tensor*>(jself);
   auto tensor_ptr2 = reinterpret_cast<torch::Tensor*>(jother);
-  const auto* result_ptr = new torch::Tensor(tensor_ptr1->eq(*tensor_ptr2).logical_not_());
+  const auto* result_ptr = new torch::Tensor(tensor_ptr1->ne(*tensor_ptr2));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNeqScalar(JNIEnv* env, jobject jthis, jlong jself,
+    jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->ne(scalar));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }
@@ -55,12 +75,32 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGt(
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGtScalar(JNIEnv* env, jobject jthis, jlong jself,
+    jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->gt(scalar));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGte(
     JNIEnv* env, jobject jthis, jlong jself, jlong jother) {
   API_BEGIN()
   auto tensor_ptr1 = reinterpret_cast<torch::Tensor*>(jself);
   auto tensor_ptr2 = reinterpret_cast<torch::Tensor*>(jother);
   const auto* result_ptr = new torch::Tensor(tensor_ptr1->ge(*tensor_ptr2));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGteScalar(JNIEnv* env, jobject jthis, jlong jself,
+    jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->ge(scalar));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }
@@ -75,12 +115,32 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchLt(
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchLtScalar(JNIEnv* env, jobject jthis, jlong jself,
+    jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->lt(scalar));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchLte(
     JNIEnv* env, jobject jthis, jlong jself, jlong jother) {
   API_BEGIN()
   auto tensor_ptr1 = reinterpret_cast<torch::Tensor*>(jself);
   auto tensor_ptr2 = reinterpret_cast<torch::Tensor*>(jother);
   const auto* result_ptr = new torch::Tensor(tensor_ptr1->le(*tensor_ptr2));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchLteScalar(JNIEnv* env, jobject jthis, jlong jself,
+    jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->le(scalar));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }

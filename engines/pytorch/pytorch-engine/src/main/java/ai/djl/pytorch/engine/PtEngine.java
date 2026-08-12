@@ -182,12 +182,30 @@ public final class PtEngine extends Engine {
         return new PtInferenceMode(useNativeInferenceMode);
     }
 
+    /**
+     * Opens a thread-local compute stream selected from PyTorch's stream pool.
+     *
+     * @param device accelerator device whose stream should become current
+     * @return scope that restores the previous stream when closed
+     */
+    public PtStreamScope newStreamScope(Device device) {
+        return new PtStreamScope(device);
+    }
+
+    /**
+     * Creates a reusable accelerator graph for a fixed-shape inference workload.
+     *
+     * @param device accelerator device on which capture and replay execute
+     * @return inference graph owned by the caller
+     */
+    public PtInferenceGraph newInferenceGraph(Device device) {
+        return new PtInferenceGraph(device);
+    }
+
     /** {@inheritDoc} */
     @Override
-    public ParameterServer newParameterServer(
-            Optimizer optimizer, TrainingConfig trainingConfig) {
-        Optional<DistributedTrainingConfig> config =
-                trainingConfig.getDistributedTrainingConfig();
+    public ParameterServer newParameterServer(Optimizer optimizer, TrainingConfig trainingConfig) {
+        Optional<DistributedTrainingConfig> config = trainingConfig.getDistributedTrainingConfig();
         if (config.isPresent() && config.get().getWorldSize() > 1) {
             if (!hasCapability("NATIVE_DISTRIBUTED_NCCL")) {
                 throw new EngineException(

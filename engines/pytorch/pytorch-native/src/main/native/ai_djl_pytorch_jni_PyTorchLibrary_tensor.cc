@@ -307,6 +307,17 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinn
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyToPinnedBufferAsync(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  const auto* source_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
+  auto* event = djl_pytorch::accel::CopyToHostAsync(*source_ptr, buffer);
+  return reinterpret_cast<uintptr_t>(event);
+  API_END_RETURN()
+}
+
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSynchronizeCopyEvent(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
@@ -386,6 +397,17 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatter(
   const auto* index_ptr = reinterpret_cast<torch::Tensor*>(jindex_handle);
   const auto* data_ptr = reinterpret_cast<torch::Tensor*>(jdata_handle);
   const auto* result_ptr = new torch::Tensor(tensor_ptr->scatter(jaxis, *index_ptr, *data_ptr));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIndexAdd(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle, jlong jdata_handle, jint jaxis) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* index_ptr = reinterpret_cast<torch::Tensor*>(jindex_handle);
+  const auto* data_ptr = reinterpret_cast<torch::Tensor*>(jdata_handle);
+  const auto* result_ptr = new torch::Tensor(tensor_ptr->index_add(jaxis, *index_ptr, *data_ptr));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }

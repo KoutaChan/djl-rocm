@@ -16,23 +16,26 @@ import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.util.NativeResource;
 
 /**
- * {@code PtCopyEvent} represents completion of an asynchronous pinned host-to-device copy.
+ * {@code PtCopyEvent} represents completion of an asynchronous pinned host transfer.
  *
- * <p>The event keeps a Java reference to the source pinned buffer so the buffer cannot be garbage
- * collected while the native copy is in flight. The caller must still avoid overwriting or closing
- * the pinned buffer before this event is synchronized or closed.
+ * <p>The event keeps a Java reference to the pinned buffer so the buffer cannot be garbage
+ * collected while the native copy is in flight. The caller must still avoid reading, overwriting,
+ * or closing the pinned buffer before this event is synchronized or closed.
  */
 public final class PtCopyEvent extends NativeResource<Long> {
 
     private final PtNDManager manager;
+
     @SuppressWarnings("PMD.UnusedPrivateField")
-    private final PtPinnedBuffer source;
+    private final PtPinnedBuffer buffer;
+
+    private boolean synchronizedCopy;
 
     @SuppressWarnings("this-escape")
-    PtCopyEvent(PtNDManager manager, long handle, PtPinnedBuffer source) {
+    PtCopyEvent(PtNDManager manager, long handle, PtPinnedBuffer buffer) {
         super(handle);
         this.manager = manager;
-        this.source = source;
+        this.buffer = buffer;
         manager.attachInternal(getUid(), this);
     }
 
@@ -43,8 +46,9 @@ public final class PtCopyEvent extends NativeResource<Long> {
      */
     public void synchronize() {
         Long pointer = getHandle();
-        if (pointer != 0) {
+        if (pointer != 0 && !synchronizedCopy) {
             JniUtils.synchronizeCopyEvent(pointer);
+            synchronizedCopy = true;
         }
     }
 
@@ -55,7 +59,9 @@ public final class PtCopyEvent extends NativeResource<Long> {
         Long pointer = handle.getAndSet(null);
         if (pointer != null && pointer != 0) {
             try {
-                JniUtils.synchronizeCopyEvent(pointer);
+                if (!synchronizedCopy) {
+                    JniUtils.synchronizeCopyEvent(pointer);
+                }
             } finally {
                 JniUtils.deleteCopyEvent(pointer);
             }

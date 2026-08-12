@@ -178,6 +178,69 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCloseInferenceMode(JNIEnv* env, jobj
   API_END()
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchOpenStreamScope(
+    JNIEnv* env, jobject jthis, jintArray jdevice) {
+  API_BEGIN()
+  const torch::Device device = utils::GetDeviceFromJDevice(env, jdevice);
+  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::NewStreamScope(device));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCloseStreamScope(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::DeleteStreamScope(
+      reinterpret_cast<djl_pytorch::accel::StreamScope*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateInferenceGraph(
+    JNIEnv* env, jobject jthis, jintArray jdevice) {
+  API_BEGIN()
+  const torch::Device device = utils::GetDeviceFromJDevice(env, jdevice);
+  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::NewInferenceGraph(device));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBeginInferenceGraphCapture(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::BeginInferenceGraphCapture(
+      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEndInferenceGraphCapture(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::EndInferenceGraphCapture(
+      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchReplayInferenceGraph(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::ReplayInferenceGraph(
+      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteInferenceGraph(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::DeleteInferenceGraph(
+      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  API_END()
+}
+
 JNIEXPORT jint JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetGpuCount(JNIEnv* env, jobject jthis) {
   API_BEGIN()
 #if defined(__ANDROID__)
@@ -237,6 +300,8 @@ static torch::jit::CodeTemplate event_template(R"(
   "pid": "CPU Functions",
   "shape": ${shape},
   "cpu mem": "${cpu_mem}",
+  "gpu dur": ${gpu_dur},
+  "device": ${device},
   "args": {}
 })");
 #else
@@ -250,13 +315,12 @@ static const at::jit::CodeTemplate event_template(R"(
   "pid": "CPU Functions",
   "shape": ${shape},
   "cpu mem": "${cpu_mem}",
+  "gpu dur": ${gpu_dur},
+  "device": ${device},
   "args": {}
 })");
 #endif
 
-// The function doesn't support GPU yet
-// You can refer to
-// https://github.com/pytorch/pytorch/blob/8908f6ad8e9f2815b4ec49e15eefa467ffee03c3/torch/autograd/profiler.py#L925
 void WriteProfilerEventsToStream(std::ostream& out, const std::vector<std::vector<LegacyEvent*>>& thread_events) {
   TORCH_CHECK(out, "Could not open file");
   std::set<std::string> filtered_out_names = {
@@ -317,6 +381,9 @@ void WriteProfilerEventsToStream(std::ostream& out, const std::vector<std::vecto
         // we add extra info here
         env.s("shape", ToString(start->shapes()));
         env.s("cpu_mem", FormatMemory(memory_usage));
+        bool has_gpu_timing = start->hasCuda() && evt->hasCuda();
+        env.d("gpu_dur", has_gpu_timing ? start->cudaElapsedUs(*evt) : -1.0);
+        env.d("device", has_gpu_timing ? start->device() : -1);
         out << event_template.format(env);
 
         events_map.erase(it);
