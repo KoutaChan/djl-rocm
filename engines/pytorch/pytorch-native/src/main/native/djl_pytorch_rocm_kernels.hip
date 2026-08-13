@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 #include "djl_pytorch_rocm_kernels.h"
@@ -13,6 +14,7 @@ namespace djl::pytorch::rocm {
 namespace {
 
 constexpr int kElementwiseThreads = 256;
+constexpr int kGroupedAttentionThreads = 256;
 constexpr int kResidualNormThreads = 256;
 
 void check_hip_kernel_launch(const char* kernel_name) {
@@ -57,108 +59,204 @@ __global__ void indexed_relation_bias_kernel(const scalar_t* relation_logits, co
   }
 }
 
-template <typename scalar_t, typename index_t>
+struct GroupedIndexedAttentionLayout {
+  int64_t queries_per_group;
+  int64_t heads;
+  int64_t key_features;
+  int64_t value_features;
+  int64_t shared_tokens;
+  int64_t indexed_tokens;
+  int64_t packed_width;
+  int64_t query_stride_query;
+  int64_t query_stride_head;
+  int64_t query_stride_feature;
+  int64_t shared_stride_group;
+  int64_t shared_stride_token;
+  int64_t shared_stride_feature;
+  int64_t shared_delta_stride_query;
+  int64_t shared_delta_stride_token;
+  int64_t shared_delta_stride_feature;
+  int64_t indexed_delta_stride_query;
+  int64_t indexed_delta_stride_token;
+  int64_t indexed_delta_stride_feature;
+  int64_t indexed_id_stride_query;
+  int64_t indexed_id_stride_token;
+};
+
+template <bool contiguous>
+__device__ __forceinline__ int64_t query_offset(
+    const GroupedIndexedAttentionLayout& layout, int64_t query, int64_t head, int64_t feature) {
+  if constexpr (contiguous) {
+    return (query * layout.heads + head) * layout.key_features + feature;
+  }
+  return query * layout.query_stride_query + head * layout.query_stride_head +
+         feature * layout.query_stride_feature;
+}
+
+template <bool contiguous>
+__device__ __forceinline__ int64_t shared_offset(const GroupedIndexedAttentionLayout& layout, int64_t group,
+    int64_t token, int64_t feature) {
+  if constexpr (contiguous) {
+    return (group * layout.shared_tokens + token) * layout.packed_width + feature;
+  }
+  return group * layout.shared_stride_group + token * layout.shared_stride_token +
+         feature * layout.shared_stride_feature;
+}
+
+template <bool contiguous>
+__device__ __forceinline__ int64_t shared_delta_offset(const GroupedIndexedAttentionLayout& layout, int64_t query,
+    int64_t token, int64_t feature) {
+  if constexpr (contiguous) {
+    return (query * layout.shared_tokens + token) * layout.packed_width + feature;
+  }
+  return query * layout.shared_delta_stride_query + token * layout.shared_delta_stride_token +
+         feature * layout.shared_delta_stride_feature;
+}
+
+template <bool contiguous>
+__device__ __forceinline__ int64_t indexed_delta_offset(const GroupedIndexedAttentionLayout& layout, int64_t query,
+    int64_t token, int64_t feature) {
+  if constexpr (contiguous) {
+    return (query * layout.indexed_tokens + token) * layout.packed_width + feature;
+  }
+  return query * layout.indexed_delta_stride_query + token * layout.indexed_delta_stride_token +
+         feature * layout.indexed_delta_stride_feature;
+}
+
+template <bool contiguous>
+__device__ __forceinline__ int64_t indexed_id_offset(
+    const GroupedIndexedAttentionLayout& layout, int64_t query, int64_t token) {
+  if constexpr (contiguous) {
+    return query * layout.indexed_tokens + token;
+  }
+  return query * layout.indexed_id_stride_query + token * layout.indexed_id_stride_token;
+}
+
+template <typename scalar_t, typename index_t, bool contiguous>
 __global__ void grouped_indexed_attention_kernel(const scalar_t* query, const scalar_t* shared_key_values,
     const scalar_t* shared_deltas, const scalar_t* indexed_deltas, const index_t* indexed_shared_ids, scalar_t* output,
-    int64_t queries_per_group, int64_t heads, int64_t key_features, int64_t value_features, int64_t shared_tokens,
-    int64_t indexed_tokens, int64_t query_stride_query, int64_t query_stride_head, int64_t query_stride_feature,
-    int64_t shared_stride_group, int64_t shared_stride_token, int64_t shared_stride_feature,
-    int64_t shared_delta_stride_query, int64_t shared_delta_stride_token, int64_t shared_delta_stride_feature,
-    int64_t indexed_delta_stride_query, int64_t indexed_delta_stride_token, int64_t indexed_delta_stride_feature,
-    int64_t indexed_id_stride_query, int64_t indexed_id_stride_token, float scale) {
-  extern __shared__ float token_weights[];
-  const int64_t query_head = blockIdx.x;
-  const int64_t query_index = query_head / heads;
-  const int64_t head = query_head % heads;
-  const int64_t group = query_index / queries_per_group;
-  const int lane = threadIdx.x;
-  const int64_t total_tokens = shared_tokens + indexed_tokens;
-  const int64_t key_offset = head * key_features;
-  const int64_t value_offset = heads * key_features + head * value_features;
+    int64_t query_head_count, GroupedIndexedAttentionLayout layout, float scale) {
+  extern __shared__ unsigned char shared_storage[];
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  const int64_t total_tokens = layout.shared_tokens + layout.indexed_tokens;
+  float* all_token_weights = reinterpret_cast<float*>(shared_storage);
+  int32_t* all_shared_indices =
+      reinterpret_cast<int32_t*>(all_token_weights + waves_per_block * total_tokens);
+  float* all_query_values =
+      reinterpret_cast<float*>(all_shared_indices + waves_per_block * total_tokens);
+  float* token_weights = all_token_weights + wave * total_tokens;
+  int32_t* shared_indices = all_shared_indices + wave * total_tokens;
+  float* query_values = all_query_values + wave * layout.key_features;
+
+  const int64_t query_head = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+  const bool active = query_head < query_head_count;
+  const int64_t query_index = query_head / layout.heads;
+  const int64_t head = query_head % layout.heads;
+  const int64_t group = query_index / layout.queries_per_group;
+  const int64_t key_offset = head * layout.key_features;
+  const int64_t value_offset = layout.heads * layout.key_features + head * layout.value_features;
+
+  if (active) {
+    for (int64_t feature = lane; feature < layout.key_features; feature += warpSize) {
+      query_values[feature] = static_cast<float>(
+          query[query_offset<contiguous>(layout, query_index, head, feature)]);
+    }
+  }
+  __syncthreads();
 
   float local_maximum = -std::numeric_limits<float>::infinity();
-  for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
-    const bool shared_token = attended_token < shared_tokens;
-    const int64_t token = shared_token ? attended_token : attended_token - shared_tokens;
-    const int64_t stored_id =
-        shared_token ? attended_token + 1
-                     : static_cast<int64_t>(
-                           indexed_shared_ids[query_index * indexed_id_stride_query + token * indexed_id_stride_token]);
-    const bool present = stored_id > 0 && stored_id <= shared_tokens;
-    float score = -std::numeric_limits<float>::infinity();
-    if (present) {
-      score = 0.0f;
+  if (active) {
+    for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
+      const bool shared_token = attended_token < layout.shared_tokens;
+      const int64_t token = shared_token ? attended_token : attended_token - layout.shared_tokens;
+      const int64_t stored_id =
+          shared_token
+              ? attended_token + 1
+              : static_cast<int64_t>(
+                    indexed_shared_ids[indexed_id_offset<contiguous>(layout, query_index, token)]);
+      const bool present = stored_id > 0 && stored_id <= layout.shared_tokens;
       const int64_t shared_index = stored_id - 1;
-      for (int64_t feature = 0; feature < key_features; feature++) {
-        const int64_t packed_feature = key_offset + feature;
-        const float base =
-            static_cast<float>(shared_key_values[group * shared_stride_group + shared_index * shared_stride_token +
-                                                 packed_feature * shared_stride_feature]);
-        const float delta =
-            shared_token
-                ? static_cast<float>(
-                      shared_deltas[query_index * shared_delta_stride_query + token * shared_delta_stride_token +
-                                    packed_feature * shared_delta_stride_feature])
-                : static_cast<float>(
-                      indexed_deltas[query_index * indexed_delta_stride_query + token * indexed_delta_stride_token +
-                                     packed_feature * indexed_delta_stride_feature]);
-        const float query_value = static_cast<float>(
-            query[query_index * query_stride_query + head * query_stride_head + feature * query_stride_feature]);
-        score += query_value * (base + delta);
+      float score = -std::numeric_limits<float>::infinity();
+      if (present) {
+        score = 0.0f;
+        for (int64_t feature = 0; feature < layout.key_features; feature++) {
+          const int64_t packed_feature = key_offset + feature;
+          const float base = static_cast<float>(shared_key_values[shared_offset<contiguous>(
+              layout, group, shared_index, packed_feature)]);
+          const float delta =
+              shared_token
+                  ? static_cast<float>(shared_deltas[shared_delta_offset<contiguous>(
+                        layout, query_index, token, packed_feature)])
+                  : static_cast<float>(indexed_deltas[indexed_delta_offset<contiguous>(
+                        layout, query_index, token, packed_feature)]);
+          score += query_values[feature] * (base + delta);
+        }
+        score *= scale;
       }
-      score *= scale;
+      shared_indices[attended_token] = present ? static_cast<int32_t>(shared_index) : -1;
+      token_weights[attended_token] = score;
+      local_maximum = fmaxf(local_maximum, score);
     }
-    token_weights[attended_token] = score;
-    local_maximum = fmaxf(local_maximum, score);
   }
   for (int offset = warpSize / 2; offset > 0; offset /= 2) {
     local_maximum = fmaxf(local_maximum, __shfl_down(local_maximum, offset));
   }
   const float maximum = __shfl(local_maximum, 0);
-  __syncthreads();
 
   float local_sum = 0.0f;
-  for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
-    const float score = token_weights[attended_token];
-    const float weight = score == -std::numeric_limits<float>::infinity() ? 0.0f : expf(score - maximum);
-    token_weights[attended_token] = weight;
-    local_sum += weight;
+  if (active) {
+    for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
+      const float score = token_weights[attended_token];
+      const float weight = score == -std::numeric_limits<float>::infinity() ? 0.0f : expf(score - maximum);
+      token_weights[attended_token] = weight;
+      local_sum += weight;
+    }
   }
   for (int offset = warpSize / 2; offset > 0; offset /= 2) {
     local_sum += __shfl_down(local_sum, offset);
   }
-  const float inverse_sum = 1.0f / __shfl(local_sum, 0);
+  const float inverse_sum = active ? 1.0f / __shfl(local_sum, 0) : 0.0f;
   __syncthreads();
 
-  for (int64_t feature = lane; feature < value_features; feature += warpSize) {
+  if (!active) {
+    return;
+  }
+  for (int64_t feature = lane; feature < layout.value_features; feature += warpSize) {
     const int64_t packed_feature = value_offset + feature;
     float context = 0.0f;
     for (int64_t attended_token = 0; attended_token < total_tokens; attended_token++) {
-      const bool shared_token = attended_token < shared_tokens;
-      const int64_t token = shared_token ? attended_token : attended_token - shared_tokens;
-      const int64_t stored_id =
-          shared_token
-              ? attended_token + 1
-              : static_cast<int64_t>(
-                    indexed_shared_ids[query_index * indexed_id_stride_query + token * indexed_id_stride_token]);
-      if (stored_id > 0 && stored_id <= shared_tokens) {
-        const int64_t shared_index = stored_id - 1;
-        const float base =
-            static_cast<float>(shared_key_values[group * shared_stride_group + shared_index * shared_stride_token +
-                                                 packed_feature * shared_stride_feature]);
+      const int32_t shared_index = shared_indices[attended_token];
+      if (shared_index >= 0) {
+        const bool shared_token = attended_token < layout.shared_tokens;
+        const int64_t token = shared_token ? attended_token : attended_token - layout.shared_tokens;
+        const float base = static_cast<float>(shared_key_values[shared_offset<contiguous>(
+            layout, group, shared_index, packed_feature)]);
         const float delta =
             shared_token
-                ? static_cast<float>(
-                      shared_deltas[query_index * shared_delta_stride_query + token * shared_delta_stride_token +
-                                    packed_feature * shared_delta_stride_feature])
-                : static_cast<float>(
-                      indexed_deltas[query_index * indexed_delta_stride_query + token * indexed_delta_stride_token +
-                                     packed_feature * indexed_delta_stride_feature]);
+                ? static_cast<float>(shared_deltas[shared_delta_offset<contiguous>(
+                      layout, query_index, token, packed_feature)])
+                : static_cast<float>(indexed_deltas[indexed_delta_offset<contiguous>(
+                      layout, query_index, token, packed_feature)]);
         context += token_weights[attended_token] * (base + delta);
       }
     }
-    output[(query_index * heads + head) * value_features + feature] = static_cast<scalar_t>(context * inverse_sum);
+    output[query_head * layout.value_features + feature] = static_cast<scalar_t>(context * inverse_sum);
   }
+}
+
+template <typename scalar_t, typename index_t, bool contiguous>
+void launch_grouped_indexed_attention(const torch::Tensor& query, const torch::Tensor& shared_key_values,
+    const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
+    const torch::Tensor& indexed_shared_ids, torch::Tensor& output, int64_t grid_size, int block_threads,
+    size_t shared_memory_bytes, hipStream_t stream, int64_t query_head_count,
+    const GroupedIndexedAttentionLayout& layout, float scale) {
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_indexed_attention_kernel<scalar_t, index_t, contiguous>),
+      dim3(grid_size), dim3(block_threads), shared_memory_bytes, stream, query.data_ptr<scalar_t>(),
+      shared_key_values.data_ptr<scalar_t>(), shared_deltas.data_ptr<scalar_t>(),
+      indexed_deltas.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<index_t>(), output.data_ptr<scalar_t>(),
+      query_head_count, layout, scale);
 }
 
 template <typename residual_t, typename update_t, typename parameter_t>
@@ -335,35 +433,70 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
   }
   const auto properties = device_properties(query.get_device());
   const int64_t total_tokens = shared_tokens + indexed_tokens;
-  const size_t shared_memory_bytes = static_cast<size_t>(total_tokens) * sizeof(float);
-  TORCH_CHECK(shared_memory_bytes <= static_cast<size_t>(properties.sharedMemPerBlock),
+  const size_t shared_memory_per_wave =
+      static_cast<size_t>(total_tokens) * (sizeof(float) + sizeof(int32_t)) +
+      static_cast<size_t>(key_features) * sizeof(float);
+  const int64_t query_head_count = query_count * heads;
+  const int maximum_waves_by_threads =
+      std::min(kGroupedAttentionThreads, properties.maxThreadsPerBlock) / properties.warpSize;
+  const int maximum_waves_by_memory =
+      static_cast<int>(static_cast<size_t>(properties.sharedMemPerBlock) / shared_memory_per_wave);
+  const int waves_per_block = static_cast<int>(std::min<int64_t>(
+      std::min(maximum_waves_by_threads, maximum_waves_by_memory), query_head_count));
+  TORCH_CHECK(waves_per_block > 0,
       "grouped indexed attention token count exceeds per-block shared memory");
-  const int64_t grid_size = query_count * heads;
+  const size_t shared_memory_bytes = shared_memory_per_wave * waves_per_block;
+  const int block_threads = waves_per_block * properties.warpSize;
+  const int64_t grid_size = (query_head_count + waves_per_block - 1) / waves_per_block;
   TORCH_CHECK(
       grid_size <= static_cast<int64_t>(properties.maxGridSize[0]), "grouped indexed attention grid is too large");
+  const GroupedIndexedAttentionLayout layout{queries_per_group,
+      heads,
+      key_features,
+      value_features,
+      shared_tokens,
+      indexed_tokens,
+      packed_width,
+      query.stride(0),
+      query.stride(1),
+      query.stride(2),
+      shared_key_values.stride(0),
+      shared_key_values.stride(1),
+      shared_key_values.stride(2),
+      shared_deltas.stride(0),
+      shared_deltas.stride(1),
+      shared_deltas.stride(2),
+      indexed_deltas.stride(0),
+      indexed_deltas.stride(1),
+      indexed_deltas.stride(2),
+      indexed_shared_ids.stride(0),
+      indexed_shared_ids.stride(1)};
+  const bool contiguous = query.is_contiguous() && shared_key_values.is_contiguous() &&
+                          shared_deltas.is_contiguous() && indexed_deltas.is_contiguous() &&
+                          indexed_shared_ids.is_contiguous();
   const hipStream_t stream = c10::hip::getCurrentHIPStream(query.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, query.scalar_type(), "grouped_indexed_attention", [&] {
         if (indexed_shared_ids.scalar_type() == torch::kInt32) {
-          hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_indexed_attention_kernel<scalar_t, int32_t>), dim3(grid_size),
-              dim3(properties.warpSize), shared_memory_bytes, stream, query.data_ptr<scalar_t>(),
-              shared_key_values.data_ptr<scalar_t>(), shared_deltas.data_ptr<scalar_t>(),
-              indexed_deltas.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<int32_t>(), output.data_ptr<scalar_t>(),
-              queries_per_group, heads, key_features, value_features, shared_tokens, indexed_tokens, query.stride(0),
-              query.stride(1), query.stride(2), shared_key_values.stride(0), shared_key_values.stride(1),
-              shared_key_values.stride(2), shared_deltas.stride(0), shared_deltas.stride(1), shared_deltas.stride(2),
-              indexed_deltas.stride(0), indexed_deltas.stride(1), indexed_deltas.stride(2),
-              indexed_shared_ids.stride(0), indexed_shared_ids.stride(1), scale);
+          if (contiguous) {
+            launch_grouped_indexed_attention<scalar_t, int32_t, true>(query, shared_key_values,
+                shared_deltas, indexed_deltas, indexed_shared_ids, output, grid_size, block_threads,
+                shared_memory_bytes, stream, query_head_count, layout, scale);
+          } else {
+            launch_grouped_indexed_attention<scalar_t, int32_t, false>(query, shared_key_values,
+                shared_deltas, indexed_deltas, indexed_shared_ids, output, grid_size, block_threads,
+                shared_memory_bytes, stream, query_head_count, layout, scale);
+          }
         } else {
-          hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_indexed_attention_kernel<scalar_t, int64_t>), dim3(grid_size),
-              dim3(properties.warpSize), shared_memory_bytes, stream, query.data_ptr<scalar_t>(),
-              shared_key_values.data_ptr<scalar_t>(), shared_deltas.data_ptr<scalar_t>(),
-              indexed_deltas.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<int64_t>(), output.data_ptr<scalar_t>(),
-              queries_per_group, heads, key_features, value_features, shared_tokens, indexed_tokens, query.stride(0),
-              query.stride(1), query.stride(2), shared_key_values.stride(0), shared_key_values.stride(1),
-              shared_key_values.stride(2), shared_deltas.stride(0), shared_deltas.stride(1), shared_deltas.stride(2),
-              indexed_deltas.stride(0), indexed_deltas.stride(1), indexed_deltas.stride(2),
-              indexed_shared_ids.stride(0), indexed_shared_ids.stride(1), scale);
+          if (contiguous) {
+            launch_grouped_indexed_attention<scalar_t, int64_t, true>(query, shared_key_values,
+                shared_deltas, indexed_deltas, indexed_shared_ids, output, grid_size, block_threads,
+                shared_memory_bytes, stream, query_head_count, layout, scale);
+          } else {
+            launch_grouped_indexed_attention<scalar_t, int64_t, false>(query, shared_key_values,
+                shared_deltas, indexed_deltas, indexed_shared_ids, output, grid_size, block_threads,
+                shared_memory_bytes, stream, query_head_count, layout, scale);
+          }
         }
       });
   check_hip_kernel_launch("grouped_indexed_attention");

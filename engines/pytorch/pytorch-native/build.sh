@@ -138,13 +138,9 @@ stub_cuda_cmake_macros() {
 }
 
 set_rocm_arch() {
-  # libtorch's LoadHIP.cmake requires PYTORCH_ROCM_ARCH at configure time
-  # even when the downstream project has no HIP kernels. DJL JNI contains
-  # zero HIP device code, so the arch list is really a placeholder: the
-  # runtime GPU support is determined by the fat-binary libtorch shipped
-  # by pytorch.org. Still, list every arch that the matching libtorch
-  # actually targets so a future hipified kernel in the JNI covers the
-  # same hardware surface. ROCm 7 drops gfx906 and adds gfx1200/1201.
+  # Build DJL's ROCm kernels for the same hardware surface as the matching
+  # libtorch package. Callers can narrow the list through PYTORCH_ROCM_ARCH
+  # when building a machine-specific binary.
   if [[ -n "${PYTORCH_ROCM_ARCH:-}" ]]; then
     return
   fi
@@ -189,6 +185,8 @@ fi
 # Build
 #
 
+BUILD_TYPE=${DJL_NATIVE_BUILD_TYPE:-Release}
+
 pushd .
 
 rm -rf build
@@ -206,11 +204,12 @@ if [[ -z "${JAVA_HOME:-}" ]] && command -v javac >/dev/null 2>&1; then
 fi
 
 cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" \
+      -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
       -DPT_VERSION="${PT_VERSION_MACRO}" \
       -DUSE_CUDA="$USE_CUDA" \
       -DUSE_ROCM="$USE_ROCM" \
       -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" ..
-cmake --build . --config Release -- -j "${NUM_PROC}"
+cmake --build . --config "${BUILD_TYPE}" -- -j "${NUM_PROC}"
 
 if [[ $PLATFORM == 'darwin' ]]; then
   install_name_tool -add_rpath @loader_path libdjl_torch.dylib

@@ -2,6 +2,15 @@ cmake_minimum_required(VERSION 3.6 FATAL_ERROR)
 
 project(djl_torch)
 
+# Unix Makefiles and Ninja are single-configuration generators, so passing
+# --config Release to `cmake --build` does not select optimized compiler flags.
+# Default those generators to Release while still allowing callers to request
+# Debug or RelWithDebInfo explicitly.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Native build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 option(BUILD_ANDROID "Build the static djl_torch jni linked with libtorch statically" OFF)
 option(REQUIRE_DISTRIBUTED_NCCL "Fail if native distributed NCCL/RCCL support cannot be built" OFF)
 
@@ -62,6 +71,19 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         message(STATUS "Building DJL ROCm kernels for GPU arch: ${CMAKE_HIP_ARCHITECTURES}")
     endif()
     enable_language(HIP)
+    # Some ROCm libtorch CMake packages leave the configuration-specific HIP
+    # flags empty. Preserve explicit caller overrides, but restore the standard
+    # optimized defaults when the selected configuration would otherwise
+    # compile device kernels without optimization.
+    if(NOT DEFINED CMAKE_HIP_FLAGS_RELEASE OR CMAKE_HIP_FLAGS_RELEASE STREQUAL "")
+        set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "HIP Release flags" FORCE)
+    endif()
+    if(NOT DEFINED CMAKE_HIP_FLAGS_RELWITHDEBINFO OR CMAKE_HIP_FLAGS_RELWITHDEBINFO STREQUAL "")
+        set(CMAKE_HIP_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG" CACHE STRING "HIP RelWithDebInfo flags" FORCE)
+    endif()
+    if(NOT DEFINED CMAKE_HIP_FLAGS_MINSIZEREL OR CMAKE_HIP_FLAGS_MINSIZEREL STREQUAL "")
+        set(CMAKE_HIP_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "HIP MinSizeRel flags" FORCE)
+    endif()
     list(APPEND SOURCE_FILES "src/main/native/djl_pytorch_rocm_kernels.hip")
     set_source_files_properties(
         "src/main/native/djl_pytorch_rocm_kernels.hip"

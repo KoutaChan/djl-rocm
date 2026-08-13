@@ -8,6 +8,7 @@ import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 
 import org.testng.Assert;
@@ -182,17 +183,121 @@ public class StructuredAttentionTest {
     }
 
     private static void verifyGroupedAttention(NDManager manager) {
-        int queries = 6;
-        NDArray query = manager.randomNormal(new Shape(queries, 3, 5));
-        NDArray shared = manager.randomNormal(new Shape(2, 7, 42));
-        NDArray sharedDeltas = manager.randomNormal(new Shape(queries, 7, 42));
-        NDArray indexedDeltas = manager.randomNormal(new Shape(queries, 4, 42));
-        int[] ids = new int[queries * 4];
+        verifyGroupedAttentionShape(manager, 2, 3, 3, 5, 9, 7, 4, false);
+        verifyGroupedAttentionShape(manager, 3, 5, 4, 8, 16, 34, 13, false);
+        verifyGroupedAttentionShape(manager, 1, 7, 5, 33, 37, 65, 17, true);
+        verifyGroupedAttentionShape(manager, 1, 3, 2, 7, 11, 9, 5, false, DataType.FLOAT64, 2e-5f);
+        verifyStridedGroupedAttention(manager);
+    }
+
+    private static void verifyGroupedAttentionShape(
+            NDManager manager,
+            int groups,
+            int queriesPerGroup,
+            int heads,
+            int keyFeatures,
+            int valueFeatures,
+            int sharedTokens,
+            int indexedTokens,
+            boolean longIndices) {
+        verifyGroupedAttentionShape(
+                manager,
+                groups,
+                queriesPerGroup,
+                heads,
+                keyFeatures,
+                valueFeatures,
+                sharedTokens,
+                indexedTokens,
+                longIndices,
+                DataType.FLOAT32,
+                2e-4f);
+    }
+
+    private static void verifyGroupedAttentionShape(
+            NDManager manager,
+            int groups,
+            int queriesPerGroup,
+            int heads,
+            int keyFeatures,
+            int valueFeatures,
+            int sharedTokens,
+            int indexedTokens,
+            boolean longIndices,
+            DataType dataType,
+            float tolerance) {
+        int queries = groups * queriesPerGroup;
+        int packedWidth = heads * (keyFeatures + valueFeatures);
+        NDArray query =
+                manager.randomNormal(new Shape(queries, heads, keyFeatures))
+                        .toType(dataType, false);
+        NDArray shared =
+                manager.randomNormal(new Shape(groups, sharedTokens, packedWidth))
+                        .toType(dataType, false);
+        NDArray sharedDeltas =
+                manager.randomNormal(new Shape(queries, sharedTokens, packedWidth))
+                        .toType(dataType, false);
+        NDArray indexedDeltas =
+                manager.randomNormal(new Shape(queries, indexedTokens, packedWidth))
+                        .toType(dataType, false);
+        int[] ids = new int[queries * indexedTokens];
         for (int i = 0; i < ids.length; i++) {
-            ids[i] = i % 8;
+            ids[i] = i % (sharedTokens + 1);
         }
-        NDArray indexedIds = manager.create(ids, new Shape(queries, 4));
-        double scale = 1.0 / Math.sqrt(5);
+        NDArray indexedIds =
+                longIndices
+                        ? manager.create(
+                                java.util.Arrays.stream(ids).asLongStream().toArray(),
+                                new Shape(queries, indexedTokens))
+                        : manager.create(ids, new Shape(queries, indexedTokens));
+        double scale = 1.0 / Math.sqrt(keyFeatures);
+
+        NDArray portable =
+                NDArrays.groupedIndexedScaledDotProductAttention(
+                        query,
+                        shared,
+                        sharedDeltas,
+                        indexedDeltas,
+                        indexedIds,
+                        queriesPerGroup,
+                        scale,
+                        true);
+        NDArray fused =
+                NDArrays.groupedIndexedScaledDotProductAttention(
+                        query,
+                        shared,
+                        sharedDeltas,
+                        indexedDeltas,
+                        indexedIds,
+                        queriesPerGroup,
+                        scale,
+                        false);
+        assertClose(
+                fused.toType(DataType.FLOAT32, false).toFloatArray(),
+                portable.toType(DataType.FLOAT32, false).toFloatArray(),
+                tolerance);
+    }
+
+    private static void verifyStridedGroupedAttention(NDManager manager) {
+        int queries = 6;
+        int heads = 3;
+        int keyFeatures = 5;
+        int sharedTokens = 7;
+        int indexedTokens = 4;
+        int packedWidth = 42;
+        NDArray query = manager.randomNormal(new Shape(queries, keyFeatures, heads)).swapAxes(1, 2);
+        NDArray shared =
+                manager.randomNormal(new Shape(2, packedWidth, sharedTokens)).swapAxes(1, 2);
+        NDArray sharedDeltas =
+                manager.randomNormal(new Shape(queries, packedWidth, sharedTokens)).swapAxes(1, 2);
+        NDArray indexedDeltas =
+                manager.randomNormal(new Shape(queries, packedWidth, indexedTokens)).swapAxes(1, 2);
+        int[] ids = new int[queries * indexedTokens];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = i % (sharedTokens + 1);
+        }
+        NDArray indexedIds = manager.create(ids, new Shape(indexedTokens, queries)).transpose();
+        double scale = 1.0 / Math.sqrt(keyFeatures);
 
         NDArray portable =
                 NDArrays.groupedIndexedScaledDotProductAttention(
