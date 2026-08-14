@@ -18,9 +18,11 @@ import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.AbstractBlock;
 import ai.djl.nn.Block;
 import ai.djl.nn.Parameter;
+import ai.djl.nn.core.Embedding;
 import ai.djl.training.ParameterStore;
 import ai.djl.util.PairList;
 
@@ -64,18 +66,13 @@ public final class IdEmbedding extends AbstractBlock {
             ParameterStore ps, NDList inputs, boolean training, PairList<String, Object> params) {
         NDArray input = inputs.singletonOrThrow();
         try (NDManager scope = NDManager.subManagerOf(input)) {
-            // on info to the right shapes, see: http://beta.mxnet.io/r/api/mx.symbol.gather_nd.html
-            NDArray ids = input.flatten().reshape(1, input.getShape().size());
-            // create the embedding Table
-            NDArray embeddingTable = ps.getValue(embedding, ids.getDevice(), training);
+            NDArray embeddingTable = ps.getValue(embedding, input.getDevice(), training);
             scope.tempAttachAll(embeddingTable);
-            // We do not perform a sparse lookup, instead we just project into the table
-            NDArray result = embeddingTable.gatherNd(ids);
+            NDArray result =
+                    Embedding.embedding(input, embeddingTable, SparseFormat.DENSE)
+                            .singletonOrThrow();
             result.attach(inputs.getManager());
-            // we want the original shape of the input + the last dimension of the embedding
-            Shape targetShape =
-                    input.getShape().addAll(new Shape(embeddingTable.getShape().get(1)));
-            return new NDList(result.reshape(targetShape));
+            return new NDList(result);
         }
     }
 
