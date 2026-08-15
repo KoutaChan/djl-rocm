@@ -724,8 +724,8 @@ public interface NDArrayEx {
      * [queryTokens, keyTokens]} or {@code [batch, queryTokens, keyTokens]}, and relation bias is
      * broadcastable to {@code [batch, heads, queryTokens, keyTokens]}.
      *
-     * <p>Engines may use a fused inference implementation. The default implementation is a
-     * differentiable decomposition and therefore also defines the portable fallback semantics.
+     * <p>Engines may use fused forward and backward implementations. The default implementation is
+     * a differentiable decomposition and therefore also defines the portable fallback semantics.
      *
      * @param key key tensor
      * @param value value tensor

@@ -54,8 +54,8 @@ public final class NDArrays {
     /**
      * Applies relation-biased scaled-dot-product attention.
      *
-     * <p>The engine selects a fused implementation only when automatic differentiation is not
-     * required. Otherwise it uses a differentiable implementation with the same semantics.
+     * <p>Engines may select fused forward and backward implementations while retaining a
+     * differentiable implementation with the same semantics as a fallback.
      *
      * <p>Leading dimensions are flattened only at the engine boundary. Existing canonical rank-four
      * inputs therefore reach a native implementation unchanged.
@@ -164,9 +164,9 @@ public final class NDArrays {
      *
      * <p>Packed key/value tensors store all head keys followed by all head values in the last
      * dimension. Its width is {@code heads * (keyFeatures + valueFeatures)}. Positive auxiliary
-     * indices are one-based shared-token indices and zero denotes padding. The engine automatically
-     * selects a fused implementation only when automatic differentiation is not required and
-     * otherwise uses a differentiable implementation with the same semantics.
+     * indices are one-based shared-token indices and zero denotes padding. Engines may select a
+     * fused implementation for both forward and automatic differentiation while retaining a
+     * differentiable implementation with the same semantics as a fallback.
      *
      * <p>All query-leading and group-leading dimensions are flattened in row-major order at the
      * engine boundary. Existing canonical rank-three inputs reach a native implementation

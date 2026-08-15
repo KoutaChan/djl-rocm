@@ -139,9 +139,10 @@ public class StructuredAttentionTest {
     @Test
     public void structuredAttentionPreservesAutograd() {
         Engine engine = Engine.getInstance();
-        verifyStructuredAttentionGradients(engine, Device.cpu());
+        verifyStructuredAttentionGradients(engine, Device.cpu(), DataType.FLOAT32);
         if (engine.getGpuCount() > 0) {
-            verifyStructuredAttentionGradients(engine, Device.gpu());
+            verifyStructuredAttentionGradients(engine, Device.gpu(), DataType.FLOAT32);
+            verifyStructuredAttentionGradients(engine, Device.gpu(), DataType.BFLOAT16);
         }
     }
 
@@ -359,62 +360,119 @@ public class StructuredAttentionTest {
         assertClose(actual.toFloatArray(), expected.toFloatArray(), 2e-4f);
     }
 
-    private static void verifyStructuredAttentionGradients(Engine engine, Device device) {
-        verifyRelationAttentionGradients(engine, device);
-        verifyGroupedAttentionGradients(engine, device);
+    private static void verifyStructuredAttentionGradients(
+            Engine engine, Device device, DataType dataType) {
+        verifyRelationAttentionGradients(engine, device, dataType);
+        verifyGroupedAttentionGradients(engine, device, dataType);
     }
 
-    private static void verifyRelationAttentionGradients(Engine engine, Device device) {
-        try (NDManager manager = engine.newBaseManager(device);
-                GradientCollector collector = engine.newGradientCollector()) {
-            NDArray query = requiringGradient(manager.randomNormal(new Shape(1, 2, 2, 3, 4)));
-            NDArray key = requiringGradient(manager.randomNormal(new Shape(1, 2, 2, 5, 4)));
-            NDArray value = requiringGradient(manager.randomNormal(new Shape(1, 2, 2, 5, 3)));
-            NDArray relationKeys =
-                    requiringGradient(manager.randomNormal(new Shape(1, 2, 2, 4, 7)));
-            NDArray relationBias =
-                    requiringGradient(manager.randomNormal(new Shape(1, 2, 1, 3, 5)));
+    private static void verifyRelationAttentionGradients(
+            Engine engine, Device device, DataType dataType) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray queryValues = manager.randomNormal(new Shape(2, 2, 3, 4), dataType);
+            NDArray keyValues = manager.randomNormal(new Shape(2, 2, 5, 4), dataType);
+            NDArray valueValues = manager.randomNormal(new Shape(2, 2, 5, 3), dataType);
+            NDArray relationKeyValues = manager.randomNormal(new Shape(1, 2, 4, 7), dataType);
+            NDArray relationBiasValues = manager.randomNormal(new Shape(1, 2, 3, 5), dataType);
             NDArray relationIds =
                     manager.create(
-                            new int[] {
-                                0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0,
-                                1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1
-                            },
-                            new Shape(1, 2, 3, 5));
+                            new int[] {0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0},
+                            new Shape(3, 5));
 
-            NDArray output =
-                    NDArrays.relationBiasedScaledDotProductAttention(
-                            query, key, value, relationKeys, relationBias, relationIds, 0.31);
-            collector.backward(output.mul(output).sum());
+            NDArray query = requiringGradient(queryValues.duplicate());
+            NDArray key = requiringGradient(keyValues.duplicate());
+            NDArray value = requiringGradient(valueValues.duplicate());
+            NDArray relationKeys = requiringGradient(relationKeyValues.duplicate());
+            NDArray relationBias = requiringGradient(relationBiasValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.relationBiasedScaledDotProductAttention(
+                                query, key, value, relationKeys, relationBias, relationIds, 0.31);
+                collector.backward(output.mul(output).sum());
+            }
+
+            NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+            NDArray referenceKey = requiringGradient(keyValues.duplicate());
+            NDArray referenceValue = requiringGradient(valueValues.duplicate());
+            NDArray referenceRelationKeys = requiringGradient(relationKeyValues.duplicate());
+            NDArray referenceRelationBias = requiringGradient(relationBiasValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        relationAttentionReference(
+                                referenceQuery,
+                                referenceKey,
+                                referenceValue,
+                                referenceRelationKeys,
+                                referenceRelationBias,
+                                relationIds,
+                                0.31);
+                collector.backward(output.mul(output).sum());
+            }
 
             assertFiniteNonzeroGradient(query, key, value, relationKeys, relationBias);
+            float tolerance = gradientTolerance(dataType);
+            assertGradientClose(query, referenceQuery, tolerance);
+            assertGradientClose(key, referenceKey, tolerance);
+            assertGradientClose(value, referenceValue, tolerance);
+            assertGradientClose(relationKeys, referenceRelationKeys, tolerance);
+            assertGradientClose(relationBias, referenceRelationBias, tolerance);
         }
     }
 
-    private static void verifyGroupedAttentionGradients(Engine engine, Device device) {
-        try (NDManager manager = engine.newBaseManager(device);
-                GradientCollector collector = engine.newGradientCollector()) {
+    private static void verifyGroupedAttentionGradients(
+            Engine engine, Device device, DataType dataType) {
+        try (NDManager manager = engine.newBaseManager(device)) {
             int heads = 2;
             int keyFeatures = 3;
             int packedWidth = heads * (keyFeatures + 4);
-            NDArray query =
-                    requiringGradient(manager.randomNormal(new Shape(2, 2, heads, keyFeatures)));
-            NDArray shared = requiringGradient(manager.randomNormal(new Shape(2, 5, packedWidth)));
-            NDArray sharedDeltas =
-                    requiringGradient(manager.randomNormal(new Shape(2, 2, 5, packedWidth)));
-            NDArray indexedDeltas =
-                    requiringGradient(manager.randomNormal(new Shape(2, 2, 3, packedWidth)));
+            NDArray queryValues = manager.randomNormal(new Shape(4, heads, keyFeatures), dataType);
+            NDArray sharedValues = manager.randomNormal(new Shape(2, 5, packedWidth), dataType);
+            NDArray sharedDeltaValues =
+                    manager.randomNormal(new Shape(4, 5, packedWidth), dataType);
+            NDArray indexedDeltaValues =
+                    manager.randomNormal(new Shape(4, 3, packedWidth), dataType);
             NDArray indexedIds =
-                    manager.create(
-                            new int[] {1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 1}, new Shape(2, 2, 3));
+                    manager.create(new int[] {1, 2, 3, 2, 0, 4, 3, 4, 5, 4, 5, 1}, new Shape(4, 3));
 
-            NDArray output =
-                    NDArrays.groupedIndexedScaledDotProductAttention(
-                            query, shared, sharedDeltas, indexedDeltas, indexedIds, 2, 0.27);
-            collector.backward(output.mul(output).sum());
+            NDArray query = requiringGradient(queryValues.duplicate());
+            NDArray shared = requiringGradient(sharedValues.duplicate());
+            NDArray sharedDeltas = requiringGradient(sharedDeltaValues.duplicate());
+            NDArray indexedDeltas = requiringGradient(indexedDeltaValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.groupedIndexedScaledDotProductAttention(
+                                query, shared, sharedDeltas, indexedDeltas, indexedIds, 2, 0.27);
+                collector.backward(output.mul(output).sum());
+            }
+
+            NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+            NDArray referenceShared = requiringGradient(sharedValues.duplicate());
+            NDArray referenceSharedDeltas = requiringGradient(sharedDeltaValues.duplicate());
+            NDArray referenceIndexedDeltas = requiringGradient(indexedDeltaValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        groupedAttentionReference(
+                                referenceQuery,
+                                referenceShared,
+                                referenceSharedDeltas,
+                                referenceIndexedDeltas,
+                                indexedIds,
+                                2,
+                                0.27);
+                collector.backward(output.mul(output).sum());
+            }
 
             assertFiniteNonzeroGradient(query, shared, sharedDeltas, indexedDeltas);
+            float tolerance = gradientTolerance(dataType);
+            assertGradientClose(query, referenceQuery, tolerance);
+            assertGradientClose(shared, referenceShared, tolerance);
+            assertGradientClose(sharedDeltas, referenceSharedDeltas, tolerance);
+            assertGradientClose(indexedDeltas, referenceIndexedDeltas, tolerance);
         }
+    }
+
+    private static float gradientTolerance(DataType dataType) {
+        return dataType == DataType.FLOAT32 ? 8e-4f : 8e-2f;
     }
 
     private static void runStructuredStep(
@@ -763,15 +821,28 @@ public class StructuredAttentionTest {
 
     private static void assertFiniteNonzeroGradient(NDArray... arrays) {
         for (NDArray array : arrays) {
-            try (NDArray gradient = array.getGradient()) {
+            try (NDArray gradient = array.getGradient();
+                    NDArray values = gradient.toType(DataType.FLOAT32, false)) {
                 Assert.assertNotNull(gradient);
                 boolean nonzero = false;
-                for (float value : gradient.toFloatArray()) {
+                for (float value : values.toFloatArray()) {
                     Assert.assertTrue(Float.isFinite(value));
                     nonzero |= value != 0f;
                 }
                 Assert.assertTrue(nonzero, "expected a nonzero gradient for " + array.getShape());
             }
+        }
+    }
+
+    private static void assertGradientClose(NDArray actual, NDArray expected, float tolerance) {
+        try (NDArray actualGradient = actual.getGradient();
+                NDArray expectedGradient = expected.getGradient()) {
+            Assert.assertNotNull(actualGradient);
+            Assert.assertNotNull(expectedGradient);
+            assertClose(
+                    actualGradient.toType(DataType.FLOAT32, false).toFloatArray(),
+                    expectedGradient.toType(DataType.FLOAT32, false).toFloatArray(),
+                    tolerance);
         }
     }
 }
