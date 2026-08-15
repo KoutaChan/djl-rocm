@@ -32,6 +32,46 @@ public interface NDArrayEx {
     // NDArrays
     */
 
+    /** Selects leading-axis rows while preserving all trailing dimensions. */
+    default NDArray gatherRows(NDArray rowIndices) {
+        NDArray rows = getArray();
+        Shape inputShape = rows.getShape();
+        long inputRows = inputShape.get(0);
+        long outputRows = rowIndices.getShape().size();
+        long rowWidth = inputShape.slice(1).size();
+        NDArray gatherIndices =
+                rowIndices
+                        .reshape(outputRows, 1)
+                        .toType(DataType.INT64, false)
+                        .broadcast(outputRows, rowWidth)
+                        .stopGradient();
+        long[] outputShape = inputShape.getShape().clone();
+        outputShape[0] = outputRows;
+        return rows.reshape(inputRows, rowWidth)
+                .gather(gatherIndices, 0)
+                .reshape(new Shape(outputShape));
+    }
+
+    /** Places leading-axis rows into a zero-initialized dense tensor. */
+    default NDArray scatterRows(NDArray rowIndices, long rowCount) {
+        NDArray rows = getArray();
+        Shape inputShape = rows.getShape();
+        long inputRows = inputShape.get(0);
+        long rowWidth = inputShape.slice(1).size();
+        NDArray scatterIndices =
+                rowIndices
+                        .reshape(inputRows, 1)
+                        .toType(DataType.INT64, false)
+                        .broadcast(inputRows, rowWidth)
+                        .stopGradient();
+        long[] outputShape = inputShape.getShape().clone();
+        outputShape[0] = rowCount;
+        return rows.getManager()
+                .zeros(new Shape(rowCount, rowWidth), rows.getDataType())
+                .scatter(scatterIndices, rows.reshape(inputRows, rowWidth), 0)
+                .reshape(new Shape(outputShape));
+    }
+
     /**
      * Applies reverse division with a scalar - i.e., (n / thisArrayValues).
      *
@@ -676,7 +716,7 @@ public interface NDArrayEx {
     }
 
     /**
-     * Applies relation-biased scaled-dot-product attention.
+     * Applies relation-biased scaled-dot-product attention in canonical engine layout.
      *
      * <p>The operation evaluates {@code softmax((Q K^T + gather(Q R, relationIds)) * scale +
      * relationBias) V}. Query, key, and value use {@code [batch, heads, tokens, features]}.
@@ -693,17 +733,15 @@ public interface NDArrayEx {
      * @param relationBias additive pairwise relation bias
      * @param relationIds relation ID for each query-key pair
      * @param scale scale applied to content and relation-key dot products
-     * @param training whether gradients must be preserved
      * @return attended values shaped {@code [batch, heads, queryTokens, valueFeatures]}
      */
-    default NDArray relationBiasedScaledDotProductAttention(
+    default NDArray canonicalRelationBiasedScaledDotProductAttention(
             NDArray key,
             NDArray value,
             NDArray relationKeys,
             NDArray relationBias,
             NDArray relationIds,
-            double scale,
-            boolean training) {
+            double scale) {
         NDArray query = getArray();
         NDManager outputManager = query.getManager();
         try (NDManager scope = outputManager.newSubManager()) {
@@ -760,7 +798,7 @@ public interface NDArrayEx {
     }
 
     /**
-     * Applies grouped attention with shared tokens and indexed auxiliary tokens.
+     * Applies grouped attention in canonical packed engine layout.
      *
      * <p>Consecutive queries share one packed key/value table. Query-specific packed deltas are
      * added to every shared token. Each auxiliary token adds a query-specific delta to one indexed
@@ -781,17 +819,15 @@ public interface NDArrayEx {
      *     zero denotes padding
      * @param queriesPerGroup consecutive query count sharing one group
      * @param scale attention score scale
-     * @param training whether gradients must be preserved
      * @return attended values shaped {@code [query, heads, valueFeatures]}
      */
-    default NDArray groupedIndexedScaledDotProductAttention(
+    default NDArray canonicalGroupedIndexedScaledDotProductAttention(
             NDArray sharedKeyValues,
             NDArray sharedDeltas,
             NDArray indexedDeltas,
             NDArray indexedSharedIds,
             long queriesPerGroup,
-            double scale,
-            boolean training) {
+            double scale) {
         NDArray query = getArray();
         NDManager outputManager = query.getManager();
         try (NDManager scope = outputManager.newSubManager()) {
@@ -929,7 +965,7 @@ public interface NDArrayEx {
      * @param eps normalization epsilon
      * @return normalized updated residual
      */
-    default NDArray residualAddLayerNormInPlace(
+    default NDArray addToOwnedResidualAndLayerNorm(
             NDArray update, NDArray weight, NDArray bias, float eps) {
         NDArray residual = getArray();
         NDManager outputManager = residual.getManager();
@@ -970,6 +1006,32 @@ public interface NDArrayEx {
             NDArray key, NDArray value, NDArray attnMask, double dropoutP, boolean isCausal) {
         throw new UnsupportedOperationException(
                 "scaledDotProductAttention is not supported by this engine");
+    }
+
+    /**
+     * Applies scaled-dot-product attention with an explicit score scale.
+     *
+     * <p>This overload has the same broadcasting and masking semantics as {@link
+     * #scaledDotProductAttention(NDArray, NDArray, NDArray, double, boolean)}, but uses {@code
+     * scale} instead of {@code 1 / sqrt(keyFeatures)}.
+     *
+     * @param key key tensor, shape {@code [..., K, D]}
+     * @param value value tensor, shape {@code [..., K, D_v]}
+     * @param attnMask additive float bias broadcastable over {@code [..., Q, K]}, or {@code null}
+     * @param dropoutP dropout probability
+     * @param isCausal whether to apply a causal mask
+     * @param scale multiplier applied to query-key scores
+     * @return attention output with shape {@code [..., Q, D_v]}
+     */
+    default NDArray scaledDotProductAttention(
+            NDArray key,
+            NDArray value,
+            NDArray attnMask,
+            double dropoutP,
+            boolean isCausal,
+            double scale) {
+        throw new UnsupportedOperationException(
+                "scaledDotProductAttention with explicit scale is not supported by this engine");
     }
 
     /**

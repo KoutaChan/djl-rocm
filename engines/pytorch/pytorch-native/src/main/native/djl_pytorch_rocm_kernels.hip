@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "djl_pytorch_rocm_kernels.h"
 
@@ -309,20 +310,93 @@ __global__ void residual_add_layer_norm_in_place_kernel(residual_t* residual, co
   }
 }
 
-hipDeviceProp_t device_properties(int device) {
-  hipDeviceProp_t properties;
-  C10_HIP_CHECK(hipGetDeviceProperties(&properties, device));
+const hipDeviceProp_t& device_properties(int device) {
+  static const std::vector<hipDeviceProp_t> all_properties = [] {
+    int device_count;
+    C10_HIP_CHECK(hipGetDeviceCount(&device_count));
+    std::vector<hipDeviceProp_t> properties(device_count);
+    for (int index = 0; index < device_count; ++index) {
+      C10_HIP_CHECK(hipGetDeviceProperties(&properties[index], index));
+    }
+    return properties;
+  }();
+  TORCH_CHECK(device >= 0 && device < static_cast<int>(all_properties.size()), "invalid ROCm device index");
+  const auto& properties = all_properties[device];
   TORCH_CHECK(
       properties.warpSize == 32 || properties.warpSize == 64, "ROCm kernels require a 32- or 64-lane wavefront");
   return properties;
 }
 
 int residual_norm_waves_per_block(int device) {
-  const auto properties = device_properties(device);
+  const auto& properties = device_properties(device);
   return kResidualNormThreads / properties.warpSize;
 }
 
 }  // namespace
+
+bool can_use_indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
+    const torch::Tensor& relation_ids) {
+  return relation_logits.is_cuda() && relation_logits.dim() == 4 && is_fused_floating(relation_logits) &&
+         relation_logits.scalar_type() == relation_bias.scalar_type() &&
+         (relation_ids.scalar_type() == torch::kInt32 || relation_ids.scalar_type() == torch::kInt64) &&
+         (relation_ids.dim() == 2 || relation_ids.dim() == 3) &&
+         relation_logits.size(2) > 0 && relation_logits.size(3) > 0 && relation_ids.size(-1) > 0 &&
+         relation_ids.size(-2) == relation_logits.size(2) &&
+         (relation_ids.dim() == 2 || relation_ids.size(0) == relation_logits.size(0)) &&
+         relation_bias.device() == relation_logits.device() && relation_ids.device() == relation_logits.device();
+}
+
+bool can_use_grouped_indexed_scaled_dot_product_attention(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
+    const torch::Tensor& indexed_shared_ids, int64_t queries_per_group) {
+  if (!query.is_cuda() || query.dim() != 3 || shared_key_values.dim() != 3 || shared_deltas.dim() != 3 ||
+      indexed_deltas.dim() != 3 || indexed_shared_ids.dim() != 2 || queries_per_group <= 0 ||
+      !is_fused_floating(query) || query.scalar_type() != shared_key_values.scalar_type() ||
+      query.scalar_type() != shared_deltas.scalar_type() || query.scalar_type() != indexed_deltas.scalar_type() ||
+      (indexed_shared_ids.scalar_type() != torch::kInt32 && indexed_shared_ids.scalar_type() != torch::kInt64)) {
+    return false;
+  }
+  const int64_t query_count = query.size(0);
+  const int64_t heads = query.size(1);
+  const int64_t key_features = query.size(2);
+  const int64_t group_count = shared_key_values.size(0);
+  const int64_t shared_tokens = shared_key_values.size(1);
+  const int64_t packed_width = shared_key_values.size(2);
+  const int64_t indexed_tokens = indexed_deltas.size(1);
+  const int64_t key_width = heads * key_features;
+  if (query_count == 0 || heads <= 0 || key_features <= 0 || shared_tokens <= 0 ||
+      query_count != group_count * queries_per_group || packed_width <= key_width ||
+      (packed_width - key_width) % heads != 0 ||
+      shared_deltas.size(0) != query_count || shared_deltas.size(1) != shared_tokens ||
+      shared_deltas.size(2) != packed_width ||
+      indexed_deltas.size(0) != query_count || indexed_deltas.size(2) != packed_width ||
+      indexed_shared_ids.size(0) != query_count || indexed_shared_ids.size(1) != indexed_tokens ||
+      shared_key_values.device() != query.device() || shared_deltas.device() != query.device() ||
+      indexed_deltas.device() != query.device() || indexed_shared_ids.device() != query.device()) {
+    return false;
+  }
+  const auto& properties = device_properties(query.get_device());
+  const size_t shared_memory_per_wave =
+      static_cast<size_t>(shared_tokens + indexed_tokens) * (sizeof(float) + sizeof(int32_t)) +
+      static_cast<size_t>(key_features) * sizeof(float);
+  const int maximum_waves_by_threads =
+      std::min(kGroupedAttentionThreads, properties.maxThreadsPerBlock) / properties.warpSize;
+  const int maximum_waves_by_memory =
+      static_cast<int>(static_cast<size_t>(properties.sharedMemPerBlock) / shared_memory_per_wave);
+  return maximum_waves_by_threads > 0 && maximum_waves_by_memory > 0;
+}
+
+bool can_use_owned_residual_layer_norm(const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias) {
+  return residual.is_cuda() && residual.is_contiguous() && update.is_contiguous() && weight.is_contiguous() &&
+         bias.is_contiguous() && residual.dim() >= 1 && residual.size(-1) > 0 &&
+         residual.sizes() == update.sizes() && weight.dim() == 1 && weight.size(0) == residual.size(-1) &&
+         bias.sizes() == weight.sizes() && is_fused_floating(residual) && is_fused_floating(update) &&
+         weight.scalar_type() == bias.scalar_type() &&
+         (weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == residual.scalar_type()) &&
+         update.device() == residual.device() && weight.device() == residual.device() &&
+         bias.device() == residual.device();
+}
 
 torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids, float scale) {
@@ -431,7 +505,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
   if (query_count == 0) {
     return output;
   }
-  const auto properties = device_properties(query.get_device());
+  const auto& properties = device_properties(query.get_device());
   const int64_t total_tokens = shared_tokens + indexed_tokens;
   const size_t shared_memory_per_wave =
       static_cast<size_t>(total_tokens) * (sizeof(float) + sizeof(int32_t)) +
@@ -503,7 +577,7 @@ torch::Tensor grouped_indexed_scaled_dot_product_attention(const torch::Tensor& 
   return output;
 }
 
-torch::Tensor residual_add_layer_norm_in_place(torch::Tensor& residual, const torch::Tensor& update,
+torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, const torch::Tensor& update,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon) {
   TORCH_CHECK(residual.is_cuda(), "residual add LayerNorm requires a ROCm tensor");
   TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");

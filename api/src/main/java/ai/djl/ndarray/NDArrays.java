@@ -23,22 +23,55 @@ public final class NDArrays {
     private NDArrays() {}
 
     /**
+     * Selects rows from the leading axis without expanding the row indices across trailing axes.
+     *
+     * <p>The returned shape is {@code [rowIndices.size(), source.shape[1], ...]}. Repeated indices
+     * are allowed and retain ordinary gather gradient semantics.
+     *
+     * @param source source tensor shaped {@code [rows, ...]}
+     * @param rowIndices one-dimensional row indices
+     * @return selected rows in index order
+     */
+    public static NDArray gatherRows(NDArray source, NDArray rowIndices) {
+        return source.getNDArrayInternal().gatherRows(rowIndices);
+    }
+
+    /**
+     * Places compact rows on the leading axis of a zero-initialized dense tensor.
+     *
+     * <p>The returned shape is {@code [rowCount, rows.shape[1], ...]}. Row indices are expected to
+     * be unique; unspecified rows remain zero.
+     *
+     * @param rows compact rows shaped {@code [presentRows, ...]}
+     * @param rowIndices one-dimensional destination row indices
+     * @param rowCount number of rows in the dense result
+     * @return zero-filled dense tensor containing the compact rows
+     */
+    public static NDArray scatterRows(NDArray rows, NDArray rowIndices, long rowCount) {
+        return rows.getNDArrayInternal().scatterRows(rowIndices, rowCount);
+    }
+
+    /**
      * Applies relation-biased scaled-dot-product attention.
      *
-     * <p>The engine automatically selects a supported fused inference implementation and otherwise
-     * uses the differentiable portable decomposition.
+     * <p>The engine selects a fused implementation only when automatic differentiation is not
+     * required. Otherwise it uses a differentiable implementation with the same semantics.
      *
-     * @param query query tensor shaped {@code [batch, heads, queryTokens, keyFeatures]}
-     * @param key key tensor shaped {@code [batch, heads, keyTokens, keyFeatures]}
-     * @param value value tensor shaped {@code [batch, heads, keyTokens, valueFeatures]}
-     * @param relationKeys relation keys shaped {@code [1|batch, heads, keyFeatures, relations]}
-     * @param relationBias pairwise bias broadcastable to {@code [batch, heads, queryTokens,
-     *     keyTokens]}
-     * @param relationIds relation IDs shaped {@code [queryTokens, keyTokens]} or {@code [batch,
+     * <p>Leading dimensions are flattened only at the engine boundary. Existing canonical rank-four
+     * inputs therefore reach a native implementation unchanged.
+     *
+     * @param query query tensor shaped {@code [..., heads, queryTokens, keyFeatures]}
+     * @param key key tensor shaped {@code [..., heads, keyTokens, keyFeatures]}
+     * @param value value tensor shaped {@code [..., heads, keyTokens, valueFeatures]}
+     * @param relationKeys globally shared relation keys shaped {@code [heads, keyFeatures,
+     *     relations]} or {@code [1, heads, keyFeatures, relations]}, or keys aligned with the query
+     *     leading dimensions
+     * @param relationBias pairwise bias shared across leading dimensions or aligned with them and
+     *     broadcastable over {@code [heads, queryTokens, keyTokens]}
+     * @param relationIds relation IDs shaped {@code [queryTokens, keyTokens]} or {@code [...,
      *     queryTokens, keyTokens]}
      * @param scale score scale
-     * @param training whether gradients must be preserved
-     * @return attended values shaped {@code [batch, heads, queryTokens, valueFeatures]}
+     * @return attended values shaped {@code [..., heads, queryTokens, valueFeatures]}
      */
     public static NDArray relationBiasedScaledDotProductAttention(
             NDArray query,
@@ -47,11 +80,83 @@ public final class NDArrays {
             NDArray relationKeys,
             NDArray relationBias,
             NDArray relationIds,
-            double scale,
-            boolean training) {
-        return query.getNDArrayInternal()
-                .relationBiasedScaledDotProductAttention(
-                        key, value, relationKeys, relationBias, relationIds, scale, training);
+            double scale) {
+        Shape queryShape = query.getShape();
+        Shape keyShape = key.getShape();
+        Shape valueShape = value.getShape();
+        int rank = queryShape.dimension();
+        if (rank < 3 || keyShape.dimension() != rank || valueShape.dimension() != rank) {
+            throw new IllegalArgumentException(
+                    "query, key, and value must have matching rank of at least three");
+        }
+        if (rank == 4
+                && relationKeys.getShape().dimension() == 4
+                && (relationIds.getShape().dimension() == 2
+                        || relationIds.getShape().dimension() == 3)) {
+            return query.getNDArrayInternal()
+                    .canonicalRelationBiasedScaledDotProductAttention(
+                            key, value, relationKeys, relationBias, relationIds, scale);
+        }
+
+        long[] leadingDimensions = leadingDimensions(queryShape, 3);
+        if (!Arrays.equals(leadingDimensions, leadingDimensions(keyShape, 3))
+                || !Arrays.equals(leadingDimensions, leadingDimensions(valueShape, 3))) {
+            throw new IllegalArgumentException(
+                    "query, key, and value must have identical leading dimensions");
+        }
+        int headAxis = rank - 3;
+        long heads = queryShape.get(headAxis);
+        long queryTokens = queryShape.get(headAxis + 1);
+        long keyFeatures = queryShape.get(headAxis + 2);
+        long keyTokens = keyShape.get(headAxis + 1);
+        long valueFeatures = valueShape.get(headAxis + 2);
+        if (keyShape.get(headAxis) != heads
+                || valueShape.get(headAxis) != heads
+                || keyShape.get(headAxis + 2) != keyFeatures
+                || valueShape.get(headAxis + 1) != keyTokens) {
+            throw new IllegalArgumentException("query, key, and value shapes are incompatible");
+        }
+
+        long batch = elementCount(leadingDimensions);
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(query, key, value, relationKeys, relationBias, relationIds);
+            NDArray canonicalQuery = query.reshape(batch, heads, queryTokens, keyFeatures);
+            NDArray canonicalKey = key.reshape(batch, heads, keyTokens, keyFeatures);
+            NDArray canonicalValue = value.reshape(batch, heads, keyTokens, valueFeatures);
+            NDArray canonicalResult =
+                    canonicalQuery
+                            .getNDArrayInternal()
+                            .canonicalRelationBiasedScaledDotProductAttention(
+                                    canonicalKey,
+                                    canonicalValue,
+                                    canonicalRelationKeys(
+                                            relationKeys,
+                                            leadingDimensions,
+                                            batch,
+                                            heads,
+                                            keyFeatures),
+                                    canonicalRelationBias(
+                                            relationBias,
+                                            leadingDimensions,
+                                            batch,
+                                            heads,
+                                            queryTokens,
+                                            keyTokens),
+                                    canonicalRelationIds(
+                                            relationIds,
+                                            leadingDimensions,
+                                            batch,
+                                            queryTokens,
+                                            keyTokens),
+                                    scale);
+            NDArray result =
+                    canonicalResult.reshape(
+                            shapeWithTrailing(
+                                    leadingDimensions, heads, queryTokens, valueFeatures));
+            outputManager.attachAll(result);
+            return result;
+        }
     }
 
     /**
@@ -60,22 +165,25 @@ public final class NDArrays {
      * <p>Packed key/value tensors store all head keys followed by all head values in the last
      * dimension. Its width is {@code heads * (keyFeatures + valueFeatures)}. Positive auxiliary
      * indices are one-based shared-token indices and zero denotes padding. The engine automatically
-     * selects a supported fused inference implementation and otherwise uses the differentiable
-     * portable decomposition.
+     * selects a fused implementation only when automatic differentiation is not required and
+     * otherwise uses a differentiable implementation with the same semantics.
      *
-     * @param query query tensor shaped {@code [query, heads, keyFeatures]}
-     * @param sharedKeyValues packed shared data shaped {@code [group, sharedTokens, packedWidth]}
-     * @param sharedDeltas query-specific shared-token deltas shaped {@code [query, sharedTokens,
+     * <p>All query-leading and group-leading dimensions are flattened in row-major order at the
+     * engine boundary. Existing canonical rank-three inputs reach a native implementation
+     * unchanged.
+     *
+     * @param query query tensor shaped {@code [queryDimensions..., heads, keyFeatures]}
+     * @param sharedKeyValues packed shared data shaped {@code [groupDimensions..., sharedTokens,
      *     packedWidth]}
-     * @param indexedDeltas query-specific indexed-token deltas shaped {@code [query, indexedTokens,
+     * @param sharedDeltas query-specific deltas shaped {@code [queryDimensions..., sharedTokens,
      *     packedWidth]}
-     * @param indexedSharedIds one-based shared-token indices shaped {@code [query, indexedTokens]};
-     *     zero denotes padding
-     * @param queriesPerGroup consecutive query count sharing one group; {@code query} must equal
-     *     {@code group * queriesPerGroup}
+     * @param indexedDeltas auxiliary-token deltas shaped {@code [queryDimensions..., indexedTokens,
+     *     packedWidth]}
+     * @param indexedSharedIds one-based shared-token indices shaped {@code [queryDimensions...,
+     *     indexedTokens]}; zero denotes padding
+     * @param queriesPerGroup consecutive flattened query count sharing one flattened group
      * @param scale score scale
-     * @param training whether gradients must be preserved
-     * @return attended values shaped {@code [query, heads, valueFeatures]}
+     * @return attended values shaped {@code [queryDimensions..., heads, valueFeatures]}
      */
     public static NDArray groupedIndexedScaledDotProductAttention(
             NDArray query,
@@ -84,17 +192,81 @@ public final class NDArrays {
             NDArray indexedDeltas,
             NDArray indexedSharedIds,
             long queriesPerGroup,
-            double scale,
-            boolean training) {
-        return query.getNDArrayInternal()
-                .groupedIndexedScaledDotProductAttention(
-                        sharedKeyValues,
-                        sharedDeltas,
-                        indexedDeltas,
-                        indexedSharedIds,
-                        queriesPerGroup,
-                        scale,
-                        training);
+            double scale) {
+        Shape queryShape = query.getShape();
+        Shape sharedShape = sharedKeyValues.getShape();
+        if (queryShape.dimension() < 3 || sharedShape.dimension() < 3) {
+            throw new IllegalArgumentException(
+                    "query and shared key/value data must have rank of at least three");
+        }
+        if (queryShape.dimension() == 3
+                && sharedShape.dimension() == 3
+                && sharedDeltas.getShape().dimension() == 3
+                && indexedDeltas.getShape().dimension() == 3
+                && indexedSharedIds.getShape().dimension() == 2) {
+            return query.getNDArrayInternal()
+                    .canonicalGroupedIndexedScaledDotProductAttention(
+                            sharedKeyValues,
+                            sharedDeltas,
+                            indexedDeltas,
+                            indexedSharedIds,
+                            queriesPerGroup,
+                            scale);
+        }
+
+        long[] queryDimensions = leadingDimensions(queryShape, 2);
+        long[] groupDimensions = leadingDimensions(sharedShape, 2);
+        long queryCount = elementCount(queryDimensions);
+        long groupCount = elementCount(groupDimensions);
+        long heads = queryShape.get(queryShape.dimension() - 2);
+        long keyFeatures = queryShape.get(queryShape.dimension() - 1);
+        long sharedTokens = sharedShape.get(sharedShape.dimension() - 2);
+        long packedWidth = sharedShape.get(sharedShape.dimension() - 1);
+        Shape sharedDeltaShape = sharedDeltas.getShape();
+        Shape indexedDeltaShape = indexedDeltas.getShape();
+        Shape indexedIdShape = indexedSharedIds.getShape();
+        if (!sharedDeltaShape.equals(shapeWithTrailing(queryDimensions, sharedTokens, packedWidth))
+                || indexedDeltaShape.dimension() != queryDimensions.length + 2
+                || indexedIdShape.dimension() != queryDimensions.length + 1
+                || !Arrays.equals(queryDimensions, leadingDimensions(indexedDeltaShape, 2))
+                || !Arrays.equals(queryDimensions, leadingDimensions(indexedIdShape, 1))) {
+            throw new IllegalArgumentException(
+                    "query-specific tensors must preserve the query leading dimensions");
+        }
+        long indexedTokens = indexedDeltaShape.get(indexedDeltaShape.dimension() - 2);
+        if (indexedDeltaShape.get(indexedDeltaShape.dimension() - 1) != packedWidth
+                || indexedIdShape.get(indexedIdShape.dimension() - 1) != indexedTokens
+                || queriesPerGroup <= 0
+                || queryCount != groupCount * queriesPerGroup) {
+            throw new IllegalArgumentException("grouped indexed attention shapes are incompatible");
+        }
+        long keyWidth = heads * keyFeatures;
+        if (heads <= 0 || packedWidth <= keyWidth || (packedWidth - keyWidth) % heads != 0) {
+            throw new IllegalArgumentException(
+                    "packed shared features must contain per-head keys followed by values");
+        }
+        long valueFeatures = (packedWidth - keyWidth) / heads;
+
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(
+                    query, sharedKeyValues, sharedDeltas, indexedDeltas, indexedSharedIds);
+            NDArray canonicalResult =
+                    query.reshape(queryCount, heads, keyFeatures)
+                            .getNDArrayInternal()
+                            .canonicalGroupedIndexedScaledDotProductAttention(
+                                    sharedKeyValues.reshape(groupCount, sharedTokens, packedWidth),
+                                    sharedDeltas.reshape(queryCount, sharedTokens, packedWidth),
+                                    indexedDeltas.reshape(queryCount, indexedTokens, packedWidth),
+                                    indexedSharedIds.reshape(queryCount, indexedTokens),
+                                    queriesPerGroup,
+                                    scale);
+            NDArray result =
+                    canonicalResult.reshape(
+                            shapeWithTrailing(queryDimensions, heads, valueFeatures));
+            outputManager.attachAll(result);
+            return result;
+        }
     }
 
     /**
@@ -110,9 +282,119 @@ public final class NDArrays {
      * @param eps normalization epsilon
      * @return normalized updated residual
      */
-    public static NDArray residualAddLayerNormInPlace(
+    public static NDArray addToOwnedResidualAndLayerNorm(
             NDArray residual, NDArray update, NDArray weight, NDArray bias, float eps) {
-        return residual.getNDArrayInternal().residualAddLayerNormInPlace(update, weight, bias, eps);
+        return residual.getNDArrayInternal()
+                .addToOwnedResidualAndLayerNorm(update, weight, bias, eps);
+    }
+
+    private static NDArray canonicalRelationKeys(
+            NDArray relationKeys,
+            long[] leadingDimensions,
+            long batch,
+            long heads,
+            long keyFeatures) {
+        Shape shape = relationKeys.getShape();
+        int rank = shape.dimension();
+        if (rank < 3
+                || shape.get(rank - 2) != keyFeatures
+                || (shape.get(rank - 3) != 1 && shape.get(rank - 3) != heads)) {
+            throw new IllegalArgumentException("relation-key shape is incompatible with the query");
+        }
+        long relations = shape.get(rank - 1);
+        if (rank == 3) {
+            return relationKeys.reshape(1, shape.get(0), keyFeatures, relations);
+        }
+        if (rank == 4 && (shape.get(0) == 1 || shape.get(0) == batch)) {
+            return relationKeys;
+        }
+        if (rank == leadingDimensions.length + 3
+                && Arrays.equals(leadingDimensions, leadingDimensions(shape, 3))) {
+            return relationKeys.reshape(batch, shape.get(rank - 3), keyFeatures, relations);
+        }
+        throw new IllegalArgumentException(
+                "relation keys must be globally shared or preserve the query leading dimensions");
+    }
+
+    private static NDArray canonicalRelationBias(
+            NDArray relationBias,
+            long[] leadingDimensions,
+            long batch,
+            long heads,
+            long queryTokens,
+            long keyTokens) {
+        Shape shape = relationBias.getShape();
+        int rank = shape.dimension();
+        if (rank <= 4) {
+            return relationBias;
+        }
+        if (rank != leadingDimensions.length + 3
+                || !Arrays.equals(leadingDimensions, leadingDimensions(shape, 3))
+                || !broadcastsTo(shape.get(rank - 3), heads)
+                || !broadcastsTo(shape.get(rank - 2), queryTokens)
+                || !broadcastsTo(shape.get(rank - 1), keyTokens)) {
+            throw new IllegalArgumentException(
+                    "relation bias must be shared or preserve the query leading dimensions");
+        }
+        return relationBias.reshape(
+                batch, shape.get(rank - 3), shape.get(rank - 2), shape.get(rank - 1));
+    }
+
+    private static NDArray canonicalRelationIds(
+            NDArray relationIds,
+            long[] leadingDimensions,
+            long batch,
+            long queryTokens,
+            long keyTokens) {
+        Shape shape = relationIds.getShape();
+        int rank = shape.dimension();
+        if (rank == 2 && shape.get(0) == queryTokens && shape.get(1) == keyTokens) {
+            return relationIds;
+        }
+        if (rank == 3
+                && shape.get(0) == 1
+                && shape.get(1) == queryTokens
+                && shape.get(2) == keyTokens) {
+            return relationIds.reshape(queryTokens, keyTokens);
+        }
+        if (rank == leadingDimensions.length + 2
+                && Arrays.equals(leadingDimensions, leadingDimensions(shape, 2))
+                && shape.get(rank - 2) == queryTokens
+                && shape.get(rank - 1) == keyTokens) {
+            return relationIds.reshape(batch, queryTokens, keyTokens);
+        }
+        throw new IllegalArgumentException(
+                "relation IDs must be shared or preserve the query leading dimensions");
+    }
+
+    private static long[] leadingDimensions(Shape shape, int trailingDimensions) {
+        long[] dimensions = shape.getShape();
+        return Arrays.copyOf(dimensions, dimensions.length - trailingDimensions);
+    }
+
+    private static long elementCount(long[] dimensions) {
+        long count = 1;
+        for (long dimension : dimensions) {
+            count *= dimension;
+        }
+        return count;
+    }
+
+    private static Shape shapeWithTrailing(long[] leadingDimensions, long... trailingDimensions) {
+        long[] dimensions =
+                Arrays.copyOf(
+                        leadingDimensions, leadingDimensions.length + trailingDimensions.length);
+        System.arraycopy(
+                trailingDimensions,
+                0,
+                dimensions,
+                leadingDimensions.length,
+                trailingDimensions.length);
+        return new Shape(dimensions);
+    }
+
+    private static boolean broadcastsTo(long source, long target) {
+        return source == 1 || source == target;
     }
 
     private static void checkInputs(NDArray[] arrays) {

@@ -693,6 +693,27 @@ public final class JniUtils {
                         ndArray.getHandle(), index.getHandle(), value.getHandle(), axis));
     }
 
+    /** Selects leading-axis rows with a one-dimensional index tensor. */
+    public static PtNDArray gatherRows(PtNDArray rows, PtNDArray rowIndices) {
+        if (rowIndices.getDataType() != DataType.INT64) {
+            rowIndices = rowIndices.toType(DataType.INT64, true);
+        }
+        return new PtNDArray(
+                rows.getManager(),
+                PyTorchLibrary.LIB.torchGatherRows(rows.getHandle(), rowIndices.getHandle()));
+    }
+
+    /** Places leading-axis rows into a zero-initialized dense tensor. */
+    public static PtNDArray scatterRows(PtNDArray rows, PtNDArray rowIndices, long rowCount) {
+        if (rowIndices.getDataType() != DataType.INT64) {
+            rowIndices = rowIndices.toType(DataType.INT64, true);
+        }
+        return new PtNDArray(
+                rows.getManager(),
+                PyTorchLibrary.LIB.torchScatterRows(
+                        rows.getHandle(), rowIndices.getHandle(), rowCount));
+    }
+
     /** Returns {@code ndArray.index_add(axis, index, value)} without mutating the input tensor. */
     public static PtNDArray indexAdd(
             PtNDArray ndArray, PtNDArray index, PtNDArray value, int axis) {
@@ -815,7 +836,8 @@ public final class JniUtils {
             PtNDArray value,
             PtNDArray attnMask,
             double dropoutP,
-            boolean isCausal) {
+            boolean isCausal,
+            double scale) {
         long maskHandle = attnMask == null ? 0L : attnMask.getHandle();
         return new PtNDArray(
                 query.getManager(),
@@ -825,7 +847,8 @@ public final class JniUtils {
                         value.getHandle(),
                         maskHandle,
                         dropoutP,
-                        isCausal));
+                        isCausal,
+                        scale));
     }
 
     /** Gathers relation logits into a pairwise additive attention bias. */
@@ -881,11 +904,11 @@ public final class JniUtils {
      * <p>The residual remains the unnormalized sum so the following residual branch observes the
      * same value as the ordinary {@code addi} followed by LayerNorm path.
      */
-    public static PtNDArray residualAddLayerNormInPlace(
+    public static PtNDArray addToOwnedResidualAndLayerNorm(
             PtNDArray residual, PtNDArray update, PtNDArray weight, PtNDArray bias, float epsilon) {
         return new PtNDArray(
                 residual.getManager(),
-                PyTorchLibrary.LIB.torchResidualAddLayerNormInPlace(
+                PyTorchLibrary.LIB.torchAddToOwnedResidualAndLayerNorm(
                         residual.getHandle(),
                         update.getHandle(),
                         weight.getHandle(),

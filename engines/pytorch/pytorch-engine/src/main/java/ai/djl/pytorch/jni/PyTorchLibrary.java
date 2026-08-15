@@ -250,7 +250,13 @@ final class PyTorchLibrary {
     native long torchLogSoftmax(long handle, long dim, int dType);
 
     native long torchScaledDotProductAttention(
-            long query, long key, long value, long mask, double dropoutP, boolean isCausal);
+            long query,
+            long key,
+            long value,
+            long mask,
+            double dropoutP,
+            boolean isCausal,
+            double scale);
 
     native long torchIndexedRelationBias(
             long relationLogits, long relationBias, long relationIds, float scale);
@@ -264,7 +270,7 @@ final class PyTorchLibrary {
             long queriesPerGroup,
             float scale);
 
-    native long torchResidualAddLayerNormInPlace(
+    native long torchAddToOwnedResidualAndLayerNorm(
             long residual, long update, long weight, long bias, float epsilon);
 
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
@@ -343,6 +349,10 @@ final class PyTorchLibrary {
     native long torchPut(long handle, long index, long value);
 
     native long torchScatter(long handle, long index, long value, int axis);
+
+    native long torchGatherRows(long handle, long index);
+
+    native long torchScatterRows(long handle, long index, long rowCount);
 
     native long torchIndexAdd(long handle, long index, long value, int axis);
 

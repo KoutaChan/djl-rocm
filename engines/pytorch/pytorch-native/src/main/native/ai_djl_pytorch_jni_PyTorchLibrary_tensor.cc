@@ -401,6 +401,30 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatter(
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGatherRows(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* index_ptr = reinterpret_cast<torch::Tensor*>(jindex_handle);
+  const auto* result_ptr = new torch::Tensor(tensor_ptr->index_select(0, index_ptr->reshape({-1})));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatterRows(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle, jlong jrow_count) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* index_ptr = reinterpret_cast<torch::Tensor*>(jindex_handle);
+  auto output_shape = tensor_ptr->sizes().vec();
+  output_shape[0] = jrow_count;
+  auto result = torch::zeros(output_shape, tensor_ptr->options())
+                    .index_copy(0, index_ptr->reshape({-1}), *tensor_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIndexAdd(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle, jlong jdata_handle, jint jaxis) {
   API_BEGIN()
