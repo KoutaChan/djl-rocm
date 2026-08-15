@@ -90,7 +90,9 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
     if(NOT DEFINED CMAKE_HIP_FLAGS_MINSIZEREL OR CMAKE_HIP_FLAGS_MINSIZEREL STREQUAL "")
         set(CMAKE_HIP_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "HIP MinSizeRel flags" FORCE)
     endif()
-    list(APPEND SOURCE_FILES "src/main/native/djl_pytorch_rocm_kernels.hip")
+    list(APPEND SOURCE_FILES
+        "src/main/native/djl_pytorch_rocm_kernels.hip"
+        "src/main/native/djl_pytorch_rocm_launch_config.cc")
     set_source_files_properties(
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         PROPERTIES LANGUAGE HIP)

@@ -34,8 +34,11 @@ torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
 torch::Tensor scatter_rows_backward(
     const torch::Tensor& gradient_output, const torch::Tensor& row_indices);
 
-bool supports_indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
+bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids);
+
+bool supports_indexed_relation_bias_logit_gradient(const torch::Tensor& relation_logits,
+    const torch::Tensor& relation_bias, const torch::Tensor& relation_ids);
 
 torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids, float scale);
@@ -43,9 +46,13 @@ torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits
 torch::Tensor indexed_relation_bias_logit_gradient(const torch::Tensor& gradient_output,
     const torch::Tensor& relation_ids, at::IntArrayRef relation_logits_shape, float scale);
 
-bool supports_grouped_indexed_attention(const torch::Tensor& query,
+bool supports_grouped_indexed_attention_forward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group);
+
+bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
+    const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, bool needs_shared_gradient);
 
 struct GroupedIndexedAttentionForwardResult {
   torch::Tensor output;

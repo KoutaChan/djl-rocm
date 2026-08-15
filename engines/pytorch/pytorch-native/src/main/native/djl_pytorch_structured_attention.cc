@@ -172,8 +172,12 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
 torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids, double scale) {
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_indexed_relation_bias(relation_logits, relation_bias, relation_ids)) {
-    if (requires_autograd({&relation_logits, &relation_bias})) {
+  const bool needs_autograd = requires_autograd({&relation_logits, &relation_bias});
+  const bool needs_logit_gradient = needs_autograd && relation_logits.requires_grad();
+  if (rocm::supports_indexed_relation_bias_forward(relation_logits, relation_bias, relation_ids) &&
+      (!needs_logit_gradient ||
+          rocm::supports_indexed_relation_bias_logit_gradient(relation_logits, relation_bias, relation_ids))) {
+    if (needs_autograd) {
       return IndexedRelationBiasFunction::apply(relation_logits, relation_bias, relation_ids, scale);
     }
     return rocm::indexed_relation_bias_forward(
@@ -187,9 +191,13 @@ torch::Tensor grouped_indexed_attention(const torch::Tensor& query, const torch:
     const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, double scale) {
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_grouped_indexed_attention(
-          query, shared_key_values, shared_deltas, indexed_deltas, indexed_shared_ids, queries_per_group)) {
-    if (requires_autograd({&query, &shared_key_values, &shared_deltas, &indexed_deltas})) {
+  const bool needs_autograd = requires_autograd({&query, &shared_key_values, &shared_deltas, &indexed_deltas});
+  if (rocm::supports_grouped_indexed_attention_forward(
+          query, shared_key_values, shared_deltas, indexed_deltas, indexed_shared_ids, queries_per_group) &&
+      (!needs_autograd || rocm::supports_grouped_indexed_attention_backward(query, shared_key_values,
+          shared_deltas, indexed_deltas, indexed_shared_ids, queries_per_group,
+          shared_key_values.requires_grad()))) {
+    if (needs_autograd) {
       return GroupedIndexedAttentionFunction::apply(query, shared_key_values, shared_deltas, indexed_deltas,
           indexed_shared_ids, queries_per_group, scale);
     }

@@ -217,6 +217,33 @@ installed on your GPU machine, you can use one of the following library:
 </dependency>
 ```
 
+### ROCm kernel launch tuning
+
+DJL chooses conservative launch defaults for its native ROCm structured-attention, masked-categorical,
+optimizer, normalization, and row-operation kernels. Advanced deployments can override these defaults with
+environment variables before the first native ROCm operation. These settings control launch geometry, not
+operator selection or shape thresholds. The configuration is loaded once per process; CPU and CUDA execution
+are unaffected.
+
+| Environment variable | Default | Constraint |
+| --- | ---: | --- |
+| `DJL_ROCM_RELATION_FORWARD_WAVES_PER_BLOCK` | 4 | Positive; must fit the device block limit |
+| `DJL_ROCM_RELATION_BACKWARD_WAVES_PER_BLOCK` | 4 | Positive; must fit the device block limit |
+| `DJL_ROCM_RELATION_FORWARD_QUERIES_PER_WAVE` | 4 | One of 1, 2, 4, 8, 16, 32 |
+| `DJL_ROCM_RELATION_BACKWARD_QUERIES_PER_WAVE` | 16 | One of 1, 2, 4, 8, 16, 32 |
+| `DJL_ROCM_GROUPED_ATTENTION_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
+| `DJL_ROCM_GROUPED_ATTENTION_BACKWARD_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
+| `DJL_ROCM_SHARED_GRADIENT_THREADS_PER_BLOCK` | 256 | Positive; must fit the device block limit |
+| `DJL_ROCM_SHARED_GRADIENT_FEATURE_TILE` | 8 | One of 1, 2, 4, 8, 16, 32 |
+| `DJL_ROCM_RESIDUAL_NORM_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
+| `DJL_ROCM_OPTIMIZER_THREADS_PER_BLOCK` | 256 | Positive; must fit the device block limit |
+| `DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
+| `DJL_ROCM_ROW_OPERATION_THREADS_PER_BLOCK` | 256 | Positive; must fit the device block limit |
+
+The complete configuration is validated when a native ROCm kernel first loads it, so any invalid override fails
+fast. DJL does not perform runtime autotuning or shape-dependent performance dispatch; benchmark overrides on
+the target GPU before adopting them.
+
 ### For aarch64 build
 
 - ai.djl.pytorch:pytorch-jni:2.7.1-0.36.0
