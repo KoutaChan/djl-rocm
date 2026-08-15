@@ -25,9 +25,6 @@
 namespace djl::pytorch {
 namespace {
 
-// The single HIP kernel wins on small bias maps; ATen gather scales better for larger no-grad maps.
-constexpr int64_t kIndexedRelationBiasForwardFusionElementLimit = 2 * 1024 * 1024;
-
 bool requires_autograd(std::initializer_list<const torch::Tensor*> tensors) {
   if (!at::GradMode::is_enabled()) {
     return false;
@@ -35,13 +32,6 @@ bool requires_autograd(std::initializer_list<const torch::Tensor*> tensors) {
   return std::any_of(tensors.begin(), tensors.end(), [](const torch::Tensor* tensor) {
     return tensor != nullptr && tensor->requires_grad();
   });
-}
-
-bool should_fuse_indexed_relation_bias_forward(
-    const torch::Tensor& relation_logits, const torch::Tensor& relation_ids) {
-  const int64_t output_elements = relation_logits.size(0) * relation_logits.size(1) * relation_logits.size(2) *
-                                  relation_ids.size(-1);
-  return output_elements <= kIndexedRelationBiasForwardFusionElementLimit;
 }
 
 torch::Tensor indexed_relation_bias_reference(const torch::Tensor& relation_logits,
@@ -135,9 +125,13 @@ class IndexedRelationBiasFunction : public torch::autograd::Function<IndexedRela
     const auto relation_bias_shape = context->saved_data["relation_bias_shape"].toIntVector();
     const auto scale = context->saved_data["scale"].toDouble();
     const auto& gradient_output = gradient_outputs.at(0);
-    auto relation_logits_gradient = rocm::indexed_relation_bias_logit_gradient(
-        gradient_output, relation_ids, relation_logits_shape, static_cast<float>(scale));
-    auto relation_bias_gradient = gradient_output.sum_to_size(relation_bias_shape);
+    auto relation_logits_gradient =
+        context->needs_input_grad(0)
+            ? rocm::indexed_relation_bias_logit_gradient(
+                  gradient_output, relation_ids, relation_logits_shape, static_cast<float>(scale))
+            : torch::Tensor();
+    auto relation_bias_gradient =
+        context->needs_input_grad(1) ? gradient_output.sum_to_size(relation_bias_shape) : torch::Tensor();
     return {relation_logits_gradient, relation_bias_gradient, torch::Tensor(), torch::Tensor()};
   }
 };
@@ -163,7 +157,9 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
     const auto queries_per_group = context->saved_data["queries_per_group"].toInt();
     const auto scale = context->saved_data["scale"].toDouble();
     auto gradients = rocm::grouped_indexed_attention_backward(saved.at(0), saved.at(1), saved.at(2), saved.at(3),
-        saved.at(4), saved.at(5), gradient_outputs.at(0), queries_per_group, static_cast<float>(scale));
+        saved.at(4), saved.at(5), gradient_outputs.at(0), queries_per_group, static_cast<float>(scale),
+        context->needs_input_grad(0), context->needs_input_grad(1), context->needs_input_grad(2),
+        context->needs_input_grad(3));
     return {gradients.query, gradients.shared_key_values, gradients.shared_deltas, gradients.indexed_deltas,
         torch::Tensor(), torch::Tensor(), torch::Tensor()};
   }
@@ -176,14 +172,12 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
 torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids, double scale) {
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::can_use_indexed_relation_bias(relation_logits, relation_bias, relation_ids)) {
+  if (rocm::supports_indexed_relation_bias(relation_logits, relation_bias, relation_ids)) {
     if (requires_autograd({&relation_logits, &relation_bias})) {
       return IndexedRelationBiasFunction::apply(relation_logits, relation_bias, relation_ids, scale);
     }
-    if (should_fuse_indexed_relation_bias_forward(relation_logits, relation_ids)) {
-      return rocm::indexed_relation_bias_forward(
-          relation_logits, relation_bias, relation_ids, static_cast<float>(scale));
-    }
+    return rocm::indexed_relation_bias_forward(
+        relation_logits, relation_bias, relation_ids, static_cast<float>(scale));
   }
 #endif
   return indexed_relation_bias_reference(relation_logits, relation_bias, relation_ids, scale);
@@ -193,7 +187,7 @@ torch::Tensor grouped_indexed_attention(const torch::Tensor& query, const torch:
     const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, double scale) {
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::can_use_grouped_indexed_scaled_dot_product_attention(
+  if (rocm::supports_grouped_indexed_attention(
           query, shared_key_values, shared_deltas, indexed_deltas, indexed_shared_ids, queries_per_group)) {
     if (requires_autograd({&query, &shared_key_values, &shared_deltas, &indexed_deltas})) {
       return GroupedIndexedAttentionFunction::apply(query, shared_key_values, shared_deltas, indexed_deltas,

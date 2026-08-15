@@ -38,6 +38,19 @@ bool requires_autograd(std::initializer_list<const torch::Tensor*> tensors) {
   return false;
 }
 
+torch::Tensor scaled_dot_product_attention_preserving_mask_autograd(const torch::Tensor& query,
+    const torch::Tensor& key, const torch::Tensor& value, const std::optional<torch::Tensor>& mask,
+    double dropout, bool causal, const std::optional<double>& scale) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (at::GradMode::is_enabled() && mask.has_value() && mask->requires_grad() && !query.requires_grad() &&
+      !key.requires_grad() && !value.requires_grad()) {
+    return std::get<0>(
+        at::_scaled_dot_product_attention_math(query, key, value, mask, dropout, causal, std::nullopt, scale, false));
+  }
+#endif
+  return at::scaled_dot_product_attention(query, key, value, mask, dropout, causal, scale);
+}
+
 }  // namespace
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPad(
@@ -115,7 +128,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScaledDotPro
   }
   const std::optional<double> scale_opt =
       std::isnan(jscale) ? std::nullopt : std::optional<double>(static_cast<double>(jscale));
-  auto result = at::scaled_dot_product_attention(
+  auto result = scaled_dot_product_attention_preserving_mask_autograd(
       *q_ptr, *k_ptr, *v_ptr, mask_opt, static_cast<double>(jdropout), jcausal == JNI_TRUE, scale_opt);
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
@@ -196,7 +209,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchA
 
   torch::Tensor result;
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (djl::pytorch::rocm::can_use_owned_residual_layer_norm(
+  if (djl::pytorch::rocm::supports_owned_residual_layer_norm(
           *residual_ptr, *update_ptr, *weight_ptr, *bias_ptr)) {
     result = djl::pytorch::rocm::add_to_owned_residual_and_layer_norm(
         *residual_ptr, *update_ptr, *weight_ptr, *bias_ptr, static_cast<float>(jepsilon));

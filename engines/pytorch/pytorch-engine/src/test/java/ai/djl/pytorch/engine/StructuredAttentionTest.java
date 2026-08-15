@@ -147,6 +147,16 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void structuredAttentionHonorsPartialGradientRequests() {
+        Engine engine = Engine.getInstance();
+        verifyPartialGradientRequests(engine, Device.cpu(), DataType.FLOAT32);
+        if (engine.getGpuCount() > 0) {
+            verifyPartialGradientRequests(engine, Device.gpu(), DataType.BFLOAT16);
+            verifyLargeRelationBiasGradient(engine);
+        }
+    }
+
+    @Test
     public void ownedResidualLayerNormRejectsAutograd() {
         Engine engine = Engine.getInstance();
         try (NDManager manager = engine.newBaseManager()) {
@@ -364,6 +374,104 @@ public class StructuredAttentionTest {
             Engine engine, Device device, DataType dataType) {
         verifyRelationAttentionGradients(engine, device, dataType);
         verifyGroupedAttentionGradients(engine, device, dataType);
+    }
+
+    private static void verifyPartialGradientRequests(
+            Engine engine, Device device, DataType dataType) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray query = manager.randomNormal(new Shape(2, 2, 3, 4), dataType);
+            NDArray key = manager.randomNormal(new Shape(2, 2, 5, 4), dataType);
+            NDArray value = manager.randomNormal(new Shape(2, 2, 5, 3), dataType);
+            NDArray relationKeys = manager.randomNormal(new Shape(1, 2, 4, 7), dataType);
+            NDArray relationBias =
+                    requiringGradient(manager.randomNormal(new Shape(1, 2, 3, 5), dataType));
+            NDArray relationIds =
+                    manager.create(
+                            new int[] {0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0},
+                            new Shape(3, 5));
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.relationBiasedScaledDotProductAttention(
+                                query, key, value, relationKeys, relationBias, relationIds, 0.31);
+                collector.backward(output.mul(output).sum());
+            }
+
+            assertFiniteNonzeroGradient(relationBias);
+            Assert.assertFalse(query.hasGradient());
+            Assert.assertFalse(key.hasGradient());
+            Assert.assertFalse(value.hasGradient());
+            Assert.assertFalse(relationKeys.hasGradient());
+        }
+
+        try (NDManager manager = engine.newBaseManager(device)) {
+            int heads = 2;
+            int keyFeatures = 3;
+            int packedWidth = heads * (keyFeatures + 4);
+            NDArray query =
+                    requiringGradient(
+                            manager.randomNormal(new Shape(4, heads, keyFeatures), dataType));
+            NDArray shared = manager.randomNormal(new Shape(2, 5, packedWidth), dataType);
+            NDArray sharedDeltas = manager.randomNormal(new Shape(4, 5, packedWidth), dataType);
+            NDArray indexedDeltas = manager.randomNormal(new Shape(4, 3, packedWidth), dataType);
+            NDArray indexedIds =
+                    manager.create(new int[] {1, 2, 3, 2, 0, 4, 3, 4, 5, 4, 5, 1}, new Shape(4, 3));
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.groupedIndexedScaledDotProductAttention(
+                                query, shared, sharedDeltas, indexedDeltas, indexedIds, 2, 0.27);
+                collector.backward(output.mul(output).sum());
+            }
+
+            assertFiniteNonzeroGradient(query);
+            Assert.assertFalse(shared.hasGradient());
+            Assert.assertFalse(sharedDeltas.hasGradient());
+            Assert.assertFalse(indexedDeltas.hasGradient());
+        }
+    }
+
+    private static void verifyLargeRelationBiasGradient(Engine engine) {
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            int batch = 64;
+            int heads = 4;
+            int tokens = 34;
+            int features = 16;
+            int relations = 15;
+            NDArray query =
+                    manager.randomNormal(
+                            new Shape(batch, heads, tokens, features), DataType.BFLOAT16);
+            NDArray key =
+                    manager.randomNormal(
+                            new Shape(batch, heads, tokens, features), DataType.BFLOAT16);
+            NDArray value =
+                    manager.randomNormal(
+                            new Shape(batch, heads, tokens, features), DataType.BFLOAT16);
+            NDArray relationKeys =
+                    manager.randomNormal(
+                            new Shape(1, heads, features, relations), DataType.BFLOAT16);
+            NDArray relationBias =
+                    requiringGradient(
+                            manager.randomNormal(
+                                    new Shape(1, heads, tokens, tokens), DataType.BFLOAT16));
+            int[] storedIds = new int[tokens * tokens];
+            for (int index = 0; index < storedIds.length; ++index) {
+                storedIds[index] = index % relations;
+            }
+            NDArray relationIds = manager.create(storedIds, new Shape(tokens, tokens));
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.relationBiasedScaledDotProductAttention(
+                                query,
+                                key,
+                                value,
+                                relationKeys,
+                                relationBias,
+                                relationIds,
+                                1.0 / Math.sqrt(features));
+                collector.backward(output.sum());
+            }
+
+            assertFiniteNonzeroGradient(relationBias);
+        }
     }
 
     private static void verifyRelationAttentionGradients(

@@ -5,7 +5,7 @@
 
 namespace djl::pytorch::rocm {
 
-bool can_use_indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
+bool supports_indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids);
 
 torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
@@ -14,7 +14,7 @@ torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits
 torch::Tensor indexed_relation_bias_logit_gradient(const torch::Tensor& gradient_output,
     const torch::Tensor& relation_ids, at::IntArrayRef relation_logits_shape, float scale);
 
-bool can_use_grouped_indexed_scaled_dot_product_attention(const torch::Tensor& query,
+bool supports_grouped_indexed_attention(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group);
 
@@ -37,9 +37,10 @@ struct GroupedIndexedAttentionGradients {
 GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, const torch::Tensor& log_sum_exp,
-    const torch::Tensor& gradient_output, int64_t queries_per_group, float scale);
+    const torch::Tensor& gradient_output, int64_t queries_per_group, float scale, bool needs_query_gradient,
+    bool needs_shared_gradient, bool needs_shared_delta_gradient, bool needs_indexed_delta_gradient);
 
-bool can_use_owned_residual_layer_norm(const torch::Tensor& residual, const torch::Tensor& update,
+bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const torch::Tensor& update,
     const torch::Tensor& weight, const torch::Tensor& bias);
 
 torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, const torch::Tensor& update,
