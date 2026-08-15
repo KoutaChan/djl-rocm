@@ -15,28 +15,28 @@ package ai.djl.pytorch.engine;
 import ai.djl.Device;
 import ai.djl.pytorch.jni.JniUtils;
 
-/** A fixed-shape PyTorch accelerator graph that can replay a captured inference workload. */
-public final class PtInferenceGraph implements AutoCloseable {
+/** A reusable fixed-shape CUDA or ROCm execution graph. */
+public final class PtAcceleratorGraph implements AutoCloseable {
 
     private long handle;
 
-    PtInferenceGraph(Device device) {
-        handle = JniUtils.createInferenceGraph(device);
+    PtAcceleratorGraph(Device device) {
+        handle = JniUtils.createAcceleratorGraph(device);
     }
 
     /** Starts capture on the graph's private accelerator stream. */
     public void beginCapture() {
-        JniUtils.beginInferenceGraphCapture(handle);
+        JniUtils.beginAcceleratorGraphCapture(handle);
     }
 
     /** Ends capture and instantiates the executable graph. */
     public void endCapture() {
-        JniUtils.endInferenceGraphCapture(handle);
+        JniUtils.endAcceleratorGraphCapture(handle);
     }
 
     /** Replays the captured workload and orders its output before the caller's current stream. */
     public void replay() {
-        JniUtils.replayInferenceGraph(handle);
+        JniUtils.replayAcceleratorGraph(handle);
     }
 
     /** Releases the native graph and its private memory pool. */
@@ -45,7 +45,7 @@ public final class PtInferenceGraph implements AutoCloseable {
         long nativeHandle = handle;
         if (nativeHandle != 0) {
             handle = 0;
-            JniUtils.deleteInferenceGraph(nativeHandle);
+            JniUtils.deleteAcceleratorGraph(nativeHandle);
         }
     }
 }

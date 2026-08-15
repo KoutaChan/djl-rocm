@@ -22,7 +22,7 @@ namespace accel {
 
 struct CopyEvent;
 struct HostBuffer;
-struct InferenceGraph;
+struct AcceleratorGraph;
 struct StreamScope;
 
 bool IsAvailable();
@@ -45,11 +45,11 @@ StreamScope* NewStreamScope();
 StreamScope* NewStreamScope(c10::Device device);
 void DeleteStreamScope(StreamScope* scope);
 
-InferenceGraph* NewInferenceGraph(c10::Device device);
-void BeginInferenceGraphCapture(InferenceGraph* graph);
-void EndInferenceGraphCapture(InferenceGraph* graph);
-void ReplayInferenceGraph(InferenceGraph* graph);
-void DeleteInferenceGraph(InferenceGraph* graph);
+AcceleratorGraph* NewAcceleratorGraph(c10::Device device);
+void BeginAcceleratorGraphCapture(AcceleratorGraph* graph);
+void EndAcceleratorGraphCapture(AcceleratorGraph* graph);
+void ReplayAcceleratorGraph(AcceleratorGraph* graph);
+void DeleteAcceleratorGraph(AcceleratorGraph* graph);
 
 void EmptyCache();
 

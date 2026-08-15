@@ -5,6 +5,35 @@
 
 namespace djl::pytorch::rocm {
 
+bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor& gradient,
+    const torch::Tensor& mean, const torch::Tensor& variance);
+
+void fused_adam_update(torch::Tensor& weight, const torch::Tensor& gradient, torch::Tensor& mean,
+    torch::Tensor& variance, float learning_rate, float learning_rate_bias_correction, float weight_decay,
+    float rescale_gradient, float clip_gradient, float beta1, float beta2, float epsilon, bool adamw);
+
+bool supports_masked_categorical(
+    const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis);
+
+bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices);
+
+torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::Tensor& mask);
+
+torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& probabilities, const torch::Tensor& mask,
+    torch::ScalarType input_type);
+
+torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torch::Tensor& mask);
+
+torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& normalizers);
+
+torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
+    const torch::Tensor& row_indices, const torch::Tensor& output);
+
+torch::Tensor scatter_rows_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& row_indices);
+
 bool supports_indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids);
 

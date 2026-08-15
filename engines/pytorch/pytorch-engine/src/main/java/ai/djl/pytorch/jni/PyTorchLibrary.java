@@ -36,15 +36,15 @@ final class PyTorchLibrary {
 
     native void torchCloseStreamScope(long handle);
 
-    native long torchCreateInferenceGraph(int[] device);
+    native long torchCreateAcceleratorGraph(int[] device);
 
-    native void torchBeginInferenceGraphCapture(long handle);
+    native void torchBeginAcceleratorGraphCapture(long handle);
 
-    native void torchEndInferenceGraphCapture(long handle);
+    native void torchEndAcceleratorGraphCapture(long handle);
 
-    native void torchReplayInferenceGraph(long handle);
+    native void torchReplayAcceleratorGraph(long handle);
 
-    native void torchDeleteInferenceGraph(long handle);
+    native void torchDeleteAcceleratorGraph(long handle);
 
     native boolean torchAutocastIsEnabled(int deviceType);
 
@@ -248,6 +248,10 @@ final class PyTorchLibrary {
     native long torchSoftmax(long handle, long dim, int dType);
 
     native long torchLogSoftmax(long handle, long dim, int dType);
+
+    native long torchMaskedSoftmax(long logits, long mask, long axis);
+
+    native long torchMaskedLogSumExp(long logits, long mask, long axis);
 
     native long torchScaledDotProductAttention(
             long query,

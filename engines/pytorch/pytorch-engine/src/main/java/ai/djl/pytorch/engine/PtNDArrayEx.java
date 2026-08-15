@@ -60,6 +60,20 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray maskedSoftmax(NDArray mask, int axis) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.maskedSoftmax(array, manager.from(mask), axis);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray maskedLogSumExp(NDArray mask, int axis) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.maskedLogSumExp(array, manager.from(mask), axis);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public PtNDArray rdivi(NDArray b) {
         throw new UnsupportedOperationException("Not implemented");
     }

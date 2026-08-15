@@ -13,6 +13,7 @@
 package ai.djl.ndarray.internal;
 
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.index.NDArrayIndexer;
@@ -70,6 +71,48 @@ public interface NDArrayEx {
                 .zeros(new Shape(rowCount, rowWidth), rows.getDataType())
                 .scatter(scatterIndices, rows.reshape(inputRows, rowWidth), 0)
                 .reshape(new Shape(outputShape));
+    }
+
+    /** Returns float32 probabilities normalized over nonzero mask entries. */
+    default NDArray maskedSoftmax(NDArray mask, int axis) {
+        NDArray logits = getArray().toType(DataType.FLOAT32, false);
+        NDArray floatMask =
+                mask.neq(0)
+                        .toType(DataType.FLOAT32, false)
+                        .broadcast(logits.getShape())
+                        .stopGradient();
+        NDArray masked = logits.add(floatMask.neg().add(1.0f).mul(-1.0e30f));
+        return NDArrays.where(floatMask, masked.softmax(axis), logits.zerosLike());
+    }
+
+    /** Returns the float32 log normalizer over nonzero mask entries, retaining the reduced axis. */
+    default NDArray maskedLogSumExp(NDArray mask, int axis) {
+        NDArray logits = getArray().toType(DataType.FLOAT32, false);
+        int normalizedAxis = axis < 0 ? axis + logits.getShape().dimension() : axis;
+        long[] reducedShape = logits.getShape().getShape().clone();
+        reducedShape[normalizedAxis] = 1;
+        NDArray floatMask =
+                mask.neq(0)
+                        .toType(DataType.FLOAT32, false)
+                        .broadcast(logits.getShape())
+                        .stopGradient();
+        NDArray masked = logits.add(floatMask.neg().add(1.0f).mul(-1.0e30f));
+        NDArray maximum = masked.max(new int[] {normalizedAxis}).reshape(new Shape(reducedShape));
+        NDArray sum =
+                masked.sub(maximum)
+                        .exp()
+                        .mul(floatMask)
+                        .sum(new int[] {normalizedAxis})
+                        .reshape(new Shape(reducedShape))
+                        .maximum(1.0e-30f);
+        NDArray present =
+                floatMask
+                        .sum(new int[] {normalizedAxis})
+                        .reshape(new Shape(reducedShape))
+                        .gt(0.5f)
+                        .toType(DataType.FLOAT32, false)
+                        .stopGradient();
+        return sum.log().add(maximum).mul(present);
     }
 
     /**

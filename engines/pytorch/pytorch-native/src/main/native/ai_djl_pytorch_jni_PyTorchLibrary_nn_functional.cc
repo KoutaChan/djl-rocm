@@ -18,6 +18,7 @@
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_jni_exception.h"
+#include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_structured_attention.h"
 #include "djl_pytorch_utils.h"
@@ -188,6 +189,26 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchG
       *indexed_deltas_ptr, *indexed_shared_ids_ptr, queries_per_group, static_cast<double>(jscale));
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedSoftmax(
+    JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
+  API_BEGIN()
+  const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto* result = new torch::Tensor(djl::pytorch::masked_softmax(logits, mask, jaxis));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedLogSumExp(
+    JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
+  API_BEGIN()
+  const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto* result = new torch::Tensor(djl::pytorch::masked_log_sum_exp(logits, mask, jaxis));
+  return reinterpret_cast<uintptr_t>(result);
   API_END_RETURN()
 }
 

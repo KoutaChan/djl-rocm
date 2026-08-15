@@ -12,8 +12,10 @@
  */
 #include "djl_pytorch_accelerator.h"
 
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(DJL_USE_ROCM_KERNELS)
 #include <ATen/hip/HIPGraph.h>
+#elif defined(DJL_USE_ACCELERATOR_GRAPH)
+#include <ATen/cuda/CUDAGraph.h>
 #endif
 
 #if __has_include(<ATen/DeviceAccelerator.h>)
@@ -53,18 +55,18 @@ struct StreamScope {
   explicit StreamScope(c10::Stream stream) : stream(stream), guard(this->stream) {}
 };
 
-#if defined(DJL_USE_ROCM_KERNELS)
-struct InferenceGraph {
+#if defined(DJL_USE_ACCELERATOR_GRAPH)
+struct AcceleratorGraph {
   c10::Device device;
   c10::Stream stream;
   at::cuda::CUDAGraph graph;
   std::unique_ptr<c10::StreamGuard> capture_guard;
 
-  InferenceGraph(c10::Device device, c10::Stream stream)
+  AcceleratorGraph(c10::Device device, c10::Stream stream)
       : device(device), stream(stream), graph(false) {}
 };
 #else
-struct InferenceGraph {};
+struct AcceleratorGraph {};
 #endif
 
 std::optional<c10::DeviceType> GetAcceleratorType() {
@@ -228,19 +230,19 @@ void DeleteStreamScope(StreamScope* scope) {
   delete scope;
 }
 
-InferenceGraph* NewInferenceGraph(c10::Device device) {
-#if defined(DJL_USE_ROCM_KERNELS)
-  TORCH_CHECK(IsAcceleratorDevice(device), "inference graph requires an accelerator device");
+AcceleratorGraph* NewAcceleratorGraph(c10::Device device) {
+#if defined(DJL_USE_ACCELERATOR_GRAPH)
+  TORCH_CHECK(IsAcceleratorDevice(device), "accelerator graph requires an accelerator device");
   c10::DeviceGuard device_guard(device);
   c10::impl::VirtualGuardImpl guard_impl(device.type());
-  return new InferenceGraph(device, guard_impl.getStreamFromGlobalPool(device));
+  return new AcceleratorGraph(device, guard_impl.getStreamFromGlobalPool(device));
 #else
-  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+  TORCH_CHECK(false, "accelerator graph is unavailable in this build");
 #endif
 }
 
-void BeginInferenceGraphCapture(InferenceGraph* graph) {
-#if defined(DJL_USE_ROCM_KERNELS)
+void BeginAcceleratorGraphCapture(AcceleratorGraph* graph) {
+#if defined(DJL_USE_ACCELERATOR_GRAPH)
   c10::DeviceGuard device_guard(graph->device);
   c10::impl::VirtualGuardImpl guard_impl(graph->device.type());
   c10::Stream caller_stream = guard_impl.getStream(graph->device);
@@ -250,24 +252,28 @@ void BeginInferenceGraphCapture(InferenceGraph* graph) {
     ready.block(graph->stream);
   }
   graph->capture_guard = std::make_unique<c10::StreamGuard>(graph->stream);
+#if defined(DJL_USE_ROCM_KERNELS)
   graph->graph.capture_begin({0, 0}, hipStreamCaptureModeThreadLocal);
 #else
-  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+  graph->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
+#endif
+#else
+  TORCH_CHECK(false, "accelerator graph is unavailable in this build");
 #endif
 }
 
-void EndInferenceGraphCapture(InferenceGraph* graph) {
-#if defined(DJL_USE_ROCM_KERNELS)
+void EndAcceleratorGraphCapture(AcceleratorGraph* graph) {
+#if defined(DJL_USE_ACCELERATOR_GRAPH)
   c10::DeviceGuard device_guard(graph->device);
   graph->graph.capture_end();
   graph->capture_guard.reset();
 #else
-  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+  TORCH_CHECK(false, "accelerator graph is unavailable in this build");
 #endif
 }
 
-void ReplayInferenceGraph(InferenceGraph* graph) {
-#if defined(DJL_USE_ROCM_KERNELS)
+void ReplayAcceleratorGraph(AcceleratorGraph* graph) {
+#if defined(DJL_USE_ACCELERATOR_GRAPH)
   c10::DeviceGuard device_guard(graph->device);
   c10::impl::VirtualGuardImpl guard_impl(graph->device.type());
   c10::Stream caller_stream = guard_impl.getStream(graph->device);
@@ -286,12 +292,12 @@ void ReplayInferenceGraph(InferenceGraph* graph) {
     }
   }
 #else
-  TORCH_CHECK(false, "inference graph is only available in ROCm builds");
+  TORCH_CHECK(false, "accelerator graph is unavailable in this build");
 #endif
 }
 
-void DeleteInferenceGraph(InferenceGraph* graph) {
-#if defined(DJL_USE_ROCM_KERNELS)
+void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
+#if defined(DJL_USE_ACCELERATOR_GRAPH)
   if (graph != nullptr) {
     c10::DeviceGuard device_guard(graph->device);
     delete graph;

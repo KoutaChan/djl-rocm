@@ -118,25 +118,25 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchCloseStreamScope(handle);
     }
 
-    public static long createInferenceGraph(Device device) {
-        return PyTorchLibrary.LIB.torchCreateInferenceGraph(
+    public static long createAcceleratorGraph(Device device) {
+        return PyTorchLibrary.LIB.torchCreateAcceleratorGraph(
                 new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
     }
 
-    public static void beginInferenceGraphCapture(long handle) {
-        PyTorchLibrary.LIB.torchBeginInferenceGraphCapture(handle);
+    public static void beginAcceleratorGraphCapture(long handle) {
+        PyTorchLibrary.LIB.torchBeginAcceleratorGraphCapture(handle);
     }
 
-    public static void endInferenceGraphCapture(long handle) {
-        PyTorchLibrary.LIB.torchEndInferenceGraphCapture(handle);
+    public static void endAcceleratorGraphCapture(long handle) {
+        PyTorchLibrary.LIB.torchEndAcceleratorGraphCapture(handle);
     }
 
-    public static void replayInferenceGraph(long handle) {
-        PyTorchLibrary.LIB.torchReplayInferenceGraph(handle);
+    public static void replayAcceleratorGraph(long handle) {
+        PyTorchLibrary.LIB.torchReplayAcceleratorGraph(handle);
     }
 
-    public static void deleteInferenceGraph(long handle) {
-        PyTorchLibrary.LIB.torchDeleteInferenceGraph(handle);
+    public static void deleteAcceleratorGraph(long handle) {
+        PyTorchLibrary.LIB.torchDeleteAcceleratorGraph(handle);
     }
 
     // ------------------------------------------------------------------
@@ -828,6 +828,21 @@ public final class JniUtils {
         return new PtNDArray(
                 ndArray.getManager(),
                 PyTorchLibrary.LIB.torchSoftmax(ndArray.getHandle(), dim, dTpe.ordinal()));
+    }
+
+    /** Returns float32 probabilities normalized over legal mask entries. */
+    public static PtNDArray maskedSoftmax(PtNDArray logits, PtNDArray mask, long axis) {
+        return new PtNDArray(
+                logits.getManager(),
+                PyTorchLibrary.LIB.torchMaskedSoftmax(logits.getHandle(), mask.getHandle(), axis));
+    }
+
+    /** Returns the float32 log normalizer over legal mask entries. */
+    public static PtNDArray maskedLogSumExp(PtNDArray logits, PtNDArray mask, long axis) {
+        return new PtNDArray(
+                logits.getManager(),
+                PyTorchLibrary.LIB.torchMaskedLogSumExp(
+                        logits.getHandle(), mask.getHandle(), axis));
     }
 
     public static PtNDArray scaledDotProductAttention(

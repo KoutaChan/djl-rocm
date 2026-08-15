@@ -193,13 +193,13 @@ public final class PtEngine extends Engine {
     }
 
     /**
-     * Creates a reusable accelerator graph for a fixed-shape inference workload.
+     * Creates a reusable accelerator graph for a fixed-shape workload.
      *
      * @param device accelerator device on which capture and replay execute
-     * @return inference graph owned by the caller
+     * @return accelerator graph owned by the caller
      */
-    public PtInferenceGraph newInferenceGraph(Device device) {
-        return new PtInferenceGraph(device);
+    public PtAcceleratorGraph newAcceleratorGraph(Device device) {
+        return new PtAcceleratorGraph(device);
     }
 
     /** {@inheritDoc} */

@@ -15,6 +15,10 @@
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
 
+#if defined(DJL_USE_ROCM_KERNELS)
+#include "djl_pytorch_rocm_kernels.h"
+#endif
+
 // The file is the implementation for PyTorch training operations
 
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_adamUpdate(JNIEnv* env, jobject jthis, jlong jweight,
@@ -23,10 +27,18 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_adamUpdate(JNIEnv*
     jboolean adamw) {
   API_BEGIN()
   torch::autograd::AutoGradMode no_autograd_guard{false};
-  const auto* weight_ptr = reinterpret_cast<torch::Tensor*>(jweight);
-  const auto grad = reinterpret_cast<torch::Tensor*>(jgrad)->clone();
-  const auto* mean_ptr = reinterpret_cast<torch::Tensor*>(jmean);
-  const auto* variance_ptr = reinterpret_cast<torch::Tensor*>(jvariance);
+  auto& weight = *reinterpret_cast<torch::Tensor*>(jweight);
+  const auto& gradient = *reinterpret_cast<torch::Tensor*>(jgrad);
+  auto& mean = *reinterpret_cast<torch::Tensor*>(jmean);
+  auto& variance = *reinterpret_cast<torch::Tensor*>(jvariance);
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (djl::pytorch::rocm::supports_fused_adam_update(weight, gradient, mean, variance)) {
+    djl::pytorch::rocm::fused_adam_update(weight, gradient, mean, variance, learning_rate,
+        learning_rate_bias_correction, weight_decay, rescale_grad, clip_grad, beta1, beta2, eps, adamw);
+    return;
+  }
+#endif
+  const auto grad = gradient.clone();
   // following this formula: rescaled_grad = clip(rescale_grad * grad, clip_gradient)) + wd * weight
   if (rescale_grad != 1.0) {
     grad.mul_(rescale_grad);
@@ -37,13 +49,13 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_adamUpdate(JNIEnv*
   }
   if (!adamw) {
     // rescaled_grad is obtained here
-    grad.add_(*weight_ptr, weight_decay);
+    grad.add_(weight, weight_decay);
   } else {
-    weight_ptr->sub_(weight_ptr->mul(learning_rate).mul(weight_decay));
+    weight.sub_(weight.mul(learning_rate).mul(weight_decay));
   }
-  mean_ptr->mul_(beta1).add_(grad, 1 - beta1);
-  variance_ptr->mul_(beta2).addcmul_(grad, grad, 1 - beta2);
-  weight_ptr->sub_(mean_ptr->mul(learning_rate_bias_correction).div(variance_ptr->sqrt().add(eps)));
+  mean.mul_(beta1).add_(grad, 1 - beta1);
+  variance.mul_(beta2).addcmul_(grad, grad, 1 - beta2);
+  weight.sub_(mean.mul(learning_rate_bias_correction).div(variance.sqrt().add(eps)));
   API_END()
 }
 

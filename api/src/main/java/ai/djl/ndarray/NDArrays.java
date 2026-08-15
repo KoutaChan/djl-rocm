@@ -12,6 +12,7 @@
  */
 package ai.djl.ndarray;
 
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.util.Preconditions;
 
@@ -39,8 +40,8 @@ public final class NDArrays {
     /**
      * Places compact rows on the leading axis of a zero-initialized dense tensor.
      *
-     * <p>The returned shape is {@code [rowCount, rows.shape[1], ...]}. Row indices are expected to
-     * be unique; unspecified rows remain zero.
+     * <p>The returned shape is {@code [rowCount, rows.shape[1], ...]}. Row indices must be unique
+     * and lie in {@code [0, rowCount)}; unspecified rows remain zero.
      *
      * @param rows compact rows shaped {@code [presentRows, ...]}
      * @param rowIndices one-dimensional destination row indices
@@ -49,6 +50,37 @@ public final class NDArrays {
      */
     public static NDArray scatterRows(NDArray rows, NDArray rowIndices, long rowCount) {
         return rows.getNDArrayInternal().scatterRows(rowIndices, rowCount);
+    }
+
+    /**
+     * Normalizes logits over legal elements while returning zero for masked elements.
+     *
+     * <p>Computation and output use {@link DataType#FLOAT32}. A row with no legal element returns
+     * all zeros. The mask may be boolean or numeric and must be broadcastable to the logits.
+     *
+     * @param logits unnormalized scores
+     * @param mask nonzero entries identify legal elements
+     * @param axis normalization axis
+     * @return masked probabilities with the same shape as {@code logits}
+     */
+    public static NDArray maskedSoftmax(NDArray logits, NDArray mask, int axis) {
+        return logits.getNDArrayInternal().maskedSoftmax(mask, axis);
+    }
+
+    /**
+     * Computes the log normalizer over legal elements.
+     *
+     * <p>Computation and output use {@link DataType#FLOAT32}; the reduced axis is retained with
+     * length one. A row with no legal element returns zero. The mask may be boolean or numeric and
+     * must be broadcastable to the logits.
+     *
+     * @param logits unnormalized scores
+     * @param mask nonzero entries identify legal elements
+     * @param axis reduction axis
+     * @return masked log normalizer with {@code axis} retained
+     */
+    public static NDArray maskedLogSumExp(NDArray logits, NDArray mask, int axis) {
+        return logits.getNDArrayInternal().maskedLogSumExp(mask, axis);
     }
 
     /**

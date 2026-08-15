@@ -197,47 +197,47 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCloseStreamScope(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateInferenceGraph(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateAcceleratorGraph(
     JNIEnv* env, jobject jthis, jintArray jdevice) {
   API_BEGIN()
   const torch::Device device = utils::GetDeviceFromJDevice(env, jdevice);
-  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::NewInferenceGraph(device));
+  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::NewAcceleratorGraph(device));
   API_END_RETURN()
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBeginInferenceGraphCapture(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBeginAcceleratorGraphCapture(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-  djl_pytorch::accel::BeginInferenceGraphCapture(
-      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  djl_pytorch::accel::BeginAcceleratorGraphCapture(
+      reinterpret_cast<djl_pytorch::accel::AcceleratorGraph*>(jhandle));
   API_END()
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEndInferenceGraphCapture(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEndAcceleratorGraphCapture(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-  djl_pytorch::accel::EndInferenceGraphCapture(
-      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  djl_pytorch::accel::EndAcceleratorGraphCapture(
+      reinterpret_cast<djl_pytorch::accel::AcceleratorGraph*>(jhandle));
   API_END()
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchReplayInferenceGraph(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchReplayAcceleratorGraph(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-  djl_pytorch::accel::ReplayInferenceGraph(
-      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  djl_pytorch::accel::ReplayAcceleratorGraph(
+      reinterpret_cast<djl_pytorch::accel::AcceleratorGraph*>(jhandle));
   API_END()
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteInferenceGraph(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteAcceleratorGraph(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-  djl_pytorch::accel::DeleteInferenceGraph(
-      reinterpret_cast<djl_pytorch::accel::InferenceGraph*>(jhandle));
+  djl_pytorch::accel::DeleteAcceleratorGraph(
+      reinterpret_cast<djl_pytorch::accel::AcceleratorGraph*>(jhandle));
   API_END()
 }
 

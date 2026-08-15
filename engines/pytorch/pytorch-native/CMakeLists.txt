@@ -46,6 +46,10 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_accelerator.cc"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
+    "src/main/native/djl_pytorch_masked_categorical.h"
+    "src/main/native/djl_pytorch_masked_categorical.cc"
+    "src/main/native/djl_pytorch_row_ops.h"
+    "src/main/native/djl_pytorch_row_ops.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_autocast.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc"
@@ -147,6 +151,9 @@ endif()
 
 add_library(djl_torch SHARED ${SOURCE_FILES})
 set_property(TARGET djl_torch PROPERTY CXX_STANDARD 17)
+if((USE_CUDA OR USE_ROCM) AND NOT BUILD_ANDROID)
+    target_compile_definitions(djl_torch PRIVATE DJL_USE_ACCELERATOR_GRAPH)
+endif()
 if(USE_ROCM AND NOT BUILD_ANDROID)
     target_compile_definitions(djl_torch PRIVATE DJL_USE_ROCM_KERNELS)
     set_property(TARGET djl_torch PROPERTY HIP_STANDARD 17)

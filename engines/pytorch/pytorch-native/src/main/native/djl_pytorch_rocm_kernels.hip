@@ -21,6 +21,9 @@ constexpr int kGroupedAttentionThreads = 256;
 constexpr int kGroupedAttentionBackwardThreads = 256;
 constexpr int kSharedGradientFeatureTile = 8;
 constexpr int kResidualNormThreads = 256;
+constexpr int kOptimizerThreads = 256;
+constexpr int kMaskedCategoricalThreads = 256;
+constexpr int kRowOperationThreads = 256;
 
 void check_hip_kernel_launch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
@@ -30,6 +33,165 @@ void check_hip_kernel_launch(const char* kernel_name) {
 bool is_fused_floating(const torch::Tensor& tensor) {
   return tensor.scalar_type() == torch::kFloat32 || tensor.scalar_type() == torch::kFloat16 ||
          tensor.scalar_type() == torch::kBFloat16;
+}
+
+__device__ float maximum_propagating_nan(float left, float right) {
+  return isnan(left) || isnan(right) ? NAN : fmaxf(left, right);
+}
+
+template <typename scalar_t>
+__global__ void fused_adam_update_kernel(scalar_t* weight, const scalar_t* gradient, scalar_t* mean,
+    scalar_t* variance, int64_t element_count, float learning_rate, float learning_rate_bias_correction,
+    float weight_decay, float rescale_gradient, float clip_gradient, float beta1, float beta2, float epsilon,
+    bool adamw) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < element_count;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    float weight_value = static_cast<float>(weight[index]);
+    float gradient_value = static_cast<float>(gradient[index]) * rescale_gradient;
+    if (clip_gradient >= 0.0f && gradient_value > clip_gradient) {
+      gradient_value = clip_gradient;
+    }
+    if (adamw) {
+      weight_value -= weight_value * learning_rate * weight_decay;
+    } else {
+      gradient_value += weight_value * weight_decay;
+    }
+    const float mean_value = beta1 * static_cast<float>(mean[index]) + (1.0f - beta1) * gradient_value;
+    const float variance_value =
+        beta2 * static_cast<float>(variance[index]) + (1.0f - beta2) * gradient_value * gradient_value;
+    weight_value -= learning_rate_bias_correction * mean_value / (sqrtf(variance_value) + epsilon);
+    weight[index] = static_cast<scalar_t>(weight_value);
+    mean[index] = static_cast<scalar_t>(mean_value);
+    variance[index] = static_cast<scalar_t>(variance_value);
+  }
+}
+
+template <typename scalar_t, bool write_probabilities>
+__global__ void masked_categorical_forward_kernel(const scalar_t* logits, const bool* mask,
+    float* output, int64_t row_count, int64_t width) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < row_count;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    const int64_t row_offset = row * width;
+    float local_maximum = -INFINITY;
+    int local_choice_count = 0;
+    for (int64_t column = lane; column < width; column += warpSize) {
+      if (mask[row_offset + column]) {
+        local_maximum = maximum_propagating_nan(
+            local_maximum, static_cast<float>(logits[row_offset + column]));
+        ++local_choice_count;
+      }
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      local_maximum = maximum_propagating_nan(
+          local_maximum, __shfl_down(local_maximum, offset));
+      local_choice_count += __shfl_down(local_choice_count, offset);
+    }
+    const float maximum = __shfl(local_maximum, 0);
+    const int choice_count = __shfl(local_choice_count, 0);
+    float local_sum = 0.0f;
+    if (choice_count > 0) {
+      for (int64_t column = lane; column < width; column += warpSize) {
+        if (mask[row_offset + column]) {
+          local_sum += expf(static_cast<float>(logits[row_offset + column]) - maximum);
+        }
+      }
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      local_sum += __shfl_down(local_sum, offset);
+    }
+    const float denominator = __shfl(local_sum, 0);
+    if constexpr (write_probabilities) {
+      for (int64_t column = lane; column < width; column += warpSize) {
+        output[row_offset + column] = mask[row_offset + column] && choice_count > 0
+            ? expf(static_cast<float>(logits[row_offset + column]) - maximum) / denominator
+            : 0.0f;
+      }
+    } else if (lane == 0) {
+      output[row] = choice_count > 0 ? logf(denominator) + maximum : 0.0f;
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void masked_softmax_backward_kernel(const float* gradient_output,
+    const float* probabilities, const bool* mask, scalar_t* gradient_input,
+    int64_t row_count, int64_t width) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < row_count;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    const int64_t row_offset = row * width;
+    float local_dot = 0.0f;
+    for (int64_t column = lane; column < width; column += warpSize) {
+      local_dot += gradient_output[row_offset + column] * probabilities[row_offset + column];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      local_dot += __shfl_down(local_dot, offset);
+    }
+    const float dot = __shfl(local_dot, 0);
+    for (int64_t column = lane; column < width; column += warpSize) {
+      const int64_t index = row_offset + column;
+      gradient_input[index] = mask[index]
+          ? static_cast<scalar_t>(probabilities[index] * (gradient_output[index] - dot))
+          : static_cast<scalar_t>(0.0f);
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void masked_log_sum_exp_backward_kernel(const float* gradient_output,
+    const scalar_t* logits, const bool* mask, const float* normalizers, scalar_t* gradient_input,
+    int64_t row_count, int64_t width) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < row_count;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    const int64_t row_offset = row * width;
+    const float row_gradient = gradient_output[row];
+    const float normalizer = normalizers[row];
+    for (int64_t column = lane; column < width; column += warpSize) {
+      const int64_t index = row_offset + column;
+      gradient_input[index] = mask[index]
+          ? static_cast<scalar_t>(row_gradient * expf(static_cast<float>(logits[index]) - normalizer))
+          : static_cast<scalar_t>(0.0f);
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void scatter_rows_kernel(const scalar_t* rows, const int64_t* row_indices,
+    scalar_t* output, int64_t compact_element_count, int64_t row_width, int64_t row_count) {
+  for (int64_t source_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       source_index < compact_element_count;
+       source_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t source_row = source_index / row_width;
+    const int64_t destination_row = row_indices[source_row];
+    if (destination_row >= 0 && destination_row < row_count) {
+      output[destination_row * row_width + source_index % row_width] = rows[source_index];
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void gather_scattered_row_gradients_kernel(const scalar_t* gradient_output,
+    const int64_t* row_indices, scalar_t* gradient_rows, int64_t compact_element_count,
+    int64_t row_width) {
+  for (int64_t destination_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       destination_index < compact_element_count;
+       destination_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t compact_row = destination_index / row_width;
+    gradient_rows[destination_index] =
+        gradient_output[row_indices[compact_row] * row_width + destination_index % row_width];
+  }
 }
 
 template <typename scalar_t, typename index_t>
@@ -711,6 +873,229 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
          (weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == residual.scalar_type()) &&
          update.device() == residual.device() && weight.device() == residual.device() &&
          bias.device() == residual.device();
+}
+
+bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor& gradient,
+    const torch::Tensor& mean, const torch::Tensor& variance) {
+  return weight.is_cuda() && weight.is_contiguous() && gradient.is_contiguous() && mean.is_contiguous() &&
+         variance.is_contiguous() && is_fused_floating(weight) && gradient.scalar_type() == weight.scalar_type() &&
+         mean.scalar_type() == weight.scalar_type() && variance.scalar_type() == weight.scalar_type() &&
+         gradient.sizes() == weight.sizes() && mean.sizes() == weight.sizes() &&
+         variance.sizes() == weight.sizes() && gradient.device() == weight.device() &&
+         mean.device() == weight.device() && variance.device() == weight.device();
+}
+
+bool supports_masked_categorical(
+    const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
+  return logits.is_cuda() && logits.is_contiguous() && mask.is_contiguous() &&
+         is_fused_floating(logits) && mask.scalar_type() == torch::kBool &&
+         mask.sizes() == logits.sizes() && mask.device() == logits.device() && logits.dim() > 0 &&
+         logits.size(-1) > 0 && axis == logits.dim() - 1;
+}
+
+bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices) {
+  return rows.is_cuda() && rows.is_contiguous() && is_fused_floating(rows) &&
+         row_indices.is_cuda() && row_indices.is_contiguous() &&
+         row_indices.scalar_type() == torch::kInt64 && row_indices.device() == rows.device();
+}
+
+void fused_adam_update(torch::Tensor& weight, const torch::Tensor& gradient, torch::Tensor& mean,
+    torch::Tensor& variance, float learning_rate, float learning_rate_bias_correction, float weight_decay,
+    float rescale_gradient, float clip_gradient, float beta1, float beta2, float epsilon, bool adamw) {
+  TORCH_CHECK(supports_fused_adam_update(weight, gradient, mean, variance),
+      "fused Adam update received an unsupported ROCm tensor layout");
+  if (weight.numel() == 0) {
+    return;
+  }
+  c10::DeviceGuard device_guard(weight.device());
+  const auto& properties = device_properties(weight.get_device());
+  const int64_t required_blocks = (weight.numel() + kOptimizerThreads - 1) / kOptimizerThreads;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(weight.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, weight.scalar_type(), "fused_adam_update", [&] {
+        hipLaunchKernelGGL(fused_adam_update_kernel<scalar_t>, dim3(blocks), dim3(kOptimizerThreads), 0,
+            stream, weight.data_ptr<scalar_t>(), gradient.data_ptr<scalar_t>(), mean.data_ptr<scalar_t>(),
+            variance.data_ptr<scalar_t>(), weight.numel(), learning_rate, learning_rate_bias_correction,
+            weight_decay, rescale_gradient, clip_gradient, beta1, beta2, epsilon, adamw);
+      });
+  check_hip_kernel_launch("fused_adam_update");
+}
+
+torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::Tensor& mask) {
+  TORCH_CHECK(supports_masked_categorical(logits, mask, logits.dim() - 1),
+      "masked softmax received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(logits.device());
+  auto output = torch::empty(logits.sizes(), logits.options().dtype(torch::kFloat32));
+  const int64_t width = logits.size(-1);
+  const int64_t row_count = logits.numel() / width;
+  if (row_count == 0) {
+    return output;
+  }
+  const auto& properties = device_properties(logits.get_device());
+  const int waves_per_block = kMaskedCategoricalThreads / properties.warpSize;
+  const int64_t required_blocks =
+      (row_count + waves_per_block - 1) / waves_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, logits.scalar_type(), "masked_softmax", [&] {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, true>),
+            dim3(blocks), dim3(kMaskedCategoricalThreads), 0, stream, logits.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+      });
+  check_hip_kernel_launch("masked_softmax");
+  return output;
+}
+
+torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& probabilities, const torch::Tensor& mask,
+    torch::ScalarType input_type) {
+  c10::DeviceGuard device_guard(probabilities.device());
+  auto contiguous_gradient = gradient_output.to(torch::kFloat32).contiguous();
+  auto gradient_input = torch::empty(probabilities.sizes(), probabilities.options().dtype(input_type));
+  const int64_t width = probabilities.size(-1);
+  const int64_t row_count = probabilities.numel() / width;
+  if (row_count == 0) {
+    return gradient_input;
+  }
+  const auto& properties = device_properties(probabilities.get_device());
+  const int waves_per_block = kMaskedCategoricalThreads / properties.warpSize;
+  const int64_t required_blocks =
+      (row_count + waves_per_block - 1) / waves_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(probabilities.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, input_type, "masked_softmax_backward", [&] {
+        hipLaunchKernelGGL(masked_softmax_backward_kernel<scalar_t>, dim3(blocks),
+            dim3(kMaskedCategoricalThreads), 0, stream, contiguous_gradient.data_ptr<float>(),
+            probabilities.data_ptr<float>(), mask.data_ptr<bool>(),
+            gradient_input.data_ptr<scalar_t>(), row_count, width);
+      });
+  check_hip_kernel_launch("masked_softmax_backward");
+  return gradient_input;
+}
+
+torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torch::Tensor& mask) {
+  TORCH_CHECK(supports_masked_categorical(logits, mask, logits.dim() - 1),
+      "masked log-sum-exp received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(logits.device());
+  auto output_shape = logits.sizes().vec();
+  output_shape.back() = 1;
+  auto output = torch::empty(output_shape, logits.options().dtype(torch::kFloat32));
+  const int64_t width = logits.size(-1);
+  const int64_t row_count = logits.numel() / width;
+  if (row_count == 0) {
+    return output;
+  }
+  const auto& properties = device_properties(logits.get_device());
+  const int waves_per_block = kMaskedCategoricalThreads / properties.warpSize;
+  const int64_t required_blocks =
+      (row_count + waves_per_block - 1) / waves_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, logits.scalar_type(), "masked_log_sum_exp", [&] {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, false>),
+            dim3(blocks), dim3(kMaskedCategoricalThreads), 0, stream, logits.data_ptr<scalar_t>(),
+            mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+      });
+  check_hip_kernel_launch("masked_log_sum_exp");
+  return output;
+}
+
+torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& normalizers) {
+  c10::DeviceGuard device_guard(logits.device());
+  auto contiguous_gradient = gradient_output.to(torch::kFloat32).contiguous();
+  auto gradient_input = torch::empty_like(logits);
+  const int64_t width = logits.size(-1);
+  const int64_t row_count = logits.numel() / width;
+  if (row_count == 0) {
+    return gradient_input;
+  }
+  const auto& properties = device_properties(logits.get_device());
+  const int waves_per_block = kMaskedCategoricalThreads / properties.warpSize;
+  const int64_t required_blocks =
+      (row_count + waves_per_block - 1) / waves_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, logits.scalar_type(), "masked_log_sum_exp_backward", [&] {
+        hipLaunchKernelGGL(masked_log_sum_exp_backward_kernel<scalar_t>, dim3(blocks),
+            dim3(kMaskedCategoricalThreads), 0, stream, contiguous_gradient.data_ptr<float>(),
+            logits.data_ptr<scalar_t>(), mask.data_ptr<bool>(), normalizers.data_ptr<float>(),
+            gradient_input.data_ptr<scalar_t>(), row_count, width);
+      });
+  check_hip_kernel_launch("masked_log_sum_exp_backward");
+  return gradient_input;
+}
+
+torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
+    const torch::Tensor& row_indices, const torch::Tensor& output) {
+  TORCH_CHECK(supports_scatter_rows(rows, row_indices),
+      "scatter rows received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(rows.device());
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(rows.get_device()).stream();
+  const size_t output_bytes = static_cast<size_t>(output.numel()) * output.element_size();
+  if (output_bytes > 0) {
+    const hipError_t memset_error = hipMemsetAsync(output.data_ptr(), 0, output_bytes, stream);
+    TORCH_CHECK(memset_error == hipSuccess,
+        "scatter rows zero initialization failed: ", hipGetErrorString(memset_error));
+  }
+  if (rows.numel() == 0) {
+    return output;
+  }
+  const int64_t row_width = rows.numel() / rows.size(0);
+  const int64_t row_count = output.size(0);
+  const auto& properties = device_properties(rows.get_device());
+  const int64_t required_blocks =
+      (rows.numel() + kRowOperationThreads - 1) / kRowOperationThreads;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, rows.scalar_type(), "scatter_rows", [&] {
+        hipLaunchKernelGGL(scatter_rows_kernel<scalar_t>, dim3(blocks),
+            dim3(kRowOperationThreads), 0, stream, rows.data_ptr<scalar_t>(),
+            row_indices.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), rows.numel(),
+            row_width, row_count);
+      });
+  check_hip_kernel_launch("scatter_rows");
+  return output;
+}
+
+torch::Tensor scatter_rows_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& row_indices) {
+  auto contiguous_gradient = gradient_output.contiguous();
+  auto output_shape = contiguous_gradient.sizes().vec();
+  output_shape[0] = row_indices.numel();
+  auto gradient_rows = torch::empty(output_shape, contiguous_gradient.options());
+  if (gradient_rows.numel() == 0) {
+    return gradient_rows;
+  }
+  c10::DeviceGuard device_guard(contiguous_gradient.device());
+  const int64_t row_width = gradient_rows.numel() / row_indices.numel();
+  const auto& properties = device_properties(contiguous_gradient.get_device());
+  const int64_t required_blocks =
+      (gradient_rows.numel() + kRowOperationThreads - 1) / kRowOperationThreads;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(contiguous_gradient.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+      contiguous_gradient.scalar_type(), "scatter_rows_backward", [&] {
+        hipLaunchKernelGGL(gather_scattered_row_gradients_kernel<scalar_t>, dim3(blocks),
+            dim3(kRowOperationThreads), 0, stream, contiguous_gradient.data_ptr<scalar_t>(),
+            row_indices.data_ptr<int64_t>(), gradient_rows.data_ptr<scalar_t>(),
+            gradient_rows.numel(), row_width);
+      });
+  check_hip_kernel_launch("scatter_rows_backward");
+  return gradient_rows;
 }
 
 torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,

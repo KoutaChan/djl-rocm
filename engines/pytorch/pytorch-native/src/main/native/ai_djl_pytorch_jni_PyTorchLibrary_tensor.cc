@@ -14,6 +14,7 @@
 #include "ai_djl_pytorch_jni_cache.h"
 #include "djl_pytorch_accelerator.h"
 #include "djl_pytorch_jni_exception.h"
+#include "djl_pytorch_row_ops.h"
 #include "djl_pytorch_utils.h"
 
 // The file is the implementation for PyTorch tensor core functionality operation
@@ -401,7 +402,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatter(
   API_END_RETURN()
 }
 
-JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGatherRows(
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGatherRows(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle) {
   API_BEGIN()
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
@@ -411,15 +412,12 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGatherRows(
   API_END_RETURN()
 }
 
-JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatterRows(
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatterRows(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle, jlong jrow_count) {
   API_BEGIN()
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
   const auto* index_ptr = reinterpret_cast<torch::Tensor*>(jindex_handle);
-  auto output_shape = tensor_ptr->sizes().vec();
-  output_shape[0] = jrow_count;
-  auto result = torch::zeros(output_shape, tensor_ptr->options())
-                    .index_copy(0, index_ptr->reshape({-1}), *tensor_ptr);
+  auto result = djl::pytorch::scatter_rows(*tensor_ptr, *index_ptr, jrow_count);
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
