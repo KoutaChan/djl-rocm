@@ -188,7 +188,7 @@ __global__ void gather_scattered_row_gradients_kernel(const scalar_t* gradient_o
 
 template <int queries_per_wave, typename scalar_t, typename index_t>
 __global__ void indexed_relation_bias_kernel(const scalar_t* relation_logits, const scalar_t* relation_bias,
-    const index_t* relation_ids, scalar_t* output, int64_t query_tile_count, int64_t work_item_count,
+    const index_t* relation_ids, scalar_t* output, int64_t query_chunk_count, int64_t work_item_count,
     int64_t heads, int64_t query_tokens, int64_t key_tokens, int64_t relation_count, int64_t logits_stride_batch,
     int64_t logits_stride_head,
     int64_t logits_stride_query, int64_t logits_stride_relation, int64_t bias_stride_batch, int64_t bias_stride_head,
@@ -201,11 +201,11 @@ __global__ void indexed_relation_bias_kernel(const scalar_t* relation_logits, co
   if (work_item >= work_item_count) {
     return;
   }
-  const int64_t query_tile = work_item % query_tile_count;
-  const int64_t batch_head = work_item / query_tile_count;
+  const int64_t query_chunk = work_item % query_chunk_count;
+  const int64_t batch_head = work_item / query_chunk_count;
   const int64_t head = batch_head % heads;
   const int64_t batch = batch_head / heads;
-  const int64_t first_query = query_tile * queries_per_wave;
+  const int64_t first_query = query_chunk * queries_per_wave;
   const int64_t query_limit = min(first_query + queries_per_wave, query_tokens);
   for (int64_t query_token = first_query; query_token < query_limit; ++query_token) {
     for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
@@ -231,7 +231,7 @@ __global__ void indexed_relation_bias_kernel(const scalar_t* relation_logits, co
 
 template <int queries_per_wave, typename scalar_t, typename index_t>
 __global__ void indexed_relation_bias_logit_gradient_kernel(const scalar_t* gradient_output,
-    const index_t* relation_ids, scalar_t* relation_logits_gradient, int64_t query_tile_count,
+    const index_t* relation_ids, scalar_t* relation_logits_gradient, int64_t query_chunk_count,
     int64_t work_item_count, int64_t heads, int64_t query_tokens, int64_t key_tokens, int64_t relation_count,
     int64_t relation_id_stride_batch, int64_t relation_id_stride_query, int64_t relation_id_stride_key,
     float scale) {
@@ -241,9 +241,9 @@ __global__ void indexed_relation_bias_logit_gradient_kernel(const scalar_t* grad
   const int waves_per_block = blockDim.x / warpSize;
   const int64_t work_item = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
   const bool active = work_item < work_item_count;
-  const int64_t query_tile = active ? work_item % query_tile_count : 0;
-  const int64_t batch_head = active ? work_item / query_tile_count : 0;
-  const int64_t first_query = query_tile * queries_per_wave;
+  const int64_t query_chunk = active ? work_item % query_chunk_count : 0;
+  const int64_t batch_head = active ? work_item / query_chunk_count : 0;
+  const int64_t first_query = query_chunk * queries_per_wave;
   const int64_t batch = batch_head / heads;
   float* wave_gradients = shared_gradients + wave * relation_count;
 
@@ -655,17 +655,18 @@ __global__ void grouped_indexed_attention_backward_query_kernel(const scalar_t* 
   }
 }
 
-template <int feature_tile_size, typename scalar_t, typename index_t, bool contiguous_ids>
-__global__ void grouped_indexed_attention_shared_gradient_kernel(const scalar_t* shared_delta_gradient,
+template <int features_per_block, typename scalar_t, typename index_t, bool contiguous_ids>
+__global__ void grouped_indexed_attention_shared_key_value_gradient_kernel(
+    const scalar_t* shared_delta_gradient,
     const scalar_t* indexed_delta_gradient, const index_t* indexed_shared_ids, scalar_t* shared_gradient,
-    int64_t group_feature_tile_count, GroupedIndexedAttentionLayout layout) {
+    int64_t feature_block_count_per_group, GroupedIndexedAttentionLayout layout) {
   extern __shared__ float partial_sums[];
-  const int64_t group = static_cast<int64_t>(blockIdx.x) / group_feature_tile_count;
-  const int64_t feature_tile = static_cast<int64_t>(blockIdx.x) % group_feature_tile_count;
-  const int64_t first_feature = feature_tile * feature_tile_size;
+  const int64_t group = static_cast<int64_t>(blockIdx.x) / feature_block_count_per_group;
+  const int64_t feature_block = static_cast<int64_t>(blockIdx.x) % feature_block_count_per_group;
+  const int64_t first_feature = feature_block * features_per_block;
   const int64_t contribution_count =
       layout.queries_per_group * (layout.shared_tokens + layout.indexed_tokens);
-  const int64_t partial_sum_count = layout.shared_tokens * feature_tile_size;
+  const int64_t partial_sum_count = layout.shared_tokens * features_per_block;
 
   for (int64_t index = threadIdx.x; index < partial_sum_count; index += blockDim.x) {
     partial_sums[index] = 0.0f;
@@ -691,10 +692,10 @@ __global__ void grouped_indexed_attention_shared_gradient_kernel(const scalar_t*
         shared_token ? (query_index * layout.shared_tokens + token) * layout.packed_width
                      : (query_index * layout.indexed_tokens + token) * layout.packed_width;
     const scalar_t* source = shared_token ? shared_delta_gradient : indexed_delta_gradient;
-    for (int64_t local_feature = 0; local_feature < feature_tile_size; local_feature++) {
+    for (int64_t local_feature = 0; local_feature < features_per_block; local_feature++) {
       const int64_t feature = first_feature + local_feature;
       if (feature < layout.packed_width) {
-        atomicAdd(partial_sums + shared_index * feature_tile_size + local_feature,
+        atomicAdd(partial_sums + shared_index * features_per_block + local_feature,
             static_cast<float>(source[source_offset + feature]));
       }
     }
@@ -702,8 +703,8 @@ __global__ void grouped_indexed_attention_shared_gradient_kernel(const scalar_t*
   __syncthreads();
 
   for (int64_t index = threadIdx.x; index < partial_sum_count; index += blockDim.x) {
-    const int64_t shared_token = index / feature_tile_size;
-    const int64_t local_feature = index % feature_tile_size;
+    const int64_t shared_token = index / features_per_block;
+    const int64_t local_feature = index % features_per_block;
     const int64_t feature = first_feature + local_feature;
     if (feature < layout.packed_width) {
       shared_gradient[(group * layout.shared_tokens + shared_token) * layout.packed_width + feature] =
@@ -799,7 +800,7 @@ int configured_waves_per_block(
 }
 
 template <typename Callback>
-decltype(auto) dispatch_specialized_tile(int value, const char* setting, Callback&& callback) {
+decltype(auto) dispatch_compiled_work_size(int value, const char* setting, Callback&& callback) {
   switch (value) {
     case 1:
       return callback(std::integral_constant<int, 1>{});
@@ -818,24 +819,25 @@ decltype(auto) dispatch_specialized_tile(int value, const char* setting, Callbac
   }
 }
 
-struct RelationLaunchPlan {
+struct IndexedRelationBiasLaunchPlan {
   int block_threads;
-  int64_t query_tile_count;
+  int64_t query_chunk_count;
   int64_t work_item_count;
   int64_t grid_size;
   size_t shared_memory_bytes;
 };
 
-std::optional<RelationLaunchPlan> relation_launch_plan(int device, int64_t batch, int64_t heads,
+std::optional<IndexedRelationBiasLaunchPlan> indexed_relation_bias_launch_plan(
+    int device, int64_t batch, int64_t heads,
     int64_t query_tokens, int64_t relation_count, int requested_waves,
     int queries_per_wave, bool backward) {
   const auto& properties = device_properties(device);
   const int waves_per_block = configured_waves_per_block(properties, requested_waves,
-      backward ? "DJL_ROCM_RELATION_BACKWARD_WAVES_PER_BLOCK"
-               : "DJL_ROCM_RELATION_FORWARD_WAVES_PER_BLOCK");
-  const int64_t query_tile_count =
+      backward ? launch_environment::kIndexedRelationBiasBackwardWavesPerBlock
+               : launch_environment::kIndexedRelationBiasForwardWavesPerBlock);
+  const int64_t query_chunk_count =
       (query_tokens + queries_per_wave - 1) / queries_per_wave;
-  const int64_t work_item_count = batch * heads * query_tile_count;
+  const int64_t work_item_count = batch * heads * query_chunk_count;
   const int64_t grid_size = (work_item_count + waves_per_block - 1) / waves_per_block;
   const size_t shared_memory_bytes =
       backward ? static_cast<size_t>(waves_per_block) * relation_count * sizeof(float) : 0;
@@ -843,25 +845,27 @@ std::optional<RelationLaunchPlan> relation_launch_plan(int device, int64_t batch
       shared_memory_bytes > static_cast<size_t>(properties.sharedMemPerBlock)) {
     return std::nullopt;
   }
-  return RelationLaunchPlan{waves_per_block * properties.warpSize,
-      query_tile_count, work_item_count, grid_size, shared_memory_bytes};
+  return IndexedRelationBiasLaunchPlan{waves_per_block * properties.warpSize,
+      query_chunk_count, work_item_count, grid_size, shared_memory_bytes};
 }
 
-struct GroupedAttentionLaunchPlan {
+struct GroupedIndexedAttentionLaunchPlan {
   int block_threads;
   int64_t grid_size;
   size_t shared_memory_bytes;
 };
 
-std::optional<GroupedAttentionLaunchPlan> grouped_attention_launch_plan(const torch::Tensor& query,
+std::optional<GroupedIndexedAttentionLaunchPlan> grouped_indexed_attention_launch_plan(
+    const torch::Tensor& query,
     int64_t shared_tokens, int64_t indexed_tokens, int64_t value_features, bool backward) {
   const auto& properties = device_properties(query.get_device());
   const auto& config = rocm_kernel_launch_config();
-  const int requested_threads = backward ? config.grouped_attention_backward_threads_per_block
-                                         : config.grouped_attention_threads_per_block;
-  const int block_thread_limit = configured_threads_per_block(properties, requested_threads,
-      backward ? "DJL_ROCM_GROUPED_ATTENTION_BACKWARD_THREADS_PER_BLOCK"
-               : "DJL_ROCM_GROUPED_ATTENTION_THREADS_PER_BLOCK",
+  const int requested_maximum_threads =
+      backward ? config.grouped_indexed_attention_backward_max_threads_per_block
+               : config.grouped_indexed_attention_forward_max_threads_per_block;
+  const int maximum_threads_per_block = configured_threads_per_block(properties, requested_maximum_threads,
+      backward ? launch_environment::kGroupedIndexedAttentionBackwardMaxThreadsPerBlock
+               : launch_environment::kGroupedIndexedAttentionForwardMaxThreadsPerBlock,
       true);
   const int64_t total_tokens = shared_tokens + indexed_tokens;
   const size_t shared_memory_per_wave =
@@ -870,7 +874,7 @@ std::optional<GroupedAttentionLaunchPlan> grouped_attention_launch_plan(const to
                 static_cast<size_t>(query.size(2) + value_features) * sizeof(float)
           : static_cast<size_t>(total_tokens) * (sizeof(float) + sizeof(int32_t)) +
                 static_cast<size_t>(query.size(2)) * sizeof(float);
-  const int maximum_waves_by_threads = block_thread_limit / properties.warpSize;
+  const int maximum_waves_by_threads = maximum_threads_per_block / properties.warpSize;
   const int maximum_waves_by_memory =
       static_cast<int>(static_cast<size_t>(properties.sharedMemPerBlock) / shared_memory_per_wave);
   const int64_t query_head_count = query.size(0) * query.size(1);
@@ -883,34 +887,38 @@ std::optional<GroupedAttentionLaunchPlan> grouped_attention_launch_plan(const to
   if (grid_size > static_cast<int64_t>(properties.maxGridSize[0])) {
     return std::nullopt;
   }
-  return GroupedAttentionLaunchPlan{waves_per_block * properties.warpSize,
+  return GroupedIndexedAttentionLaunchPlan{waves_per_block * properties.warpSize,
       grid_size, shared_memory_per_wave * waves_per_block};
 }
 
-struct SharedGradientLaunchPlan {
+struct GroupedIndexedAttentionSharedKeyValueGradientLaunchPlan {
   int threads_per_block;
-  int64_t group_feature_tile_count;
+  int64_t feature_block_count_per_group;
   int64_t grid_size;
   size_t shared_memory_bytes;
 };
 
-std::optional<SharedGradientLaunchPlan> shared_gradient_launch_plan(
+std::optional<GroupedIndexedAttentionSharedKeyValueGradientLaunchPlan>
+grouped_indexed_attention_shared_key_value_gradient_launch_plan(
     const torch::Tensor& query, int64_t group_count, int64_t shared_tokens, int64_t packed_width) {
   const auto& properties = device_properties(query.get_device());
   const auto& config = rocm_kernel_launch_config();
   const int threads_per_block = configured_threads_per_block(properties,
-      config.shared_gradient_threads_per_block, "DJL_ROCM_SHARED_GRADIENT_THREADS_PER_BLOCK", false);
-  const int64_t group_feature_tile_count =
-      (packed_width + config.shared_gradient_feature_tile - 1) / config.shared_gradient_feature_tile;
-  const int64_t grid_size = group_count * group_feature_tile_count;
+      config.grouped_indexed_attention_shared_key_value_gradient_threads_per_block,
+      launch_environment::kGroupedIndexedAttentionSharedKeyValueGradientThreadsPerBlock, false);
+  const int features_per_block =
+      config.grouped_indexed_attention_shared_key_value_gradient_features_per_block;
+  const int64_t feature_block_count_per_group =
+      (packed_width + features_per_block - 1) / features_per_block;
+  const int64_t grid_size = group_count * feature_block_count_per_group;
   const size_t shared_memory_bytes =
-      static_cast<size_t>(shared_tokens * config.shared_gradient_feature_tile) * sizeof(float);
+      static_cast<size_t>(shared_tokens * features_per_block) * sizeof(float);
   if (grid_size > static_cast<int64_t>(properties.maxGridSize[0]) ||
       shared_memory_bytes > static_cast<size_t>(properties.sharedMemPerBlock)) {
     return std::nullopt;
   }
-  return SharedGradientLaunchPlan{
-      threads_per_block, group_feature_tile_count, grid_size, shared_memory_bytes};
+  return GroupedIndexedAttentionSharedKeyValueGradientLaunchPlan{
+      threads_per_block, feature_block_count_per_group, grid_size, shared_memory_bytes};
 }
 
 bool is_indexed_relation_bias_layout_supported(const torch::Tensor& relation_logits,
@@ -962,9 +970,10 @@ bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits
     return false;
   }
   const auto& config = rocm_kernel_launch_config();
-  return relation_launch_plan(relation_logits.get_device(), relation_logits.size(0), relation_logits.size(1),
-      relation_logits.size(2), relation_logits.size(3), config.relation_forward_waves_per_block,
-      config.relation_forward_queries_per_wave, false).has_value();
+  return indexed_relation_bias_launch_plan(relation_logits.get_device(), relation_logits.size(0),
+      relation_logits.size(1), relation_logits.size(2), relation_logits.size(3),
+      config.indexed_relation_bias_forward_waves_per_block,
+      config.indexed_relation_bias_forward_queries_per_wave, false).has_value();
 }
 
 bool supports_indexed_relation_bias_logit_gradient(const torch::Tensor& relation_logits,
@@ -973,9 +982,10 @@ bool supports_indexed_relation_bias_logit_gradient(const torch::Tensor& relation
     return false;
   }
   const auto& config = rocm_kernel_launch_config();
-  return relation_launch_plan(relation_logits.get_device(), relation_logits.size(0), relation_logits.size(1),
-      relation_logits.size(2), relation_logits.size(3), config.relation_backward_waves_per_block,
-      config.relation_backward_queries_per_wave, true).has_value();
+  return indexed_relation_bias_launch_plan(relation_logits.get_device(), relation_logits.size(0),
+      relation_logits.size(1), relation_logits.size(2), relation_logits.size(3),
+      config.indexed_relation_bias_backward_waves_per_block,
+      config.indexed_relation_bias_backward_queries_per_wave, true).has_value();
 }
 
 bool supports_grouped_indexed_attention_forward(const torch::Tensor& query,
@@ -990,14 +1000,14 @@ bool supports_grouped_indexed_attention_forward(const torch::Tensor& query,
   const int64_t packed_width = shared_key_values.size(2);
   const int64_t indexed_tokens = indexed_deltas.size(1);
   const int64_t value_features = (packed_width - heads * query.size(2)) / heads;
-  return grouped_attention_launch_plan(
+  return grouped_indexed_attention_launch_plan(
       query, shared_tokens, indexed_tokens, value_features, false).has_value();
 }
 
 bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids,
-    int64_t queries_per_group, bool needs_shared_gradient) {
+    int64_t queries_per_group, bool needs_shared_key_value_gradient) {
   if (!is_grouped_indexed_attention_layout_supported(query, shared_key_values, shared_deltas,
           indexed_deltas, indexed_shared_ids, queries_per_group)) {
     return false;
@@ -1007,12 +1017,13 @@ bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
   const int64_t packed_width = shared_key_values.size(2);
   const int64_t indexed_tokens = indexed_deltas.size(1);
   const int64_t value_features = (packed_width - heads * query.size(2)) / heads;
-  if (!grouped_attention_launch_plan(
+  if (!grouped_indexed_attention_launch_plan(
           query, shared_tokens, indexed_tokens, value_features, true).has_value()) {
     return false;
   }
-  return !needs_shared_gradient || shared_gradient_launch_plan(
-      query, shared_key_values.size(0), shared_tokens, packed_width).has_value();
+  return !needs_shared_key_value_gradient ||
+      grouped_indexed_attention_shared_key_value_gradient_launch_plan(
+          query, shared_key_values.size(0), shared_tokens, packed_width).has_value();
 }
 
 bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const torch::Tensor& update,
@@ -1062,8 +1073,8 @@ void fused_adam_update(torch::Tensor& weight, const torch::Tensor& gradient, tor
   c10::DeviceGuard device_guard(weight.device());
   const auto& properties = device_properties(weight.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
-      rocm_kernel_launch_config().optimizer_threads_per_block,
-      "DJL_ROCM_OPTIMIZER_THREADS_PER_BLOCK", false);
+      rocm_kernel_launch_config().fused_adam_update_threads_per_block,
+      launch_environment::kFusedAdamUpdateThreadsPerBlock, false);
   const int64_t required_blocks = (weight.numel() + threads_per_block - 1) / threads_per_block;
   const int blocks = static_cast<int>(
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
@@ -1091,7 +1102,7 @@ torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::T
   const auto& properties = device_properties(logits.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().masked_categorical_threads_per_block,
-      "DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK", true);
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
   const int waves_per_block = threads_per_block / properties.warpSize;
   const int64_t required_blocks =
       (row_count + waves_per_block - 1) / waves_per_block;
@@ -1122,7 +1133,7 @@ torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,
   const auto& properties = device_properties(probabilities.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().masked_categorical_threads_per_block,
-      "DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK", true);
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
   const int waves_per_block = threads_per_block / properties.warpSize;
   const int64_t required_blocks =
       (row_count + waves_per_block - 1) / waves_per_block;
@@ -1155,7 +1166,7 @@ torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torc
   const auto& properties = device_properties(logits.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().masked_categorical_threads_per_block,
-      "DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK", true);
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
   const int waves_per_block = threads_per_block / properties.warpSize;
   const int64_t required_blocks =
       (row_count + waves_per_block - 1) / waves_per_block;
@@ -1185,7 +1196,7 @@ torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,
   const auto& properties = device_properties(logits.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().masked_categorical_threads_per_block,
-      "DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK", true);
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
   const int waves_per_block = threads_per_block / properties.warpSize;
   const int64_t required_blocks =
       (row_count + waves_per_block - 1) / waves_per_block;
@@ -1222,8 +1233,8 @@ torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
   const int64_t row_count = output.size(0);
   const auto& properties = device_properties(rows.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
-      rocm_kernel_launch_config().row_operation_threads_per_block,
-      "DJL_ROCM_ROW_OPERATION_THREADS_PER_BLOCK", false);
+      rocm_kernel_launch_config().scatter_rows_threads_per_block,
+      launch_environment::kScatterRowsThreadsPerBlock, false);
   const int64_t required_blocks =
       (rows.numel() + threads_per_block - 1) / threads_per_block;
   const int blocks = static_cast<int>(
@@ -1252,8 +1263,8 @@ torch::Tensor scatter_rows_backward(
   const int64_t row_width = gradient_rows.numel() / row_indices.numel();
   const auto& properties = device_properties(contiguous_gradient.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
-      rocm_kernel_launch_config().row_operation_threads_per_block,
-      "DJL_ROCM_ROW_OPERATION_THREADS_PER_BLOCK", false);
+      rocm_kernel_launch_config().scatter_rows_threads_per_block,
+      launch_environment::kScatterRowsThreadsPerBlock, false);
   const int64_t required_blocks =
       (gradient_rows.numel() + threads_per_block - 1) / threads_per_block;
   const int blocks = static_cast<int>(
@@ -1301,17 +1312,18 @@ torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits
     return output;
   }
   const auto& config = rocm_kernel_launch_config();
-  const auto launch_plan = relation_launch_plan(relation_logits.get_device(), batch, heads, query_tokens,
-      relation_count, config.relation_forward_waves_per_block,
-      config.relation_forward_queries_per_wave, false);
+  const auto launch_plan = indexed_relation_bias_launch_plan(
+      relation_logits.get_device(), batch, heads, query_tokens, relation_count,
+      config.indexed_relation_bias_forward_waves_per_block,
+      config.indexed_relation_bias_forward_queries_per_wave, false);
   TORCH_CHECK(launch_plan.has_value(), "indexed relation bias launch exceeds this device's limits");
   const int64_t id_batch_stride = relation_ids.dim() == 2 ? 0 : relation_ids.stride(0);
   const int64_t id_query_stride = relation_ids.dim() == 2 ? relation_ids.stride(0) : relation_ids.stride(1);
   const int64_t id_key_stride = relation_ids.dim() == 2 ? relation_ids.stride(1) : relation_ids.stride(2);
   const hipStream_t stream = c10::hip::getCurrentHIPStream(relation_logits.get_device()).stream();
-  dispatch_specialized_tile(config.relation_forward_queries_per_wave,
-      "DJL_ROCM_RELATION_FORWARD_QUERIES_PER_WAVE", [&](auto query_tile) {
-        constexpr int queries_per_wave = decltype(query_tile)::value;
+  dispatch_compiled_work_size(config.indexed_relation_bias_forward_queries_per_wave,
+      launch_environment::kIndexedRelationBiasForwardQueriesPerWave, [&](auto query_work_size) {
+        constexpr int queries_per_wave = decltype(query_work_size)::value;
         AT_DISPATCH_FLOATING_TYPES_AND2(
             torch::kHalf, torch::kBFloat16, relation_logits.scalar_type(), "indexed_relation_bias", [&] {
               if (relation_ids.scalar_type() == torch::kInt32) {
@@ -1320,7 +1332,7 @@ torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits
                     dim3(launch_plan->grid_size), dim3(launch_plan->block_threads), 0, stream,
                     relation_logits.data_ptr<scalar_t>(), expanded_bias.data_ptr<scalar_t>(),
                     relation_ids.data_ptr<int32_t>(), output.data_ptr<scalar_t>(),
-                    launch_plan->query_tile_count, launch_plan->work_item_count, heads, query_tokens,
+                    launch_plan->query_chunk_count, launch_plan->work_item_count, heads, query_tokens,
                     key_tokens, relation_count, relation_logits.stride(0), relation_logits.stride(1),
                     relation_logits.stride(2), relation_logits.stride(3), expanded_bias.stride(0),
                     expanded_bias.stride(1), expanded_bias.stride(2), expanded_bias.stride(3),
@@ -1331,7 +1343,7 @@ torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits
                     dim3(launch_plan->grid_size), dim3(launch_plan->block_threads), 0, stream,
                     relation_logits.data_ptr<scalar_t>(), expanded_bias.data_ptr<scalar_t>(),
                     relation_ids.data_ptr<int64_t>(), output.data_ptr<scalar_t>(),
-                    launch_plan->query_tile_count, launch_plan->work_item_count, heads, query_tokens,
+                    launch_plan->query_chunk_count, launch_plan->work_item_count, heads, query_tokens,
                     key_tokens, relation_count, relation_logits.stride(0), relation_logits.stride(1),
                     relation_logits.stride(2), relation_logits.stride(3), expanded_bias.stride(0),
                     expanded_bias.stride(1), expanded_bias.stride(2), expanded_bias.stride(3),
@@ -1359,18 +1371,19 @@ torch::Tensor indexed_relation_bias_logit_gradient(const torch::Tensor& gradient
     return relation_logits_gradient;
   }
   const auto& config = rocm_kernel_launch_config();
-  const auto launch_plan = relation_launch_plan(gradient_output.get_device(), batch, heads, query_tokens,
-      relation_count, config.relation_backward_waves_per_block,
-      config.relation_backward_queries_per_wave, true);
+  const auto launch_plan = indexed_relation_bias_launch_plan(
+      gradient_output.get_device(), batch, heads, query_tokens, relation_count,
+      config.indexed_relation_bias_backward_waves_per_block,
+      config.indexed_relation_bias_backward_queries_per_wave, true);
   TORCH_CHECK(launch_plan.has_value(), "indexed relation bias backward launch exceeds this device's limits");
   const int64_t id_batch_stride = relation_ids.dim() == 2 ? 0 : relation_ids.stride(0);
   const int64_t id_query_stride = relation_ids.dim() == 2 ? relation_ids.stride(0) : relation_ids.stride(1);
   const int64_t id_key_stride = relation_ids.dim() == 2 ? relation_ids.stride(1) : relation_ids.stride(2);
   const torch::Tensor contiguous_gradient = gradient_output.contiguous();
   const hipStream_t stream = c10::hip::getCurrentHIPStream(gradient_output.get_device()).stream();
-  dispatch_specialized_tile(config.relation_backward_queries_per_wave,
-      "DJL_ROCM_RELATION_BACKWARD_QUERIES_PER_WAVE", [&](auto query_tile) {
-        constexpr int queries_per_wave = decltype(query_tile)::value;
+  dispatch_compiled_work_size(config.indexed_relation_bias_backward_queries_per_wave,
+      launch_environment::kIndexedRelationBiasBackwardQueriesPerWave, [&](auto query_work_size) {
+        constexpr int queries_per_wave = decltype(query_work_size)::value;
         AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
             gradient_output.scalar_type(), "indexed_relation_bias_backward", [&] {
               if (relation_ids.scalar_type() == torch::kInt32) {
@@ -1379,7 +1392,7 @@ torch::Tensor indexed_relation_bias_logit_gradient(const torch::Tensor& gradient
                     dim3(launch_plan->grid_size), dim3(launch_plan->block_threads),
                     launch_plan->shared_memory_bytes, stream, contiguous_gradient.data_ptr<scalar_t>(),
                     relation_ids.data_ptr<int32_t>(), relation_logits_gradient.data_ptr<scalar_t>(),
-                    launch_plan->query_tile_count, launch_plan->work_item_count, heads, query_tokens,
+                    launch_plan->query_chunk_count, launch_plan->work_item_count, heads, query_tokens,
                     key_tokens, relation_count, id_batch_stride, id_query_stride, id_key_stride, scale);
               } else {
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(
@@ -1387,7 +1400,7 @@ torch::Tensor indexed_relation_bias_logit_gradient(const torch::Tensor& gradient
                     dim3(launch_plan->grid_size), dim3(launch_plan->block_threads),
                     launch_plan->shared_memory_bytes, stream, contiguous_gradient.data_ptr<scalar_t>(),
                     relation_ids.data_ptr<int64_t>(), relation_logits_gradient.data_ptr<scalar_t>(),
-                    launch_plan->query_tile_count, launch_plan->work_item_count, heads, query_tokens,
+                    launch_plan->query_chunk_count, launch_plan->work_item_count, heads, query_tokens,
                     key_tokens, relation_count, id_batch_stride, id_query_stride, id_key_stride, scale);
               }
             });
@@ -1448,7 +1461,7 @@ GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const tor
     return {output, log_sum_exp};
   }
   const int64_t query_head_count = query_count * heads;
-  const auto launch_plan = grouped_attention_launch_plan(
+  const auto launch_plan = grouped_indexed_attention_launch_plan(
       query, shared_tokens, indexed_tokens, value_features, false);
   TORCH_CHECK(launch_plan.has_value(), "grouped indexed attention launch exceeds this device's limits");
   const GroupedIndexedAttentionLayout layout{queries_per_group,
@@ -1513,7 +1526,8 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, const torch::Tensor& log_sum_exp,
     const torch::Tensor& gradient_output, int64_t queries_per_group, float scale, bool needs_query_gradient,
-    bool needs_shared_gradient, bool needs_shared_delta_gradient, bool needs_indexed_delta_gradient) {
+    bool needs_shared_key_value_gradient, bool needs_shared_delta_gradient,
+    bool needs_indexed_delta_gradient) {
   const int64_t query_count = query.size(0);
   const int64_t heads = query.size(1);
   const int64_t key_features = query.size(2);
@@ -1539,8 +1553,10 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
   const auto gradient_options = query.options().memory_format(torch::MemoryFormat::Contiguous);
   torch::Tensor query_gradient =
       needs_query_gradient ? torch::empty({query_count, heads, key_features}, gradient_options) : torch::Tensor();
-  const bool needs_shared_delta_workspace = needs_shared_gradient || needs_shared_delta_gradient;
-  const bool needs_indexed_delta_workspace = needs_shared_gradient || needs_indexed_delta_gradient;
+  const bool needs_shared_delta_workspace =
+      needs_shared_key_value_gradient || needs_shared_delta_gradient;
+  const bool needs_indexed_delta_workspace =
+      needs_shared_key_value_gradient || needs_indexed_delta_gradient;
   torch::Tensor shared_delta_workspace =
       needs_shared_delta_workspace
           ? torch::empty({query_count, shared_tokens, packed_width}, gradient_options)
@@ -1549,12 +1565,12 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
       needs_indexed_delta_workspace
           ? torch::empty({query_count, indexed_tokens, packed_width}, gradient_options)
           : torch::Tensor();
-  torch::Tensor shared_gradient =
-      needs_shared_gradient
+  torch::Tensor shared_key_value_gradient =
+      needs_shared_key_value_gradient
           ? torch::empty({group_count, shared_tokens, packed_width}, gradient_options)
           : torch::Tensor();
   if (query_count == 0) {
-    return {query_gradient, shared_gradient,
+    return {query_gradient, shared_key_value_gradient,
         needs_shared_delta_gradient ? shared_delta_workspace : torch::Tensor(),
         needs_indexed_delta_gradient ? indexed_delta_workspace : torch::Tensor()};
   }
@@ -1584,16 +1600,16 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
                           shared_deltas.is_contiguous() && indexed_deltas.is_contiguous() &&
                           indexed_shared_ids.is_contiguous();
   const int64_t query_head_count = query_count * heads;
-  const auto query_launch_plan = grouped_attention_launch_plan(
+  const auto query_launch_plan = grouped_indexed_attention_launch_plan(
       query, shared_tokens, indexed_tokens, value_features, true);
   TORCH_CHECK(query_launch_plan.has_value(),
       "grouped indexed attention backward launch exceeds this device's limits");
-  std::optional<SharedGradientLaunchPlan> shared_launch_plan;
-  if (needs_shared_gradient) {
-    shared_launch_plan = shared_gradient_launch_plan(
+  std::optional<GroupedIndexedAttentionSharedKeyValueGradientLaunchPlan> shared_launch_plan;
+  if (needs_shared_key_value_gradient) {
+    shared_launch_plan = grouped_indexed_attention_shared_key_value_gradient_launch_plan(
         query, group_count, shared_tokens, packed_width);
     TORCH_CHECK(shared_launch_plan.has_value(),
-        "grouped indexed attention shared-gradient launch exceeds this device's limits");
+        "grouped indexed attention shared key/value gradient launch exceeds this device's limits");
   }
 
   const torch::Tensor contiguous_log_sum_exp = log_sum_exp.contiguous();
@@ -1630,28 +1646,34 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
                 needs_indexed_delta_workspace ? indexed_delta_workspace.data_ptr<scalar_t>() : nullptr,
                 query_head_count, layout, scale);
           }
-          if (needs_shared_gradient) {
+          if (needs_shared_key_value_gradient) {
             const auto& config = rocm_kernel_launch_config();
-            dispatch_specialized_tile(config.shared_gradient_feature_tile,
-                "DJL_ROCM_SHARED_GRADIENT_FEATURE_TILE", [&](auto feature_tile) {
-                  constexpr int feature_tile_size = decltype(feature_tile)::value;
+            dispatch_compiled_work_size(
+                config.grouped_indexed_attention_shared_key_value_gradient_features_per_block,
+                launch_environment::kGroupedIndexedAttentionSharedKeyValueGradientFeaturesPerBlock,
+                [&](auto feature_work_size) {
+                  constexpr int features_per_block = decltype(feature_work_size)::value;
                   if (indexed_shared_ids.is_contiguous()) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_indexed_attention_shared_gradient_kernel<
-                                           feature_tile_size, scalar_t, index_t, true>),
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(
+                                           grouped_indexed_attention_shared_key_value_gradient_kernel<
+                                               features_per_block, scalar_t, index_t, true>),
                         dim3(shared_launch_plan->grid_size), dim3(shared_launch_plan->threads_per_block),
                         shared_launch_plan->shared_memory_bytes, stream,
                         shared_delta_workspace.data_ptr<scalar_t>(),
                         indexed_delta_workspace.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<index_t>(),
-                        shared_gradient.data_ptr<scalar_t>(), shared_launch_plan->group_feature_tile_count,
+                        shared_key_value_gradient.data_ptr<scalar_t>(),
+                        shared_launch_plan->feature_block_count_per_group,
                         layout);
                   } else {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_indexed_attention_shared_gradient_kernel<
-                                           feature_tile_size, scalar_t, index_t, false>),
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(
+                                           grouped_indexed_attention_shared_key_value_gradient_kernel<
+                                               features_per_block, scalar_t, index_t, false>),
                         dim3(shared_launch_plan->grid_size), dim3(shared_launch_plan->threads_per_block),
                         shared_launch_plan->shared_memory_bytes, stream,
                         shared_delta_workspace.data_ptr<scalar_t>(),
                         indexed_delta_workspace.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<index_t>(),
-                        shared_gradient.data_ptr<scalar_t>(), shared_launch_plan->group_feature_tile_count,
+                        shared_key_value_gradient.data_ptr<scalar_t>(),
+                        shared_launch_plan->feature_block_count_per_group,
                         layout);
                   }
                 });
@@ -1664,7 +1686,7 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
         }
       });
   check_hip_kernel_launch("grouped_indexed_attention_backward");
-  return {query_gradient, shared_gradient,
+  return {query_gradient, shared_key_value_gradient,
       needs_shared_delta_gradient ? shared_delta_workspace : torch::Tensor(),
       needs_indexed_delta_gradient ? indexed_delta_workspace : torch::Tensor()};
 }
@@ -1696,8 +1718,8 @@ torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, cons
   }
   const auto& properties = device_properties(residual.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
-      rocm_kernel_launch_config().residual_norm_threads_per_block,
-      "DJL_ROCM_RESIDUAL_NORM_THREADS_PER_BLOCK", true);
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
   const int waves_per_block = threads_per_block / properties.warpSize;
   const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
   const dim3 block(threads_per_block);

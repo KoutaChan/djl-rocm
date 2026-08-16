@@ -225,20 +225,23 @@ environment variables before the first native ROCm operation. These settings con
 operator selection or shape thresholds. The configuration is loaded once per process; CPU and CUDA execution
 are unaffected.
 
-| Environment variable | Default | Constraint |
-| --- | ---: | --- |
-| `DJL_ROCM_RELATION_FORWARD_WAVES_PER_BLOCK` | 4 | Positive; must fit the device block limit |
-| `DJL_ROCM_RELATION_BACKWARD_WAVES_PER_BLOCK` | 4 | Positive; must fit the device block limit |
-| `DJL_ROCM_RELATION_FORWARD_QUERIES_PER_WAVE` | 4 | One of 1, 2, 4, 8, 16, 32 |
-| `DJL_ROCM_RELATION_BACKWARD_QUERIES_PER_WAVE` | 16 | One of 1, 2, 4, 8, 16, 32 |
-| `DJL_ROCM_GROUPED_ATTENTION_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
-| `DJL_ROCM_GROUPED_ATTENTION_BACKWARD_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
-| `DJL_ROCM_SHARED_GRADIENT_THREADS_PER_BLOCK` | 256 | Positive; must fit the device block limit |
-| `DJL_ROCM_SHARED_GRADIENT_FEATURE_TILE` | 8 | One of 1, 2, 4, 8, 16, 32 |
-| `DJL_ROCM_RESIDUAL_NORM_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
-| `DJL_ROCM_OPTIMIZER_THREADS_PER_BLOCK` | 256 | Positive; must fit the device block limit |
-| `DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK` | 256 | Positive multiple of the device wavefront size |
-| `DJL_ROCM_ROW_OPERATION_THREADS_PER_BLOCK` | 256 | Positive; must fit the device block limit |
+Each variable names the generic operator that consumes it. A "feature" below is a scalar in the grouped
+attention operator's packed key/value dimension, not an application or model input feature.
+
+| Operator | Environment variable | Default | Launch unit and constraint |
+| --- | --- | ---: | --- |
+| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_FORWARD_WAVES_PER_BLOCK` | 4 | Forward waves per block; positive and within the device block limit |
+| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_BACKWARD_WAVES_PER_BLOCK` | 4 | Backward waves per block; positive and within the device block limit |
+| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_FORWARD_QUERIES_PER_WAVE` | 4 | Forward queries handled by each wave; one of 1, 2, 4, 8, 16, 32 |
+| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_BACKWARD_QUERIES_PER_WAVE` | 16 | Backward queries handled by each wave; one of 1, 2, 4, 8, 16, 32 |
+| Grouped indexed attention | `DJL_ROCM_GROUPED_INDEXED_ATTENTION_FORWARD_MAX_THREADS_PER_BLOCK` | 256 | Upper bound for forward threads per block; positive multiple of the device wavefront size |
+| Grouped indexed attention | `DJL_ROCM_GROUPED_INDEXED_ATTENTION_BACKWARD_MAX_THREADS_PER_BLOCK` | 256 | Upper bound for backward threads per block; positive multiple of the device wavefront size |
+| Grouped indexed attention shared key/value gradient | `DJL_ROCM_GROUPED_INDEXED_ATTENTION_SHARED_KEY_VALUE_GRADIENT_THREADS_PER_BLOCK` | 256 | Reduction threads per block; positive and within the device block limit |
+| Grouped indexed attention shared key/value gradient | `DJL_ROCM_GROUPED_INDEXED_ATTENTION_SHARED_KEY_VALUE_GRADIENT_FEATURES_PER_BLOCK` | 8 | Consecutive packed key/value features reduced by each block; one of 1, 2, 4, 8, 16, 32 |
+| Residual add and LayerNorm | `DJL_ROCM_RESIDUAL_ADD_LAYER_NORM_THREADS_PER_BLOCK` | 256 | Threads per block; positive multiple of the device wavefront size |
+| Fused Adam update | `DJL_ROCM_FUSED_ADAM_UPDATE_THREADS_PER_BLOCK` | 256 | Threads per block; positive and within the device block limit |
+| Masked categorical | `DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK` | 256 | Threads per block; positive multiple of the device wavefront size |
+| Scatter rows | `DJL_ROCM_SCATTER_ROWS_THREADS_PER_BLOCK` | 256 | Forward and backward threads per block; positive and within the device block limit |
 
 The complete configuration is validated when a native ROCm kernel first loads it, so any invalid override fails
 fast. DJL does not perform runtime autotuning or shape-dependent performance dispatch; benchmark overrides on

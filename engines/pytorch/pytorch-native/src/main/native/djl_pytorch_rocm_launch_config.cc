@@ -23,7 +23,7 @@ int read_positive_integer(const char* name, int default_value) {
   return value;
 }
 
-bool is_specialized_tile(int value) {
+bool has_compiled_work_size(int value) {
   switch (value) {
     case 1:
     case 2:
@@ -37,26 +37,29 @@ bool is_specialized_tile(int value) {
   }
 }
 
-int read_specialized_tile(const char* name, int default_value) {
+int read_compiled_work_size(const char* name, int default_value) {
   const int value = read_positive_integer(name, default_value);
-  TORCH_CHECK(is_specialized_tile(value), name, " must be one of 1, 2, 4, 8, 16, or 32, but was ", value);
+  TORCH_CHECK(has_compiled_work_size(value), name,
+      " must be one of 1, 2, 4, 8, 16, or 32, but was ", value);
   return value;
 }
 
 RocmKernelLaunchConfig load_launch_config() {
   return {
-      read_positive_integer("DJL_ROCM_RELATION_FORWARD_WAVES_PER_BLOCK", 4),
-      read_positive_integer("DJL_ROCM_RELATION_BACKWARD_WAVES_PER_BLOCK", 4),
-      read_specialized_tile("DJL_ROCM_RELATION_FORWARD_QUERIES_PER_WAVE", 4),
-      read_specialized_tile("DJL_ROCM_RELATION_BACKWARD_QUERIES_PER_WAVE", 16),
-      read_positive_integer("DJL_ROCM_GROUPED_ATTENTION_THREADS_PER_BLOCK", 256),
-      read_positive_integer("DJL_ROCM_GROUPED_ATTENTION_BACKWARD_THREADS_PER_BLOCK", 256),
-      read_positive_integer("DJL_ROCM_SHARED_GRADIENT_THREADS_PER_BLOCK", 256),
-      read_specialized_tile("DJL_ROCM_SHARED_GRADIENT_FEATURE_TILE", 8),
-      read_positive_integer("DJL_ROCM_RESIDUAL_NORM_THREADS_PER_BLOCK", 256),
-      read_positive_integer("DJL_ROCM_OPTIMIZER_THREADS_PER_BLOCK", 256),
-      read_positive_integer("DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK", 256),
-      read_positive_integer("DJL_ROCM_ROW_OPERATION_THREADS_PER_BLOCK", 256),
+      read_positive_integer(launch_environment::kIndexedRelationBiasForwardWavesPerBlock, 4),
+      read_positive_integer(launch_environment::kIndexedRelationBiasBackwardWavesPerBlock, 4),
+      read_compiled_work_size(launch_environment::kIndexedRelationBiasForwardQueriesPerWave, 4),
+      read_compiled_work_size(launch_environment::kIndexedRelationBiasBackwardQueriesPerWave, 16),
+      read_positive_integer(launch_environment::kGroupedIndexedAttentionForwardMaxThreadsPerBlock, 256),
+      read_positive_integer(launch_environment::kGroupedIndexedAttentionBackwardMaxThreadsPerBlock, 256),
+      read_positive_integer(
+          launch_environment::kGroupedIndexedAttentionSharedKeyValueGradientThreadsPerBlock, 256),
+      read_compiled_work_size(
+          launch_environment::kGroupedIndexedAttentionSharedKeyValueGradientFeaturesPerBlock, 8),
+      read_positive_integer(launch_environment::kResidualAddLayerNormThreadsPerBlock, 256),
+      read_positive_integer(launch_environment::kFusedAdamUpdateThreadsPerBlock, 256),
+      read_positive_integer(launch_environment::kMaskedCategoricalThreadsPerBlock, 256),
+      read_positive_integer(launch_environment::kScatterRowsThreadsPerBlock, 256),
   };
 }
 

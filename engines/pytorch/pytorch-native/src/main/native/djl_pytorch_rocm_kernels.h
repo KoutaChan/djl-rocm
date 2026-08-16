@@ -52,7 +52,8 @@ bool supports_grouped_indexed_attention_forward(const torch::Tensor& query,
 
 bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
-    const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, bool needs_shared_gradient);
+    const torch::Tensor& indexed_shared_ids, int64_t queries_per_group,
+    bool needs_shared_key_value_gradient);
 
 struct GroupedIndexedAttentionForwardResult {
   torch::Tensor output;
@@ -74,7 +75,8 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, const torch::Tensor& log_sum_exp,
     const torch::Tensor& gradient_output, int64_t queries_per_group, float scale, bool needs_query_gradient,
-    bool needs_shared_gradient, bool needs_shared_delta_gradient, bool needs_indexed_delta_gradient);
+    bool needs_shared_key_value_gradient, bool needs_shared_delta_gradient,
+    bool needs_indexed_delta_gradient);
 
 bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const torch::Tensor& update,
     const torch::Tensor& weight, const torch::Tensor& bias);
