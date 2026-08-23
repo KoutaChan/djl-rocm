@@ -76,6 +76,33 @@ public class PtNDArrayTest {
     }
 
     @Test
+    public void testCopyToConvertsFloatingDataType() {
+        try (NDManager manager = NDManager.newBaseManager();
+                NDArray source = manager.create(new float[] {1.25f, -2.5f, 3.75f});
+                NDArray target = manager.zeros(new Shape(3), DataType.BFLOAT16)) {
+            source.copyTo(target);
+            try (NDArray restored = target.toType(DataType.FLOAT32, false)) {
+                Assert.assertEquals(
+                        restored.toFloatArray(), new float[] {1.25f, -2.5f, 3.75f}, 1e-2f);
+            }
+        }
+    }
+
+    @Test
+    public void testCopyToPortableFallbackConvertsFloatingDataType() {
+        try (NDManager manager = NDManager.newBaseManager();
+                NDArray source =
+                        manager.create(new float[] {1.25f, -2.5f, 3.75f}, new Shape(1, 3));
+                NDArray target = manager.zeros(new Shape(3), DataType.BFLOAT16)) {
+            source.copyTo(target);
+            try (NDArray restored = target.toType(DataType.FLOAT32, false)) {
+                Assert.assertEquals(
+                        restored.toFloatArray(), new float[] {1.25f, -2.5f, 3.75f}, 1e-2f);
+            }
+        }
+    }
+
+    @Test
     public void testSwish() {
         try (NDManager manager = NDManager.newBaseManager()) {
             NDArray values = manager.create(new float[] {-2.0f, 0.0f, 3.0f});

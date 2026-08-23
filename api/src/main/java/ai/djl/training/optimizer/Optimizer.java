@@ -16,6 +16,8 @@ import ai.djl.Device;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
+import ai.djl.util.Preconditions;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -164,6 +166,88 @@ public abstract class Optimizer {
      * @param grad the gradients
      */
     public abstract void update(String parameterId, NDArray weight, NDArray grad);
+
+    /**
+     * Updates a full-precision master weight and refreshes its lower-precision model weight.
+     *
+     * <p>This entry point is intended for mixed-precision training where forward and backward use a
+     * compact model weight. The update itself and all optimizer-specific state use {@code
+     * masterWeight}; the updated value is then copied to {@code modelWeight}, converting to its
+     * data type when necessary.
+     *
+     * <p>The optimizer does not own or serialize either weight. In particular, {@link #saveState}
+     * saves optimizer state such as update counters and moments, but not {@code masterWeight}.
+     * Callers must keep the master weight as the authoritative checkpoint value and restore it
+     * together with the optimizer state.
+     *
+     * @param parameterId the parameter to be updated
+     * @param modelWeight the weight consumed by forward and backward
+     * @param masterWeight the higher-precision weight updated by the optimizer
+     * @param grad the gradient in the master weight's data type
+     * @throws IllegalArgumentException if shapes, devices, or data types are incompatible
+     */
+    public void updateWithMasterWeight(
+            String parameterId, NDArray modelWeight, NDArray masterWeight, NDArray grad) {
+        Preconditions.checkArgument(
+                modelWeight.getShape().equals(masterWeight.getShape()),
+                "Model and master weight shapes must match: "
+                        + modelWeight.getShape()
+                        + " / "
+                        + masterWeight.getShape());
+        Preconditions.checkArgument(
+                modelWeight.getDevice().equals(masterWeight.getDevice()),
+                "Model and master weights must share a device: "
+                        + modelWeight.getDevice()
+                        + " / "
+                        + masterWeight.getDevice());
+        Preconditions.checkArgument(
+                masterWeight.getShape().equals(grad.getShape()),
+                "Master weight and gradient shapes must match: "
+                        + masterWeight.getShape()
+                        + " / "
+                        + grad.getShape());
+        Preconditions.checkArgument(
+                masterWeight.getDevice().equals(grad.getDevice()),
+                "Master weight and gradient must share a device: "
+                        + masterWeight.getDevice()
+                        + " / "
+                        + grad.getDevice());
+        Preconditions.checkArgument(
+                isRealFloating(modelWeight.getDataType())
+                        && isRealFloating(masterWeight.getDataType())
+                        && grad.getDataType() == masterWeight.getDataType(),
+                "Master-weight update requires real floating weights and a master-precision "
+                        + "gradient: "
+                        + modelWeight.getDataType()
+                        + " / "
+                        + masterWeight.getDataType()
+                        + " / "
+                        + grad.getDataType());
+        Preconditions.checkArgument(
+                masterWeight.getDataType().getNumOfBytes()
+                        >= modelWeight.getDataType().getNumOfBytes(),
+                "Master weight must not have lower precision than model weight: "
+                        + modelWeight.getDataType()
+                        + " / "
+                        + masterWeight.getDataType());
+
+        update(parameterId, masterWeight, grad);
+        if (modelWeight != masterWeight) {
+            masterWeight.copyTo(modelWeight);
+        }
+    }
+
+    private static boolean isRealFloating(DataType dataType) {
+        switch (dataType) {
+            case FLOAT16:
+            case BFLOAT16:
+            case FLOAT32:
+            case FLOAT64:
+                return true;
+            default:
+                return false;
+        }
+    }
 
     /**
      * Saves this optimizer's state.
