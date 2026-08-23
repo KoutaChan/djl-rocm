@@ -230,9 +230,9 @@ attention operator's packed key/value dimension, not an application or model inp
 
 | Operator | Environment variable | Default | Launch unit and constraint |
 | --- | --- | ---: | --- |
-| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_FORWARD_WAVES_PER_BLOCK` | 4 | Forward waves per block; positive and within the device block limit |
+| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_FORWARD_WAVES_PER_BLOCK` | 8 | Forward waves per block; positive and within the device block limit |
 | Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_BACKWARD_WAVES_PER_BLOCK` | 4 | Backward waves per block; positive and within the device block limit |
-| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_FORWARD_QUERIES_PER_WAVE` | 4 | Forward queries handled by each wave; one of 1, 2, 4, 8, 16, 32 |
+| Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_FORWARD_QUERIES_PER_WAVE` | 8 | Forward queries handled by each wave; one of 1, 2, 4, 8, 16, 32 |
 | Indexed relation bias | `DJL_ROCM_INDEXED_RELATION_BIAS_BACKWARD_QUERIES_PER_WAVE` | 16 | Backward queries handled by each wave; one of 1, 2, 4, 8, 16, 32 |
 | Grouped indexed attention | `DJL_ROCM_GROUPED_INDEXED_ATTENTION_FORWARD_MAX_THREADS_PER_BLOCK` | 256 | Upper bound for forward threads per block; positive multiple of the device wavefront size |
 | Grouped indexed attention | `DJL_ROCM_GROUPED_INDEXED_ATTENTION_BACKWARD_MAX_THREADS_PER_BLOCK` | 256 | Upper bound for backward threads per block; positive multiple of the device wavefront size |

@@ -363,10 +363,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     public void copyTo(NDArray array) {
         if (array instanceof PtNDArray) {
             PtNDArray target = (PtNDArray) array;
-            if (getDataType() == target.getDataType()
-                    && getShape().equals(target.getShape())
-                    && !isSparse()
-                    && !target.isSparse()) {
+            if (getShape().equals(target.getShape()) && !isSparse() && !target.isSparse()) {
                 JniUtils.copyTo(this, target);
                 return;
             }

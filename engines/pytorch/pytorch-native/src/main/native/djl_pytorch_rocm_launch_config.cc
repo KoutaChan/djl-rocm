@@ -46,9 +46,9 @@ int read_compiled_work_size(const char* name, int default_value) {
 
 RocmKernelLaunchConfig load_launch_config() {
   return {
-      read_positive_integer(launch_environment::kIndexedRelationBiasForwardWavesPerBlock, 4),
+      read_positive_integer(launch_environment::kIndexedRelationBiasForwardWavesPerBlock, 8),
       read_positive_integer(launch_environment::kIndexedRelationBiasBackwardWavesPerBlock, 4),
-      read_compiled_work_size(launch_environment::kIndexedRelationBiasForwardQueriesPerWave, 4),
+      read_compiled_work_size(launch_environment::kIndexedRelationBiasForwardQueriesPerWave, 8),
       read_compiled_work_size(launch_environment::kIndexedRelationBiasBackwardQueriesPerWave, 16),
       read_positive_integer(launch_environment::kGroupedIndexedAttentionForwardMaxThreadsPerBlock, 256),
       read_positive_integer(launch_environment::kGroupedIndexedAttentionBackwardMaxThreadsPerBlock, 256),

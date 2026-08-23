@@ -860,9 +860,18 @@ public interface NDArray extends NDResource, BytesSupplier {
     /**
      * Deep-copies the current {@code NDArray} to the one passed in.
      *
+     * <p>If the target has a different data type, values are converted to the target data type
+     * before copying. Implementations may override this method with an engine-native conversion.
+     *
      * @param array this {@code NDArray} prepared to be copied to
      */
     default void copyTo(NDArray array) {
+        if (getDataType() != array.getDataType()) {
+            try (NDArray converted = toType(array.getDataType(), false)) {
+                converted.copyTo(array);
+            }
+            return;
+        }
         array.set(toByteBuffer());
     }
 
