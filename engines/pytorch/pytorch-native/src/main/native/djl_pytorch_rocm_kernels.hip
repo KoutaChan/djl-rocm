@@ -17,6 +17,9 @@
 namespace djl::pytorch::rocm {
 namespace {
 
+// Bound register-backed specializations; wider rows retain the original two-pass kernel.
+constexpr int kResidualCachedValuesPerLaneLimit = 16;
+
 void check_hip_kernel_launch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
   TORCH_CHECK(error == hipSuccess, kernel_name, " launch failed: ", hipGetErrorString(error));
@@ -109,6 +112,56 @@ __global__ void masked_categorical_forward_kernel(const scalar_t* logits, const 
   }
 }
 
+template <int subwave_width, typename scalar_t, bool write_probabilities>
+__global__ void masked_categorical_forward_subwave_kernel(const scalar_t* logits, const bool* mask,
+    float* output, int64_t row_count, int64_t width) {
+  const int lane = threadIdx.x % subwave_width;
+  const int group = threadIdx.x / subwave_width;
+  const int groups_per_block = blockDim.x / subwave_width;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * groups_per_block + group;
+       row < row_count;
+       row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t row_offset = row * width;
+    float local_maximum = -INFINITY;
+    int local_choice_count = 0;
+    for (int64_t column = lane; column < width; column += subwave_width) {
+      if (mask[row_offset + column]) {
+        local_maximum = maximum_propagating_nan(
+            local_maximum, static_cast<float>(logits[row_offset + column]));
+        ++local_choice_count;
+      }
+    }
+    for (int offset = subwave_width / 2; offset > 0; offset /= 2) {
+      local_maximum = maximum_propagating_nan(
+          local_maximum, __shfl_down(local_maximum, offset, subwave_width));
+      local_choice_count += __shfl_down(local_choice_count, offset, subwave_width);
+    }
+    const float maximum = __shfl(local_maximum, 0, subwave_width);
+    const int choice_count = __shfl(local_choice_count, 0, subwave_width);
+    float local_sum = 0.0f;
+    if (choice_count > 0) {
+      for (int64_t column = lane; column < width; column += subwave_width) {
+        if (mask[row_offset + column]) {
+          local_sum += expf(static_cast<float>(logits[row_offset + column]) - maximum);
+        }
+      }
+    }
+    for (int offset = subwave_width / 2; offset > 0; offset /= 2) {
+      local_sum += __shfl_down(local_sum, offset, subwave_width);
+    }
+    const float denominator = __shfl(local_sum, 0, subwave_width);
+    if constexpr (write_probabilities) {
+      for (int64_t column = lane; column < width; column += subwave_width) {
+        output[row_offset + column] = mask[row_offset + column] && choice_count > 0
+            ? expf(static_cast<float>(logits[row_offset + column]) - maximum) / denominator
+            : 0.0f;
+      }
+    } else if (lane == 0) {
+      output[row] = choice_count > 0 ? logf(denominator) + maximum : 0.0f;
+    }
+  }
+}
+
 template <typename scalar_t>
 __global__ void masked_softmax_backward_kernel(const float* gradient_output,
     const float* probabilities, const bool* mask, scalar_t* gradient_input,
@@ -183,6 +236,44 @@ __global__ void gather_scattered_row_gradients_kernel(const scalar_t* gradient_o
     const int64_t compact_row = destination_index / row_width;
     gradient_rows[destination_index] =
         gradient_output[row_indices[compact_row] * row_width + destination_index % row_width];
+  }
+}
+
+template <int group_width, typename scalar_t>
+__global__ void scatter_rows_grouped_kernel(const scalar_t* rows, const int64_t* row_indices,
+    scalar_t* output, int64_t compact_row_count, int64_t row_width, int64_t row_count) {
+  const int lane = threadIdx.x % group_width;
+  const int group = threadIdx.x / group_width;
+  const int groups_per_block = blockDim.x / group_width;
+  for (int64_t source_row = static_cast<int64_t>(blockIdx.x) * groups_per_block + group;
+       source_row < compact_row_count;
+       source_row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t destination_row = row_indices[source_row];
+    if (destination_row >= 0 && destination_row < row_count) {
+      const int64_t source_offset = source_row * row_width;
+      const int64_t destination_offset = destination_row * row_width;
+      for (int64_t column = lane; column < row_width; column += group_width) {
+        output[destination_offset + column] = rows[source_offset + column];
+      }
+    }
+  }
+}
+
+template <int group_width, typename scalar_t>
+__global__ void gather_scattered_row_gradients_grouped_kernel(const scalar_t* gradient_output,
+    const int64_t* row_indices, scalar_t* gradient_rows, int64_t compact_row_count,
+    int64_t row_width) {
+  const int lane = threadIdx.x % group_width;
+  const int group = threadIdx.x / group_width;
+  const int groups_per_block = blockDim.x / group_width;
+  for (int64_t compact_row = static_cast<int64_t>(blockIdx.x) * groups_per_block + group;
+       compact_row < compact_row_count;
+       compact_row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t source_offset = row_indices[compact_row] * row_width;
+    const int64_t destination_offset = compact_row * row_width;
+    for (int64_t column = lane; column < row_width; column += group_width) {
+      gradient_rows[destination_offset + column] = gradient_output[source_offset + column];
+    }
   }
 }
 
@@ -763,6 +854,67 @@ __global__ void residual_add_layer_norm_in_place_kernel(residual_t* residual, co
   }
 }
 
+template <int cached_values_per_lane, typename residual_t, typename update_t, typename parameter_t>
+__global__ void residual_add_layer_norm_cached_in_place_kernel(residual_t* residual,
+    const update_t* update, const parameter_t* weight, const parameter_t* bias, residual_t* output,
+    int64_t row_count, int64_t width, float epsilon) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+  if (row >= row_count) {
+    return;
+  }
+
+  float cached_values[cached_values_per_lane];
+  float mean = 0.0f;
+  float moment = 0.0f;
+  int count = 0;
+  const int64_t row_offset = row * width;
+#pragma unroll
+  for (int cached_index = 0; cached_index < cached_values_per_lane; cached_index++) {
+    const int64_t feature = lane + static_cast<int64_t>(cached_index) * warpSize;
+    if (feature < width) {
+      const int64_t index = row_offset + feature;
+      const float value = static_cast<float>(residual[index]) + static_cast<float>(update[index]);
+      const residual_t rounded_value = static_cast<residual_t>(value);
+      residual[index] = rounded_value;
+      cached_values[cached_index] = static_cast<float>(rounded_value);
+      count++;
+      const float delta = value - mean;
+      mean += delta / count;
+      moment += delta * (value - mean);
+    }
+  }
+
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    const float other_mean = __shfl_down(mean, offset);
+    const float other_moment = __shfl_down(moment, offset);
+    const int other_count = __shfl_down(count, offset);
+    if (lane + offset < warpSize && other_count > 0) {
+      const int combined_count = count + other_count;
+      const float delta = other_mean - mean;
+      moment += other_moment + delta * delta * static_cast<float>(count) * static_cast<float>(other_count) /
+                                   static_cast<float>(combined_count);
+      mean += delta * static_cast<float>(other_count) / static_cast<float>(combined_count);
+      count = combined_count;
+    }
+  }
+  mean = __shfl(mean, 0);
+  const float inverse_standard_deviation =
+      rsqrtf(__shfl(moment, 0) / static_cast<float>(width) + epsilon);
+
+#pragma unroll
+  for (int cached_index = 0; cached_index < cached_values_per_lane; cached_index++) {
+    const int64_t feature = lane + static_cast<int64_t>(cached_index) * warpSize;
+    if (feature < width) {
+      const float normalized = (cached_values[cached_index] - mean) * inverse_standard_deviation;
+      output[row_offset + feature] = static_cast<residual_t>(
+          normalized * static_cast<float>(weight[feature]) + static_cast<float>(bias[feature]));
+    }
+  }
+}
+
 const hipDeviceProp_t& device_properties(int device) {
   static const std::vector<hipDeviceProp_t> all_properties = [] {
     int device_count;
@@ -816,6 +968,58 @@ decltype(auto) dispatch_compiled_work_size(int value, const char* setting, Callb
       return callback(std::integral_constant<int, 32>{});
     default:
       TORCH_CHECK(false, setting, " has no compiled kernel specialization for ", value);
+  }
+}
+
+int masked_categorical_group_width(int64_t width, int hardware_wave_width) {
+  if (width <= 4) {
+    return 4;
+  }
+  if (width <= 8) {
+    return 8;
+  }
+  if (width <= 16) {
+    return 16;
+  }
+  return hardware_wave_width;
+}
+
+template <typename Callback>
+void dispatch_masked_categorical_subwave_width(int64_t width, Callback&& callback) {
+  if (width <= 4) {
+    callback(std::integral_constant<int, 4>{});
+  } else if (width <= 8) {
+    callback(std::integral_constant<int, 8>{});
+  } else if (width <= 16) {
+    callback(std::integral_constant<int, 16>{});
+  } else {
+    TORCH_CHECK(false, "masked categorical subwave width is unavailable for width ", width);
+  }
+}
+
+template <typename Callback>
+void dispatch_scatter_rows_group_width(int group_width, Callback&& callback) {
+  switch (group_width) {
+    case 32:
+      callback(std::integral_constant<int, 32>{});
+      break;
+    case 64:
+      callback(std::integral_constant<int, 64>{});
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported scatter rows group width: ", group_width);
+  }
+}
+
+template <int compiled_values_per_lane = 1, typename Callback>
+void dispatch_residual_cached_values_per_lane(int values_per_lane, Callback&& callback) {
+  if (values_per_lane == compiled_values_per_lane) {
+    callback(std::integral_constant<int, compiled_values_per_lane>{});
+  } else if constexpr (compiled_values_per_lane < kResidualCachedValuesPerLaneLimit) {
+    dispatch_residual_cached_values_per_lane<compiled_values_per_lane + 1>(
+        values_per_lane, callback);
+  } else {
+    TORCH_CHECK(false, "unsupported residual cache values per lane: ", values_per_lane);
   }
 }
 
@@ -1103,17 +1307,28 @@ torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::T
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().masked_categorical_threads_per_block,
       launch_environment::kMaskedCategoricalThreadsPerBlock, true);
-  const int waves_per_block = threads_per_block / properties.warpSize;
+  const int groups_per_block =
+      threads_per_block / masked_categorical_group_width(width, properties.warpSize);
   const int64_t required_blocks =
-      (row_count + waves_per_block - 1) / waves_per_block;
+      (row_count + groups_per_block - 1) / groups_per_block;
   const int blocks = static_cast<int>(
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   const hipStream_t stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, logits.scalar_type(), "masked_softmax", [&] {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, true>),
-            dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
-            mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+        if (width <= 16) {
+          dispatch_masked_categorical_subwave_width(width, [&](auto subwave_width) {
+            constexpr int compiled_subwave_width = decltype(subwave_width)::value;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_subwave_kernel<
+                                   compiled_subwave_width, scalar_t, true>),
+                dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
+                mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+          });
+        } else {
+          hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, true>),
+              dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
+              mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+        }
       });
   check_hip_kernel_launch("masked_softmax");
   return output;
@@ -1175,9 +1390,19 @@ torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torc
   const hipStream_t stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, logits.scalar_type(), "masked_log_sum_exp", [&] {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, false>),
-            dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
-            mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+        if (width <= 16) {
+          dispatch_masked_categorical_subwave_width(width, [&](auto subwave_width) {
+            constexpr int compiled_subwave_width = decltype(subwave_width)::value;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_subwave_kernel<
+                                   compiled_subwave_width, scalar_t, false>),
+                dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
+                mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+          });
+        } else {
+          hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, false>),
+              dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
+              mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+        }
       });
   check_hip_kernel_launch("masked_log_sum_exp");
   return output;
@@ -1235,16 +1460,31 @@ torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().scatter_rows_threads_per_block,
       launch_environment::kScatterRowsThreadsPerBlock, false);
-  const int64_t required_blocks =
-      (rows.numel() + threads_per_block - 1) / threads_per_block;
+  const int group_width = properties.warpSize;
+  const bool use_grouped_kernel =
+      row_width >= group_width && threads_per_block % group_width == 0;
+  const int groups_per_block = use_grouped_kernel ? threads_per_block / group_width : 0;
+  const int64_t required_blocks = use_grouped_kernel
+      ? (rows.size(0) + groups_per_block - 1) / groups_per_block
+      : (rows.numel() + threads_per_block - 1) / threads_per_block;
   const int blocks = static_cast<int>(
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, rows.scalar_type(), "scatter_rows", [&] {
-        hipLaunchKernelGGL(scatter_rows_kernel<scalar_t>, dim3(blocks),
-            dim3(threads_per_block), 0, stream, rows.data_ptr<scalar_t>(),
-            row_indices.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), rows.numel(),
-            row_width, row_count);
+        if (use_grouped_kernel) {
+          dispatch_scatter_rows_group_width(group_width, [&](auto compiled_group_width) {
+            constexpr int launch_group_width = decltype(compiled_group_width)::value;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(scatter_rows_grouped_kernel<launch_group_width, scalar_t>),
+                dim3(blocks), dim3(threads_per_block), 0, stream, rows.data_ptr<scalar_t>(),
+                row_indices.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), rows.size(0), row_width,
+                row_count);
+          });
+        } else {
+          hipLaunchKernelGGL(scatter_rows_kernel<scalar_t>, dim3(blocks),
+              dim3(threads_per_block), 0, stream, rows.data_ptr<scalar_t>(),
+              row_indices.data_ptr<int64_t>(), output.data_ptr<scalar_t>(), rows.numel(),
+              row_width, row_count);
+        }
       });
   check_hip_kernel_launch("scatter_rows");
   return output;
@@ -1265,18 +1505,34 @@ torch::Tensor scatter_rows_backward(
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().scatter_rows_threads_per_block,
       launch_environment::kScatterRowsThreadsPerBlock, false);
-  const int64_t required_blocks =
-      (gradient_rows.numel() + threads_per_block - 1) / threads_per_block;
+  const int group_width = properties.warpSize;
+  const bool use_grouped_kernel =
+      row_width >= group_width && threads_per_block % group_width == 0;
+  const int groups_per_block = use_grouped_kernel ? threads_per_block / group_width : 0;
+  const int64_t required_blocks = use_grouped_kernel
+      ? (row_indices.numel() + groups_per_block - 1) / groups_per_block
+      : (gradient_rows.numel() + threads_per_block - 1) / threads_per_block;
   const int blocks = static_cast<int>(
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   const hipStream_t stream =
       c10::hip::getCurrentHIPStream(contiguous_gradient.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
       contiguous_gradient.scalar_type(), "scatter_rows_backward", [&] {
-        hipLaunchKernelGGL(gather_scattered_row_gradients_kernel<scalar_t>, dim3(blocks),
-            dim3(threads_per_block), 0, stream, contiguous_gradient.data_ptr<scalar_t>(),
-            row_indices.data_ptr<int64_t>(), gradient_rows.data_ptr<scalar_t>(),
-            gradient_rows.numel(), row_width);
+        if (use_grouped_kernel) {
+          dispatch_scatter_rows_group_width(group_width, [&](auto compiled_group_width) {
+            constexpr int launch_group_width = decltype(compiled_group_width)::value;
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gather_scattered_row_gradients_grouped_kernel<launch_group_width, scalar_t>),
+                dim3(blocks), dim3(threads_per_block), 0, stream, contiguous_gradient.data_ptr<scalar_t>(),
+                row_indices.data_ptr<int64_t>(), gradient_rows.data_ptr<scalar_t>(), row_indices.numel(),
+                row_width);
+          });
+        } else {
+          hipLaunchKernelGGL(gather_scattered_row_gradients_kernel<scalar_t>, dim3(blocks),
+              dim3(threads_per_block), 0, stream, contiguous_gradient.data_ptr<scalar_t>(),
+              row_indices.data_ptr<int64_t>(), gradient_rows.data_ptr<scalar_t>(),
+              gradient_rows.numel(), row_width);
+        }
       });
   check_hip_kernel_launch("scatter_rows_backward");
   return gradient_rows;
@@ -1721,29 +1977,50 @@ torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, cons
       rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
       launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
   const int waves_per_block = threads_per_block / properties.warpSize;
+  const int cached_values_per_lane =
+      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
+  const bool use_cached_kernel =
+      cached_values_per_lane <= kResidualCachedValuesPerLaneLimit &&
+      residual.scalar_type() == update.scalar_type() && weight.scalar_type() == torch::kFloat32;
   const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
   const dim3 block(threads_per_block);
   const hipStream_t stream = c10::hip::getCurrentHIPStream(residual.get_device()).stream();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      torch::kHalf, torch::kBFloat16, residual.scalar_type(), "residual_add_layer_norm", [&] {
-        using residual_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            torch::kHalf, torch::kBFloat16, update.scalar_type(), "residual_add_layer_norm_update", [&] {
-              using update_t = scalar_t;
-              if (weight.scalar_type() == torch::kFloat32) {
-                hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, float>), grid, block,
-                    0, stream, residual.data_ptr<residual_t>(), update.data_ptr<update_t>(), weight.data_ptr<float>(),
-                    bias.data_ptr<float>(), output.data_ptr<residual_t>(), row_count, width, epsilon);
-              } else {
-                hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, residual_t>), grid,
-                    block, 0, stream, residual.data_ptr<residual_t>(), update.data_ptr<update_t>(),
-                    weight.data_ptr<residual_t>(), bias.data_ptr<residual_t>(), output.data_ptr<residual_t>(),
-                    row_count, width, epsilon);
-              }
-            });
-      });
+  if (use_cached_kernel) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf, torch::kBFloat16, residual.scalar_type(), "residual_add_layer_norm_cached", [&] {
+          using residual_t = scalar_t;
+          dispatch_residual_cached_values_per_lane(cached_values_per_lane, [&](auto cached_values) {
+            constexpr int compiled_cached_values = decltype(cached_values)::value;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_cached_in_place_kernel<
+                                   compiled_cached_values, residual_t, residual_t, float>),
+                grid, block, 0, stream, residual.data_ptr<residual_t>(), update.data_ptr<residual_t>(),
+                weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<residual_t>(), row_count,
+                width, epsilon);
+          });
+        });
+  } else {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf, torch::kBFloat16, residual.scalar_type(), "residual_add_layer_norm", [&] {
+          using residual_t = scalar_t;
+          AT_DISPATCH_FLOATING_TYPES_AND2(
+              torch::kHalf, torch::kBFloat16, update.scalar_type(), "residual_add_layer_norm_update", [&] {
+                using update_t = scalar_t;
+                if (weight.scalar_type() == torch::kFloat32) {
+                  hipLaunchKernelGGL(
+                      HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, float>), grid,
+                      block, 0, stream, residual.data_ptr<residual_t>(), update.data_ptr<update_t>(),
+                      weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<residual_t>(), row_count,
+                      width, epsilon);
+                } else {
+                  hipLaunchKernelGGL(
+                      HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, residual_t>),
+                      grid, block, 0, stream, residual.data_ptr<residual_t>(), update.data_ptr<update_t>(),
+                      weight.data_ptr<residual_t>(), bias.data_ptr<residual_t>(), output.data_ptr<residual_t>(),
+                      row_count, width, epsilon);
+                }
+              });
+        });
+  }
   check_hip_kernel_launch("residual_add_layer_norm");
   return output;
 }
