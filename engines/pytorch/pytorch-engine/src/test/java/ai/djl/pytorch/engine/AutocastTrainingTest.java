@@ -108,7 +108,7 @@ public class AutocastTrainingTest {
                 trainer.loadGradScalerState(stateFile);
 
                 Assert.assertEquals(scaler.getScale(), 128f);
-                Assert.assertEquals(scaler.getGrowthTracker(), 7);
+                Assert.assertEquals(scaler.getGrowthCount(), 7);
             }
         } finally {
             Files.deleteIfExists(stateFile);
@@ -197,7 +197,7 @@ public class AutocastTrainingTest {
                 }
 
                 Assert.assertEquals(weight.toFloatArray(), before, 0f);
-                Assert.assertTrue(scaler.wasLastStepSkipped());
+                Assert.assertTrue(scaler.isLastStepSkipped());
                 Assert.assertEquals(scaler.getScale(), 4f);
                 for (Parameter parameter : block.getParameters().values()) {
                     if (parameter.requiresGradient()) {
@@ -248,7 +248,7 @@ public class AutocastTrainingTest {
                 }
 
                 Assert.assertEquals(weight.toFloatArray(), before, 0f);
-                Assert.assertTrue(scaler.wasLastStepSkipped());
+                Assert.assertTrue(scaler.isLastStepSkipped());
                 try (NDArray gradient = weight.getGradient();
                         NDArray denseGradient = gradient.toDense()) {
                     Assert.assertTrue(gradient.isSparse());
@@ -302,7 +302,7 @@ public class AutocastTrainingTest {
                 Assert.assertFalse(Arrays.equals(weight.toFloatArray(), before));
                 if (autocastDataType == DataType.FLOAT16) {
                     GradScaler scaler = trainer.getGradScaler().orElseThrow(AssertionError::new);
-                    Assert.assertFalse(scaler.wasLastStepSkipped());
+                    Assert.assertFalse(scaler.isLastStepSkipped());
                     Assert.assertEquals(scaler.getScale(), 65536f);
                 } else {
                     Assert.assertFalse(trainer.getGradScaler().isPresent());
@@ -364,7 +364,7 @@ public class AutocastTrainingTest {
                     Assert.assertFalse(
                             trainer.getGradScaler()
                                     .orElseThrow(AssertionError::new)
-                                    .wasLastStepSkipped());
+                                    .isLastStepSkipped());
                 } else {
                     Assert.assertFalse(trainer.getGradScaler().isPresent());
                 }
@@ -409,7 +409,7 @@ public class AutocastTrainingTest {
                 if (autocastDataType == DataType.FLOAT16) {
                     GradScaler scaler = trainer.getGradScaler().orElseThrow(AssertionError::new);
                     Assert.assertEquals(scaler.getScale(), 65536f);
-                    Assert.assertFalse(scaler.wasLastStepSkipped());
+                    Assert.assertFalse(scaler.isLastStepSkipped());
                 }
             }
         }

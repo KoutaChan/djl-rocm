@@ -233,13 +233,13 @@ public final class PtEngine extends Engine {
 
     /** {@inheritDoc} */
     @Override
-    public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
-        return new PtAutocast(device, dtype, true, cacheEnabled);
+    public Autocast newAutocast(Device device, DataType dataType, boolean cacheEnabled) {
+        return new PtAutocast(device, dataType, true, cacheEnabled);
     }
 
     /** {@inheritDoc} */
     @Override
-    public boolean unscaleGradientsAndCheckFinite(NDList gradients, float inverseScale) {
+    public boolean unscaleGradients(NDList gradients, float inverseScale) {
         if (inverseScale <= 0f || !Float.isFinite(inverseScale)) {
             throw new IllegalArgumentException("inverseScale must be positive and finite.");
         }
@@ -268,7 +268,7 @@ public final class PtEngine extends Engine {
         boolean gradientsFinite = true;
         for (Map<DataType, List<PtNDArray>> byDataType : grouped.values()) {
             for (List<PtNDArray> group : byDataType.values()) {
-                boolean groupFinite = JniUtils.unscaleGradientsAndCheckFinite(group, inverseScale);
+                boolean groupFinite = JniUtils.unscaleGradients(group, inverseScale);
                 gradientsFinite = groupFinite && gradientsFinite;
             }
         }

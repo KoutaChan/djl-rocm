@@ -37,8 +37,8 @@ final class PtAutocast implements Autocast {
     private final Thread ownerThread;
     private boolean closed;
 
-    PtAutocast(Device device, DataType dtype, boolean enabled, boolean cacheEnabled) {
-        if (enabled && dtype != DataType.FLOAT16 && dtype != DataType.BFLOAT16) {
+    PtAutocast(Device device, DataType dataType, boolean enabled, boolean cacheEnabled) {
+        if (enabled && dataType != DataType.FLOAT16 && dataType != DataType.BFLOAT16) {
             throw new IllegalArgumentException(
                     "PyTorch autocast data type must be FLOAT16 or BFLOAT16.");
         }
@@ -52,8 +52,8 @@ final class PtAutocast implements Autocast {
         // inside the scope sees a consistent (enabled, dtype) pair. The
         // nesting counter bumps regardless of enabled so the cache clear at
         // the outermost exit still fires symmetrically.
-        if (dtype != null) {
-            JniUtils.autocastSetDtype(deviceType, dtype.ordinal());
+        if (dataType != null) {
+            JniUtils.autocastSetDtype(deviceType, dataType.ordinal());
         }
         JniUtils.autocastSetEnabled(deviceType, enabled);
         JniUtils.autocastIncrementNesting();

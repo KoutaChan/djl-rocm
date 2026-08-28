@@ -318,7 +318,7 @@ public class Trainer implements AutoCloseable {
                     checkGradients(gradients);
                 }
                 long begin = System.nanoTime();
-                boolean gradientsFinite = gradScaler.unscaleAndCheckFinite(gradients);
+                boolean gradientsFinite = gradScaler.unscale(gradients);
                 if (!gradientsFinite) {
                     for (NDArray gradient : gradients) {
                         gradient.fillI(0);

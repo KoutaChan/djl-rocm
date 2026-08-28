@@ -84,12 +84,12 @@ public class DefaultTrainingConfigAutocastTest {
         restored.loadState(new GradScaler.State(64f, 3));
         GradScaler.State state = restored.getState();
         Assert.assertEquals(state.getScale(), 64f);
-        Assert.assertEquals(state.getGrowthTracker(), 3);
+        Assert.assertEquals(state.getGrowthCount(), 3);
 
         source.loadState(state);
         Assert.assertEquals(source.getScale(), 64f);
-        Assert.assertEquals(source.getGrowthTracker(), 3);
-        Assert.assertFalse(source.wasLastStepSkipped());
+        Assert.assertEquals(source.getGrowthCount(), 3);
+        Assert.assertFalse(source.isLastStepSkipped());
     }
 
     @Test
@@ -115,7 +115,7 @@ public class DefaultTrainingConfigAutocastTest {
                             .build();
             restored.loadState(path);
             Assert.assertEquals(restored.getScale(), 64f);
-            Assert.assertEquals(restored.getGrowthTracker(), 3);
+            Assert.assertEquals(restored.getGrowthCount(), 3);
 
             GradScaler incompatible = GradScaler.builder().optGrowthInterval(4).build();
             Assert.assertThrows(IOException.class, () -> incompatible.loadState(path));

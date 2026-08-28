@@ -83,7 +83,7 @@ public class GradScalerTest {
                 NDArray integer = manager.ones(new Shape(2), DataType.INT32)) {
             Assert.expectThrows(
                     IllegalArgumentException.class,
-                    () -> engine.unscaleGradientsAndCheckFinite(new NDList(dense, integer), 0.5f));
+                    () -> engine.unscaleGradients(new NDList(dense, integer), 0.5f));
             Assert.assertEquals(dense.toFloatArray(), new float[] {1f, 1f});
         }
     }
@@ -124,10 +124,9 @@ public class GradScalerTest {
             parameterServer.prepareGradients(
                     "weight", new NDArray[] {firstGradient, secondGradient});
             Assert.assertTrue(Float.isInfinite(firstGradient.getFloat()));
-            Assert.assertFalse(
-                    scaler.unscaleAndCheckFinite(new NDList(firstGradient, secondGradient)));
+            Assert.assertFalse(scaler.unscale(new NDList(firstGradient, secondGradient)));
             scaler.update();
-            Assert.assertTrue(scaler.wasLastStepSkipped());
+            Assert.assertTrue(scaler.isLastStepSkipped());
         }
     }
 
@@ -233,7 +232,7 @@ public class GradScalerTest {
 
                 Assert.assertEquals(firstParameter.getFloat(), 0f, 1.0e-6f);
                 Assert.assertEquals(block.getLastForwardParameter().getFloat(), 0f, 1.0e-6f);
-                Assert.assertFalse(scaler.wasLastStepSkipped());
+                Assert.assertFalse(scaler.isLastStepSkipped());
             }
         }
     }
@@ -247,7 +246,7 @@ public class GradScalerTest {
                 NDArray scaledLoss = scaler.scale(loss);
                 NDArray gradient = manager.create(new float[] {8f})) {
             Assert.assertEquals(scaledLoss.getFloat(), 8f);
-            Assert.assertTrue(scaler.unscaleAndCheckFinite(new NDList(gradient)));
+            Assert.assertTrue(scaler.unscale(new NDList(gradient)));
             Assert.assertThrows(IllegalStateException.class, () -> scaler.scale(loss));
             Assert.assertThrows(IllegalArgumentException.class, () -> scaler.update(false));
             scaler.update();
@@ -271,7 +270,7 @@ public class GradScalerTest {
             Assert.assertThrows(
                     IllegalStateException.class,
                     () -> scaler.loadState(new GradScaler.State(4f, 0)));
-            Assert.assertTrue(scaler.unscaleAndCheckFinite(new NDList(gradient)));
+            Assert.assertTrue(scaler.unscale(new NDList(gradient)));
             scaler.update();
             scaler.saveState(path);
         } finally {
@@ -287,15 +286,15 @@ public class GradScalerTest {
                         NDArray scaledLoss = scaler.scale(loss);
                         NDArray gradient = manager.create(new float[] {8f, -16f})) {
                     Assert.assertEquals(scaledLoss.getFloat(), scaler.getScale());
-                    Assert.assertTrue(scaler.unscaleAndCheckFinite(new NDList(gradient)));
+                    Assert.assertTrue(scaler.unscale(new NDList(gradient)));
                     Assert.assertEquals(gradient.toFloatArray(), new float[] {1f, -2f}, 0f);
                     scaler.update(true);
                 }
             }
         }
         Assert.assertEquals(scaler.getScale(), 16f);
-        Assert.assertEquals(scaler.getGrowthTracker(), 0);
-        Assert.assertFalse(scaler.wasLastStepSkipped());
+        Assert.assertEquals(scaler.getGrowthCount(), 0);
+        Assert.assertFalse(scaler.isLastStepSkipped());
     }
 
     private static boolean supportsBasicTensorOperation(Engine engine, Device device) {
@@ -315,13 +314,13 @@ public class GradScalerTest {
                 NDArray scaledLoss = scaler.scale(loss);
                 NDArray gradient = manager.create(new float[] {8f, Float.POSITIVE_INFINITY})) {
             Assert.assertEquals(scaledLoss.getFloat(), 8f);
-            Assert.assertFalse(scaler.unscaleAndCheckFinite(new NDList(gradient)));
+            Assert.assertFalse(scaler.unscale(new NDList(gradient)));
             Assert.assertEquals(gradient.getFloat(0), 1f);
             Assert.assertTrue(Float.isInfinite(gradient.getFloat(1)));
             scaler.update(false);
         }
         Assert.assertEquals(scaler.getScale(), 4f);
-        Assert.assertTrue(scaler.wasLastStepSkipped());
+        Assert.assertTrue(scaler.isLastStepSkipped());
     }
 
     private static void verifyGradientDataTypes(Engine engine, Device device) {
@@ -336,9 +335,7 @@ public class GradScalerTest {
                         NDArray gradient =
                                 manager.create(new float[] {8f, -16f}).toType(dataType, false)) {
                     Assert.assertEquals(scaledLoss.getFloat(), 8f);
-                    Assert.assertTrue(
-                            scaler.unscaleAndCheckFinite(new NDList(gradient)),
-                            dataType.toString());
+                    Assert.assertTrue(scaler.unscale(new NDList(gradient)), dataType.toString());
                     try (NDArray floatGradient = gradient.toType(DataType.FLOAT32, false)) {
                         Assert.assertEquals(
                                 floatGradient.toFloatArray(),
@@ -361,7 +358,7 @@ public class GradScalerTest {
                 NDArray sparse = dense.toSparse(SparseFormat.COO)) {
             Assert.assertTrue(sparse.isSparse());
             Assert.assertEquals(scaledLoss.getFloat(), 8f);
-            Assert.assertTrue(scaler.unscaleAndCheckFinite(new NDList(sparse)));
+            Assert.assertTrue(scaler.unscale(new NDList(sparse)));
             try (NDArray unscaled = sparse.toDense()) {
                 Assert.assertEquals(unscaled.toFloatArray(), new float[] {0f, 1f, 0f, -2f}, 0f);
             }
@@ -381,7 +378,7 @@ public class GradScalerTest {
                                 new Shape(1));
                 NDArray sparse = sparseFloat.toType(DataType.FLOAT16, false)) {
             Assert.assertEquals(scaledLoss.getFloat(), 8f);
-            Assert.assertFalse(scaler.unscaleAndCheckFinite(new NDList(sparse)));
+            Assert.assertFalse(scaler.unscale(new NDList(sparse)));
             scaler.update();
             Assert.assertEquals(scaler.getScale(), 4f);
         }

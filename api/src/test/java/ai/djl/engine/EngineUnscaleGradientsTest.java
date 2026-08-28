@@ -25,7 +25,7 @@ import org.testng.annotations.Test;
 import java.lang.reflect.Proxy;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class EngineGradientUnscaleFallbackTest {
+public class EngineUnscaleGradientsTest {
 
     @Test
     public void sparseGradientIsRejectedBeforeDenseMutation() {
@@ -36,7 +36,7 @@ public class EngineGradientUnscaleFallbackTest {
 
         Assert.expectThrows(
                 UnsupportedOperationException.class,
-                () -> engine.unscaleGradientsAndCheckFinite(new NDList(dense, sparse), 0.5f));
+                () -> engine.unscaleGradients(new NDList(dense, sparse), 0.5f));
         Assert.assertEquals(mutations.get(), 0);
     }
 
@@ -50,7 +50,7 @@ public class EngineGradientUnscaleFallbackTest {
 
         Assert.expectThrows(
                 IllegalArgumentException.class,
-                () -> engine.unscaleGradientsAndCheckFinite(new NDList(dense, foreign), 0.5f));
+                () -> engine.unscaleGradients(new NDList(dense, foreign), 0.5f));
         Assert.assertEquals(mutations.get(), 0);
     }
 
@@ -63,7 +63,7 @@ public class EngineGradientUnscaleFallbackTest {
 
         Assert.expectThrows(
                 IllegalArgumentException.class,
-                () -> engine.unscaleGradientsAndCheckFinite(new NDList(dense, integer), 0.5f));
+                () -> engine.unscaleGradients(new NDList(dense, integer), 0.5f));
         Assert.assertEquals(mutations.get(), 0);
     }
 

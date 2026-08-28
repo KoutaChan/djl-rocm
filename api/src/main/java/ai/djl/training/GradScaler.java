@@ -47,7 +47,7 @@ public final class GradScaler {
     private final float backoffFactor;
     private final int growthInterval;
 
-    private int growthTracker;
+    private int growthCount;
     private boolean scaledSinceUpdate;
     private boolean unscaledSinceUpdate;
     private boolean gradientsFiniteSinceUnscale;
@@ -82,16 +82,15 @@ public final class GradScaler {
     /**
      * Unscales gradients in place and checks that every value is finite.
      *
-     * <p>This method may be called only once between {@link #scale(NDArray)} and {@link
-     * #update(boolean)}.
+     * <p>This method may be called only once between {@link #scale(NDArray)} and {@link #update()}.
      *
      * @param gradients the gradients to unscale
      * @return {@code true} if all gradients are finite
      */
-    public synchronized boolean unscaleAndCheckFinite(NDList gradients) {
+    public synchronized boolean unscale(NDList gradients) {
         if (!scaledSinceUpdate) {
             throw new IllegalStateException(
-                    "GradScaler.unscaleAndCheckFinite() requires scale() in the current step.");
+                    "GradScaler.unscale() requires scale() in the current step.");
         }
         if (unscaledSinceUpdate) {
             throw new IllegalStateException(
@@ -111,7 +110,7 @@ public final class GradScaler {
         }
 
         float inverseScale = (float) (1.0d / scale);
-        boolean gradientsFinite = engine.unscaleGradientsAndCheckFinite(gradients, inverseScale);
+        boolean gradientsFinite = engine.unscaleGradients(gradients, inverseScale);
         gradientsFiniteSinceUnscale = gradientsFinite;
         unscaledSinceUpdate = true;
         return gradientsFinite;
@@ -127,10 +126,9 @@ public final class GradScaler {
      * Updates the dynamic scale after an optimizer step or skipped step.
      *
      * <p>The supplied result must match the value returned by the current step's {@link
-     * #unscaleAndCheckFinite(NDList)} call. Prefer {@link #update()} when no additional assertion
-     * is needed.
+     * #unscale(NDList)} call. Prefer {@link #update()} when no additional assertion is needed.
      *
-     * @param gradientsFinite the result returned by {@link #unscaleAndCheckFinite(NDList)}
+     * @param gradientsFinite the result returned by {@link #unscale(NDList)}
      */
     public synchronized void update(boolean gradientsFinite) {
         requireUnscaled();
@@ -144,17 +142,17 @@ public final class GradScaler {
     private void updateScale(boolean gradientsFinite) {
         lastStepSkipped = !gradientsFinite;
         if (gradientsFinite) {
-            ++growthTracker;
-            if (growthTracker >= growthInterval) {
+            ++growthCount;
+            if (growthCount >= growthInterval) {
                 float grownScale = scale * growthFactor;
                 if (Float.isFinite(grownScale)) {
                     scale = grownScale;
                 }
-                growthTracker = 0;
+                growthCount = 0;
             }
         } else {
             scale = Math.max(scale * backoffFactor, MIN_SCALE);
-            growthTracker = 0;
+            growthCount = 0;
         }
 
         scaledSinceUpdate = false;
@@ -168,12 +166,12 @@ public final class GradScaler {
     }
 
     /** Returns the number of consecutive finite steps since the last scale change. */
-    public synchronized int getGrowthTracker() {
-        return growthTracker;
+    public synchronized int getGrowthCount() {
+        return growthCount;
     }
 
     /** Returns whether the most recent optimizer step was skipped. */
-    public synchronized boolean wasLastStepSkipped() {
+    public synchronized boolean isLastStepSkipped() {
         return lastStepSkipped;
     }
 
@@ -183,7 +181,7 @@ public final class GradScaler {
             throw new IllegalStateException(
                     "GradScaler state can only be saved between completed steps.");
         }
-        return new State(scale, growthTracker);
+        return new State(scale, growthCount);
     }
 
     /**
@@ -205,7 +203,7 @@ public final class GradScaler {
             output.writeFloat(backoffFactor);
             output.writeInt(growthInterval);
             output.writeFloat(state.scale);
-            output.writeInt(state.growthTracker);
+            output.writeInt(state.growthCount);
         }
     }
 
@@ -264,12 +262,12 @@ public final class GradScaler {
             throw new IllegalArgumentException("GradScaler state must not be null.");
         }
         requirePositiveFinite(state.scale, "scale");
-        if (state.growthTracker < 0 || state.growthTracker >= growthInterval) {
+        if (state.growthCount < 0 || state.growthCount >= growthInterval) {
             throw new IllegalArgumentException(
-                    "GradScaler growthTracker must be in [0, growthInterval).");
+                    "GradScaler growthCount must be in [0, growthInterval).");
         }
         scale = state.scale;
-        growthTracker = state.growthTracker;
+        growthCount = state.growthCount;
         scaledSinceUpdate = false;
         unscaledSinceUpdate = false;
         gradientsFiniteSinceUnscale = false;
@@ -311,17 +309,17 @@ public final class GradScaler {
     public static final class State {
 
         private final float scale;
-        private final int growthTracker;
+        private final int growthCount;
 
         /**
          * Creates a state value.
          *
          * @param scale the current loss scale
-         * @param growthTracker the current finite-step counter
+         * @param growthCount the current finite-step counter
          */
-        public State(float scale, int growthTracker) {
+        public State(float scale, int growthCount) {
             this.scale = scale;
-            this.growthTracker = growthTracker;
+            this.growthCount = growthCount;
         }
 
         /** Returns the saved loss scale. */
@@ -330,8 +328,8 @@ public final class GradScaler {
         }
 
         /** Returns the saved finite-step counter. */
-        public int getGrowthTracker() {
-            return growthTracker;
+        public int getGrowthCount() {
+            return growthCount;
         }
     }
 

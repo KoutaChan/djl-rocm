@@ -359,22 +359,22 @@ public abstract class Engine {
 
     /**
      * Opens an autocast scope on the given {@link Device}. Heavy matmul / conv / attention ops
-     * inside the scope are cast to {@code dtype}; numerically sensitive ops stay in FP32. The
-     * previous autocast state (enabled flag, dtype, cache flag) is saved on entry and restored on
-     * {@link Autocast#close()}, so scopes nest safely.
+     * inside the scope are cast to {@code dataType}; numerically sensitive ops stay in FP32. The
+     * previous autocast state (enabled flag, data type, cache flag) is saved on entry and restored
+     * on {@link Autocast#close()}, so scopes nest safely.
      *
      * <p>The default implementation is a no-op guard, which lets callers write engine-agnostic code
      * ({@code try (Autocast ac = engine.newAutocast(...)) { ... }}). Engines that implement
      * autocast must override this method.
      *
      * @param device the device to autocast on (typically a GPU)
-     * @param dtype the lower-precision dtype ({@link DataType#BFLOAT16} or {@link
+     * @param dataType the lower-precision data type ({@link DataType#BFLOAT16} or {@link
      *     DataType#FLOAT16})
      * @param cacheEnabled whether to enable the op-result cache inside the scope (matches PyTorch's
      *     {@code cache_enabled} flag)
      * @return an {@link Autocast} guard whose {@code close()} restores state
      */
-    public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
+    public Autocast newAutocast(Device device, DataType dataType, boolean cacheEnabled) {
         return NoOpAutocast.INSTANCE;
     }
 
@@ -383,11 +383,11 @@ public abstract class Engine {
      * #newAutocast(Device, DataType, boolean)} with {@code cacheEnabled = true}.
      *
      * @param device the device to autocast on
-     * @param dtype the lower-precision dtype
+     * @param dataType the lower-precision data type
      * @return an {@link Autocast} guard
      */
-    public Autocast newAutocast(Device device, DataType dtype) {
-        return newAutocast(device, dtype, true);
+    public Autocast newAutocast(Device device, DataType dataType) {
+        return newAutocast(device, dataType, true);
     }
 
     /**
@@ -400,7 +400,7 @@ public abstract class Engine {
      * @param inverseScale the reciprocal of the loss scale
      * @return {@code true} if every unscaled gradient value is finite
      */
-    public boolean unscaleGradientsAndCheckFinite(NDList gradients, float inverseScale) {
+    public boolean unscaleGradients(NDList gradients, float inverseScale) {
         if (inverseScale <= 0f || !Float.isFinite(inverseScale)) {
             throw new IllegalArgumentException("inverseScale must be positive and finite.");
         }

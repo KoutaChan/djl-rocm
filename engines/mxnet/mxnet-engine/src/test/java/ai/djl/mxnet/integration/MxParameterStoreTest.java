@@ -199,7 +199,7 @@ public class MxParameterStoreTest {
                     }
                     parameterServer.prepareGradients("weight", gradients);
                     Assert.assertEquals(firstGradient.getFloat(), Float.POSITIVE_INFINITY);
-                    finite = scaler.unscaleAndCheckFinite(new NDList(gradients));
+                    finite = scaler.unscale(new NDList(gradients));
                     if (finite) {
                         parameterServer.update("weight", gradients, weights);
                     }
@@ -221,7 +221,7 @@ public class MxParameterStoreTest {
                         Assert.assertEquals(scaledLoss.getFloat(), 4f);
                     }
                     parameterServer.prepareGradients("weight", gradients);
-                    finite = scaler.unscaleAndCheckFinite(new NDList(gradients));
+                    finite = scaler.unscale(new NDList(gradients));
                     if (finite) {
                         parameterServer.update("weight", gradients, weights);
                     }
