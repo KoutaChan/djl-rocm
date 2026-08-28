@@ -31,7 +31,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -183,7 +182,7 @@ public abstract class Optimizer {
      * @param parameterId the parameter to be updated
      * @param modelWeight the weight consumed by forward and backward
      * @param masterWeight the higher-precision weight updated by the optimizer
-     * @param grad the gradient in the master weight's data type
+     * @param grad the real floating gradient; it is converted to the master weight's data type
      * @throws IllegalArgumentException if shapes, devices, or data types are incompatible
      */
     public void updateWithMasterWeight(
@@ -215,9 +214,8 @@ public abstract class Optimizer {
         Preconditions.checkArgument(
                 isRealFloating(modelWeight.getDataType())
                         && isRealFloating(masterWeight.getDataType())
-                        && grad.getDataType() == masterWeight.getDataType(),
-                "Master-weight update requires real floating weights and a master-precision "
-                        + "gradient: "
+                        && isRealFloating(grad.getDataType()),
+                "Master-weight update requires real floating weights and gradient: "
                         + modelWeight.getDataType()
                         + " / "
                         + masterWeight.getDataType()
@@ -231,9 +229,20 @@ public abstract class Optimizer {
                         + " / "
                         + masterWeight.getDataType());
 
-        update(parameterId, masterWeight, grad);
+        if (grad.getDataType() == masterWeight.getDataType()) {
+            update(parameterId, masterWeight, grad);
+        } else {
+            try (NDArray convertedGrad = grad.toType(masterWeight.getDataType(), false)) {
+                update(parameterId, masterWeight, convertedGrad);
+            }
+        }
         if (modelWeight != masterWeight) {
             masterWeight.copyTo(modelWeight);
+            if (modelWeight.hasGradient()) {
+                try (NDArray modelGradient = modelWeight.getGradient()) {
+                    modelGradient.fillI(0);
+                }
+            }
         }
     }
 
@@ -353,7 +362,7 @@ public abstract class Optimizer {
             }
             byte[] bytes = new byte[byteLength];
             is.readFully(bytes);
-            Map<String, Map<String, Map<Device, NDArray>>> states = new HashMap<>();
+            Map<String, Map<String, Map<Device, NDArray>>> states = new ConcurrentHashMap<>();
             try (NDList arrays = NDList.decode(manager, new ByteArrayInputStream(bytes))) {
                 for (NDArray array : arrays) {
                     StateKey key = decodeName(array.getName());

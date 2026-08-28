@@ -2395,6 +2395,12 @@ public final class JniUtils {
         PyTorchLibrary.LIB.zeroGrad(weight.getHandle());
     }
 
+    public static boolean unscaleGradientsAndCheckFinite(
+            List<PtNDArray> gradients, float inverseScale) {
+        long[] handles = gradients.stream().mapToLong(PtNDArray::getHandle).toArray();
+        return PyTorchLibrary.LIB.torchUnscaleGradientsAndCheckFinite(handles, inverseScale);
+    }
+
     public static void adamUpdate(
             PtNDArray weight,
             PtNDArray grad,

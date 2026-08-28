@@ -1,5 +1,14 @@
 /*
- * Copyright 2025 KoutaChan. Licensed under the Apache License, Version 2.0.
+ * Copyright 2025 KoutaChan.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
+ * with the License. A copy of the License is located at
+ *
+ * http://aws.amazon.com/apache2.0/
+ *
+ * or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+ * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
+ * and limitations under the License.
  */
 package ai.djl.pytorch.engine;
 
@@ -25,13 +34,19 @@ final class PtAutocast implements Autocast {
     private final boolean prevEnabled;
     private final int prevDtype;
     private final boolean prevCacheEnabled;
+    private final Thread ownerThread;
     private boolean closed;
 
     PtAutocast(Device device, DataType dtype, boolean enabled, boolean cacheEnabled) {
+        if (enabled && dtype != DataType.FLOAT16 && dtype != DataType.BFLOAT16) {
+            throw new IllegalArgumentException(
+                    "PyTorch autocast data type must be FLOAT16 or BFLOAT16.");
+        }
         this.deviceType = PtDeviceType.toDeviceType(device);
         this.prevEnabled = JniUtils.autocastIsEnabled(deviceType);
         this.prevDtype = JniUtils.autocastGetDtype(deviceType);
         this.prevCacheEnabled = JniUtils.autocastIsCacheEnabled();
+        this.ownerThread = Thread.currentThread();
 
         // Match PyTorch's ordering: set dtype before enabled so the first op
         // inside the scope sees a consistent (enabled, dtype) pair. The
@@ -48,6 +63,10 @@ final class PtAutocast implements Autocast {
     /** {@inheritDoc} */
     @Override
     public void close() {
+        if (Thread.currentThread() != ownerThread) {
+            throw new IllegalStateException(
+                    "PyTorch autocast scope can only be closed from the thread that created it.");
+        }
         if (closed) {
             return;
         }

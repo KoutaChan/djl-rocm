@@ -23,6 +23,60 @@ You can also build the latest javadocs locally using the following command:
 
 The javadocs output is built in the `build/doc/javadoc` folder.
 
+## Automatic mixed-precision training
+
+Training autocast is opt-in through `DefaultTrainingConfig`. BF16 is the recommended starting
+point because it has a wider exponent range and normally does not require loss scaling:
+
+```java
+DefaultTrainingConfig config =
+        new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                .optAutocast(DataType.BFLOAT16);
+```
+
+`Trainer.forward`, `Trainer.evaluate`, and the loss calculation in `EasyTrain` run inside the
+configured autocast scope. The standard training and validation evaluators use the same scope.
+Autocast does not change the stored parameter dtype, and optimizer updates run outside autocast; with
+the default model dtype, both remain FP32. `Trainer.newGradientCollector()` also keeps the configured
+scope active around the conventional custom-loop sequence of forward, loss, and backward, while
+temporarily leaving autocast for backward and for `Trainer.step()` if it is called before the
+collector closes. This lets existing loops that create the collector before forward use mixed
+precision without source changes. Operations performed outside the collector lifetime should be
+wrapped with `Trainer.newAutocast(device)`.
+
+Selecting FP16 automatically installs a dynamic `GradScaler`; FP16 training cannot accidentally
+run through `Trainer` without scaling. The scaler unscales and checks every gradient before the
+optimizer, skips the complete update if any gradient is non-finite, and adjusts its scale for the
+next step. FP16 training requires `pytorch-engine` and `pytorch-jni` from the same release because
+the fused GradScaler JNI entry point is mandatory; it does not fall back to a generic unscale
+implementation:
+
+```java
+DefaultTrainingConfig config =
+        new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                .optAutocast(DataType.FLOAT16);
+```
+
+A custom scaler can be supplied when different growth behavior is needed:
+
+```java
+GradScaler scaler =
+        GradScaler.builder()
+                .optInitialScale(32768f)
+                .optGrowthInterval(1000)
+                .build();
+DefaultTrainingConfig config =
+        new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                .optAutocast(DataType.FLOAT16)
+                .optGradScaler(scaler);
+```
+
+For exact FP16 training continuation, save scaler state after `Trainer.step()` beside the model and
+optimizer checkpoint with `Trainer.saveGradScalerState(path)` and restore it with
+`Trainer.loadGradScalerState(path)`. The versioned scaler state includes its growth configuration
+and rejects a mismatched restore. Engines that do not implement autocast return a no-op guard,
+preserving compatibility with existing `TrainingConfig` and training code.
+
 ## Installation
 
 You can pull the PyTorch engine from the central Maven repository by including the following dependency:

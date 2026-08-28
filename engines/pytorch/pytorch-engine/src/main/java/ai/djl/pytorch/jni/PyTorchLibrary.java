@@ -839,6 +839,8 @@ final class PyTorchLibrary {
 
     native void zeroGrad(long handle);
 
+    native boolean torchUnscaleGradientsAndCheckFinite(long[] gradientHandles, float inverseScale);
+
     native void adamUpdate(
             long weight,
             long grad,

@@ -91,14 +91,19 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSubiScalar(JN
   API_END()
 }
 
-// fill_ overwrites the buffer without reading existing values, so it is the
-// only safe way to clear a tensor that may currently hold NaN or Inf. It also
-// works for 0-dim scalars where slice-based set() does not.
+// fill_ overwrites the buffer without reading existing values, so it is safe
+// for dense tensors that may currently hold NaN or Inf. PyTorch does not
+// implement fill_.Scalar for sparse COO tensors, but zero_ has the same
+// semantics for a zero fill and supports both dense and sparse layouts.
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFill(
     JNIEnv* env, jobject jthis, jlong jself, jdouble jvalue) {
   API_BEGIN()
   auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
-  self_ptr->fill_(jvalue);
+  if (self_ptr->is_sparse() && jvalue == 0.0) {
+    self_ptr->zero_();
+  } else {
+    self_ptr->fill_(jvalue);
+  }
   API_END()
 }
 

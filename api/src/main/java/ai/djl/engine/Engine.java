@@ -14,6 +14,8 @@ package ai.djl.engine;
 
 import ai.djl.Device;
 import ai.djl.Model;
+import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
@@ -373,7 +375,7 @@ public abstract class Engine {
      * @return an {@link Autocast} guard whose {@code close()} restores state
      */
     public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
-        throw new UnsupportedOperationException("Not supported.");
+        return NoOpAutocast.INSTANCE;
     }
 
     /**
@@ -388,7 +390,65 @@ public abstract class Engine {
         return newAutocast(device, dtype, true);
     }
 
+    /**
+     * Unscales gradients in place and checks whether all values are finite.
+     *
+     * <p>The default implementation is engine-agnostic. Engines may override it with a fused
+     * backend implementation to avoid per-gradient host synchronization.
+     *
+     * @param gradients the gradients to unscale
+     * @param inverseScale the reciprocal of the loss scale
+     * @return {@code true} if every unscaled gradient value is finite
+     */
+    public boolean unscaleGradientsAndCheckFinite(NDList gradients, float inverseScale) {
+        if (inverseScale <= 0f || !Float.isFinite(inverseScale)) {
+            throw new IllegalArgumentException("inverseScale must be positive and finite.");
+        }
+
+        for (NDArray gradient : gradients) {
+            if (gradient.getManager().getEngine() != this) {
+                throw new IllegalArgumentException(
+                        "All gradients must belong to the engine performing the unscale.");
+            }
+            if (gradient.isSparse()) {
+                throw new UnsupportedOperationException(
+                        "Sparse GradScaler gradients require an engine-specific implementation.");
+            }
+            switch (gradient.getDataType()) {
+                case FLOAT16:
+                case BFLOAT16:
+                case FLOAT32:
+                case FLOAT64:
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "GradScaler gradients must use a real floating data type.");
+            }
+        }
+
+        boolean gradientsFinite = true;
+        for (NDArray gradient : gradients) {
+            gradient.muli(inverseScale);
+            try (NDArray nan = gradient.isNaN();
+                    NDArray infinite = gradient.isInfinite();
+                    NDArray nonFinite = nan.logicalOr(infinite);
+                    NDArray anyNonFinite = nonFinite.any()) {
+                if (anyNonFinite.getBoolean()) {
+                    gradientsFinite = false;
+                }
+            }
+        }
+        return gradientsFinite;
+    }
+
     private enum NoOpInferenceMode implements InferenceMode {
+        INSTANCE;
+
+        @Override
+        public void close() {}
+    }
+
+    private enum NoOpAutocast implements Autocast {
         INSTANCE;
 
         @Override

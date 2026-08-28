@@ -18,6 +18,8 @@ import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
 import ai.djl.engine.InferenceMode;
+import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
@@ -38,7 +40,12 @@ import java.io.FileNotFoundException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The {@code PtEngine} is an implementation of the {@link Engine} based on the <a
@@ -228,6 +235,44 @@ public final class PtEngine extends Engine {
     @Override
     public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
         return new PtAutocast(device, dtype, true, cacheEnabled);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean unscaleGradientsAndCheckFinite(NDList gradients, float inverseScale) {
+        if (inverseScale <= 0f || !Float.isFinite(inverseScale)) {
+            throw new IllegalArgumentException("inverseScale must be positive and finite.");
+        }
+
+        Map<Device, Map<DataType, List<PtNDArray>>> grouped = new ConcurrentHashMap<>();
+        for (NDArray gradient : gradients) {
+            if (!(gradient instanceof PtNDArray)) {
+                throw new IllegalArgumentException(
+                        "PyTorch GradScaler requires PyTorch gradient arrays.");
+            }
+            switch (gradient.getDataType()) {
+                case FLOAT16:
+                case BFLOAT16:
+                case FLOAT32:
+                case FLOAT64:
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "GradScaler gradients must use a real floating data type.");
+            }
+            grouped.computeIfAbsent(gradient.getDevice(), key -> new EnumMap<>(DataType.class))
+                    .computeIfAbsent(gradient.getDataType(), key -> new ArrayList<>())
+                    .add((PtNDArray) gradient);
+        }
+
+        boolean gradientsFinite = true;
+        for (Map<DataType, List<PtNDArray>> byDataType : grouped.values()) {
+            for (List<PtNDArray> group : byDataType.values()) {
+                boolean groupFinite = JniUtils.unscaleGradientsAndCheckFinite(group, inverseScale);
+                gradientsFinite = groupFinite && gradientsFinite;
+            }
+        }
+        return gradientsFinite;
     }
 
     /** {@inheritDoc} */

@@ -183,6 +183,9 @@ if(NOT BUILD_ANDROID)
     if(MSVC)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
         file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
+        # An override directory may already contain an older JNI build. Never copy it back over
+        # the target that was just linked.
+        list(FILTER TORCH_DLLS EXCLUDE REGEX "djl_torch\\.dll$")
         add_custom_command(TARGET djl_torch
                 POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -19,11 +19,14 @@ import ai.djl.training.optimizer.Optimizer;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** {@code LocalParameterServer} is an implementation of the {@code ParameterServer} interface. */
 public class LocalParameterServer implements ParameterServer {
 
     private Optimizer optimizer;
+    private Set<String> preparedGradients;
 
     /**
      * Create a new instance of {@code LocalParameterServer} for the given optimizer.
@@ -32,6 +35,7 @@ public class LocalParameterServer implements ParameterServer {
      */
     public LocalParameterServer(Optimizer optimizer) {
         this.optimizer = optimizer;
+        preparedGradients = ConcurrentHashMap.newKeySet();
     }
 
     /** {@inheritDoc} */
@@ -41,13 +45,10 @@ public class LocalParameterServer implements ParameterServer {
     /** {@inheritDoc} */
     @Override
     public void update(String parameterId, NDArray[] grads, NDArray[] params) {
-        Device firstDevice = params[0].getDevice();
-        // reduce gradient from all devices to first device
-        for (int i = 1; i < grads.length; i++) {
-            try (NDArray gradCopy = grads[i].toDevice(firstDevice, true)) {
-                grads[0].addi(gradCopy);
-            }
+        if (!preparedGradients.remove(parameterId)) {
+            reduceGradients(grads);
         }
+        Device firstDevice = params[0].getDevice();
         // update weights on different devices with reduced gradient
         // use duplicate because after the first optimizer.update
         // PyTorch optimizer will zero grads[0]
@@ -67,6 +68,25 @@ public class LocalParameterServer implements ParameterServer {
 
     /** {@inheritDoc} */
     @Override
+    public void prepareGradients(String parameterId, NDArray[] gradients) {
+        reduceGradients(gradients);
+        preparedGradients.add(parameterId);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean requiresGradientPreparation() {
+        return true;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void finishGradientStep() {
+        preparedGradients.clear();
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public void saveOptimizerState(Path path) throws IOException {
         optimizer.saveState(path);
     }
@@ -79,5 +99,16 @@ public class LocalParameterServer implements ParameterServer {
 
     /** {@inheritDoc} */
     @Override
-    public void close() {}
+    public void close() {
+        finishGradientStep();
+    }
+
+    private static void reduceGradients(NDArray[] gradients) {
+        Device firstDevice = gradients[0].getDevice();
+        for (int i = 1; i < gradients.length; ++i) {
+            try (NDArray gradientCopy = gradients[i].toDevice(firstDevice, true)) {
+                gradients[0].addi(gradientCopy);
+            }
+        }
+    }
 }

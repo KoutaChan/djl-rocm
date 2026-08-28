@@ -1385,7 +1385,7 @@ public class MxNDArray extends NativeResource<Pointer> implements LazyNDArray {
     /** {@inheritDoc} */
     @Override
     public NDArray isInfinite() {
-        throw new UnsupportedOperationException("Not implemented yet.");
+        return manager.invoke("_npi_isinf", this, null);
     }
 
     /** {@inheritDoc} */

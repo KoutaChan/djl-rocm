@@ -12,7 +12,7 @@
  */
 #include "djl_pytorch_accelerator.h"
 
-#if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(USE_ROCM)
 #include <ATen/hip/HIPGraph.h>
 #elif defined(DJL_USE_ACCELERATOR_GRAPH)
 #include <ATen/cuda/CUDAGraph.h>
@@ -30,6 +30,9 @@
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
+#if defined(USE_ROCM)
+#include <c10/hip/HIPCachingAllocator.h>
+#endif
 
 #include <optional>
 #include <memory>
@@ -252,7 +255,7 @@ void BeginAcceleratorGraphCapture(AcceleratorGraph* graph) {
     ready.block(graph->stream);
   }
   graph->capture_guard = std::make_unique<c10::StreamGuard>(graph->stream);
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(USE_ROCM)
   graph->graph.capture_begin({0, 0}, hipStreamCaptureModeThreadLocal);
 #else
   graph->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
@@ -311,7 +314,9 @@ void EmptyCache() {
   if (!IsAvailable()) {
     return;
   }
-#if DJL_HAS_DEVICE_ACCELERATOR
+#if defined(USE_ROCM)
+  c10::hip::HIPCachingAllocator::emptyCache();
+#elif DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::emptyCache();
 #else
   at::getDeviceAllocator(c10::DeviceType::CUDA)->emptyCache();

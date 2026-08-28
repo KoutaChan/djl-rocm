@@ -13,6 +13,7 @@
 package ai.djl.training;
 
 import ai.djl.Device;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.Parameter;
 import ai.djl.training.evaluator.Evaluator;
 import ai.djl.training.initializer.Initializer;
@@ -85,6 +86,33 @@ public interface TrainingConfig {
      * @return an {@link Optimizer}
      */
     Optimizer getOptimizer();
+
+    /**
+     * Returns the lower-precision data type used for training autocast.
+     *
+     * @return the autocast data type, or empty when autocast is disabled
+     */
+    default Optional<DataType> getAutocastDataType() {
+        return Optional.empty();
+    }
+
+    /**
+     * Returns whether the backend autocast cache is enabled.
+     *
+     * @return whether the autocast cache is enabled
+     */
+    default boolean isAutocastCacheEnabled() {
+        return true;
+    }
+
+    /**
+     * Returns the gradient scaler used during training.
+     *
+     * @return the configured gradient scaler, or empty when scaling is disabled
+     */
+    default Optional<GradScaler> getGradScaler() {
+        return Optional.empty();
+    }
 
     /**
      * Gets the {@link Loss} function to compute the loss against.

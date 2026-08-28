@@ -24,8 +24,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -38,6 +40,10 @@ public class ParameterStore {
     private Map<Device, Integer> deviceMap;
     private boolean copy;
     private ParameterServer parameterServer;
+    private Map<String, NDArray[]> preparedGradients;
+    private boolean gradientsFinalized;
+    private boolean gradientsPrepared;
+    private NDList activeGradients;
 
     /** Constructs a new {@code ParameterStore} instance. */
     public ParameterStore() {
@@ -55,6 +61,7 @@ public class ParameterStore {
         this.copy = copy;
         parameterMap = new ConcurrentHashMap<>();
         deviceMap = new ConcurrentHashMap<>();
+        preparedGradients = new ConcurrentHashMap<>();
         deviceMap.put(manager.getDevice(), 0);
     }
 
@@ -81,13 +88,134 @@ public class ParameterStore {
 
     /** Updates all the mirrored parameters. */
     public void updateAllParameters() {
-        for (Map.Entry<String, ParameterData> entry : parameterMap.entrySet()) {
-            String parameterId = entry.getKey();
-            ParameterData data = entry.getValue();
-            if (data.requireGradient()) {
-                NDArray[] params = data.toArray();
-                parameterServer.update(parameterId, params);
+        boolean releaseAfterUpdate = gradientsFinalized && activeGradients == null;
+        try {
+            for (Map.Entry<String, ParameterData> entry : parameterMap.entrySet()) {
+                String parameterId = entry.getKey();
+                ParameterData data = entry.getValue();
+                if (data.requireGradient()) {
+                    NDArray[] params = data.toArray();
+                    NDArray[] gradients = preparedGradients.get(parameterId);
+                    if (gradients == null) {
+                        parameterServer.update(parameterId, params);
+                    } else {
+                        parameterServer.update(parameterId, gradients, params);
+                    }
+                }
             }
+        } finally {
+            if (releaseAfterUpdate) {
+                discardGradientStep(null);
+            }
+        }
+    }
+
+    /** Finalizes any asynchronous or distributed gradient reduction before an optimizer step. */
+    public void finalizeGradients() {
+        finalizeGradients(true);
+    }
+
+    /**
+     * Finalizes gradients and optionally prepares them for inspection before the optimizer step.
+     *
+     * @param prepareForInspection whether parameter-server reductions must be visible to a
+     *     subsequent finite-gradient check
+     */
+    void finalizeGradients(boolean prepareForInspection) {
+        if (parameterServer == null || (gradientsFinalized && !prepareForInspection)) {
+            return;
+        }
+
+        NDList acquiredGradients = new NDList();
+        try {
+            if (!gradientsFinalized) {
+                gradientsFinalized = true;
+                parameterServer.finalizeGradients();
+            }
+            if (prepareForInspection
+                    && !gradientsPrepared
+                    && parameterServer.requiresGradientPreparation()) {
+                for (Map.Entry<String, ParameterData> entry : parameterMap.entrySet()) {
+                    ParameterData data = entry.getValue();
+                    if (data.requireGradient()) {
+                        NDArray[] parameters = data.toArray();
+                        NDArray[] gradients = new NDArray[parameters.length];
+                        for (int i = 0; i < parameters.length; ++i) {
+                            gradients[i] = parameters[i].getGradient();
+                            // Retain each wrapper immediately so partial acquisition is safe.
+                            acquiredGradients.add(gradients[i]); // NOPMD
+                        }
+                        parameterServer.prepareGradients(entry.getKey(), gradients);
+                        preparedGradients.put(entry.getKey(), gradients);
+                    }
+                }
+            }
+            gradientsPrepared = prepareForInspection || gradientsPrepared;
+            acquiredGradients.clear();
+        } catch (RuntimeException | Error e) {
+            try {
+                discardGradientStep(acquiredGradients);
+            } catch (RuntimeException | Error closeException) {
+                e.addSuppressed(closeException);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Returns wrappers for all trainable parameter gradients.
+     *
+     * <p>The returned list owns the wrappers and must be closed by the caller.
+     *
+     * @return all trainable parameter gradients
+     */
+    NDList getGradients() {
+        if (!gradientsFinalized) {
+            throw new IllegalStateException("Gradients must be finalized before inspection.");
+        }
+        if (activeGradients != null) {
+            throw new IllegalStateException(
+                    "Gradients have already been acquired for the current step.");
+        }
+
+        NDList gradients = new NDList();
+        try {
+            for (Map.Entry<String, ParameterData> entry : parameterMap.entrySet()) {
+                ParameterData data = entry.getValue();
+                if (data.requireGradient()) {
+                    NDArray[] prepared = preparedGradients.get(entry.getKey());
+                    if (prepared == null) {
+                        for (NDArray parameter : data.toArray()) {
+                            gradients.add(parameter.getGradient());
+                        }
+                    } else {
+                        Collections.addAll(gradients, prepared);
+                    }
+                }
+            }
+            activeGradients = gradients;
+            return gradients;
+        } catch (RuntimeException | Error e) {
+            try {
+                discardGradientStep(gradients);
+            } catch (RuntimeException | Error closeException) {
+                e.addSuppressed(closeException);
+            }
+            throw e;
+        }
+    }
+
+    /** Releases references retained for a gradient list before the caller closes that list. */
+    void releaseGradientStep() {
+        if (!gradientsFinalized && preparedGradients.isEmpty() && activeGradients == null) {
+            return;
+        }
+        preparedGradients.clear();
+        activeGradients = null;
+        gradientsFinalized = false;
+        gradientsPrepared = false;
+        if (parameterServer != null) {
+            parameterServer.finishGradientStep();
         }
     }
 
@@ -99,6 +227,13 @@ public class ParameterStore {
     public void prepareForBackward(NDList outputs) {
         if (parameterServer != null) {
             parameterServer.prepareForBackward(outputs);
+        }
+    }
+
+    /** Completes parameter-server initialization before a forward pass. */
+    public void prepareForForward() {
+        if (parameterServer != null) {
+            parameterServer.prepareForForward();
         }
     }
 
@@ -203,7 +338,56 @@ public class ParameterStore {
     /** Closes the associated parameter server. */
     public void close() {
         if (parameterServer != null) {
-            parameterServer.close();
+            try {
+                discardGradientStep(null);
+            } finally {
+                parameterServer.close();
+            }
+        }
+    }
+
+    private void discardGradientStep(NDList additionalGradients) {
+        Set<NDArray> gradients = Collections.newSetFromMap(new IdentityHashMap<>());
+        NDList borrowedGradients = activeGradients;
+        if (additionalGradients != null) {
+            gradients.addAll(additionalGradients);
+        }
+        if (borrowedGradients != null) {
+            gradients.addAll(borrowedGradients);
+        }
+        for (NDArray[] prepared : preparedGradients.values()) {
+            Collections.addAll(gradients, prepared);
+        }
+
+        Throwable failure = null;
+        try {
+            releaseGradientStep();
+        } catch (RuntimeException | Error e) {
+            failure = e;
+        }
+        for (NDArray gradient : gradients) {
+            try {
+                gradient.close();
+            } catch (RuntimeException | Error e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (additionalGradients != null) {
+            additionalGradients.clear();
+        }
+        if (borrowedGradients != null) {
+            borrowedGradients.clear();
+        }
+
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        if (failure != null) {
+            throw (Error) failure;
         }
     }
 

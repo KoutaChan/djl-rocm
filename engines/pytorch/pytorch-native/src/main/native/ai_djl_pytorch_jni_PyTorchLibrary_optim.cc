@@ -11,6 +11,8 @@
  * and limitations under the License.
  */
 
+#include <ATen/Functions.h>
+
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
@@ -100,4 +102,60 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_zeroGrad(JNIEnv* e
     weight_ptr->grad().zero_();
   }
   API_END()
+}
+
+JNIEXPORT jboolean JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchUnscaleGradientsAndCheckFinite(
+    JNIEnv* env, jobject jthis, jlongArray jgradient_handles, jfloat jinverse_scale) {
+  API_BEGIN()
+  (void) jthis;
+  torch::NoGradGuard no_grad;
+  const auto gradient_handles = djl::utils::jni::GetVecFromJLongArray(env, jgradient_handles);
+  if (gradient_handles.empty()) {
+    throw std::invalid_argument("GradScaler requires at least one gradient tensor.");
+  }
+
+  std::vector<at::Tensor> gradients;
+  gradients.reserve(gradient_handles.size());
+  for (const auto handle : gradient_handles) {
+    gradients.push_back(*reinterpret_cast<at::Tensor*>(handle));
+  }
+
+  const auto& first = gradients.front();
+  std::vector<at::Tensor> tensors_to_unscale;
+  tensors_to_unscale.reserve(gradients.size());
+  for (const auto& gradient : gradients) {
+    if (gradient.device() != first.device() || gradient.scalar_type() != first.scalar_type()) {
+      throw std::invalid_argument("Fused GradScaler inputs must share a device and data type.");
+    }
+    tensors_to_unscale.push_back(gradient.is_sparse() ? gradient._values() : gradient);
+  }
+
+  const auto scalar_options = first.options().dtype(at::kFloat).layout(at::kStrided).requires_grad(false);
+  auto found_non_finite = at::zeros({}, scalar_options);
+  auto inverse_scale = at::full({}, static_cast<double>(jinverse_scale), scalar_options);
+  for (const auto& gradient : gradients) {
+    if (gradient.is_sparse() && gradient.scalar_type() == at::kHalf) {
+      // PyTorch coalesces scaled FP16 sparse gradients before unscale because summing duplicate
+      // indices can overflow even when each stored value is finite. The optimizer can retain the
+      // original sparse layout, but the finite check must still observe that coalesced result.
+      auto coalesced = gradient.coalesce();
+      found_non_finite.add_(at::logical_not(at::isfinite(coalesced._values())).any().to(at::kFloat));
+    }
+  }
+#if defined(USE_ROCM)
+  if (first.is_cuda() && first.scalar_type() == at::kBFloat16) {
+    // ROCm does not currently register the fused AMP kernel for BF16. Keep the
+    // finite flag on the device across all gradients so only the final result synchronizes.
+    for (auto& tensor : tensors_to_unscale) {
+      tensor.mul_(static_cast<double>(jinverse_scale));
+      found_non_finite.add_(at::logical_not(at::isfinite(tensor)).any().to(at::kFloat));
+    }
+  } else {
+    at::_amp_foreach_non_finite_check_and_unscale_(tensors_to_unscale, found_non_finite, inverse_scale);
+  }
+#else
+  at::_amp_foreach_non_finite_check_and_unscale_(tensors_to_unscale, found_non_finite, inverse_scale);
+#endif
+  return found_non_finite.item<float>() == 0.0f ? JNI_TRUE : JNI_FALSE;
+  API_END_RETURN()
 }

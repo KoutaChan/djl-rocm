@@ -13,6 +13,7 @@
 
 package ai.djl.mxnet.engine;
 
+import ai.djl.Device;
 import ai.djl.mxnet.jna.JnaUtils;
 import ai.djl.mxnet.jna.MxnetLibrary;
 import ai.djl.ndarray.NDArray;
@@ -25,6 +26,8 @@ import ai.djl.util.NativeResource;
 import com.sun.jna.Pointer;
 
 import java.util.Arrays;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** {@code MxParameterServer} is the MXNet implementation of {@link ParameterServer}. */
 public class MxParameterServer extends NativeResource<Pointer> implements ParameterServer {
@@ -34,6 +37,7 @@ public class MxParameterServer extends NativeResource<Pointer> implements Parame
     private OptimizerCallback callback;
 
     private int priority;
+    private Set<String> preparedGradients;
 
     /**
      * Constructs a new {@code MxParameterServer}.
@@ -46,6 +50,7 @@ public class MxParameterServer extends NativeResource<Pointer> implements Parame
         callback = new OptimizerCallback(optimizer);
         JnaUtils.parameterStoreSetUpdater(getHandle(), null, callback, null);
         priority = 0;
+        preparedGradients = ConcurrentHashMap.newKeySet();
     }
 
     /** {@inheritDoc} */
@@ -60,20 +65,47 @@ public class MxParameterServer extends NativeResource<Pointer> implements Parame
     /** {@inheritDoc} */
     @Override
     public void update(String parameterId, NDArray[] grads, NDArray[] params) {
-        String[] gradKeys = new String[grads.length];
+        boolean prepared = preparedGradients.remove(parameterId);
+        int gradientCount = prepared ? 1 : grads.length;
+        String[] gradKeys = new String[gradientCount];
         String[] paramKeys = new String[params.length];
         Arrays.fill(gradKeys, parameterId);
         Arrays.fill(paramKeys, parameterId);
+        NDList gradients = prepared ? new NDList(grads[0]) : new NDList(grads);
         JnaUtils.parameterStorePushPull(
                 getHandle(),
-                grads.length,
+                gradientCount,
                 gradKeys,
                 params.length,
                 paramKeys,
-                new NDList(grads),
+                gradients,
                 new NDList(params),
                 -priority);
         priority++;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void prepareGradients(String parameterId, NDArray[] gradients) {
+        Device firstDevice = gradients[0].getDevice();
+        for (int i = 1; i < gradients.length; ++i) {
+            try (NDArray gradientCopy = gradients[i].toDevice(firstDevice, true)) {
+                gradients[0].addi(gradientCopy);
+            }
+        }
+        preparedGradients.add(parameterId);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean requiresGradientPreparation() {
+        return true;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void finishGradientStep() {
+        preparedGradients.clear();
     }
 
     private static Pointer createdKVStore() {
@@ -83,6 +115,7 @@ public class MxParameterServer extends NativeResource<Pointer> implements Parame
     /** {@inheritDoc} */
     @Override
     public void close() {
+        finishGradientStep();
         Pointer pointer = handle.getAndSet(null);
         if (pointer != null) {
             JnaUtils.parameterStoreClose(pointer);
