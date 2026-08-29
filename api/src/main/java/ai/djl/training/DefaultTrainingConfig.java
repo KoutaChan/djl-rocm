@@ -129,8 +129,8 @@ public class DefaultTrainingConfig implements TrainingConfig {
     /**
      * Enables training autocast with the backend cache enabled.
      *
-     * <p>{@link DataType#FLOAT16} automatically installs a default {@link GradScaler}. BF16
-     * autocast does not require gradient scaling by default.
+     * <p>{@link DataType#FLOAT16} automatically installs a default {@link GradScaler}. {@link
+     * DataType#BFLOAT16} autocast does not require gradient scaling by default.
      *
      * @param dataType the autocast data type, either FLOAT16 or BFLOAT16
      * @return this {@code DefaultTrainingConfig}
@@ -141,6 +141,9 @@ public class DefaultTrainingConfig implements TrainingConfig {
 
     /**
      * Enables training autocast.
+     *
+     * <p>{@link DataType#FLOAT16} automatically installs a default {@link GradScaler}. {@link
+     * DataType#BFLOAT16} autocast does not require gradient scaling by default.
      *
      * @param dataType the autocast data type, either FLOAT16 or BFLOAT16
      * @param cacheEnabled whether the backend autocast cache is enabled

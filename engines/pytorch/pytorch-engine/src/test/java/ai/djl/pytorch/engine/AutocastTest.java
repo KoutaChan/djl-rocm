@@ -22,17 +22,21 @@ import ai.djl.ndarray.types.Shape;
 import ai.djl.pytorch.jni.JniUtils;
 
 import org.testng.Assert;
+import org.testng.SkipException;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.Test;
 
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Exercises the {@link Autocast} scope guard (libtorch's {@code at::autocast} backend) end-to-end:
- * matmul / SDPA / rmsNorm results should come out in the autocast dtype, nested scopes should
- * compose, and the previous state must be restored on {@code close()}.
+ * Tests the PyTorch {@link Autocast} implementation. Matrix multiplication and scaled dot-product
+ * attention should use the autocast data type, RMSNorm should remain in FLOAT32, nested scopes
+ * should compose, and closing a scope should restore the previous state.
  */
-@SuppressWarnings("try") // Autocast resource var is used for side effects via close()
+@SuppressWarnings("try") // Autocast resources are used for their scope side effects.
 public class AutocastTest {
 
     private static final int CPU_DEVICE = 0;
@@ -56,14 +60,15 @@ public class AutocastTest {
         Engine engine = Engine.getInstance();
         Assert.assertTrue(engine.supportsAutocast(), "PyTorch engine must advertise autocast");
 
-        int before = JniUtils.autocastGetDtype(CPU_DEVICE);
-        boolean beforeEnabled = JniUtils.autocastIsEnabled(CPU_DEVICE);
+        int previousDataType = JniUtils.autocastGetDataType(CPU_DEVICE);
+        boolean previousEnabled = JniUtils.autocastIsEnabled(CPU_DEVICE);
         try (Autocast ac = engine.newAutocast(Device.cpu(), DataType.BFLOAT16)) {
             Assert.assertTrue(JniUtils.autocastIsEnabled(CPU_DEVICE));
-            Assert.assertEquals(JniUtils.autocastGetDtype(CPU_DEVICE), DataType.BFLOAT16.ordinal());
+            Assert.assertEquals(
+                    JniUtils.autocastGetDataType(CPU_DEVICE), DataType.BFLOAT16.ordinal());
         }
-        Assert.assertEquals(JniUtils.autocastIsEnabled(CPU_DEVICE), beforeEnabled);
-        Assert.assertEquals(JniUtils.autocastGetDtype(CPU_DEVICE), before);
+        Assert.assertEquals(JniUtils.autocastIsEnabled(CPU_DEVICE), previousEnabled);
+        Assert.assertEquals(JniUtils.autocastGetDataType(CPU_DEVICE), previousDataType);
     }
 
     @Test
@@ -71,16 +76,18 @@ public class AutocastTest {
         Engine engine = Engine.getInstance();
         try (Autocast outer = engine.newAutocast(Device.cpu(), DataType.BFLOAT16)) {
             Assert.assertTrue(JniUtils.autocastIsEnabled(CPU_DEVICE));
-            Assert.assertEquals(JniUtils.autocastGetDtype(CPU_DEVICE), DataType.BFLOAT16.ordinal());
+            Assert.assertEquals(
+                    JniUtils.autocastGetDataType(CPU_DEVICE), DataType.BFLOAT16.ordinal());
 
             try (Autocast inner = engine.newAutocast(Device.cpu(), DataType.FLOAT16)) {
                 Assert.assertEquals(
-                        JniUtils.autocastGetDtype(CPU_DEVICE), DataType.FLOAT16.ordinal());
+                        JniUtils.autocastGetDataType(CPU_DEVICE), DataType.FLOAT16.ordinal());
             }
-            // After the inner scope exits, the outer scope's BF16 state must
+            // After the inner scope exits, the outer scope's BFLOAT16 state must
             // be visible again.
             Assert.assertTrue(JniUtils.autocastIsEnabled(CPU_DEVICE));
-            Assert.assertEquals(JniUtils.autocastGetDtype(CPU_DEVICE), DataType.BFLOAT16.ordinal());
+            Assert.assertEquals(
+                    JniUtils.autocastGetDataType(CPU_DEVICE), DataType.BFLOAT16.ordinal());
         }
         Assert.assertFalse(JniUtils.autocastIsEnabled(CPU_DEVICE));
     }
@@ -96,36 +103,37 @@ public class AutocastTest {
     }
 
     @Test
-    public void scopeRejectsCloseFromAnotherThread() throws InterruptedException {
+    public void scopeRejectsCloseFromAnotherThread() throws Exception {
         Engine engine = Engine.getInstance();
-        boolean beforeEnabled = JniUtils.autocastIsEnabled(CPU_DEVICE);
+        boolean previousEnabled = JniUtils.autocastIsEnabled(CPU_DEVICE);
         Autocast autocast = engine.newAutocast(Device.cpu(), DataType.BFLOAT16);
-        AtomicReference<RuntimeException> failure = new AtomicReference<>();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
-            Thread thread =
-                    new Thread(
+            Future<Throwable> future =
+                    executor.submit(
                             () -> {
                                 try {
                                     autocast.close();
-                                } catch (RuntimeException e) {
-                                    failure.set(e);
+                                    return null;
+                                } catch (Throwable t) {
+                                    return t;
                                 }
                             });
-            thread.start();
-            thread.join();
 
-            Assert.assertTrue(failure.get() instanceof IllegalStateException);
+            Throwable thrown = future.get(30, TimeUnit.SECONDS);
+            Assert.assertTrue(thrown instanceof IllegalStateException);
             Assert.assertTrue(JniUtils.autocastIsEnabled(CPU_DEVICE));
         } finally {
+            executor.shutdownNow();
             autocast.close();
         }
-        Assert.assertEquals(JniUtils.autocastIsEnabled(CPU_DEVICE), beforeEnabled);
+        Assert.assertEquals(JniUtils.autocastIsEnabled(CPU_DEVICE), previousEnabled);
     }
 
     @Test
-    public void sdpaOutputsAutocastDtype() {
-        // SDPA is in PyTorch's autocast allowlist, so FP32 inputs inside a
-        // BF16 autocast scope must produce a BF16 output on CUDA/ROCm.
+    public void sdpaUsesAutocastDataType() {
+        // SDPA is in PyTorch's autocast allowlist, so FLOAT32 inputs inside a
+        // BFLOAT16 autocast scope must produce a BFLOAT16 output on CUDA/ROCm.
         runOnGpuIfAvailable(
                 (engine, manager, device) -> {
                     NDArray q =
@@ -143,7 +151,7 @@ public class AutocastTest {
                         Assert.assertEquals(
                                 out.getDataType(),
                                 DataType.BFLOAT16,
-                                "SDPA must emit the autocast dtype");
+                                "SDPA must emit the autocast data type");
                         Assert.assertTrue(isAllFinite(out), "SDPA output must be finite");
                     }
                 });
@@ -151,8 +159,8 @@ public class AutocastTest {
 
     @Test
     public void rmsNormStaysFloat32() {
-        // RMS normalization is numerically sensitive and PyTorch's autocast
-        // policy keeps an FP32 input in FP32.
+        // RMS normalization is numerically sensitive, so PyTorch's autocast
+        // policy keeps a FLOAT32 input in FLOAT32.
         runOnGpuIfAvailable(
                 (engine, manager, device) -> {
                     NDArray x = manager.randomNormal(new Shape(2, 4, 32)).toDevice(device, false);
@@ -165,14 +173,14 @@ public class AutocastTest {
                         Assert.assertEquals(
                                 out.getDataType(),
                                 DataType.FLOAT32,
-                                "numerically sensitive rms_norm must stay in FP32");
+                                "Numerically sensitive RMSNorm must stay in FLOAT32");
                         Assert.assertTrue(isAllFinite(out), "rms_norm output must be finite");
                     }
                 });
     }
 
     @Test
-    public void matmulOutputsAutocastDtype() {
+    public void matmulUsesAutocastDataType() {
         // Baseline sanity check: torch.matmul is the canonical autocast op.
         // If this fails the backend is fundamentally not wired up.
         runOnGpuIfAvailable(
@@ -189,8 +197,8 @@ public class AutocastTest {
 
     @Test
     public void matmulWithinTolerance() {
-        // FP32 matmul vs autocast BF16 matmul on random inputs should match
-        // within BF16's ~1e-2 relative error. Guards against the autocast
+        // FLOAT32 matmul and autocast BFLOAT16 matmul on random inputs should match
+        // within BFLOAT16's ~1e-2 relative error. Guards against the autocast
         // cast silently aliasing to something else.
         runOnGpuIfAvailable(
                 (engine, manager, device) -> {
@@ -208,7 +216,7 @@ public class AutocastTest {
                     float relativeMaxError = maxAbsError / (maxReference + 1e-6f);
                     Assert.assertTrue(
                             relativeMaxError < 5e-2f,
-                            "BF16 matmul relative max error "
+                            "BFLOAT16 matmul relative max error "
                                     + relativeMaxError
                                     + " exceeds tolerance");
                 });
@@ -229,9 +237,7 @@ public class AutocastTest {
     private static void runOnGpuIfAvailable(GpuTest body) {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            // Skip silently: autocast on CPU has different op coverage, so
-            // these dtype-propagation tests only make sense on CUDA/ROCm.
-            return;
+            throw new SkipException("This autocast test requires a PyTorch GPU.");
         }
         try (NDManager manager = engine.newBaseManager(Device.gpu())) {
             body.run(engine, manager, Device.gpu());

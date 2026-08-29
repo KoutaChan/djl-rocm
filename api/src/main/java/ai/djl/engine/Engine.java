@@ -358,10 +358,10 @@ public abstract class Engine {
     }
 
     /**
-     * Opens an autocast scope on the given {@link Device}. Heavy matmul / conv / attention ops
-     * inside the scope are cast to {@code dataType}; numerically sensitive ops stay in FP32. The
-     * previous autocast state (enabled flag, data type, cache flag) is saved on entry and restored
-     * on {@link Autocast#close()}, so scopes nest safely.
+     * Opens an autocast scope on the given {@link Device}. Matrix multiplication, convolution, and
+     * attention operations inside the scope can use {@code dataType}, while numerically sensitive
+     * operations remain in {@link DataType#FLOAT32}. Closing the scope restores the previous
+     * autocast state, so scopes can be nested.
      *
      * <p>The default implementation is a no-op guard, which lets callers write engine-agnostic code
      * ({@code try (Autocast ac = engine.newAutocast(...)) { ... }}). Engines that implement
@@ -370,8 +370,7 @@ public abstract class Engine {
      * @param device the device to autocast on (typically a GPU)
      * @param dataType the lower-precision data type ({@link DataType#BFLOAT16} or {@link
      *     DataType#FLOAT16})
-     * @param cacheEnabled whether to enable the op-result cache inside the scope (matches PyTorch's
-     *     {@code cache_enabled} flag)
+     * @param cacheEnabled whether to enable the backend autocast cache inside the scope
      * @return an {@link Autocast} guard whose {@code close()} restores state
      */
     public Autocast newAutocast(Device device, DataType dataType, boolean cacheEnabled) {
@@ -379,7 +378,7 @@ public abstract class Engine {
     }
 
     /**
-     * Opens an autocast scope with the op-result cache enabled. Shortcut for {@link
+     * Opens an autocast scope with the backend cache enabled. Shortcut for {@link
      * #newAutocast(Device, DataType, boolean)} with {@code cacheEnabled = true}.
      *
      * @param device the device to autocast on

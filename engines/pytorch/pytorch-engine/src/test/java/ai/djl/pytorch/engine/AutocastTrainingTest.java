@@ -44,6 +44,7 @@ import ai.djl.translate.Batchifier;
 import ai.djl.util.PairList;
 
 import org.testng.Assert;
+import org.testng.SkipException;
 import org.testng.annotations.Test;
 
 import java.io.IOException;
@@ -119,7 +120,7 @@ public class AutocastTrainingTest {
     public void optimizerRunsOutsideAutocastWhenStepIsInsideCollector() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            return;
+            throw new SkipException("This autocast training test requires a PyTorch GPU.");
         }
 
         Device device = Device.gpu();
@@ -170,7 +171,7 @@ public class AutocastTrainingTest {
     public void nonFiniteGradientSkipsCompleteStep() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            return;
+            throw new SkipException("This autocast training test requires a PyTorch GPU.");
         }
 
         Device device = Device.gpu();
@@ -217,7 +218,7 @@ public class AutocastTrainingTest {
     public void nonFiniteSparseGradientIsClearedAfterSkippedStep() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            return;
+            throw new SkipException("This autocast training test requires a PyTorch GPU.");
         }
 
         Device device = Device.gpu();
@@ -264,7 +265,7 @@ public class AutocastTrainingTest {
     private static void runFiniteTraining(DataType autocastDataType) {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            return;
+            throw new SkipException("This autocast training test requires a PyTorch GPU.");
         }
 
         Device device = Device.gpu();
@@ -314,7 +315,7 @@ public class AutocastTrainingTest {
     private static void runLegacyCustomLoop(DataType autocastDataType) {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            return;
+            throw new SkipException("This autocast training test requires a PyTorch GPU.");
         }
 
         Device device = Device.gpu();
@@ -375,7 +376,7 @@ public class AutocastTrainingTest {
     private static void runValidation(DataType autocastDataType) {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            return;
+            throw new SkipException("This autocast training test requires a PyTorch GPU.");
         }
 
         Device device = Device.gpu();

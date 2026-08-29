@@ -139,13 +139,8 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchDeleteAcceleratorGraph(handle);
     }
 
-    // ------------------------------------------------------------------
-    // Autocast (at::autocast) thread-local flags. deviceType uses the same
-    // integer encoding as PtDeviceType.toDeviceType (0=CPU, 1=CUDA/GPU).
-    // ROCm libtorch built with PYTORCH_HIP_AS_CUDA=1 registers autocast
-    // under CUDA, so both NVIDIA and AMD GPUs pass deviceType=1. dtype
-    // uses DataType.ordinal() (0=FLOAT32, 11=BFLOAT16, ...).
-    // ------------------------------------------------------------------
+    // Autocast state is thread-local. deviceType follows PtDeviceType and dataType uses
+    // DataType.ordinal(). ROCm registers autocast under the CUDA device type.
 
     public static boolean autocastIsEnabled(int deviceType) {
         return PyTorchLibrary.LIB.torchAutocastIsEnabled(deviceType);
@@ -155,12 +150,36 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchAutocastSetEnabled(deviceType, enabled);
     }
 
-    public static int autocastGetDtype(int deviceType) {
+    public static int autocastGetDataType(int deviceType) {
         return PyTorchLibrary.LIB.torchAutocastGetDtype(deviceType);
     }
 
-    public static void autocastSetDtype(int deviceType, int dtype) {
-        PyTorchLibrary.LIB.torchAutocastSetDtype(deviceType, dtype);
+    public static void autocastSetDataType(int deviceType, int dataType) {
+        PyTorchLibrary.LIB.torchAutocastSetDtype(deviceType, dataType);
+    }
+
+    /**
+     * Returns the autocast data type.
+     *
+     * @param deviceType the PyTorch device type
+     * @return the {@link DataType} ordinal
+     * @deprecated Use {@link #autocastGetDataType(int)}.
+     */
+    @Deprecated
+    public static int autocastGetDtype(int deviceType) {
+        return autocastGetDataType(deviceType);
+    }
+
+    /**
+     * Sets the autocast data type.
+     *
+     * @param deviceType the PyTorch device type
+     * @param dataType the {@link DataType} ordinal
+     * @deprecated Use {@link #autocastSetDataType(int, int)}.
+     */
+    @Deprecated
+    public static void autocastSetDtype(int deviceType, int dataType) {
+        autocastSetDataType(deviceType, dataType);
     }
 
     public static boolean autocastIsCacheEnabled() {
@@ -2397,6 +2416,7 @@ public final class JniUtils {
 
     public static boolean unscaleGradients(List<PtNDArray> gradients, float inverseScale) {
         long[] handles = gradients.stream().mapToLong(PtNDArray::getHandle).toArray();
+        // The native name is retained for JNI binary compatibility.
         return PyTorchLibrary.LIB.torchUnscaleGradientsAndCheckFinite(handles, inverseScale);
     }
 

@@ -269,7 +269,7 @@ public final class PtEngine extends Engine {
         for (Map<DataType, List<PtNDArray>> byDataType : grouped.values()) {
             for (List<PtNDArray> group : byDataType.values()) {
                 boolean groupFinite = JniUtils.unscaleGradients(group, inverseScale);
-                gradientsFinite = groupFinite && gradientsFinite;
+                gradientsFinite &= groupFinite;
             }
         }
         return gradientsFinite;

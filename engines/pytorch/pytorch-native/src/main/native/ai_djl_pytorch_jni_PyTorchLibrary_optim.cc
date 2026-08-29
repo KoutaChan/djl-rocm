@@ -132,13 +132,13 @@ JNIEXPORT jboolean JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchUnscaleGr
 
   const auto scalar_options = first.options().dtype(at::kFloat).layout(at::kStrided).requires_grad(false);
   auto found_non_finite = at::zeros({}, scalar_options);
-  auto inverse_scale = at::full({}, static_cast<double>(jinverse_scale), scalar_options);
+  const auto inverse_scale = at::full({}, static_cast<double>(jinverse_scale), scalar_options);
   for (const auto& gradient : gradients) {
     if (gradient.is_sparse() && gradient.scalar_type() == at::kHalf) {
       // PyTorch coalesces scaled FP16 sparse gradients before unscale because summing duplicate
       // indices can overflow even when each stored value is finite. The optimizer can retain the
       // original sparse layout, but the finite check must still observe that coalesced result.
-      auto coalesced = gradient.coalesce();
+      const auto coalesced = gradient.coalesce();
       found_non_finite.add_(at::logical_not(at::isfinite(coalesced._values())).any().to(at::kFloat));
     }
   }

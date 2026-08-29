@@ -36,10 +36,10 @@ DefaultTrainingConfig config =
 
 `Trainer.forward`, `Trainer.evaluate`, and the loss calculation in `EasyTrain` run inside the
 configured autocast scope. The standard training and validation evaluators use the same scope.
-Autocast does not change the stored parameter dtype, and optimizer updates run outside autocast; with
-the default model dtype, both remain FP32. `Trainer.newGradientCollector()` also keeps the configured
-scope active around the conventional custom-loop sequence of forward, loss, and backward, while
-temporarily leaving autocast for backward and for `Trainer.step()` if it is called before the
+Autocast does not change the stored parameter data type, and optimizer updates run outside autocast;
+with the default model data type, both remain FP32. `Trainer.newGradientCollector()` keeps the
+configured scope active around the conventional custom-loop sequence of forward, loss, and backward,
+while temporarily leaving autocast for backward and for `Trainer.step()` if it is called before the
 collector closes. This lets existing loops that create the collector before forward use mixed
 precision without source changes. Operations performed outside the collector lifetime should be
 wrapped with `Trainer.newAutocast(device)`.

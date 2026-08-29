@@ -12,7 +12,6 @@
  */
 package ai.djl.pytorch.engine;
 
-import ai.djl.engine.EngineException;
 import ai.djl.ndarray.NDList;
 import ai.djl.training.DistributedTrainingConfig;
 import ai.djl.training.optimizer.Optimizer;
@@ -31,9 +30,9 @@ public class PtDistributedParameterServerTest {
 
         try (PtDistributedParameterServer parameterServer =
                 new PtDistributedParameterServer(optimizer, config)) {
-            EngineException exception =
+            IllegalStateException exception =
                     Assert.expectThrows(
-                            EngineException.class,
+                            IllegalStateException.class,
                             () -> parameterServer.prepareForBackward(new NDList()));
             Assert.assertTrue(exception.getMessage().contains("prepared before the forward pass"));
         }

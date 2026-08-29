@@ -160,22 +160,38 @@ public final class GradScaler {
         gradientsFiniteSinceUnscale = false;
     }
 
-    /** Returns the current scale. */
+    /**
+     * Returns the current scale.
+     *
+     * @return the current scale
+     */
     public synchronized float getScale() {
         return scale;
     }
 
-    /** Returns the number of consecutive finite steps since the last scale change. */
+    /**
+     * Returns the number of consecutive finite steps since the last scale change.
+     *
+     * @return the number of consecutive finite steps
+     */
     public synchronized int getGrowthCount() {
         return growthCount;
     }
 
-    /** Returns whether the most recent optimizer step was skipped. */
+    /**
+     * Returns whether the most recent optimizer step was skipped.
+     *
+     * @return whether the most recent optimizer step was skipped
+     */
     public synchronized boolean isLastStepSkipped() {
         return lastStepSkipped;
     }
 
-    /** Returns a checkpointable snapshot of the dynamic state. */
+    /**
+     * Returns a checkpointable snapshot of the dynamic state.
+     *
+     * @return a snapshot of the dynamic state
+     */
     public synchronized State getState() {
         if (scaledSinceUpdate) {
             throw new IllegalStateException(
@@ -274,7 +290,11 @@ public final class GradScaler {
         lastStepSkipped = false;
     }
 
-    /** Creates a builder for a {@code GradScaler}. */
+    /**
+     * Creates a builder for a {@code GradScaler}.
+     *
+     * @return a new builder
+     */
     public static Builder builder() {
         return new Builder();
     }
@@ -322,12 +342,20 @@ public final class GradScaler {
             this.growthCount = growthCount;
         }
 
-        /** Returns the saved loss scale. */
+        /**
+         * Returns the saved loss scale.
+         *
+         * @return the saved loss scale
+         */
         public float getScale() {
             return scale;
         }
 
-        /** Returns the saved finite-step counter. */
+        /**
+         * Returns the saved finite-step counter.
+         *
+         * @return the saved finite-step counter
+         */
         public int getGrowthCount() {
             return growthCount;
         }
@@ -343,31 +371,55 @@ public final class GradScaler {
 
         private Builder() {}
 
-        /** Sets the initial loss scale. */
+        /**
+         * Sets the initial loss scale.
+         *
+         * @param initialScale the initial loss scale
+         * @return this builder
+         */
         public Builder optInitialScale(float initialScale) {
             this.initialScale = initialScale;
             return this;
         }
 
-        /** Sets the multiplier applied after enough consecutive finite steps. */
+        /**
+         * Sets the multiplier applied after enough consecutive finite steps.
+         *
+         * @param growthFactor the scale growth factor
+         * @return this builder
+         */
         public Builder optGrowthFactor(float growthFactor) {
             this.growthFactor = growthFactor;
             return this;
         }
 
-        /** Sets the multiplier applied after a non-finite step. */
+        /**
+         * Sets the multiplier applied after a non-finite step.
+         *
+         * @param backoffFactor the scale backoff factor
+         * @return this builder
+         */
         public Builder optBackoffFactor(float backoffFactor) {
             this.backoffFactor = backoffFactor;
             return this;
         }
 
-        /** Sets the number of consecutive finite steps required to grow the scale. */
+        /**
+         * Sets the number of consecutive finite steps required to grow the scale.
+         *
+         * @param growthInterval the number of consecutive finite steps
+         * @return this builder
+         */
         public Builder optGrowthInterval(int growthInterval) {
             this.growthInterval = growthInterval;
             return this;
         }
 
-        /** Builds a {@link GradScaler}. */
+        /**
+         * Builds a {@link GradScaler}.
+         *
+         * @return a new {@code GradScaler}
+         */
         public GradScaler build() {
             requirePositiveFinite(initialScale, "initialScale");
             if (growthFactor <= 1f || !Float.isFinite(growthFactor)) {

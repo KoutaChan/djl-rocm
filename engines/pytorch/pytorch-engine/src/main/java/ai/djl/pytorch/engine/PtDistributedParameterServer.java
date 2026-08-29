@@ -84,7 +84,7 @@ final class PtDistributedParameterServer implements ParameterServer {
     @Override
     public synchronized void prepareForBackward(NDList outputs) {
         if (reducerHandle == 0L) {
-            throw new EngineException(
+            throw new IllegalStateException(
                     "Native distributed parameters must be prepared before the forward pass.");
         }
         JniUtils.distributedPrepareForBackward(reducerHandle);

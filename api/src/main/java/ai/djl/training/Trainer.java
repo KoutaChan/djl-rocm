@@ -278,13 +278,13 @@ public class Trainer implements AutoCloseable {
     public void step() {
         MixedPrecisionGradientCollector collector = activeMixedPrecisionCollector.get();
         if (collector == null) {
-            stepWithoutAutocast();
+            stepInternal();
             return;
         }
 
         collector.closeAutocastScopes();
         try {
-            stepWithoutAutocast();
+            stepInternal();
         } catch (RuntimeException | Error e) {
             try {
                 collector.openAutocastScopes();
@@ -296,7 +296,7 @@ public class Trainer implements AutoCloseable {
         collector.openAutocastScopes();
     }
 
-    private void stepWithoutAutocast() {
+    private void stepInternal() {
         parameterStore.finalizeGradients(gradScaler != null);
         if (gradScaler == null) {
             try {
@@ -335,12 +335,20 @@ public class Trainer implements AutoCloseable {
         }
     }
 
-    /** Returns the configured autocast data type. */
+    /**
+     * Returns the configured autocast data type.
+     *
+     * @return the configured autocast data type, or empty if autocast is disabled
+     */
     public Optional<DataType> getAutocastDataType() {
         return Optional.ofNullable(autocastDataType);
     }
 
-    /** Returns this trainer's gradient scaler. */
+    /**
+     * Returns this trainer's gradient scaler.
+     *
+     * @return the configured gradient scaler, or empty if gradient scaling is disabled
+     */
     public Optional<GradScaler> getGradScaler() {
         return Optional.ofNullable(gradScaler);
     }
@@ -630,29 +638,28 @@ public class Trainer implements AutoCloseable {
             validateThread();
             validateOpen();
             closeAutocastScopes();
-            NDArray converted = null;
-            NDArray scaled = null;
             try {
-                NDArray backwardTarget = target;
                 DataType dataType = target.getDataType();
-                if (dataType == DataType.FLOAT16 || dataType == DataType.BFLOAT16) {
-                    converted = target.toType(DataType.FLOAT32, false);
-                    backwardTarget = converted;
+                NDArray converted =
+                        dataType == DataType.FLOAT16 || dataType == DataType.BFLOAT16
+                                ? target.toType(DataType.FLOAT32, false)
+                                : null;
+                try (NDArray convertedTarget = converted) {
+                    NDArray backwardTarget = convertedTarget == null ? target : convertedTarget;
+                    NDArray scaled = gradScaler == null ? null : gradScaler.scale(backwardTarget);
+                    try (NDArray scaledTarget = scaled) {
+                        delegate.backward(scaledTarget == null ? backwardTarget : scaledTarget);
+                    }
                 }
-                if (gradScaler != null) {
-                    scaled = gradScaler.scale(backwardTarget);
-                    backwardTarget = scaled;
+            } catch (RuntimeException | Error e) {
+                try {
+                    openAutocastScopes();
+                } catch (RuntimeException | Error openException) {
+                    e.addSuppressed(openException);
                 }
-                delegate.backward(backwardTarget);
-            } finally {
-                if (scaled != null) {
-                    scaled.close();
-                }
-                if (converted != null) {
-                    converted.close();
-                }
-                openAutocastScopes();
+                throw e;
             }
+            openAutocastScopes();
         }
 
         @Override
