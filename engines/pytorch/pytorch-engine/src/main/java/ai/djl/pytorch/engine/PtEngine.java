@@ -18,6 +18,7 @@ import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
 import ai.djl.engine.InferenceMode;
+import ai.djl.engine.fusion.FusionCompiler;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
@@ -227,6 +228,12 @@ public final class PtEngine extends Engine {
      */
     public PtAcceleratorGraph newAcceleratorGraph(Device device) {
         return new PtAcceleratorGraph(device);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public FusionCompiler newFusionCompiler(Device device) {
+        return new PtFusionCompiler(device);
     }
 
     /** {@inheritDoc} */

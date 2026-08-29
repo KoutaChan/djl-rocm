@@ -66,8 +66,25 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         super(handle);
         this.manager = manager;
         this.ptNDArrayEx = new PtNDArrayEx(this);
-        manager.attachInternal(getUid(), this);
-        NDScope.register(this);
+        boolean attached = false;
+        try {
+            manager.attachInternal(getUid(), this);
+            attached = true;
+            NDScope.register(this);
+        } catch (RuntimeException | Error failure) {
+            if (attached) {
+                manager.detachInternal(getUid());
+            }
+            Long pointer = this.handle.getAndSet(null);
+            if (pointer != null && pointer != -1) {
+                try {
+                    JniUtils.deleteNDArray(pointer);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw failure;
+        }
     }
 
     /**

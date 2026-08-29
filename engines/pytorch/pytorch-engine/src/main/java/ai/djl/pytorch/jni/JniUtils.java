@@ -14,6 +14,7 @@ package ai.djl.pytorch.jni;
 
 import ai.djl.Device;
 import ai.djl.ndarray.NDList;
+import ai.djl.ndarray.NDScope;
 import ai.djl.ndarray.index.NDIndex;
 import ai.djl.ndarray.index.dim.NDIndexAll;
 import ai.djl.ndarray.index.dim.NDIndexBooleans;
@@ -175,6 +176,50 @@ public final class JniUtils {
 
     public static void deleteAcceleratorGraph(long handle) {
         PyTorchLibrary.LIB.torchDeleteAcceleratorGraph(handle);
+    }
+
+    public static long prepareFusionPlan(Device device, ByteBuffer descriptor) {
+        return PyTorchLibrary.LIB.torchPrepareFusionPlan(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}, descriptor);
+    }
+
+    public static long bindFusionPlan(long planHandle, ByteBuffer constantHandles) {
+        return PyTorchLibrary.LIB.torchBindFusionPlan(planHandle, constantHandles);
+    }
+
+    public static long createFusionSession(long executableHandle, int bufferCount) {
+        return PyTorchLibrary.LIB.torchCreateFusionSession(executableHandle, bufferCount);
+    }
+
+    public static PtNDArray getFusionSessionOutput(
+            PtNDManager manager, long sessionHandle, int bufferIndex, int outputIndex) {
+        long outputHandle =
+                PyTorchLibrary.LIB.torchGetFusionSessionOutput(
+                        sessionHandle, bufferIndex, outputIndex);
+        PtNDArray output = new PtNDArray(manager, outputHandle);
+        NDScope.unregister(output);
+        return output;
+    }
+
+    public static void submitFusion(
+            long sessionHandle, int bufferIndex, ByteBuffer inputHandles, ByteBuffer dimensions) {
+        PyTorchLibrary.LIB.torchSubmitFusion(sessionHandle, bufferIndex, inputHandles, dimensions);
+    }
+
+    public static void synchronizeFusionOutput(long sessionHandle, int bufferIndex) {
+        PyTorchLibrary.LIB.torchSynchronizeFusionOutput(sessionHandle, bufferIndex);
+    }
+
+    public static void deleteFusionPlan(long handle) {
+        PyTorchLibrary.LIB.torchDeleteFusionPlan(handle);
+    }
+
+    public static void deleteFusionExecutable(long handle) {
+        PyTorchLibrary.LIB.torchDeleteFusionExecutable(handle);
+    }
+
+    public static void deleteFusionSession(long handle) {
+        PyTorchLibrary.LIB.torchDeleteFusionSession(handle);
     }
 
     // Autocast state is thread-local. deviceType follows PtDeviceType and dataType uses

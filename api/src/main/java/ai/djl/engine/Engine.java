@@ -14,6 +14,7 @@ package ai.djl.engine;
 
 import ai.djl.Device;
 import ai.djl.Model;
+import ai.djl.engine.fusion.FusionCompiler;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
@@ -287,6 +288,20 @@ public abstract class Engine {
      */
     public SymbolBlock newSymbolBlock(NDManager manager) {
         throw new UnsupportedOperationException("Not supported.");
+    }
+
+    /**
+     * Returns a compiler for bounded fusion recipes on the specified device.
+     *
+     * <p>Fusion is an optional engine capability. The default implementation rejects the request so
+     * existing engines remain source and binary compatible.
+     *
+     * @param device the device targeted by prepared fusion plans
+     * @return a new fusion compiler
+     * @throws UnsupportedOperationException if this engine does not support fusion
+     */
+    public FusionCompiler newFusionCompiler(Device device) {
+        throw new UnsupportedOperationException("Fusion is not supported.");
     }
 
     /**

@@ -431,7 +431,7 @@ void EmptyCache() {
     return;
   }
 #if defined(USE_ROCM)
-  c10::hip::HIPCachingAllocator::emptyCache();
+  c10::cuda::CUDACachingAllocator::emptyCache();
 #elif DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::emptyCache();
 #else

@@ -64,6 +64,25 @@ final class PyTorchLibrary {
 
     native void torchDeleteAcceleratorGraph(long handle);
 
+    native long torchPrepareFusionPlan(int[] device, ByteBuffer descriptor);
+
+    native long torchBindFusionPlan(long planHandle, ByteBuffer constantHandles);
+
+    native long torchCreateFusionSession(long executableHandle, int bufferCount);
+
+    native long torchGetFusionSessionOutput(long sessionHandle, int bufferIndex, int outputIndex);
+
+    native void torchSubmitFusion(
+            long sessionHandle, int bufferIndex, ByteBuffer inputHandles, ByteBuffer dimensions);
+
+    native void torchSynchronizeFusionOutput(long sessionHandle, int bufferIndex);
+
+    native void torchDeleteFusionPlan(long handle);
+
+    native void torchDeleteFusionExecutable(long handle);
+
+    native void torchDeleteFusionSession(long handle);
+
     native boolean torchAutocastIsEnabled(int deviceType);
 
     native void torchAutocastSetEnabled(int deviceType, boolean enabled);

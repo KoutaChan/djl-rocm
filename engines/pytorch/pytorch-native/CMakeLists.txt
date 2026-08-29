@@ -44,6 +44,9 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_utils.h"
     "src/main/native/djl_pytorch_accelerator.h"
     "src/main/native/djl_pytorch_accelerator.cc"
+    "src/main/native/djl_pytorch_fusion.h"
+    "src/main/native/djl_pytorch_fusion.cc"
+    "src/main/native/djl_pytorch_fusion_kernels.h"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
     "src/main/native/djl_pytorch_masked_categorical.h"
@@ -51,6 +54,7 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_row_ops.h"
     "src/main/native/djl_pytorch_row_ops.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
+    "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_fusion.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_autocast.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_inference.cc"
@@ -91,9 +95,11 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         set(CMAKE_HIP_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "HIP MinSizeRel flags" FORCE)
     endif()
     list(APPEND SOURCE_FILES
+        "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         "src/main/native/djl_pytorch_rocm_launch_config.cc")
     set_source_files_properties(
+        "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         PROPERTIES LANGUAGE HIP)
 endif()
