@@ -334,9 +334,9 @@ public class PtFusionTest {
                     manager.create(new float[] {3f}, new Shape(1, 1))
                             .toType(DataType.BFLOAT16, false);
             NDArray single = manager.create(new float[] {4f, 5f, 6f}, new Shape(1, 3));
-            half.toFloatArray();
-            bfloat.toFloatArray();
-            single.toFloatArray();
+            half.toByteBuffer();
+            bfloat.toByteBuffer();
+            single.toByteBuffer();
 
             FusionSession session;
             try (PtStreamScope ignored = allocationStream.openScope()) {
