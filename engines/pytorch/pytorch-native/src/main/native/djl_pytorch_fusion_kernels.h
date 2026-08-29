@@ -20,6 +20,9 @@
 namespace djl::pytorch::fusion {
 
 inline constexpr int32_t kMaximumOutputPackSources = 32;
+inline constexpr int32_t kMaximumAffineTerms = 32;
+inline constexpr int32_t kMaximumAffineGroups = 32;
+inline constexpr int32_t kMaximumAffinePrefixRank = 8;
 
 struct OutputPackSource {
   const void* data;
@@ -30,6 +33,32 @@ struct OutputPackSource {
 
 void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
     torch::Tensor& output, int64_t row_count, int64_t output_width);
+
+struct AffineInputPackSource {
+  const void* data;
+  int64_t width;
+  int64_t destination_offset;
+};
+
+void LaunchAffineInputPack(const AffineInputPackSource* sources,
+    int32_t source_count, torch::Tensor& output, int64_t row_count,
+    int64_t output_width);
+
+enum class AffineActivation : int32_t {
+  kNone = 0,
+  kSilu = 1,
+};
+
+struct AffineSumSource {
+  const void* data;
+  int64_t rows_per_batch;
+  int64_t output_strides[kMaximumAffinePrefixRank];
+};
+
+void LaunchAffineFinalize(const AffineSumSource* sources, int32_t source_count,
+    const void* bias, torch::Tensor& output, int64_t batch_count,
+    const int64_t* output_prefix, int32_t output_prefix_rank,
+    int64_t output_width, AffineActivation activation);
 
 }  // namespace djl::pytorch::fusion
 

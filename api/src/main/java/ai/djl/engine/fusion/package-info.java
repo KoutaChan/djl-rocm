@@ -14,6 +14,22 @@
 /**
  * Contains backend-neutral APIs for preparing and repeatedly executing bounded fusion recipes.
  *
+ * <p>A recipe declares a closed set of inference stages rather than an arbitrary operator graph.
+ * {@link ai.djl.engine.fusion.FusionRecipe.AffineSum AffineSum} projects and sums dynamic values,
+ * fixed singleton-leading values, and an optional bias before applying a supported activation. A
+ * fixed value shaped {@code [1, ..., featureWidth]} broadcasts over the active leading extent;
+ * backends may project constant fixed values once when constants are bound. {@link
+ * ai.djl.engine.fusion.FusionRecipe.OutputPack OutputPack} writes several score values into one
+ * persistent FLOAT32 output.
+ *
+ * <p>The lifecycle is {@code recipe -> plan -> executable -> session -> invocation -> output
+ * lease}. Preparation validates shapes and builds a bounded command plan. Binding retains caller
+ * constants and may create backend-owned packed constants or precomputed values. A session owns a
+ * ring of maximum-shape output and workspace slots. One invocation submits the whole recipe, and
+ * its lease keeps the selected slot alive until downstream work no longer uses its outputs. {@link
+ * ai.djl.engine.fusion.FusionCompilationReport FusionCompilationReport} reports shared
+ * per-executable storage separately from output and workspace storage allocated for every slot.
+ *
  * <p>Execution sessions are externally serialized: method executions using a session and its
  * derived handles are not thread-safe and must not overlap. Outstanding handle lifetimes may
  * coexist on distinct ring slots, and sequential calls may move between threads.

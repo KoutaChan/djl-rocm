@@ -17,6 +17,8 @@ import ai.djl.ndarray.types.DataType;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -53,14 +55,22 @@ final class PtFusionDescriptor {
     static final long DTYPE_INT64 = 9;
     static final long DTYPE_FLOAT64 = 10;
     static final long OUTPUT_PACK_V1 = 1;
+    static final long AFFINE_SUM_V1 = 2;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
+    static final long ATTRIBUTE_INT64 = 1;
+    static final long AFFINE_TERM_COUNT = 1;
+    static final long AFFINE_ACTIVATION = 2;
+    static final long AFFINE_HAS_BIAS = 3;
+    static final long ACTIVATION_NONE = 0;
+    static final long ACTIVATION_SILU = 1;
 
     static final int HEADER_WORDS = 16;
     static final int DIMENSION_RECORD_WORDS = 3;
     static final int VALUE_RECORD_HEADER_WORDS = 7;
     static final int BINDING_RECORD_WORDS = 2;
     static final int COMMAND_RECORD_HEADER_WORDS = 6;
+    static final int SCALAR_ATTRIBUTE_WORDS = 5;
     static final int OUTPUT_RECORD_WORDS = 2;
 
     private PtFusionDescriptor() {}
@@ -86,6 +96,11 @@ final class PtFusionDescriptor {
                         Math.addExact(
                                 commandWords,
                                 outputPackCommandWords((FusionRecipe.OutputPack) value));
+            } else if (value instanceof FusionRecipe.AffineSum) {
+                commandWords =
+                        Math.addExact(
+                                commandWords,
+                                affineSumCommandWords((FusionRecipe.AffineSum) value));
             } else if (!(value instanceof FusionRecipe.Input)
                     && !(value instanceof FusionRecipe.Constant)) {
                 throw new UnsupportedOperationException(
@@ -142,6 +157,8 @@ final class PtFusionDescriptor {
         for (FusionRecipe.Value value : recipe.getValues()) {
             if (value instanceof FusionRecipe.OutputPack) {
                 putOutputPackCommand(descriptor, (FusionRecipe.OutputPack) value);
+            } else if (value instanceof FusionRecipe.AffineSum) {
+                putAffineSumCommand(descriptor, (FusionRecipe.AffineSum) value);
             }
         }
         for (FusionRecipe.Output output : recipe.getOutputs()) {
@@ -160,6 +177,8 @@ final class PtFusionDescriptor {
         for (FusionRecipe.Value value : recipe.getValues()) {
             if (value instanceof FusionRecipe.OutputPack) {
                 ++count;
+            } else if (value instanceof FusionRecipe.AffineSum) {
+                ++count;
             }
         }
         return count;
@@ -168,10 +187,11 @@ final class PtFusionDescriptor {
     static long persistentStorageBytes(FusionRecipe recipe) {
         long bytes = 0;
         for (FusionRecipe.Value value : recipe.getValues()) {
-            if (value instanceof FusionRecipe.OutputPack) {
+            if (isComputed(value)) {
                 bytes = Math.addExact(bytes, storageBytes(value));
             }
         }
+        bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -182,11 +202,136 @@ final class PtFusionDescriptor {
         }
         long bytes = 0;
         for (FusionRecipe.Value value : recipe.getValues()) {
-            if (value instanceof FusionRecipe.OutputPack && !outputs.contains(value)) {
+            if (isComputed(value) && !outputs.contains(value)) {
                 bytes = Math.addExact(bytes, storageBytes(value));
             }
         }
+        bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         return bytes;
+    }
+
+    static long executableStorageBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.AffineSum)) {
+                continue;
+            }
+            FusionRecipe.AffineSum affineSum = (FusionRecipe.AffineSum) value;
+            long outputWidth =
+                    affineSum.getSpec()
+                            .getInnerShape()[affineSum.getSpec().getInnerShape().length - 1];
+            for (AffineGroup group : affineGroups(affineSum)) {
+                if (group.precomputeAtBind) {
+                    bytes =
+                            Math.addExact(
+                                    bytes,
+                                    affineStorageBytes(
+                                            affineSum, affineRows(affineSum, group), outputWidth));
+                } else {
+                    bytes =
+                            Math.addExact(
+                                    bytes,
+                                    affineStorageBytes(affineSum, group.inputWidth, outputWidth));
+                }
+            }
+        }
+        return bytes;
+    }
+
+    private static boolean isComputed(FusionRecipe.Value value) {
+        return value instanceof FusionRecipe.OutputPack || value instanceof FusionRecipe.AffineSum;
+    }
+
+    private static long affineWorkspaceBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.AffineSum)) {
+                continue;
+            }
+            FusionRecipe.AffineSum affineSum = (FusionRecipe.AffineSum) value;
+            long[] outputInner = affineSum.getSpec().getInnerShape();
+            long[] outputPrefix = Arrays.copyOf(outputInner, outputInner.length - 1);
+            boolean directGroupAvailable = false;
+            for (AffineGroup group : affineGroups(affineSum)) {
+                if (group.precomputeAtBind) {
+                    continue;
+                }
+                long rowCount = affineRows(affineSum, group);
+                if (group.termCount > 1) {
+                    bytes =
+                            Math.addExact(
+                                    bytes,
+                                    affineStorageBytes(affineSum, rowCount, group.inputWidth));
+                }
+                if (!directGroupAvailable
+                        && group.dynamicLeading
+                        && Arrays.equals(group.prefix, outputPrefix)) {
+                    directGroupAvailable = true;
+                } else {
+                    bytes =
+                            Math.addExact(
+                                    bytes,
+                                    affineStorageBytes(
+                                            affineSum,
+                                            rowCount,
+                                            outputInner[outputInner.length - 1]));
+                }
+            }
+        }
+        return bytes;
+    }
+
+    private static ArrayList<AffineGroup> affineGroups(FusionRecipe.AffineSum affineSum) {
+        ArrayList<AffineGroup> groups = new ArrayList<>();
+        for (FusionRecipe.AffineTerm term : affineSum.getTerms()) {
+            FusionRecipe.TensorSpec inputSpec = term.getInput().getSpec();
+            long[] inputInner = inputSpec.getInnerShape();
+            boolean dynamicLeading = inputSpec.getLeadingDimension() != null;
+            boolean constantInput = term.getInput() instanceof FusionRecipe.Constant;
+            boolean precomputeAtBind = !dynamicLeading && constantInput;
+            long[] prefix =
+                    Arrays.copyOfRange(inputInner, dynamicLeading ? 0 : 1, inputInner.length - 1);
+            AffineGroup group = findGroup(groups, prefix, dynamicLeading, precomputeAtBind);
+            if (group == null) {
+                group = new AffineGroup(prefix, dynamicLeading, precomputeAtBind);
+                groups.add(group);
+            }
+            group.inputWidth = Math.addExact(group.inputWidth, inputInner[inputInner.length - 1]);
+            ++group.termCount;
+        }
+        return groups;
+    }
+
+    private static AffineGroup findGroup(
+            ArrayList<AffineGroup> groups,
+            long[] prefix,
+            boolean dynamicLeading,
+            boolean precomputeAtBind) {
+        for (AffineGroup group : groups) {
+            if (group.dynamicLeading == dynamicLeading
+                    && group.precomputeAtBind == precomputeAtBind
+                    && Arrays.equals(group.prefix, prefix)) {
+                return group;
+            }
+        }
+        return null;
+    }
+
+    private static long affineRows(FusionRecipe.AffineSum affineSum, AffineGroup group) {
+        long rows =
+                group.dynamicLeading
+                        ? affineSum.getSpec().getLeadingDimension().getMaximumExtent()
+                        : 1;
+        for (long extent : group.prefix) {
+            rows = Math.multiplyExact(rows, extent);
+        }
+        return rows;
+    }
+
+    private static long affineStorageBytes(
+            FusionRecipe.AffineSum affineSum, long rows, long width) {
+        long elements = Math.multiplyExact(rows, width);
+        return Math.multiplyExact(elements, affineSum.getSpec().getDataType().getNumOfBytes());
     }
 
     private static long storageBytes(FusionRecipe.Value value) {
@@ -256,6 +401,77 @@ final class PtFusionDescriptor {
         descriptor.putLong(outputPack.getIndex());
         for (FusionRecipe.Value source : outputPack.getSources()) {
             descriptor.putLong(source.getIndex());
+        }
+    }
+
+    private static int affineSumCommandWords(FusionRecipe.AffineSum affineSum) {
+        int operandCount = Math.multiplyExact(affineSum.getTerms().size(), 2);
+        if (affineSum.getBias() != null) {
+            operandCount = Math.addExact(operandCount, 1);
+        }
+        return Math.addExact(
+                Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, operandCount),
+                Math.multiplyExact(3, SCALAR_ATTRIBUTE_WORDS));
+    }
+
+    private static void putAffineSumCommand(
+            ByteBuffer descriptor, FusionRecipe.AffineSum affineSum) {
+        int operandCount = Math.multiplyExact(affineSum.getTerms().size(), 2);
+        if (affineSum.getBias() != null) {
+            ++operandCount;
+        }
+        descriptor.putLong(affineSumCommandWords(affineSum));
+        descriptor.putLong(AFFINE_SUM_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(operandCount);
+        descriptor.putLong(3);
+        descriptor.putLong(affineSum.getIndex());
+        for (FusionRecipe.AffineTerm term : affineSum.getTerms()) {
+            descriptor.putLong(term.getInput().getIndex());
+            descriptor.putLong(term.getWeight().getIndex());
+        }
+        if (affineSum.getBias() != null) {
+            descriptor.putLong(affineSum.getBias().getIndex());
+        }
+        putScalarAttribute(descriptor, AFFINE_TERM_COUNT, affineSum.getTerms().size());
+        putScalarAttribute(
+                descriptor, AFFINE_ACTIVATION, activationCode(affineSum.getActivation()));
+        putScalarAttribute(descriptor, AFFINE_HAS_BIAS, affineSum.getBias() == null ? 0 : 1);
+    }
+
+    private static void putScalarAttribute(ByteBuffer descriptor, long key, long value) {
+        descriptor.putLong(SCALAR_ATTRIBUTE_WORDS);
+        descriptor.putLong(key);
+        descriptor.putLong(ATTRIBUTE_INT64);
+        descriptor.putLong(1);
+        descriptor.putLong(value);
+    }
+
+    private static long activationCode(FusionRecipe.Activation activation) {
+        switch (activation) {
+            case NONE:
+                return ACTIVATION_NONE;
+            case SILU:
+                return ACTIVATION_SILU;
+            default:
+                throw new UnsupportedOperationException(
+                        "PyTorch fusion does not support activation: " + activation);
+        }
+    }
+
+    private static final class AffineGroup {
+
+        private final long[] prefix;
+        private final boolean dynamicLeading;
+        private final boolean precomputeAtBind;
+        private long inputWidth;
+        private int termCount;
+
+        private AffineGroup(long[] prefix, boolean dynamicLeading, boolean precomputeAtBind) {
+            this.prefix = prefix;
+            this.dynamicLeading = dynamicLeading;
+            this.precomputeAtBind = precomputeAtBind;
         }
     }
 }

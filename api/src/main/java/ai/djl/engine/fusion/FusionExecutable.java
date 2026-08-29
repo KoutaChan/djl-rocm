@@ -17,6 +17,10 @@ import ai.djl.ndarray.NDManager;
 /**
  * A prepared fusion plan with model constants bound for repeated inference.
  *
+ * <p>An executable owns backend-created packed constants and precomputed values reported by {@link
+ * FusionCompilationReport#getExecutableStorageBytes()}. These resources are shared by every session
+ * created from the executable.
+ *
  * <p>Method executions on the same executable are not thread-safe and must be externally
  * serialized. Sessions created from it have independent session lifecycles.
  */

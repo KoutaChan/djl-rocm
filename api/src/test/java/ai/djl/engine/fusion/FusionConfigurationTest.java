@@ -77,12 +77,14 @@ public class FusionConfigurationTest {
         FusionCompilationReport report =
                 FusionCompilationReport.builder("test-backend")
                         .optCommandCount(3)
+                        .optExecutableStorageBytes(64)
                         .optPersistentStorageBytes(256)
                         .optWorkspaceBytes(128)
                         .optNativeOnly(true)
                         .build();
         Assert.assertEquals(report.getBackend(), "test-backend");
         Assert.assertEquals(report.getCommandCount(), 3);
+        Assert.assertEquals(report.getExecutableStorageBytes(), 64);
         Assert.assertEquals(report.getPersistentStorageBytes(), 256);
         Assert.assertEquals(report.getWorkspaceBytes(), 128);
         Assert.assertTrue(report.isNativeOnly());
@@ -97,6 +99,9 @@ public class FusionConfigurationTest {
         Assert.assertThrows(
                 IllegalArgumentException.class,
                 () -> FusionCompilationReport.builder("test").optCommandCount(-1));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> FusionCompilationReport.builder("test").optExecutableStorageBytes(-1));
         Assert.assertThrows(
                 IllegalArgumentException.class,
                 () -> FusionCompilationReport.builder("test").optPersistentStorageBytes(-1));

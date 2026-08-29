@@ -99,6 +99,97 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void affineSumBuildsBroadcastGraph() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("affine-sum");
+        FusionRecipe.Dimension rows = builder.addDimension("rows", 32);
+        FusionRecipe.Input candidates =
+                builder.addInput(
+                        "candidates", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 4, 3));
+        FusionRecipe.Input context =
+                builder.addInput(
+                        "context", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 1, 2));
+        FusionRecipe.Constant table =
+                builder.addConstant(
+                        "table", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 1, 4, 2));
+        FusionRecipe.Constant candidateWeight =
+                builder.addConstant(
+                        "candidateWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 3));
+        FusionRecipe.Constant contextWeight =
+                builder.addConstant(
+                        "contextWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 2));
+        FusionRecipe.Constant tableWeight =
+                builder.addConstant(
+                        "tableWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 2));
+        FusionRecipe.Constant bias =
+                builder.addConstant("bias", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5));
+        FusionRecipe.AffineSum affine =
+                builder.affineSum("hidden", 5)
+                        .addTerm(candidates, candidateWeight)
+                        .addTerm(context, contextWeight)
+                        .addTerm(table, tableWeight)
+                        .optBias(bias)
+                        .optActivation(FusionRecipe.Activation.SILU)
+                        .build();
+        builder.addOutput("output", affine);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertEquals(affine.getSpec().getDataType(), DataType.FLOAT16);
+        Assert.assertSame(affine.getSpec().getLeadingDimension(), rows);
+        Assert.assertEquals(affine.getSpec().getInnerShape(), new long[] {4, 5});
+        Assert.assertEquals(affine.getTerms().size(), 3);
+        Assert.assertSame(affine.getTerms().get(0).getInput(), candidates);
+        Assert.assertSame(affine.getTerms().get(0).getWeight(), candidateWeight);
+        Assert.assertSame(affine.getTerms().get(1).getInput(), context);
+        Assert.assertSame(affine.getTerms().get(2).getInput(), table);
+        Assert.assertSame(affine.getBias(), bias);
+        Assert.assertEquals(affine.getActivation(), FusionRecipe.Activation.SILU);
+        Assert.assertSame(recipe.getValues().get(7), affine);
+        Assert.assertThrows(UnsupportedOperationException.class, () -> affine.getTerms().clear());
+    }
+
+    @Test
+    public void affineSumRejectsInvalidTerms() {
+        FusionRecipe.Builder empty = FusionRecipe.builder("empty-affine");
+        Assert.assertThrows(
+                IllegalStateException.class, () -> empty.affineSum("hidden", 3).build());
+
+        FusionRecipe.Builder mismatched = FusionRecipe.builder("mismatched-affine");
+        FusionRecipe.Dimension rows = mismatched.addDimension("rows", 8);
+        FusionRecipe.Input left =
+                mismatched.addInput(
+                        "left", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 2, 3));
+        FusionRecipe.Input right =
+                mismatched.addInput(
+                        "right", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 3, 4));
+        FusionRecipe.Constant leftWeight =
+                mismatched.addConstant(
+                        "leftWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 5, 3));
+        FusionRecipe.Constant rightWeight =
+                mismatched.addConstant(
+                        "rightWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 5, 4));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        mismatched
+                                .affineSum("hidden", 5)
+                                .addTerm(left, leftWeight)
+                                .addTerm(right, rightWeight)
+                                .build());
+
+        FusionRecipe.Builder badWeight = FusionRecipe.builder("bad-weight-affine");
+        FusionRecipe.Dimension samples = badWeight.addDimension("samples", 8);
+        FusionRecipe.Input input =
+                badWeight.addInput(
+                        "input", FusionRecipe.TensorSpec.of(DataType.FLOAT16, samples, 3));
+        FusionRecipe.Constant weight =
+                badWeight.addConstant(
+                        "weight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 5, 3));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> badWeight.affineSum("hidden", 5).addTerm(input, weight).build());
+    }
+
+    @Test
     public void builderRejectsForeignHandlesAndMutationAfterBuild() {
         FusionRecipe.Builder first = FusionRecipe.builder("first");
         FusionRecipe.Dimension firstRows = first.addDimension("rows", 4);

@@ -12,13 +12,17 @@
  */
 #include "djl_pytorch_fusion.h"
 
+#include <ATen/ops/mm.h>
 #include <c10/core/DeviceGuard.h>
+#include <c10/core/InferenceMode.h>
 
+#include <algorithm>
 #include <array>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -52,6 +56,7 @@ constexpr int64_t kDTypeInt64 = 9;
 constexpr int64_t kDTypeFloat64 = 10;
 
 constexpr int64_t kOutputPackV1 = 1;
+constexpr int64_t kAffineSumV1 = 2;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
 
@@ -59,6 +64,12 @@ constexpr int64_t kAttributeInt64 = 1;
 constexpr int64_t kAttributeFloat64Bits = 2;
 constexpr int64_t kAttributeBoolean = 3;
 constexpr std::size_t kAttributeRecordHeaderWords = 4;
+
+constexpr int64_t kAffineTermCount = 1;
+constexpr int64_t kAffineActivation = 2;
+constexpr int64_t kAffineHasBias = 3;
+constexpr int64_t kActivationNone = 0;
+constexpr int64_t kActivationSilu = 1;
 
 enum class ValueKind {
   kUnbound,
@@ -109,7 +120,41 @@ struct OutputPackCommandSpec {
   std::vector<OutputPackSourceSpec> sources;
 };
 
-using FusionCommand = std::variant<OutputPackCommandSpec>;
+struct AffineTermSpec {
+  int32_t input_value_index;
+  int32_t weight_value_index;
+  int32_t weight_binding_index;
+  int64_t input_width;
+};
+
+struct AffineGroupSpec {
+  std::vector<int64_t> prefix_shape;
+  bool dynamic_leading = false;
+  bool precompute_at_bind = false;
+  int64_t rows_per_batch = 0;
+  int64_t packed_input_width = 0;
+  int32_t packed_input_storage_index = -1;
+  int32_t product_storage_index = -1;
+  std::array<int64_t, kMaximumAffinePrefixRank> output_strides{};
+  std::vector<AffineTermSpec> terms;
+};
+
+struct AffineSumCommandSpec {
+  int32_t result_value_index;
+  int32_t result_storage_index;
+  int32_t extent_index;
+  int32_t bias_value_index;
+  int64_t maximum_batches;
+  int64_t output_width;
+  int64_t output_rows_per_batch;
+  AffineActivation activation;
+  bool needs_finalize;
+  std::vector<int64_t> output_prefix_shape;
+  std::vector<int32_t> operand_value_indices;
+  std::vector<AffineGroupSpec> groups;
+};
+
+using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec>;
 
 struct FusionPlanData {
   explicit FusionPlanData(c10::Device device) : device(device) {}
@@ -130,7 +175,17 @@ struct FusionPlanData {
 struct FusionExecutableData {
   std::shared_ptr<const FusionPlanData> plan;
   std::vector<torch::Tensor> constants;
+  std::vector<std::vector<torch::Tensor>> affine_weights;
+  std::vector<std::vector<torch::Tensor>> affine_products;
+  std::unique_ptr<c10::Event> binding_ready;
 };
+
+struct CommandAttribute {
+  int64_t type;
+  std::vector<int64_t> payload;
+};
+
+using CommandAttributes = std::unordered_map<int64_t, CommandAttribute>;
 
 class DescriptorReader {
  public:
@@ -226,8 +281,13 @@ void RecordCurrentStream(const torch::Tensor& tensor) {
       tensor.storage().data_ptr(), guard_impl.getStream(tensor.device()));
 }
 
-void ValidateAttributeRecords(DescriptorReader& reader, int32_t attribute_count) {
-  std::unordered_set<int64_t> keys;
+CommandAttributes ReadAttributeRecords(
+    DescriptorReader& reader, int32_t attribute_count) {
+  TORCH_CHECK(static_cast<std::size_t>(attribute_count) <=
+          reader.Remaining() / kAttributeRecordHeaderWords,
+      "fusion command attribute count exceeds its record");
+  CommandAttributes attributes;
+  attributes.reserve(static_cast<std::size_t>(attribute_count));
   for (int32_t index = 0; index < attribute_count; ++index) {
     TORCH_CHECK(reader.Remaining() >= kAttributeRecordHeaderWords,
         "truncated fusion command attribute");
@@ -242,18 +302,35 @@ void ValidateAttributeRecords(DescriptorReader& reader, int32_t attribute_count)
         "fusion command attribute element count");
     TORCH_CHECK(element_count == record_words - kAttributeRecordHeaderWords,
         "fusion command attribute size does not match its payload");
-    TORCH_CHECK(keys.insert(key).second, "duplicate fusion command attribute key");
+    TORCH_CHECK(attributes.find(key) == attributes.end(),
+        "duplicate fusion command attribute key");
     TORCH_CHECK(type == kAttributeInt64 || type == kAttributeFloat64Bits ||
             type == kAttributeBoolean,
         "unsupported fusion command attribute type");
     TORCH_CHECK(element_count <= reader.Remaining(),
         "truncated fusion command attribute payload");
+    CommandAttribute attribute;
+    attribute.type = type;
+    attribute.payload.reserve(element_count);
     for (std::size_t element = 0; element < element_count; ++element) {
       const int64_t payload = reader.Read();
       TORCH_CHECK(type != kAttributeBoolean || payload == 0 || payload == 1,
           "fusion boolean command attribute must contain zero or one");
+      attribute.payload.push_back(payload);
     }
+    attributes.emplace(key, std::move(attribute));
   }
+  return attributes;
+}
+
+int64_t GetRequiredInt64Scalar(const CommandAttributes& attributes,
+    int64_t key, const char* name) {
+  const auto found = attributes.find(key);
+  TORCH_CHECK(found != attributes.end(), "missing ", name, " attribute");
+  TORCH_CHECK(found->second.type == kAttributeInt64 &&
+          found->second.payload.size() == 1,
+      name, " attribute must be one int64 value");
+  return found->second.payload[0];
 }
 
 void ValidateTensorMetadata(const torch::Tensor& tensor, const FusionPlanData& plan,
@@ -286,15 +363,23 @@ void ValidateTensorMetadata(const torch::Tensor& tensor, const FusionPlanData& p
   }
 }
 
+int32_t NextStorageIndex(const FusionPlanData& plan) {
+  TORCH_CHECK(plan.storages.size() <=
+          static_cast<std::size_t>(std::numeric_limits<int32_t>::max()),
+      "fusion storage count exceeds the supported range");
+  return static_cast<int32_t>(plan.storages.size());
+}
+
 OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
     int32_t command_index, const std::vector<int32_t>& results,
-    const std::vector<int32_t>& operands, int64_t flags, int32_t attribute_count) {
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
   TORCH_CHECK(flags == 0, "OUTPUT_PACK_V1 does not support command flags");
   TORCH_CHECK(results.size() == 1,
       "OUTPUT_PACK_V1 requires exactly one result");
   TORCH_CHECK(!operands.empty() && operands.size() <= kMaximumOutputPackSources,
       "OUTPUT_PACK_V1 operand count exceeds the native limit");
-  TORCH_CHECK(attribute_count == 0, "OUTPUT_PACK_V1 does not support attributes");
+  TORCH_CHECK(attributes.empty(), "OUTPUT_PACK_V1 does not support attributes");
 
   const int32_t result_index = results[0];
   ValueSpec& result = plan.values[result_index];
@@ -307,7 +392,7 @@ OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
 
   OutputPackCommandSpec command;
   command.result_value_index = result_index;
-  command.result_storage_index = static_cast<int32_t>(plan.storages.size());
+  command.result_storage_index = NextStorageIndex(plan);
   command.extent_index = result.dimension_index;
   command.maximum_rows = plan.dimensions[result.dimension_index].maximum_extent;
   command.output_width = result.inner_shape[0];
@@ -341,6 +426,258 @@ OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
   return command;
 }
 
+int64_t CheckedMultiply(int64_t left, int64_t right, const char* name) {
+  TORCH_CHECK(left >= 0 && right >= 0, name, " factors must not be negative");
+  TORCH_CHECK(left == 0 || right <= std::numeric_limits<int64_t>::max() / left,
+      name, " exceeds the supported range");
+  return left * right;
+}
+
+int64_t Product(const std::vector<int64_t>& shape, const char* name) {
+  int64_t product = 1;
+  for (int64_t extent : shape) {
+    product = CheckedMultiply(product, extent, name);
+  }
+  return product;
+}
+
+int64_t TensorPayloadBytes(const std::vector<int64_t>& shape,
+    torch::ScalarType data_type, const char* name) {
+  const std::size_t element_size = c10::elementSize(data_type);
+  TORCH_CHECK(element_size <=
+          static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
+      name, " element size exceeds the supported range");
+  return CheckedMultiply(Product(shape, name),
+      static_cast<int64_t>(element_size), name);
+}
+
+std::vector<int64_t> BroadcastPrefix(
+    const std::vector<int64_t>& left, const std::vector<int64_t>& right) {
+  const std::size_t rank = std::max(left.size(), right.size());
+  std::vector<int64_t> result(rank, 1);
+  for (std::size_t result_axis = 0; result_axis < rank; ++result_axis) {
+    const int64_t left_axis = static_cast<int64_t>(result_axis) -
+        static_cast<int64_t>(rank - left.size());
+    const int64_t right_axis = static_cast<int64_t>(result_axis) -
+        static_cast<int64_t>(rank - right.size());
+    const int64_t left_extent = left_axis < 0 ? 1 : left[left_axis];
+    const int64_t right_extent = right_axis < 0 ? 1 : right[right_axis];
+    TORCH_CHECK(left_extent == right_extent || left_extent == 1 || right_extent == 1,
+        "AFFINE_SUM_V1 input prefixes are not broadcast-compatible");
+    result[result_axis] = std::max(left_extent, right_extent);
+  }
+  return result;
+}
+
+AffineActivation AffineActivationFromWireCode(int64_t code) {
+  switch (code) {
+    case kActivationNone:
+      return AffineActivation::kNone;
+    case kActivationSilu:
+      return AffineActivation::kSilu;
+    default:
+      TORCH_CHECK(false, "unsupported AFFINE_SUM_V1 activation code: ", code);
+  }
+}
+
+AffineGroupSpec* FindAffineGroup(
+    std::vector<AffineGroupSpec>& groups, const std::vector<int64_t>& prefix,
+    bool dynamic_leading, bool precompute_at_bind) {
+  for (auto& group : groups) {
+    if (group.dynamic_leading == dynamic_leading &&
+        group.precompute_at_bind == precompute_at_bind &&
+        group.prefix_shape == prefix) {
+      return &group;
+    }
+  }
+  return nullptr;
+}
+
+AffineSumCommandSpec BuildAffineSumCommand(FusionPlanData& plan,
+    int32_t command_index, const std::vector<int32_t>& results,
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0, "AFFINE_SUM_V1 does not support command flags");
+  TORCH_CHECK(results.size() == 1,
+      "AFFINE_SUM_V1 requires exactly one result");
+  TORCH_CHECK(attributes.size() == 3,
+      "AFFINE_SUM_V1 requires exactly three attributes");
+  const int64_t term_count_wire = GetRequiredInt64Scalar(
+      attributes, kAffineTermCount, "AFFINE_SUM_V1 term count");
+  TORCH_CHECK(term_count_wire > 0 && term_count_wire <= kMaximumAffineTerms,
+      "AFFINE_SUM_V1 term count exceeds the native limit");
+  const int32_t term_count = static_cast<int32_t>(term_count_wire);
+  const int64_t has_bias_wire = GetRequiredInt64Scalar(
+      attributes, kAffineHasBias, "AFFINE_SUM_V1 bias presence");
+  TORCH_CHECK(has_bias_wire == 0 || has_bias_wire == 1,
+      "AFFINE_SUM_V1 bias presence must be zero or one");
+  const bool has_bias = has_bias_wire != 0;
+  const std::size_t expected_operands =
+      static_cast<std::size_t>(term_count) * 2 + (has_bias ? 1 : 0);
+  TORCH_CHECK(operands.size() == expected_operands,
+      "AFFINE_SUM_V1 operand count does not match its attributes");
+
+  const int32_t result_index = results[0];
+  ValueSpec& result = plan.values[result_index];
+  TORCH_CHECK(result.kind == ValueKind::kUnbound,
+      "fusion command result already has a producer or binding");
+  TORCH_CHECK(IsOutputPackDataType(result.data_type),
+      "AFFINE_SUM_V1 supports FLOAT16, BFLOAT16, and FLOAT32");
+  TORCH_CHECK(result.dimension_index >= 0 && !result.inner_shape.empty(),
+      "AFFINE_SUM_V1 result requires a leading dimension and feature axis");
+  TORCH_CHECK(result.inner_shape.size() - 1 <= kMaximumAffinePrefixRank,
+      "AFFINE_SUM_V1 result prefix rank exceeds the native limit");
+
+  AffineSumCommandSpec command;
+  command.result_value_index = result_index;
+  command.result_storage_index = NextStorageIndex(plan);
+  command.extent_index = result.dimension_index;
+  command.bias_value_index = -1;
+  command.maximum_batches = plan.dimensions[result.dimension_index].maximum_extent;
+  command.output_width = result.inner_shape.back();
+  command.output_prefix_shape.assign(
+      result.inner_shape.begin(), result.inner_shape.end() - 1);
+  command.output_rows_per_batch = Product(
+      command.output_prefix_shape, "AFFINE_SUM_V1 output prefix size");
+  command.activation = AffineActivationFromWireCode(GetRequiredInt64Scalar(
+      attributes, kAffineActivation, "AFFINE_SUM_V1 activation"));
+  command.operand_value_indices = operands;
+  command.groups.reserve(static_cast<std::size_t>(term_count));
+
+  std::vector<int64_t> inferred_output_prefix;
+  bool has_dynamic_input = false;
+  for (int32_t term_index = 0; term_index < term_count; ++term_index) {
+    const int32_t input_index = operands[static_cast<std::size_t>(term_index) * 2];
+    const int32_t weight_index = operands[static_cast<std::size_t>(term_index) * 2 + 1];
+    const ValueSpec& input = plan.values[input_index];
+    const ValueSpec& weight = plan.values[weight_index];
+    TORCH_CHECK(input.kind != ValueKind::kUnbound,
+        "AFFINE_SUM_V1 input is not topologically available");
+    const bool dynamic_leading = input.dimension_index == command.extent_index;
+    has_dynamic_input = has_dynamic_input || dynamic_leading;
+    const bool fixed_leading = input.dimension_index < 0 &&
+        input.inner_shape.size() >= 2 && input.inner_shape[0] == 1;
+    TORCH_CHECK(input.data_type == result.data_type &&
+            (dynamic_leading || fixed_leading) && !input.inner_shape.empty(),
+        "AFFINE_SUM_V1 input metadata does not match the result");
+    TORCH_CHECK(weight.kind == ValueKind::kConstant &&
+            weight.dimension_index < 0 && weight.inner_shape.size() == 2 &&
+            weight.data_type == result.data_type &&
+            weight.inner_shape[0] == command.output_width &&
+            weight.inner_shape[1] == input.inner_shape.back(),
+        "AFFINE_SUM_V1 weight metadata does not match its input");
+
+    const auto prefix_begin = input.inner_shape.begin() + (fixed_leading ? 1 : 0);
+    std::vector<int64_t> prefix(prefix_begin, input.inner_shape.end() - 1);
+    inferred_output_prefix = BroadcastPrefix(inferred_output_prefix, prefix);
+    const bool precompute_at_bind =
+        !dynamic_leading && input.kind == ValueKind::kConstant;
+    AffineGroupSpec* group = FindAffineGroup(
+        command.groups, prefix, dynamic_leading, precompute_at_bind);
+    if (group == nullptr) {
+      TORCH_CHECK(command.groups.size() < kMaximumAffineGroups,
+          "AFFINE_SUM_V1 group count exceeds the native limit");
+      command.groups.emplace_back();
+      group = &command.groups.back();
+      group->prefix_shape = std::move(prefix);
+      group->dynamic_leading = dynamic_leading;
+      group->precompute_at_bind = precompute_at_bind;
+      group->rows_per_batch = Product(
+          group->prefix_shape, "AFFINE_SUM_V1 group prefix size");
+    }
+    const int64_t input_width = input.inner_shape.back();
+    TORCH_CHECK(input_width <= std::numeric_limits<int64_t>::max() -
+            group->packed_input_width,
+        "AFFINE_SUM_V1 packed input width exceeds the supported range");
+    group->terms.push_back(AffineTermSpec{
+        input_index, weight_index, weight.binding_index, input_width});
+    group->packed_input_width += input_width;
+  }
+  TORCH_CHECK(has_dynamic_input,
+      "AFFINE_SUM_V1 requires at least one dynamically bounded input");
+  TORCH_CHECK(inferred_output_prefix == command.output_prefix_shape,
+      "AFFINE_SUM_V1 result prefix does not match its broadcast inputs");
+  for (const auto& group : command.groups) {
+    TORCH_CHECK(group.dynamic_leading ||
+            group.prefix_shape.size() == command.output_prefix_shape.size(),
+        "AFFINE_SUM_V1 fixed inputs must match the result rank");
+  }
+
+  if (has_bias) {
+    command.bias_value_index = operands.back();
+    const ValueSpec& bias = plan.values[command.bias_value_index];
+    TORCH_CHECK(bias.kind == ValueKind::kConstant &&
+            bias.dimension_index < 0 && bias.inner_shape.size() == 1 &&
+            bias.data_type == result.data_type &&
+            bias.inner_shape[0] == command.output_width,
+        "AFFINE_SUM_V1 bias metadata does not match the result");
+  }
+
+  result.kind = ValueKind::kComputed;
+  result.producer_index = command_index;
+  result.storage_index = command.result_storage_index;
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+
+  bool direct_group_assigned = false;
+  for (auto& group : command.groups) {
+    if (!group.precompute_at_bind) {
+      std::vector<int64_t> group_shape;
+      group_shape.reserve(group.prefix_shape.size() + 2);
+      group_shape.push_back(group.dynamic_leading ? command.maximum_batches : 1);
+      group_shape.insert(
+          group_shape.end(), group.prefix_shape.begin(), group.prefix_shape.end());
+      if (group.terms.size() > 1) {
+        std::vector<int64_t> packed_shape = group_shape;
+        packed_shape.push_back(group.packed_input_width);
+        TensorPayloadBytes(packed_shape, result.data_type,
+            "AFFINE_SUM_V1 packed input payload size");
+        group.packed_input_storage_index = NextStorageIndex(plan);
+        plan.storages.push_back(StorageSpec{result.data_type, std::move(packed_shape)});
+      }
+      if (!direct_group_assigned && group.dynamic_leading &&
+          group.prefix_shape == command.output_prefix_shape) {
+        group.product_storage_index = command.result_storage_index;
+        direct_group_assigned = true;
+      } else {
+        std::vector<int64_t> product_shape = group_shape;
+        product_shape.push_back(command.output_width);
+        TensorPayloadBytes(product_shape, result.data_type,
+            "AFFINE_SUM_V1 product payload size");
+        group.product_storage_index = NextStorageIndex(plan);
+        plan.storages.push_back(StorageSpec{result.data_type, std::move(product_shape)});
+      }
+    }
+    const int64_t packed_weight_elements = CheckedMultiply(
+        group.packed_input_width, command.output_width,
+        "AFFINE_SUM_V1 packed weight element count");
+    CheckedMultiply(packed_weight_elements,
+        static_cast<int64_t>(c10::elementSize(result.data_type)),
+        "AFFINE_SUM_V1 packed weight payload size");
+
+    const std::size_t output_rank = command.output_prefix_shape.size();
+    const std::size_t source_rank = group.prefix_shape.size();
+    int64_t source_stride = 1;
+    for (std::size_t reverse_axis = 0; reverse_axis < output_rank; ++reverse_axis) {
+      const std::size_t output_axis = output_rank - reverse_axis - 1;
+      if (reverse_axis < source_rank) {
+        const std::size_t source_axis = source_rank - reverse_axis - 1;
+        const int64_t source_extent = group.prefix_shape[source_axis];
+        const int64_t output_extent = command.output_prefix_shape[output_axis];
+        TORCH_CHECK(source_extent == output_extent || source_extent == 1,
+            "AFFINE_SUM_V1 group cannot broadcast to its result");
+        group.output_strides[output_axis] = source_extent == 1 ? 0 : source_stride;
+        source_stride = CheckedMultiply(source_stride, source_extent,
+            "AFFINE_SUM_V1 source prefix stride");
+      } else {
+        group.output_strides[output_axis] = 0;
+      }
+    }
+  }
+  command.needs_finalize = !direct_group_assigned || command.groups.size() != 1 ||
+      command.bias_value_index >= 0 || command.activation != AffineActivation::kNone;
+  return command;
+}
+
 void ValidateOutputReachability(const FusionPlanData& plan) {
   std::vector<bool> reachable_values(plan.values.size(), false);
   std::vector<bool> reachable_commands(plan.commands.size(), false);
@@ -367,10 +704,13 @@ void ValidateOutputReachability(const FusionPlanData& plan) {
       continue;
     }
     reachable_commands[producer_index] = true;
-    const auto& command = std::get<OutputPackCommandSpec>(plan.commands[producer_index]);
-    for (int32_t operand : command.operand_value_indices) {
-      work.push_back(operand);
-    }
+    std::visit(
+        [&work](const auto& command) {
+          for (int32_t operand : command.operand_value_indices) {
+            work.push_back(operand);
+          }
+        },
+        plan.commands[producer_index]);
   }
   for (bool reachable : reachable_commands) {
     TORCH_CHECK(reachable,
@@ -503,6 +843,8 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
       value.inner_shape.push_back(extent);
       value.maximum_shape.push_back(extent);
     }
+    TensorPayloadBytes(value.maximum_shape, value.data_type,
+        "fusion value maximum payload size");
     TORCH_CHECK(!assigned_values[index], "duplicate fusion value index");
     plan->values[index] = std::move(value);
     assigned_values[index] = true;
@@ -589,7 +931,7 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
           "fusion command operand is not topologically available");
       operands.push_back(value_index);
     }
-    ValidateAttributeRecords(record_reader, attribute_count);
+    CommandAttributes attributes = ReadAttributeRecords(record_reader, attribute_count);
     TORCH_CHECK(record_reader.IsComplete(),
         "fusion command record size does not match its payload");
     command_reader = DescriptorReader(
@@ -598,7 +940,11 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
     switch (opcode) {
       case kOutputPackV1:
         plan->commands.emplace_back(BuildOutputPackCommand(
-            *plan, command_index, results, operands, flags, attribute_count));
+            *plan, command_index, results, operands, flags, attributes));
+        break;
+      case kAffineSumV1:
+        plan->commands.emplace_back(BuildAffineSumCommand(
+            *plan, command_index, results, operands, flags, attributes));
         break;
       default:
         TORCH_CHECK(false, "unsupported fusion command opcode: ", opcode);
@@ -651,6 +997,7 @@ struct FusionSession {
   FusionSession(std::shared_ptr<const FusionExecutableData> executable, int32_t buffer_count)
       : executable(std::move(executable)), storages(static_cast<std::size_t>(buffer_count)),
         allocation_waited(static_cast<std::size_t>(buffer_count), false),
+        binding_waited(static_cast<std::size_t>(buffer_count), false),
         submission_streams(static_cast<std::size_t>(buffer_count)) {
     const auto& plan = this->executable->plan;
     c10::DeviceGuard device_guard(plan->device);
@@ -674,6 +1021,13 @@ struct FusionSession {
     }
   }
 
+  void WaitForBinding(int32_t buffer_index, const c10::Stream& stream) {
+    if (!binding_waited[buffer_index]) {
+      executable->binding_ready->block(stream);
+      binding_waited[buffer_index] = true;
+    }
+  }
+
   void SetSubmissionStream(int32_t buffer_index, const c10::Stream& stream) {
     submission_streams[buffer_index] = stream;
   }
@@ -690,6 +1044,7 @@ struct FusionSession {
   std::vector<std::vector<torch::Tensor>> storages;
   std::unique_ptr<c10::Event> allocation_ready;
   std::vector<bool> allocation_waited;
+  std::vector<bool> binding_waited;
   std::vector<std::optional<c10::Stream>> submission_streams;
   bool poisoned = false;
 };
@@ -717,6 +1072,42 @@ const torch::Tensor& ResolveValue(const FusionSession& session, int32_t buffer_i
   std::terminate();
 }
 
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const OutputPackCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  for (const auto& source : command.sources) {
+    const torch::Tensor& tensor = ResolveValue(
+        session, buffer_index, input_handles, source.value_index);
+    const ValueSpec& source_spec = plan.values[source.value_index];
+    ValidateTensorMetadata(tensor, plan, source_spec, dimensions,
+        source_spec.kind == ValueKind::kComputed, "operand");
+  }
+  const torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
+      dimensions, true, "result storage");
+}
+
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const AffineSumCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  for (const auto& group : command.groups) {
+    for (const auto& term : group.terms) {
+      const torch::Tensor& input = ResolveValue(
+          session, buffer_index, input_handles, term.input_value_index);
+      const ValueSpec& input_spec = plan.values[term.input_value_index];
+      ValidateTensorMetadata(input, plan, input_spec, dimensions,
+          input_spec.kind == ValueKind::kComputed, "affine input");
+    }
+  }
+  const torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
+      dimensions, true, "affine result storage");
+}
+
 void ValidateSubmission(const FusionSession& session, int32_t buffer_index,
     const int64_t* input_handles, const int64_t* dimensions) {
   const auto& plan = *session.executable->plan;
@@ -732,17 +1123,142 @@ void ValidateSubmission(const FusionSession& session, int32_t buffer_index,
         plan.values[plan.input_value_indices[index]], dimensions, false, "input");
   }
   for (const auto& fusion_command : plan.commands) {
-    const auto& command = std::get<OutputPackCommandSpec>(fusion_command);
-    for (const auto& source : command.sources) {
-      const torch::Tensor& tensor = ResolveValue(
-          session, buffer_index, input_handles, source.value_index);
-      ValidateTensorMetadata(tensor, plan, plan.values[source.value_index],
-          dimensions, source.value_index == command.result_value_index, "operand");
+    std::visit(
+        [&](const auto& command) {
+          ValidateCommandSubmission(
+              session, buffer_index, input_handles, dimensions, command);
+        },
+        fusion_command);
+  }
+}
+
+void ExecuteCommand(FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const OutputPackCommandSpec& command, bool& work_submitted) {
+  std::array<OutputPackSource, kMaximumOutputPackSources> launch_sources;
+  const int64_t row_count = dimensions[command.extent_index];
+  torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  for (std::size_t source_index = 0; source_index < command.sources.size(); ++source_index) {
+    const auto& source = command.sources[source_index];
+    const torch::Tensor& tensor = ResolveValue(
+        session, buffer_index, input_handles, source.value_index);
+    launch_sources[source_index] = OutputPackSource{tensor.data_ptr(),
+        source.data_type, source.width, source.destination_offset};
+    RecordCurrentStream(tensor);
+  }
+  RecordCurrentStream(result);
+  if (row_count != 0) {
+    work_submitted = true;
+  }
+  LaunchOutputPack(launch_sources.data(), static_cast<int32_t>(command.sources.size()),
+      result, row_count, command.output_width);
+}
+
+torch::Tensor ActiveAffineMatrix(const torch::Tensor& tensor, int64_t batch_count,
+    int64_t rows_per_batch, int64_t width) {
+  return tensor.narrow(0, 0, batch_count).view(
+      {CheckedMultiply(batch_count, rows_per_batch,
+           "AFFINE_SUM_V1 active matrix rows"),
+       width});
+}
+
+void ExecuteCommand(FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const AffineSumCommandSpec& command, std::size_t command_index,
+    bool& work_submitted) {
+  const int64_t batch_count = dimensions[command.extent_index];
+  if (batch_count == 0) {
+    return;
+  }
+  std::array<AffineInputPackSource, kMaximumAffineTerms> pack_sources;
+  std::array<AffineSumSource, kMaximumAffineGroups> sum_sources;
+  const auto& packed_weights = session.executable->affine_weights[command_index];
+  TORCH_CHECK(packed_weights.size() == command.groups.size(),
+      "AFFINE_SUM_V1 executable weight groups are inconsistent");
+
+  for (std::size_t group_index = 0;
+       group_index < command.groups.size(); ++group_index) {
+    const auto& group = command.groups[group_index];
+    if (group.precompute_at_bind) {
+      const torch::Tensor& product =
+          session.executable->affine_products[command_index][group_index];
+      TORCH_CHECK(product.defined(),
+          "AFFINE_SUM_V1 precomputed product is not bound");
+      RecordCurrentStream(product);
+      sum_sources[group_index].data = product.data_ptr();
+      sum_sources[group_index].rows_per_batch = 0;
+      std::copy(group.output_strides.begin(), group.output_strides.end(),
+          sum_sources[group_index].output_strides);
+      continue;
     }
-    const torch::Tensor& result = session.storages[buffer_index]
+    const int64_t matrix_batch_count = group.dynamic_leading ? batch_count : 1;
+    const torch::Tensor* group_input;
+    if (group.terms.size() == 1) {
+      group_input = &ResolveValue(session, buffer_index, input_handles,
+          group.terms[0].input_value_index);
+      RecordCurrentStream(*group_input);
+    } else {
+      torch::Tensor& packed_input = session.storages[buffer_index]
+          [group.packed_input_storage_index];
+      int64_t destination_offset = 0;
+      for (std::size_t term_index = 0;
+           term_index < group.terms.size(); ++term_index) {
+        const auto& term = group.terms[term_index];
+        const torch::Tensor& input = ResolveValue(
+            session, buffer_index, input_handles, term.input_value_index);
+        pack_sources[term_index] = AffineInputPackSource{
+            input.data_ptr(), term.input_width, destination_offset};
+        destination_offset += term.input_width;
+        RecordCurrentStream(input);
+      }
+      RecordCurrentStream(packed_input);
+      work_submitted = true;
+      LaunchAffineInputPack(pack_sources.data(),
+          static_cast<int32_t>(group.terms.size()), packed_input,
+          CheckedMultiply(matrix_batch_count, group.rows_per_batch,
+              "AFFINE_SUM_V1 packed input rows"),
+          group.packed_input_width);
+      group_input = &packed_input;
+    }
+
+    torch::Tensor& product = session.storages[buffer_index]
+        [group.product_storage_index];
+    const torch::Tensor& packed_weight = packed_weights[group_index];
+    RecordCurrentStream(product);
+    RecordCurrentStream(packed_weight);
+    torch::Tensor input_matrix = ActiveAffineMatrix(
+        *group_input, matrix_batch_count, group.rows_per_batch,
+        group.packed_input_width);
+    torch::Tensor product_matrix = ActiveAffineMatrix(
+        product, matrix_batch_count, group.rows_per_batch, command.output_width);
+    work_submitted = true;
+    at::mm_out(product_matrix, input_matrix, packed_weight);
+
+    sum_sources[group_index].data = product.data_ptr();
+    sum_sources[group_index].rows_per_batch =
+        group.dynamic_leading ? group.rows_per_batch : 0;
+    std::copy(group.output_strides.begin(), group.output_strides.end(),
+        sum_sources[group_index].output_strides);
+  }
+
+  if (command.needs_finalize) {
+    const void* bias = nullptr;
+    if (command.bias_value_index >= 0) {
+      const torch::Tensor& bias_tensor = ResolveValue(
+          session, buffer_index, input_handles, command.bias_value_index);
+      bias = bias_tensor.data_ptr();
+      RecordCurrentStream(bias_tensor);
+    }
+    torch::Tensor& result = session.storages[buffer_index]
         [command.result_storage_index];
-    ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
-        dimensions, true, "result storage");
+    RecordCurrentStream(result);
+    work_submitted = true;
+    LaunchAffineFinalize(sum_sources.data(),
+        static_cast<int32_t>(command.groups.size()), bias, result, batch_count,
+        command.output_prefix_shape.data(),
+        static_cast<int32_t>(command.output_prefix_shape.size()),
+        command.output_width, command.activation);
   }
 }
 
@@ -765,6 +1281,7 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
   TORCH_CHECK(constant_count == static_cast<std::size_t>(plan->data->constant_count),
       "fusion constant count does not match the prepared plan");
   c10::DeviceGuard device_guard(plan->data->device);
+  c10::InferenceMode inference_mode;
   auto data = std::make_shared<FusionExecutableData>();
   data->plan = plan->data;
   data->constants.reserve(constant_count);
@@ -775,6 +1292,67 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
     ValidateTensorMetadata(*constant, *plan->data, spec, nullptr, true, "constant");
     data->constants.push_back(*constant);
   }
+  data->affine_weights.resize(plan->data->commands.size());
+  data->affine_products.resize(plan->data->commands.size());
+  for (std::size_t command_index = 0;
+       command_index < plan->data->commands.size(); ++command_index) {
+    const auto* command = std::get_if<AffineSumCommandSpec>(
+        &plan->data->commands[command_index]);
+    if (command == nullptr) {
+      continue;
+    }
+    auto& packed_groups = data->affine_weights[command_index];
+    auto& product_groups = data->affine_products[command_index];
+    packed_groups.resize(command->groups.size());
+    product_groups.resize(command->groups.size());
+    for (std::size_t group_index = 0;
+         group_index < command->groups.size(); ++group_index) {
+      const auto& group = command->groups[group_index];
+      std::vector<torch::Tensor> transposed_weights;
+      transposed_weights.reserve(group.terms.size());
+      for (const auto& term : group.terms) {
+        const torch::Tensor& weight = data->constants[term.weight_binding_index];
+        RecordCurrentStream(weight);
+        transposed_weights.push_back(weight.transpose(0, 1));
+      }
+      torch::Tensor packed_weight = transposed_weights.size() == 1
+          ? transposed_weights[0].contiguous()
+          : torch::cat(transposed_weights, 0);
+      RecordCurrentStream(packed_weight);
+      if (!group.precompute_at_bind) {
+        packed_groups[group_index] = std::move(packed_weight);
+        continue;
+      }
+
+      std::vector<torch::Tensor> constant_inputs;
+      constant_inputs.reserve(group.terms.size());
+      for (const auto& term : group.terms) {
+        const ValueSpec& input_spec = plan->data->values[term.input_value_index];
+        TORCH_CHECK(input_spec.kind == ValueKind::kConstant,
+            "AFFINE_SUM_V1 precomputed input must be constant");
+        const torch::Tensor& input = data->constants[input_spec.binding_index];
+        RecordCurrentStream(input);
+        constant_inputs.push_back(input);
+      }
+      torch::Tensor packed_input = constant_inputs.size() == 1
+          ? constant_inputs[0]
+          : torch::cat(constant_inputs, -1);
+      const torch::Tensor input_matrix = packed_input.view(
+          {group.rows_per_batch, group.packed_input_width});
+      torch::Tensor product = at::mm(input_matrix, packed_weight);
+      std::vector<int64_t> product_shape;
+      product_shape.reserve(group.prefix_shape.size() + 2);
+      product_shape.push_back(1);
+      product_shape.insert(
+          product_shape.end(), group.prefix_shape.begin(), group.prefix_shape.end());
+      product_shape.push_back(command->output_width);
+      product_groups[group_index] = product.view(product_shape);
+      RecordCurrentStream(product_groups[group_index]);
+    }
+  }
+  c10::impl::VirtualGuardImpl guard_impl(plan->data->device.type());
+  data->binding_ready = std::make_unique<c10::Event>(plan->data->device.type());
+  data->binding_ready->record(guard_impl.getStream(plan->data->device));
   return new FusionExecutable(std::move(data));
 }
 
@@ -824,26 +1402,21 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
   ValidateSubmission(*session, buffer_index, input_handles, dimensions);
 
   session->WaitForAllocation(buffer_index, submission_stream);
+  session->WaitForBinding(buffer_index, submission_stream);
+  c10::InferenceMode inference_mode;
   bool work_submitted = false;
   try {
-    std::array<OutputPackSource, kMaximumOutputPackSources> launch_sources;
-    for (const auto& fusion_command : plan->commands) {
-      const auto& command = std::get<OutputPackCommandSpec>(fusion_command);
-      const int64_t row_count = dimensions[command.extent_index];
-      torch::Tensor& result = session->storages[buffer_index]
-          [command.result_storage_index];
-      for (std::size_t source_index = 0; source_index < command.sources.size(); ++source_index) {
-        const auto& source = command.sources[source_index];
-        const torch::Tensor& tensor = ResolveValue(
-            *session, buffer_index, input_handles, source.value_index);
-        launch_sources[source_index] = OutputPackSource{tensor.data_ptr(),
-            source.data_type, source.width, source.destination_offset};
-        RecordCurrentStream(tensor);
+    for (std::size_t command_index = 0;
+         command_index < plan->commands.size(); ++command_index) {
+      const auto& fusion_command = plan->commands[command_index];
+      if (const auto* command = std::get_if<OutputPackCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, work_submitted);
+      } else {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            std::get<AffineSumCommandSpec>(fusion_command), command_index,
+            work_submitted);
       }
-      RecordCurrentStream(result);
-      work_submitted = true;
-      LaunchOutputPack(launch_sources.data(), static_cast<int32_t>(command.sources.size()),
-          result, row_count, command.output_width);
     }
   } catch (...) {
     const std::exception_ptr submission_failure = std::current_exception();

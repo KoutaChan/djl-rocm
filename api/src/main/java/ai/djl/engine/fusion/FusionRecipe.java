@@ -30,10 +30,11 @@ import java.util.Set;
  * active extent of that dimension without changing the storage capacity. Inner dimensions are
  * always fixed.
  *
- * <p>The initial API supports {@link OutputPack}, which concatenates two-dimensional floating-point
- * values along their last axis and converts them into a contiguous {@link DataType#FLOAT32} value.
- * Additional value types can be added without changing the lifecycle of prepared plans and
- * sessions.
+ * <p>The API exposes a closed set of inference stages. {@link AffineSum} projects several values
+ * into one width, adds the projected values with fixed-shape broadcasting, and optionally applies
+ * an activation. {@link OutputPack} concatenates two-dimensional floating-point values along their
+ * last axis and converts them into a contiguous {@link DataType#FLOAT32} value. Additional value
+ * types can be added without changing the lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
 
@@ -343,6 +344,105 @@ public final class FusionRecipe {
         }
     }
 
+    /** An activation supported by an {@link AffineSum} stage. */
+    public enum Activation {
+        /** Leaves the affine sum unchanged. */
+        NONE,
+
+        /** Applies the sigmoid linear unit activation. */
+        SILU
+    }
+
+    /** One projected source in an {@link AffineSum} stage. */
+    public static final class AffineTerm {
+
+        private final Value input;
+        private final Constant weight;
+
+        private AffineTerm(Value input, Constant weight) {
+            this.input = input;
+            this.weight = weight;
+        }
+
+        /**
+         * Returns the value projected by this term.
+         *
+         * @return the input value
+         */
+        public Value getInput() {
+            return input;
+        }
+
+        /**
+         * Returns the {@code [outputWidth, inputWidth]} projection weight.
+         *
+         * @return the projection weight
+         */
+        public Constant getWeight() {
+            return weight;
+        }
+    }
+
+    /**
+     * A bounded affine projection sum with optional fixed-shape broadcasting and activation.
+     *
+     * <p>For terms {@code (X_i, W_i)}, this value computes {@code activation(bias + sum_i X_i
+     * W_i^T)}. Dynamic inputs use the same named leading dimension. A fully fixed input may instead
+     * use a singleton first axis, which is broadcast over the active leading extent. Including that
+     * singleton axis, each fixed input has the same rank as the output. Dimensions between the
+     * leading dimension and feature width follow standard fixed-shape broadcasting rules; no input
+     * is expanded in the recipe. Inputs, weights, bias, and output use one floating-point data
+     * type. The numerical contract permits rounding to that data type at backend GEMM or
+     * projection-group boundaries before the projected values are added.
+     */
+    public static final class AffineSum extends Value {
+
+        private final List<AffineTerm> terms;
+        private final Constant bias;
+        private final Activation activation;
+
+        private AffineSum(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                List<AffineTerm> terms,
+                Constant bias,
+                Activation activation) {
+            super(owner, index, name, spec);
+            this.terms = immutableCopy(terms);
+            this.bias = bias;
+            this.activation = activation;
+        }
+
+        /**
+         * Returns the projected terms in declaration order.
+         *
+         * @return the projected terms
+         */
+        public List<AffineTerm> getTerms() {
+            return terms;
+        }
+
+        /**
+         * Returns the optional one-dimensional bias.
+         *
+         * @return the bias, or {@code null}
+         */
+        public Constant getBias() {
+            return bias;
+        }
+
+        /**
+         * Returns the activation applied after summation.
+         *
+         * @return the activation
+         */
+        public Activation getActivation() {
+            return activation;
+        }
+    }
+
     /**
      * A value that packs two-dimensional floating-point sources into a contiguous FLOAT32 tensor.
      *
@@ -507,6 +607,24 @@ public final class FusionRecipe {
         }
 
         /**
+         * Starts an affine-sum stage.
+         *
+         * <p>The returned builder accepts one or more source and weight pairs. Validation and value
+         * insertion complete when {@link AffineSumBuilder#build()} is called.
+         *
+         * @param name the value name
+         * @param outputWidth the common projection width
+         * @return a builder for the affine-sum value
+         */
+        public AffineSumBuilder affineSum(String name, long outputWidth) {
+            checkMutable();
+            if (outputWidth <= 0) {
+                throw new IllegalArgumentException("The affine output width must be positive.");
+            }
+            return new AffineSumBuilder(this, requireName(name, "value"), outputWidth);
+        }
+
+        /**
          * Adds an output-pack value.
          *
          * <p>Each source must be a two-dimensional FLOAT16, BFLOAT16, or FLOAT32 value from this
@@ -625,12 +743,209 @@ public final class FusionRecipe {
                     || dataType == DataType.FLOAT32;
         }
 
+        private static boolean isAffineDataType(DataType dataType) {
+            return dataType == DataType.FLOAT16
+                    || dataType == DataType.BFLOAT16
+                    || dataType == DataType.FLOAT32;
+        }
+
         private static String requireName(String name, String kind) {
             Objects.requireNonNull(name, kind + " name");
             if (name.trim().isEmpty()) {
                 throw new IllegalArgumentException("The " + kind + " name must not be empty.");
             }
             return name;
+        }
+    }
+
+    /** Builds one {@link AffineSum} value within a {@link Builder}. */
+    public static final class AffineSumBuilder {
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final long outputWidth;
+        private final List<AffineTerm> terms;
+        private Constant bias;
+        private Activation activation;
+        private boolean built;
+
+        private AffineSumBuilder(Builder recipeBuilder, String name, long outputWidth) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.outputWidth = outputWidth;
+            terms = new ArrayList<>();
+            activation = Activation.NONE;
+        }
+
+        /**
+         * Adds a projected value to the sum.
+         *
+         * @param input a dynamic value, or a fixed value whose singleton first axis is included in
+         *     the output rank, whose last axis is the input feature width
+         * @param weight a fixed {@code [outputWidth, inputWidth]} constant
+         * @return this builder
+         */
+        public AffineSumBuilder addTerm(Value input, Constant weight) {
+            checkMutable();
+            recipeBuilder.checkValue(input);
+            recipeBuilder.checkValue(weight);
+            terms.add(new AffineTerm(input, weight));
+            return this;
+        }
+
+        /**
+         * Sets the optional one-dimensional bias.
+         *
+         * @param bias a fixed {@code [outputWidth]} constant
+         * @return this builder
+         */
+        public AffineSumBuilder optBias(Constant bias) {
+            checkMutable();
+            recipeBuilder.checkValue(bias);
+            this.bias = bias;
+            return this;
+        }
+
+        /**
+         * Sets the activation applied after all terms and the bias are added.
+         *
+         * @param activation the activation
+         * @return this builder
+         */
+        public AffineSumBuilder optActivation(Activation activation) {
+            checkMutable();
+            this.activation = Objects.requireNonNull(activation, "activation");
+            return this;
+        }
+
+        /**
+         * Adds the immutable affine-sum value to its recipe.
+         *
+         * @return the affine-sum value
+         */
+        public AffineSum build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            if (terms.isEmpty()) {
+                throw new IllegalStateException("An affine sum requires at least one term.");
+            }
+
+            DataType dataType = null;
+            Dimension leadingDimension = null;
+            long[] outputPrefix = new long[0];
+            for (AffineTerm term : terms) {
+                TensorSpec inputSpec = term.input.spec;
+                TensorSpec weightSpec = term.weight.getSpec();
+                boolean dynamicLeading = inputSpec.leadingDimension != null;
+                if (inputSpec.innerShape.length == 0
+                        || (!dynamicLeading
+                                && (inputSpec.innerShape.length < 2
+                                        || inputSpec.innerShape[0] != 1))) {
+                    throw new IllegalArgumentException(
+                            "Fixed affine inputs require a singleton leading axis and feature"
+                                    + " axis.");
+                }
+                if (!Builder.isAffineDataType(inputSpec.dataType)) {
+                    throw new IllegalArgumentException(
+                            "Affine sums only support FLOAT16, BFLOAT16, and FLOAT32.");
+                }
+                if (dataType == null) {
+                    dataType = inputSpec.dataType;
+                } else if (dataType != inputSpec.dataType) {
+                    throw new IllegalArgumentException(
+                            "Affine inputs and constants must use one data type.");
+                }
+                if (dynamicLeading) {
+                    if (leadingDimension == null) {
+                        leadingDimension = inputSpec.leadingDimension;
+                    } else if (leadingDimension != inputSpec.leadingDimension) {
+                        throw new IllegalArgumentException(
+                                "Dynamic affine inputs must share the same leading dimension.");
+                    }
+                }
+                if (weightSpec.leadingDimension != null || weightSpec.innerShape.length != 2) {
+                    throw new IllegalArgumentException(
+                            "Affine weights must have a fixed two-dimensional shape.");
+                }
+                if (weightSpec.dataType != dataType
+                        || weightSpec.innerShape[0] != outputWidth
+                        || weightSpec.innerShape[1]
+                                != inputSpec.innerShape[inputSpec.innerShape.length - 1]) {
+                    throw new IllegalArgumentException(
+                            "Affine weight shape or data type does not match its term.");
+                }
+                outputPrefix =
+                        broadcastShape(
+                                outputPrefix,
+                                inputSpec.innerShape,
+                                dynamicLeading ? 0 : 1,
+                                inputSpec.innerShape.length - (dynamicLeading ? 1 : 2));
+            }
+            if (leadingDimension == null) {
+                throw new IllegalArgumentException(
+                        "An affine sum requires at least one dynamically bounded input.");
+            }
+            for (AffineTerm term : terms) {
+                TensorSpec inputSpec = term.input.spec;
+                if (inputSpec.leadingDimension == null
+                        && inputSpec.innerShape.length != outputPrefix.length + 2) {
+                    throw new IllegalArgumentException(
+                            "Fixed affine inputs must match the output rank.");
+                }
+            }
+
+            if (bias != null) {
+                TensorSpec biasSpec = bias.getSpec();
+                if (biasSpec.leadingDimension != null
+                        || biasSpec.dataType != dataType
+                        || biasSpec.innerShape.length != 1
+                        || biasSpec.innerShape[0] != outputWidth) {
+                    throw new IllegalArgumentException(
+                            "Affine bias must have fixed shape [outputWidth] and matching data"
+                                    + " type.");
+                }
+            }
+
+            long[] outputInnerShape = new long[outputPrefix.length + 1];
+            System.arraycopy(outputPrefix, 0, outputInnerShape, 0, outputPrefix.length);
+            outputInnerShape[outputPrefix.length] = outputWidth;
+            String checkedName = recipeBuilder.addValueName(name);
+            AffineSum value =
+                    new AffineSum(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            TensorSpec.of(dataType, leadingDimension, outputInnerShape),
+                            terms,
+                            bias,
+                            activation);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException("The affine sum has already been built.");
+            }
+        }
+
+        private static long[] broadcastShape(
+                long[] left, long[] right, int rightOffset, int rightLength) {
+            int resultLength = Math.max(left.length, rightLength);
+            long[] result = new long[resultLength];
+            for (int resultAxis = resultLength - 1; resultAxis >= 0; --resultAxis) {
+                int leftAxis = resultAxis - (resultLength - left.length);
+                int rightAxis = resultAxis - (resultLength - rightLength);
+                long leftExtent = leftAxis < 0 ? 1 : left[leftAxis];
+                long rightExtent = rightAxis < 0 ? 1 : right[rightOffset + rightAxis];
+                if (leftExtent != rightExtent && leftExtent != 1 && rightExtent != 1) {
+                    throw new IllegalArgumentException(
+                            "Affine input prefix dimensions are not broadcast-compatible.");
+                }
+                result[resultAxis] = Math.max(leftExtent, rightExtent);
+            }
+            return result;
         }
     }
 }

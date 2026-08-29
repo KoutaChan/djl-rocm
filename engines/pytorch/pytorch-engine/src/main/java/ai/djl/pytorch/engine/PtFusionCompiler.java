@@ -58,6 +58,8 @@ final class PtFusionCompiler implements FusionCompiler {
         FusionCompilationReport report =
                 FusionCompilationReport.builder("PyTorch ROCm AOT")
                         .optCommandCount(PtFusionDescriptor.commandCount(recipe))
+                        .optExecutableStorageBytes(
+                                PtFusionDescriptor.executableStorageBytes(recipe))
                         .optPersistentStorageBytes(
                                 PtFusionDescriptor.persistentStorageBytes(recipe))
                         .optWorkspaceBytes(PtFusionDescriptor.workspaceBytes(recipe))

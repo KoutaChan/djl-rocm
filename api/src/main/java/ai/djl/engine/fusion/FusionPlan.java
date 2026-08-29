@@ -33,7 +33,10 @@ public interface FusionPlan extends AutoCloseable {
      * Binds model constants and creates an executable.
      *
      * <p>Constants are caller-owned and must remain valid until the executable is closed. An
-     * implementation may prepack constants while binding them.
+     * implementation may prepack constants while binding them. In particular, a backend may project
+     * fixed constant inputs of an {@link FusionRecipe.AffineSum} once and retain the projected
+     * contribution in the executable. Completion dependencies created during binding are part of
+     * the executable and must be honored by sessions submitting on another stream.
      *
      * @param constants the constant tensors for this recipe
      * @return an executable with bound constants
