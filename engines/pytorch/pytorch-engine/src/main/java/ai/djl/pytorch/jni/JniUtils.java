@@ -696,22 +696,8 @@ public final class JniUtils {
                 self.getHandle(), pinnedBufferHandle);
     }
 
-    public static void copyFromPinnedBufferOnCurrentStream(
-            PtNDArray self, long pinnedBufferHandle) {
-        PyTorchLibrary.LIB.torchCopyFromPinnedBufferOnCurrentStream(
-                self.getHandle(), pinnedBufferHandle);
-    }
-
-    public static PtNDArray createFromPinnedBufferAsync(
-            PtNDManager manager, long pinnedBufferHandle, Shape shape, DataType dataType) {
-        Device device = manager.getDevice();
-        long handle =
-                PyTorchLibrary.LIB.torchCreateFromPinnedBufferAsync(
-                        pinnedBufferHandle,
-                        shape.getShape(),
-                        dataType.ordinal(),
-                        new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
-        return new PtNDArray(manager, handle);
+    public static void enqueueCopyFrom(PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchEnqueueCopyFrom(self.getHandle(), pinnedBufferHandle);
     }
 
     public static long copyToPinnedBufferAsync(PtNDArray self, long pinnedBufferHandle) {
@@ -719,9 +705,12 @@ public final class JniUtils {
                 self.getHandle(), pinnedBufferHandle);
     }
 
-    public static void copyToPinnedBufferOnCurrentStream(PtNDArray self, long pinnedBufferHandle) {
-        PyTorchLibrary.LIB.torchCopyToPinnedBufferOnCurrentStream(
-                self.getHandle(), pinnedBufferHandle);
+    public static void enqueueCopyTo(PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchEnqueueCopyTo(self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static void copyTo(PtNDArray source, PtNDArray target) {
+        PyTorchLibrary.LIB.torchCopyTo(source.getHandle(), target.getHandle());
     }
 
     public static void synchronizeCopyEvent(long handle) {
@@ -732,12 +721,8 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchDeleteCopyEvent(handle);
     }
 
-    public static void recordTensorUseOnCurrentStream(PtNDArray self) {
-        PyTorchLibrary.LIB.torchRecordTensorUseOnCurrentStream(self.getHandle());
-    }
-
-    public static void copyTo(PtNDArray source, PtNDArray target) {
-        PyTorchLibrary.LIB.torchCopyTo(source.getHandle(), target.getHandle());
+    public static void recordStream(PtNDArray self) {
+        PyTorchLibrary.LIB.torchRecordStream(self.getHandle());
     }
 
     public static PtNDArray gather(PtNDArray ndArray, PtNDArray index, long dim) {

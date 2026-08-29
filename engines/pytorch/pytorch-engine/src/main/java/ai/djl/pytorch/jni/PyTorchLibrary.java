@@ -354,20 +354,17 @@ final class PyTorchLibrary {
 
     native long torchCopyFromPinnedBufferAsync(long handle, long pinnedBufferHandle);
 
-    native void torchCopyFromPinnedBufferOnCurrentStream(long handle, long pinnedBufferHandle);
-
-    native long torchCreateFromPinnedBufferAsync(
-            long pinnedBufferHandle, long[] shape, int dtype, int[] device);
+    native void torchEnqueueCopyFrom(long handle, long pinnedBufferHandle);
 
     native long torchCopyToPinnedBufferAsync(long handle, long pinnedBufferHandle);
 
-    native void torchCopyToPinnedBufferOnCurrentStream(long handle, long pinnedBufferHandle);
+    native void torchEnqueueCopyTo(long handle, long pinnedBufferHandle);
 
     native void torchSynchronizeCopyEvent(long handle);
 
     native void torchDeleteCopyEvent(long handle);
 
-    native void torchRecordTensorUseOnCurrentStream(long handle);
+    native void torchRecordStream(long handle);
 
     native void torchCopyTo(long sourceHandle, long targetHandle);
 

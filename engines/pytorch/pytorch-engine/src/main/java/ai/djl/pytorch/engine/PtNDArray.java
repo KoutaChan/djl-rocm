@@ -278,7 +278,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @param buffer the source direct byte buffer
      */
     public void copyFromDirectBuffer(ByteBuffer buffer) {
-        JniUtils.copyFromDirectBuffer(this, validateDirectCopyBuffer(buffer));
+        JniUtils.copyFromDirectBuffer(this, validateBuffer(buffer));
     }
 
     /**
@@ -290,7 +290,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @param buffer the source host transfer buffer
      */
     public void copyFromPinnedBuffer(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
+        validateBuffer(buffer);
         JniUtils.copyFromPinnedBuffer(this, buffer.getHandle());
     }
 
@@ -305,13 +305,13 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @return an event that completes when the copy is visible to this array
      */
     public PtCopyEvent copyFromPinnedBufferAsync(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
+        validateBuffer(buffer);
         long event = JniUtils.copyFromPinnedBufferAsync(this, buffer.getHandle());
         return new PtCopyEvent(manager, event, buffer);
     }
 
     /**
-     * Schedules a copy from a host transfer buffer on the current PyTorch stream.
+     * Enqueues a copy from a host transfer buffer on the current PyTorch stream.
      *
      * <p>No completion event is created. The caller must record a {@link PtEvent} after this method
      * before reusing or closing the source buffer. The caller must also order any earlier use of
@@ -320,9 +320,9 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      *
      * @param buffer the source host transfer buffer
      */
-    public void copyFromPinnedBufferOnCurrentStream(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
-        JniUtils.copyFromPinnedBufferOnCurrentStream(this, buffer.getHandle());
+    public void enqueueCopyFrom(PtPinnedBuffer buffer) {
+        validateBuffer(buffer);
+        JniUtils.enqueueCopyFrom(this, buffer.getHandle());
     }
 
     /**
@@ -337,13 +337,13 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @return an event that completes when this array has been copied into the buffer
      */
     public PtCopyEvent copyToPinnedBufferAsync(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
+        validateBuffer(buffer);
         long event = JniUtils.copyToPinnedBufferAsync(this, buffer.getHandle());
         return new PtCopyEvent(buffer.getManager(), event, buffer);
     }
 
     /**
-     * Schedules a copy from this array into a host transfer buffer on the current PyTorch stream.
+     * Enqueues a copy from this array into a host transfer buffer on the current PyTorch stream.
      *
      * <p>No completion event is created. The caller must record and synchronize a {@link PtEvent}
      * before reading or closing the destination buffer. The caller must also order any earlier
@@ -352,9 +352,22 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      *
      * @param buffer the destination host transfer buffer
      */
-    public void copyToPinnedBufferOnCurrentStream(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
-        JniUtils.copyToPinnedBufferOnCurrentStream(this, buffer.getHandle());
+    public void enqueueCopyTo(PtPinnedBuffer buffer) {
+        validateBuffer(buffer);
+        JniUtils.enqueueCopyTo(this, buffer.getHandle());
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void copyTo(NDArray array) {
+        if (array instanceof PtNDArray) {
+            PtNDArray target = (PtNDArray) array;
+            if (getShape().equals(target.getShape()) && !isSparse() && !target.isSparse()) {
+                JniUtils.copyTo(this, target);
+                return;
+            }
+        }
+        NDArray.super.copyTo(array);
     }
 
     /**
@@ -364,11 +377,11 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * that the storage must not be reused until work already enqueued on the current stream has
      * completed.
      */
-    public void recordUseOnCurrentStream() {
-        JniUtils.recordTensorUseOnCurrentStream(this);
+    void recordStream() {
+        JniUtils.recordStream(this);
     }
 
-    private ByteBuffer validateDirectCopyBuffer(ByteBuffer buffer) {
+    private ByteBuffer validateBuffer(ByteBuffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         if (!buffer.isDirect()) {
             throw new IllegalArgumentException("buffer must be direct.");
@@ -378,7 +391,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         return view;
     }
 
-    private void validatePinnedCopyBuffer(PtPinnedBuffer buffer) {
+    private void validateBuffer(PtPinnedBuffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         buffer.getHandle();
         DataType arrayDataType = getDataType();
@@ -397,19 +410,6 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
                             + " elements, but transfer buffer size is: "
                             + buffer.size());
         }
-    }
-
-    /** {@inheritDoc} */
-    @Override
-    public void copyTo(NDArray array) {
-        if (array instanceof PtNDArray) {
-            PtNDArray target = (PtNDArray) array;
-            if (getShape().equals(target.getShape()) && !isSparse() && !target.isSparse()) {
-                JniUtils.copyTo(this, target);
-                return;
-            }
-        }
-        NDArray.super.copyTo(array);
     }
 
     /** {@inheritDoc} */

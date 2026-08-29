@@ -45,18 +45,19 @@ public final class PtEvent extends NativeResource<Long> {
     }
 
     /**
-     * Makes the current stream wait for this event.
+     * Makes the stream that is current for this event's device wait for the event.
      *
      * <p>This method only enqueues a device-side dependency and does not wait for the event on the
      * calling thread.
      *
      * @throws IllegalStateException if this event has not been recorded
      */
-    public synchronized void waitOnCurrentStream() {
+    public synchronized void waitOnStream() {
+        long pointer = getHandle();
         if (!recorded) {
             throw new IllegalStateException("Cannot wait for an event before it is recorded.");
         }
-        JniUtils.waitDeviceEvent(getHandle());
+        JniUtils.waitDeviceEvent(pointer);
     }
 
     /**
@@ -67,13 +68,15 @@ public final class PtEvent extends NativeResource<Long> {
      * @return {@code true} if the event has completed
      */
     public synchronized boolean isComplete() {
-        return !recorded || JniUtils.queryDeviceEvent(getHandle());
+        long pointer = getHandle();
+        return !recorded || JniUtils.queryDeviceEvent(pointer);
     }
 
     /** Waits on the calling thread until the most recently recorded work has completed. */
     public synchronized void synchronize() {
+        long pointer = getHandle();
         if (recorded) {
-            JniUtils.synchronizeDeviceEvent(getHandle());
+            JniUtils.synchronizeDeviceEvent(pointer);
         }
     }
 

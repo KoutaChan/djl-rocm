@@ -308,41 +308,23 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinn
   API_END_RETURN()
 }
 
-JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinnedBufferOnCurrentStream(
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEnqueueCopyFrom(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
   API_BEGIN()
   torch::NoGradGuard guard;
   auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
   auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
-  djl_pytorch::accel::CopyFromHostOnCurrentStream(*target_ptr, buffer);
+  djl_pytorch::accel::EnqueueCopyFrom(*target_ptr, buffer);
   API_END()
 }
 
-JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateFromPinnedBufferAsync(JNIEnv* env,
-    jobject jthis, jlong jpinned_buffer_handle, jlongArray jshape, jint jdtype,
-    jintArray jdevice) {
-  API_BEGIN()
-  torch::NoGradGuard guard;
-  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
-  const auto shape_vec = djl::utils::jni::GetVecFromJLongArray(env, jshape);
-  const auto device = utils::GetDeviceFromJDevice(env, jdevice);
-  auto result = djl_pytorch::accel::CreateFromHostAsync(
-      buffer, shape_vec, utils::GetScalarTypeFromDType(jdtype), device);
-  const auto* result_ptr = new torch::Tensor(std::move(result));
-  return reinterpret_cast<uintptr_t>(result_ptr);
-  API_END_RETURN()
-}
-
-JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyToPinnedBufferOnCurrentStream(
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEnqueueCopyTo(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
   API_BEGIN()
   torch::NoGradGuard guard;
   const auto* source_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
   auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
-  djl_pytorch::accel::CopyToHostOnCurrentStream(*source_ptr, buffer);
+  djl_pytorch::accel::EnqueueCopyTo(*source_ptr, buffer);
   API_END()
 }
 
@@ -558,11 +540,11 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchToContiguous
 }
 
 JNIEXPORT void JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRecordTensorUseOnCurrentStream(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRecordStream(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
-  djl_pytorch::accel::RecordTensorUseOnCurrentStream(*tensor_ptr);
+  djl_pytorch::accel::RecordStream(*tensor_ptr);
   API_END()
 }
 
@@ -570,7 +552,7 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteTensor(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
-  djl_pytorch::accel::RecordTensorUseOnCurrentStream(*tensor_ptr);
+  djl_pytorch::accel::RecordStream(*tensor_ptr);
   delete tensor_ptr;
   API_END()
 }

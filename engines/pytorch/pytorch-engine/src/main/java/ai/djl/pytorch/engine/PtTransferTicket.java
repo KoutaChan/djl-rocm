@@ -47,16 +47,16 @@ public final class PtTransferTicket implements AutoCloseable {
     }
 
     /**
-     * Hands the transferred arrays off to the current PyTorch stream.
+     * Makes the transferred arrays available to the stream that is current for the transfer device.
      *
      * <p>This method enqueues a device-side wait for transfer completion and records every
      * destination array as used by the current stream. It does not wait on the calling thread.
      */
-    public synchronized void handoffToCurrentStream() {
+    public synchronized void waitOnStream() {
         ensureOpen();
-        completionEvent.waitOnCurrentStream();
+        completionEvent.waitOnStream();
         for (PtNDArray array : arrays) {
-            array.recordUseOnCurrentStream();
+            array.recordStream();
         }
     }
 
@@ -95,10 +95,15 @@ public final class PtTransferTicket implements AutoCloseable {
                         "Cannot close a PtTransferTicket while its transfer is in flight.");
             }
             completionKnown = true;
-            closed = true;
-            completionEvent.close();
-            arrays.clear();
-            buffers.clear();
+            try {
+                completionEvent.close();
+            } finally {
+                if (completionEvent.isReleased()) {
+                    closed = true;
+                    arrays.clear();
+                    buffers.clear();
+                }
+            }
         }
     }
 

@@ -75,37 +75,6 @@ public class PtNDManager extends BaseNDManager {
         }
     }
 
-    /**
-     * Creates an array from a host transfer buffer on the current PyTorch stream.
-     *
-     * <p>For an accelerator manager backed by pinned host memory, allocation and host-to-device
-     * copy are enqueued on the current stream without synchronizing the calling thread. The source
-     * buffer must not be overwritten or closed until an event recorded after this method has
-     * completed. CPU managers perform the copy synchronously.
-     *
-     * @param buffer the source host transfer buffer
-     * @param shape the shape of the new array
-     * @return a new array owned by this manager
-     */
-    public PtNDArray createFromPinnedBuffer(PtPinnedBuffer buffer, Shape shape) {
-        Objects.requireNonNull(buffer, "buffer");
-        Objects.requireNonNull(shape, "shape");
-        buffer.getHandle();
-        long size = shape.size();
-        if (size <= 0) {
-            throw new IllegalArgumentException("shape must contain at least one element.");
-        }
-        if (size > buffer.size()) {
-            throw new IllegalArgumentException(
-                    "The requested array contains "
-                            + size
-                            + " elements, but the transfer buffer contains "
-                            + buffer.size());
-        }
-        return JniUtils.createFromPinnedBufferAsync(
-                this, buffer.getHandle(), shape, buffer.getDataType());
-    }
-
     /** {@inheritDoc} */
     @Override
     public PtNDArray from(NDArray array) {

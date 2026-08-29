@@ -15,19 +15,26 @@ package ai.djl.pytorch.engine;
 import ai.djl.ndarray.types.Shape;
 
 import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 
-/** A batch of pinned host-to-device transfers enqueued on one PyTorch stream. */
+/**
+ * A batch of pinned host-to-device transfers enqueued on one PyTorch stream.
+ *
+ * <p>A batch must be used and closed by the thread that created it.
+ */
 public final class PtTransferBatch implements AutoCloseable {
 
     private final PtNDManager manager;
     private final PtEvent completionEvent;
-    private final List<PtNDArray> arrays;
-    private final List<PtPinnedBuffer> buffers;
+    private final ArrayList<PtNDArray> arrays;
+    private final ArrayList<PtPinnedBuffer> buffers;
     private final Thread ownerThread;
     private PtStreamScope scope;
     private boolean committed;
+    private boolean failed;
+    private boolean recorded;
+    private boolean released;
+    private boolean copyComplete;
 
     PtTransferBatch(PtStream stream, PtNDManager manager) {
         this.manager = Objects.requireNonNull(manager, "manager");
@@ -38,23 +45,27 @@ public final class PtTransferBatch implements AutoCloseable {
                             + ", but the manager device is: "
                             + manager.getDevice());
         }
-        completionEvent = stream.newEvent();
-        arrays = new ArrayList<>();
-        buffers = new ArrayList<>();
+        arrays = new ArrayList<>(1);
+        buffers = new ArrayList<>(1);
         ownerThread = Thread.currentThread();
+        completionEvent = stream.newEvent();
         try {
             scope = stream.openScope();
         } catch (RuntimeException | Error e) {
-            completionEvent.close();
+            try {
+                completionEvent.close();
+            } catch (RuntimeException | Error suppressed) {
+                addSuppressed(e, suppressed);
+            }
             throw e;
         }
     }
 
     /**
-     * Enqueues creation of an array from a pinned host buffer.
+     * Creates an array and enqueues a copy from a pinned host buffer.
      *
      * <p>The returned array is owned by the manager supplied when this batch was created. It must
-     * not be consumed before the committed ticket is handed off to the consumer stream.
+     * not be consumed before the consumer stream waits on the committed ticket.
      *
      * @param buffer the source host transfer buffer
      * @param shape the shape of the destination array
@@ -62,10 +73,20 @@ public final class PtTransferBatch implements AutoCloseable {
      */
     public PtNDArray copy(PtPinnedBuffer buffer, Shape shape) {
         ensureOpen();
-        PtNDArray array = manager.createFromPinnedBuffer(buffer, shape);
+        validate(buffer, shape);
+        int capacity = Math.addExact(arrays.size(), 1);
+        arrays.ensureCapacity(capacity);
+        buffers.ensureCapacity(capacity);
+        PtNDArray array = manager.create(shape, buffer.getDataType());
         arrays.add(array);
         buffers.add(buffer);
-        return array;
+        try {
+            array.enqueueCopyFrom(buffer);
+            return array;
+        } catch (RuntimeException | Error e) {
+            failed = true;
+            throw e;
+        }
     }
 
     /**
@@ -83,19 +104,22 @@ public final class PtTransferBatch implements AutoCloseable {
             throw new IllegalStateException("Cannot commit an empty transfer batch.");
         }
         completionEvent.record();
+        recorded = true;
         try {
-            scope.close();
+            try {
+                scope.close();
+            } finally {
+                scope = null;
+            }
+            PtTransferTicket ticket = new PtTransferTicket(completionEvent, arrays, buffers);
+            committed = true;
+            arrays.clear();
+            buffers.clear();
+            return ticket;
         } catch (RuntimeException | Error e) {
-            scope = null;
-            abortRecordedTransfer(e);
+            release(e);
             throw e;
         }
-        scope = null;
-        PtTransferTicket ticket = new PtTransferTicket(completionEvent, arrays, buffers);
-        committed = true;
-        arrays.clear();
-        buffers.clear();
-        return ticket;
     }
 
     /**
@@ -107,52 +131,21 @@ public final class PtTransferBatch implements AutoCloseable {
      */
     @Override
     public void close() {
-        if (committed || scope == null) {
+        if (committed || released) {
             return;
         }
         ensureOwnerThread();
-        Throwable failure = null;
-        try {
-            if (!arrays.isEmpty()) {
-                completionEvent.record();
-            }
-        } catch (RuntimeException | Error e) {
-            failure = e;
+        if (!buffers.isEmpty() && !recorded) {
+            completionEvent.record();
+            recorded = true;
         }
-        try {
-            scope.close();
-        } catch (RuntimeException | Error e) {
-            failure = addSuppressed(failure, e);
-        } finally {
-            scope = null;
-        }
-        try {
-            if (!arrays.isEmpty()) {
-                completionEvent.synchronize();
-            }
-        } catch (RuntimeException | Error e) {
-            failure = addSuppressed(failure, e);
-        }
-        try {
-            completionEvent.close();
-        } catch (RuntimeException | Error e) {
-            failure = addSuppressed(failure, e);
-        }
-        for (PtNDArray array : arrays) {
-            try {
-                array.close();
-            } catch (RuntimeException | Error e) {
-                failure = addSuppressed(failure, e);
-            }
-        }
-        arrays.clear();
-        buffers.clear();
+        Throwable failure = release(null);
         rethrow(failure);
     }
 
     private void ensureOpen() {
         ensureOwnerThread();
-        if (scope == null || committed) {
+        if (scope == null || committed || failed || recorded || released) {
             throw new IllegalStateException("PtTransferBatch is closed.");
         }
     }
@@ -164,18 +157,65 @@ public final class PtTransferBatch implements AutoCloseable {
         }
     }
 
-    private void abortRecordedTransfer(Throwable failure) {
-        try {
-            completionEvent.synchronize();
-        } catch (RuntimeException | Error e) {
-            failure.addSuppressed(e);
-        } finally {
-            completionEvent.close();
-            for (PtNDArray array : arrays) {
-                array.close();
+    private Throwable release(Throwable failure) {
+        if (scope != null) {
+            try {
+                scope.close();
+            } catch (RuntimeException | Error e) {
+                failure = addSuppressed(failure, e);
+            } finally {
+                scope = null;
             }
-            arrays.clear();
+        }
+        if (!buffers.isEmpty() && !copyComplete) {
+            try {
+                completionEvent.synchronize();
+                copyComplete = true;
+            } catch (RuntimeException | Error e) {
+                return addSuppressed(failure, e);
+            }
+        }
+        if (!completionEvent.isReleased()) {
+            try {
+                completionEvent.close();
+            } catch (RuntimeException | Error e) {
+                failure = addSuppressed(failure, e);
+            }
+        }
+        for (int i = arrays.size() - 1; i >= 0; --i) {
+            PtNDArray array = arrays.get(i);
+            if (!array.isReleased()) {
+                try {
+                    array.close();
+                } catch (RuntimeException | Error e) {
+                    failure = addSuppressed(failure, e);
+                }
+            }
+            if (array.isReleased()) {
+                arrays.remove(i);
+            }
+        }
+        if (copyComplete) {
             buffers.clear();
+        }
+        released = completionEvent.isReleased() && arrays.isEmpty() && buffers.isEmpty();
+        return failure;
+    }
+
+    private static void validate(PtPinnedBuffer buffer, Shape shape) {
+        Objects.requireNonNull(buffer, "buffer");
+        Objects.requireNonNull(shape, "shape");
+        buffer.getHandle();
+        long size = shape.size();
+        if (size <= 0) {
+            throw new IllegalArgumentException("shape must contain at least one element.");
+        }
+        if (size > buffer.size()) {
+            throw new IllegalArgumentException(
+                    "The requested array contains "
+                            + size
+                            + " elements, but the transfer buffer contains "
+                            + buffer.size());
         }
     }
 
@@ -183,7 +223,9 @@ public final class PtTransferBatch implements AutoCloseable {
         if (failure == null) {
             return suppressed;
         }
-        failure.addSuppressed(suppressed);
+        if (failure != suppressed) {
+            failure.addSuppressed(suppressed);
+        }
         return failure;
     }
 

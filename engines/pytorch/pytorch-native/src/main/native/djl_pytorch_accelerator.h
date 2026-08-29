@@ -37,15 +37,13 @@ void DeleteHostBuffer(HostBuffer* buffer);
 
 void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking = false);
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking = false);
-void CopyFromHostOnCurrentStream(torch::Tensor& target, HostBuffer* buffer);
-torch::Tensor CreateFromHostAsync(
-    HostBuffer* buffer, c10::IntArrayRef sizes, torch::ScalarType dtype, c10::Device device);
-void CopyToHostOnCurrentStream(const torch::Tensor& source, HostBuffer* buffer);
+void EnqueueCopyFrom(torch::Tensor& target, HostBuffer* buffer);
+void EnqueueCopyTo(const torch::Tensor& source, HostBuffer* buffer);
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer);
 CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer);
 void SynchronizeCopyEvent(CopyEvent* event);
 void DeleteCopyEvent(CopyEvent* event);
-void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor);
+void RecordStream(const torch::Tensor& tensor);
 
 StreamScope* NewStreamScope();
 StreamScope* NewStreamScope(c10::Device device);

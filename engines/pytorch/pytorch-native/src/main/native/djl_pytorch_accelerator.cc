@@ -34,8 +34,8 @@
 #include <c10/hip/HIPCachingAllocator.h>
 #endif
 
-#include <optional>
 #include <memory>
+#include <optional>
 
 namespace djl_pytorch {
 namespace accel {
@@ -79,12 +79,17 @@ c10::Stream GetCurrentStream(c10::Device device) {
   return guard_impl.getStream(device);
 }
 
-void ValidateHostCopy(const torch::Tensor& target, HostBuffer* buffer) {
+void CheckBuffer(const torch::Tensor& tensor, const HostBuffer* buffer) {
   TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
-  TORCH_CHECK(target.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
-  TORCH_CHECK(target.scalar_type() == buffer->storage.scalar_type(),
+  TORCH_CHECK(tensor.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
+  TORCH_CHECK(tensor.scalar_type() == buffer->storage.scalar_type(),
       "tensor and host buffer data types must match");
-  TORCH_CHECK(target.numel() <= buffer->storage.numel(), "host buffer is smaller than the target tensor");
+  TORCH_CHECK(tensor.numel() <= buffer->storage.numel(), "host buffer is smaller than the tensor");
+}
+
+void CopyFromBuffer(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
+  torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
+  target.copy_(source, non_blocking);
 }
 
 }  // namespace
@@ -159,44 +164,25 @@ void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking) {
 }
 
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
-  torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
-  target.copy_(source, non_blocking);
+  CheckBuffer(target, buffer);
+  CopyFromBuffer(target, buffer, non_blocking);
 }
 
-void CopyFromHostOnCurrentStream(torch::Tensor& target, HostBuffer* buffer) {
-  ValidateHostCopy(target, buffer);
+void EnqueueCopyFrom(torch::Tensor& target, HostBuffer* buffer) {
+  CheckBuffer(target, buffer);
   if (!IsAcceleratorDevice(target.device()) || !buffer->pinned) {
-    CopyFromHost(target, buffer);
+    CopyFromBuffer(target, buffer, false);
     return;
   }
 
   c10::Stream stream = GetCurrentStream(target.device());
-  CopyFromHost(target, buffer, true);
+  CopyFromBuffer(target, buffer, true);
   c10::impl::VirtualGuardImpl guard_impl(target.device().type());
   guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
 }
 
-torch::Tensor CreateFromHostAsync(
-    HostBuffer* buffer, c10::IntArrayRef sizes, torch::ScalarType dtype, c10::Device device) {
-  TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
-  TORCH_CHECK(dtype == buffer->storage.scalar_type(), "tensor and host buffer data types must match");
-  if (IsAcceleratorDevice(device)) {
-    GetCurrentStream(device);
-  }
-
-  auto options = torch::TensorOptions().dtype(dtype).device(device).requires_grad(false);
-  torch::Tensor target = torch::empty(sizes, options);
-  CopyFromHostOnCurrentStream(target, buffer);
-  return target;
-}
-
-void CopyToHostOnCurrentStream(const torch::Tensor& source, HostBuffer* buffer) {
-  TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
-  TORCH_CHECK(source.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
-  TORCH_CHECK(source.scalar_type() == buffer->storage.scalar_type(),
-      "tensor and host buffer data types must match");
-  TORCH_CHECK(source.numel() <= buffer->storage.numel(),
-      "host buffer is smaller than the source tensor");
+void EnqueueCopyTo(const torch::Tensor& source, HostBuffer* buffer) {
+  CheckBuffer(source, buffer);
   torch::Tensor target = buffer->storage.narrow(0, 0, source.numel()).view(source.sizes());
   if (!IsAcceleratorDevice(source.device()) || !buffer->pinned) {
     target.copy_(source);
@@ -210,8 +196,9 @@ void CopyToHostOnCurrentStream(const torch::Tensor& source, HostBuffer* buffer) 
 }
 
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
+  CheckBuffer(target, buffer);
   if (!IsAcceleratorDevice(target.device()) || !buffer->pinned) {
-    CopyFromHost(target, buffer);
+    CopyFromBuffer(target, buffer, false);
     return nullptr;
   }
   c10::DeviceGuard device_guard(target.device());
@@ -229,7 +216,7 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
     dependency.block(stream);
   }
   c10::StreamGuard stream_guard(stream);
-  CopyFromHost(target, buffer, true);
+  CopyFromBuffer(target, buffer, true);
   guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
   auto* event = new CopyEvent(target.device().type());
   event->event.record(stream);
@@ -242,10 +229,7 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
 }
 
 CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer) {
-  TORCH_CHECK(source.scalar_type() == buffer->storage.scalar_type(),
-      "tensor and host buffer data types must match");
-  TORCH_CHECK(source.numel() <= buffer->storage.numel(),
-      "host buffer is smaller than the source tensor");
+  CheckBuffer(source, buffer);
   torch::Tensor target = buffer->storage.narrow(0, 0, source.numel()).view(source.sizes());
   if (!IsAcceleratorDevice(source.device()) || !buffer->pinned) {
     target.copy_(source);
@@ -277,7 +261,7 @@ void DeleteCopyEvent(CopyEvent* event) {
   delete event;
 }
 
-void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor) {
+void RecordStream(const torch::Tensor& tensor) {
   if (!tensor.defined() || tensor.numel() == 0 || tensor.layout() != c10::kStrided ||
       !IsAcceleratorDevice(tensor.device())) {
     return;
@@ -447,7 +431,7 @@ void EmptyCache() {
     return;
   }
 #if defined(USE_ROCM)
-  c10::cuda::CUDACachingAllocator::emptyCache();
+  c10::hip::HIPCachingAllocator::emptyCache();
 #elif DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::emptyCache();
 #else
