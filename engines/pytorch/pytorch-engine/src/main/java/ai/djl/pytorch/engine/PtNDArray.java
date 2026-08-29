@@ -311,6 +311,21 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     }
 
     /**
+     * Schedules a copy from a host transfer buffer on the current PyTorch stream.
+     *
+     * <p>No completion event is created. The caller must record a {@link PtEvent} after this method
+     * before reusing or closing the source buffer. The caller must also order any earlier use of
+     * this array on another stream before the current stream. CPU arrays perform the copy
+     * synchronously.
+     *
+     * @param buffer the source host transfer buffer
+     */
+    public void copyFromPinnedBufferOnCurrentStream(PtPinnedBuffer buffer) {
+        validatePinnedCopyBuffer(buffer);
+        JniUtils.copyFromPinnedBufferOnCurrentStream(this, buffer.getHandle());
+    }
+
+    /**
      * Schedules an asynchronous copy from this array into a host transfer buffer.
      *
      * <p>The returned event must be synchronized before reading or closing the destination buffer.
@@ -325,6 +340,32 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         validatePinnedCopyBuffer(buffer);
         long event = JniUtils.copyToPinnedBufferAsync(this, buffer.getHandle());
         return new PtCopyEvent(buffer.getManager(), event, buffer);
+    }
+
+    /**
+     * Schedules a copy from this array into a host transfer buffer on the current PyTorch stream.
+     *
+     * <p>No completion event is created. The caller must record and synchronize a {@link PtEvent}
+     * before reading or closing the destination buffer. The caller must also order any earlier
+     * write to this array on another stream before the current stream. CPU arrays perform the copy
+     * synchronously.
+     *
+     * @param buffer the destination host transfer buffer
+     */
+    public void copyToPinnedBufferOnCurrentStream(PtPinnedBuffer buffer) {
+        validatePinnedCopyBuffer(buffer);
+        JniUtils.copyToPinnedBufferOnCurrentStream(this, buffer.getHandle());
+    }
+
+    /**
+     * Records this array's storage as used by the current PyTorch stream.
+     *
+     * <p>This method does not enqueue a synchronization. It informs PyTorch's caching allocator
+     * that the storage must not be reused until work already enqueued on the current stream has
+     * completed.
+     */
+    public void recordUseOnCurrentStream() {
+        JniUtils.recordTensorUseOnCurrentStream(this);
     }
 
     private ByteBuffer validateDirectCopyBuffer(ByteBuffer buffer) {

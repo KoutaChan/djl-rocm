@@ -118,6 +118,44 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchCloseStreamScope(handle);
     }
 
+    public static long createDeviceStream(Device device) {
+        return PyTorchLibrary.LIB.torchCreateDeviceStream(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+    }
+
+    public static long openDeviceStream(long handle) {
+        return PyTorchLibrary.LIB.torchOpenDeviceStream(handle);
+    }
+
+    public static void deleteDeviceStream(long handle) {
+        PyTorchLibrary.LIB.torchDeleteDeviceStream(handle);
+    }
+
+    public static long createDeviceEvent(Device device) {
+        return PyTorchLibrary.LIB.torchCreateDeviceEvent(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+    }
+
+    public static void recordDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchRecordDeviceEvent(handle);
+    }
+
+    public static void waitDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchWaitDeviceEvent(handle);
+    }
+
+    public static boolean queryDeviceEvent(long handle) {
+        return PyTorchLibrary.LIB.torchQueryDeviceEvent(handle);
+    }
+
+    public static void synchronizeDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchSynchronizeDeviceEvent(handle);
+    }
+
+    public static void deleteDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchDeleteDeviceEvent(handle);
+    }
+
     public static long createAcceleratorGraph(Device device) {
         return PyTorchLibrary.LIB.torchCreateAcceleratorGraph(
                 new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
@@ -658,8 +696,31 @@ public final class JniUtils {
                 self.getHandle(), pinnedBufferHandle);
     }
 
+    public static void copyFromPinnedBufferOnCurrentStream(
+            PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchCopyFromPinnedBufferOnCurrentStream(
+                self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static PtNDArray createFromPinnedBufferAsync(
+            PtNDManager manager, long pinnedBufferHandle, Shape shape, DataType dataType) {
+        Device device = manager.getDevice();
+        long handle =
+                PyTorchLibrary.LIB.torchCreateFromPinnedBufferAsync(
+                        pinnedBufferHandle,
+                        shape.getShape(),
+                        dataType.ordinal(),
+                        new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+        return new PtNDArray(manager, handle);
+    }
+
     public static long copyToPinnedBufferAsync(PtNDArray self, long pinnedBufferHandle) {
         return PyTorchLibrary.LIB.torchCopyToPinnedBufferAsync(
+                self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static void copyToPinnedBufferOnCurrentStream(PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchCopyToPinnedBufferOnCurrentStream(
                 self.getHandle(), pinnedBufferHandle);
     }
 
@@ -669,6 +730,10 @@ public final class JniUtils {
 
     public static void deleteCopyEvent(long handle) {
         PyTorchLibrary.LIB.torchDeleteCopyEvent(handle);
+    }
+
+    public static void recordTensorUseOnCurrentStream(PtNDArray self) {
+        PyTorchLibrary.LIB.torchRecordTensorUseOnCurrentStream(self.getHandle());
     }
 
     public static void copyTo(PtNDArray source, PtNDArray target) {

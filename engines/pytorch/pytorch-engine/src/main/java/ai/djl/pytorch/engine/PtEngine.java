@@ -200,6 +200,26 @@ public final class PtEngine extends Engine {
     }
 
     /**
+     * Creates a reusable device stream selected from PyTorch's stream pool.
+     *
+     * @param device device on which work is enqueued
+     * @return a reusable device stream
+     */
+    public PtStream newStream(Device device) {
+        return new PtStream(device);
+    }
+
+    /**
+     * Creates a reusable device event.
+     *
+     * @param device device on which the event is recorded
+     * @return a reusable device event
+     */
+    public PtEvent newEvent(Device device) {
+        return new PtEvent(device);
+    }
+
+    /**
      * Creates a reusable accelerator graph for a fixed-shape workload.
      *
      * @param device accelerator device on which capture and replay execute

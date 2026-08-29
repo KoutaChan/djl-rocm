@@ -21,6 +21,8 @@ namespace djl_pytorch {
 namespace accel {
 
 struct CopyEvent;
+struct DeviceEvent;
+struct DeviceStream;
 struct HostBuffer;
 struct AcceleratorGraph;
 struct StreamScope;
@@ -35,6 +37,10 @@ void DeleteHostBuffer(HostBuffer* buffer);
 
 void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking = false);
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking = false);
+void CopyFromHostOnCurrentStream(torch::Tensor& target, HostBuffer* buffer);
+torch::Tensor CreateFromHostAsync(
+    HostBuffer* buffer, c10::IntArrayRef sizes, torch::ScalarType dtype, c10::Device device);
+void CopyToHostOnCurrentStream(const torch::Tensor& source, HostBuffer* buffer);
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer);
 CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer);
 void SynchronizeCopyEvent(CopyEvent* event);
@@ -43,7 +49,17 @@ void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor);
 
 StreamScope* NewStreamScope();
 StreamScope* NewStreamScope(c10::Device device);
+DeviceStream* NewDeviceStream(c10::Device device);
+StreamScope* OpenDeviceStream(DeviceStream* stream);
+void DeleteDeviceStream(DeviceStream* stream);
 void DeleteStreamScope(StreamScope* scope);
+
+DeviceEvent* NewDeviceEvent(c10::Device device);
+void RecordDeviceEvent(DeviceEvent* event);
+void WaitDeviceEvent(DeviceEvent* event);
+bool QueryDeviceEvent(DeviceEvent* event);
+void SynchronizeDeviceEvent(DeviceEvent* event);
+void DeleteDeviceEvent(DeviceEvent* event);
 
 AcceleratorGraph* NewAcceleratorGraph(c10::Device device);
 void BeginAcceleratorGraphCapture(AcceleratorGraph* graph);

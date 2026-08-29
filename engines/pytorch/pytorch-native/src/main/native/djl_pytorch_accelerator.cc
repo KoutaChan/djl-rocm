@@ -51,12 +51,43 @@ struct CopyEvent {
   explicit CopyEvent(c10::DeviceType device_type) : event(device_type) {}
 };
 
+struct DeviceEvent {
+  c10::Device device;
+  c10::Event event;
+
+  explicit DeviceEvent(c10::Device device) : device(device), event(device.type()) {}
+};
+
+struct DeviceStream {
+  c10::Stream stream;
+
+  explicit DeviceStream(c10::Stream stream) : stream(stream) {}
+};
+
 struct StreamScope {
   c10::Stream stream;
   c10::StreamGuard guard;
 
   explicit StreamScope(c10::Stream stream) : stream(stream), guard(this->stream) {}
 };
+
+namespace {
+
+c10::Stream GetCurrentStream(c10::Device device) {
+  c10::DeviceGuard device_guard(device);
+  c10::impl::VirtualGuardImpl guard_impl(device.type());
+  return guard_impl.getStream(device);
+}
+
+void ValidateHostCopy(const torch::Tensor& target, HostBuffer* buffer) {
+  TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
+  TORCH_CHECK(target.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
+  TORCH_CHECK(target.scalar_type() == buffer->storage.scalar_type(),
+      "tensor and host buffer data types must match");
+  TORCH_CHECK(target.numel() <= buffer->storage.numel(), "host buffer is smaller than the target tensor");
+}
+
+}  // namespace
 
 #if defined(DJL_USE_ACCELERATOR_GRAPH)
 struct AcceleratorGraph {
@@ -130,6 +161,52 @@ void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking) {
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
   torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
   target.copy_(source, non_blocking);
+}
+
+void CopyFromHostOnCurrentStream(torch::Tensor& target, HostBuffer* buffer) {
+  ValidateHostCopy(target, buffer);
+  if (!IsAcceleratorDevice(target.device()) || !buffer->pinned) {
+    CopyFromHost(target, buffer);
+    return;
+  }
+
+  c10::Stream stream = GetCurrentStream(target.device());
+  CopyFromHost(target, buffer, true);
+  c10::impl::VirtualGuardImpl guard_impl(target.device().type());
+  guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
+}
+
+torch::Tensor CreateFromHostAsync(
+    HostBuffer* buffer, c10::IntArrayRef sizes, torch::ScalarType dtype, c10::Device device) {
+  TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
+  TORCH_CHECK(dtype == buffer->storage.scalar_type(), "tensor and host buffer data types must match");
+  if (IsAcceleratorDevice(device)) {
+    GetCurrentStream(device);
+  }
+
+  auto options = torch::TensorOptions().dtype(dtype).device(device).requires_grad(false);
+  torch::Tensor target = torch::empty(sizes, options);
+  CopyFromHostOnCurrentStream(target, buffer);
+  return target;
+}
+
+void CopyToHostOnCurrentStream(const torch::Tensor& source, HostBuffer* buffer) {
+  TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
+  TORCH_CHECK(source.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
+  TORCH_CHECK(source.scalar_type() == buffer->storage.scalar_type(),
+      "tensor and host buffer data types must match");
+  TORCH_CHECK(source.numel() <= buffer->storage.numel(),
+      "host buffer is smaller than the source tensor");
+  torch::Tensor target = buffer->storage.narrow(0, 0, source.numel()).view(source.sizes());
+  if (!IsAcceleratorDevice(source.device()) || !buffer->pinned) {
+    target.copy_(source);
+    return;
+  }
+
+  c10::Stream stream = GetCurrentStream(source.device());
+  target.copy_(source, true);
+  c10::impl::VirtualGuardImpl guard_impl(source.device().type());
+  guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), stream);
 }
 
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
@@ -229,8 +306,63 @@ StreamScope* NewStreamScope(c10::Device device) {
   return new StreamScope(stream);
 }
 
+DeviceStream* NewDeviceStream(c10::Device device) {
+  if (!IsAcceleratorDevice(device)) {
+    return nullptr;
+  }
+  c10::impl::VirtualGuardImpl guard_impl(device.type());
+  return new DeviceStream(guard_impl.getStreamFromGlobalPool(device));
+}
+
+StreamScope* OpenDeviceStream(DeviceStream* stream) {
+  if (stream == nullptr) {
+    return nullptr;
+  }
+  return new StreamScope(stream->stream);
+}
+
+void DeleteDeviceStream(DeviceStream* stream) {
+  delete stream;
+}
+
 void DeleteStreamScope(StreamScope* scope) {
   delete scope;
+}
+
+DeviceEvent* NewDeviceEvent(c10::Device device) {
+  if (!IsAcceleratorDevice(device)) {
+    return nullptr;
+  }
+  return new DeviceEvent(device);
+}
+
+void RecordDeviceEvent(DeviceEvent* event) {
+  if (event == nullptr) {
+    return;
+  }
+  event->event.record(GetCurrentStream(event->device));
+}
+
+void WaitDeviceEvent(DeviceEvent* event) {
+  if (event == nullptr) {
+    return;
+  }
+  TORCH_CHECK(event->event.was_marked_for_recording(), "cannot wait for an event before it is recorded");
+  event->event.block(GetCurrentStream(event->device));
+}
+
+bool QueryDeviceEvent(DeviceEvent* event) {
+  return event == nullptr || event->event.query();
+}
+
+void SynchronizeDeviceEvent(DeviceEvent* event) {
+  if (event != nullptr && event->event.was_marked_for_recording()) {
+    event->event.synchronize();
+  }
+}
+
+void DeleteDeviceEvent(DeviceEvent* event) {
+  delete event;
 }
 
 AcceleratorGraph* NewAcceleratorGraph(c10::Device device) {
@@ -315,7 +447,7 @@ void EmptyCache() {
     return;
   }
 #if defined(USE_ROCM)
-  c10::hip::HIPCachingAllocator::emptyCache();
+  c10::cuda::CUDACachingAllocator::emptyCache();
 #elif DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::emptyCache();
 #else

@@ -36,6 +36,24 @@ final class PyTorchLibrary {
 
     native void torchCloseStreamScope(long handle);
 
+    native long torchCreateDeviceStream(int[] device);
+
+    native long torchOpenDeviceStream(long handle);
+
+    native void torchDeleteDeviceStream(long handle);
+
+    native long torchCreateDeviceEvent(int[] device);
+
+    native void torchRecordDeviceEvent(long handle);
+
+    native void torchWaitDeviceEvent(long handle);
+
+    native boolean torchQueryDeviceEvent(long handle);
+
+    native void torchSynchronizeDeviceEvent(long handle);
+
+    native void torchDeleteDeviceEvent(long handle);
+
     native long torchCreateAcceleratorGraph(int[] device);
 
     native void torchBeginAcceleratorGraphCapture(long handle);
@@ -336,11 +354,20 @@ final class PyTorchLibrary {
 
     native long torchCopyFromPinnedBufferAsync(long handle, long pinnedBufferHandle);
 
+    native void torchCopyFromPinnedBufferOnCurrentStream(long handle, long pinnedBufferHandle);
+
+    native long torchCreateFromPinnedBufferAsync(
+            long pinnedBufferHandle, long[] shape, int dtype, int[] device);
+
     native long torchCopyToPinnedBufferAsync(long handle, long pinnedBufferHandle);
+
+    native void torchCopyToPinnedBufferOnCurrentStream(long handle, long pinnedBufferHandle);
 
     native void torchSynchronizeCopyEvent(long handle);
 
     native void torchDeleteCopyEvent(long handle);
+
+    native void torchRecordTensorUseOnCurrentStream(long handle);
 
     native void torchCopyTo(long sourceHandle, long targetHandle);
 
