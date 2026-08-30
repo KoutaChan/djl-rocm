@@ -54,7 +54,10 @@ public interface FusionInvocation extends AutoCloseable {
      * input handles and runtime extents. Implementations should cross the hot native boundary once.
      * The returned lease owns the ring slot until it is closed. Work submitted through the
      * engine-current stream is ordered with consumers subsequently enqueued on that same stream. A
-     * consumer on another stream requires an explicit event/wait dependency.
+     * consumer on another stream requires an explicit event/wait dependency. If submission fails
+     * after the backend may have enqueued work, the backend must either establish completion before
+     * returning or retain every referenced resource until the owning session is closed
+     * successfully.
      *
      * @return a lease for the persistent output slot
      */

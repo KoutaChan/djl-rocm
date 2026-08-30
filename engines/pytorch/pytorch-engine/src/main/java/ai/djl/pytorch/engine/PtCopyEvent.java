@@ -36,7 +36,24 @@ public final class PtCopyEvent extends NativeResource<Long> {
         super(handle);
         this.manager = manager;
         this.buffer = buffer;
-        manager.attachInternal(getUid(), this);
+        try {
+            manager.attachInternal(getUid(), this);
+        } catch (RuntimeException | Error failure) {
+            Long pointer = this.handle.getAndSet(null);
+            if (pointer != null && pointer != 0) {
+                try {
+                    JniUtils.synchronizeCopyEvent(pointer);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                try {
+                    JniUtils.deleteCopyEvent(pointer);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw failure;
+        }
     }
 
     /**

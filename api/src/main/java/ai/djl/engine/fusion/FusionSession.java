@@ -46,7 +46,9 @@ public interface FusionSession extends AutoCloseable {
      * Releases session-owned output storage and workspace.
      *
      * <p>The caller must close or otherwise finish every invocation and output lease before closing
-     * the session.
+     * the session. A backend may exceptionally wait for an incomplete failed submission during
+     * close. If that completion cannot be established, close fails without releasing the session
+     * resources and may be retried.
      */
     @Override
     void close();

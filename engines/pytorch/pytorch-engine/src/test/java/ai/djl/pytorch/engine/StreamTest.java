@@ -195,6 +195,20 @@ public class StreamTest {
         verifyCurrentStreamCopies(Device.gpu(0));
     }
 
+    @Test
+    public void asynchronousPinnedCopiesOnCpu() {
+        verifyAsynchronousPinnedCopies(Device.cpu());
+    }
+
+    @Test
+    public void asynchronousPinnedCopiesOnGpu() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This asynchronous transfer test requires a PyTorch GPU.");
+        }
+        verifyAsynchronousPinnedCopies(Device.gpu(0));
+    }
+
     private void verifyCurrentStreamCopies(Device device) {
         PtEngine engine = (PtEngine) Engine.getInstance();
         try (PtNDManager host = (PtNDManager) engine.newBaseManager(Device.cpu());
@@ -222,6 +236,29 @@ public class StreamTest {
                 completion.record();
             }
             completion.synchronize();
+            float[] actual = new float[expected.length];
+            target.getByteBuffer().asFloatBuffer().get(actual);
+            Assert.assertEquals(actual, expected);
+        }
+    }
+
+    private void verifyAsynchronousPinnedCopies(Device device) {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        try (PtNDManager host = (PtNDManager) engine.newBaseManager(Device.cpu());
+                PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                PtPinnedBuffer source = host.allocatePinned(4, DataType.FLOAT32);
+                PtPinnedBuffer target = host.allocatePinned(4, DataType.FLOAT32);
+                PtNDArray array = (PtNDArray) manager.zeros(new Shape(4))) {
+            float[] expected = {1.0f, 2.0f, 3.0f, 4.0f};
+            source.getByteBuffer().asFloatBuffer().put(expected);
+
+            try (PtCopyEvent copy = array.copyFromPinnedBufferAsync(source)) {
+                copy.synchronize();
+            }
+            try (PtCopyEvent copy = array.copyToPinnedBufferAsync(target)) {
+                copy.synchronize();
+            }
+
             float[] actual = new float[expected.length];
             target.getByteBuffer().asFloatBuffer().get(actual);
             Assert.assertEquals(actual, expected);

@@ -34,6 +34,7 @@
 #include <c10/hip/HIPCachingAllocator.h>
 #endif
 
+#include <exception>
 #include <memory>
 #include <optional>
 
@@ -90,6 +91,19 @@ void CheckBuffer(const torch::Tensor& tensor, const HostBuffer* buffer) {
 void CopyFromBuffer(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
   torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
   target.copy_(source, non_blocking);
+}
+
+[[noreturn]] void DrainStreamAndRethrow(
+    const c10::Stream& stream, const std::exception_ptr& failure) {
+  try {
+    stream.synchronize();
+  } catch (...) {
+    // The original exception describes the operation that failed. If the
+    // accelerator cannot drain its stream, callers must treat the device as
+    // failed; replacing the original exception would not make the transfer
+    // recoverable.
+  }
+  std::rethrow_exception(failure);
 }
 
 }  // namespace
@@ -216,16 +230,21 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
     dependency.block(stream);
   }
   c10::StreamGuard stream_guard(stream);
-  CopyFromBuffer(target, buffer, true);
-  guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
-  auto* event = new CopyEvent(target.device().type());
-  event->event.record(stream);
-  if (stream != alloc_stream) {
-    // The consumer continues on the allocation stream. Queue its dependency on
-    // the asynchronous host copy without synchronizing the CPU.
-    event->event.block(alloc_stream);
+  auto event = std::make_unique<CopyEvent>(target.device().type());
+  try {
+    CopyFromBuffer(target, buffer, true);
+    guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
+    event->event.record(stream);
+    if (stream != alloc_stream) {
+      // The consumer continues on the allocation stream. Queue its dependency on
+      // the asynchronous host copy without synchronizing the CPU.
+      event->event.block(alloc_stream);
+    }
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    DrainStreamAndRethrow(stream, failure);
   }
-  return event;
+  return event.release();
 }
 
 CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer) {
@@ -246,11 +265,16 @@ CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer) {
     dependency.block(copy_stream);
   }
   c10::StreamGuard stream_guard(copy_stream);
-  target.copy_(source, true);
-  guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), copy_stream);
-  auto* event = new CopyEvent(source.device().type());
-  event->event.record(copy_stream);
-  return event;
+  auto event = std::make_unique<CopyEvent>(source.device().type());
+  try {
+    target.copy_(source, true);
+    guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), copy_stream);
+    event->event.record(copy_stream);
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    DrainStreamAndRethrow(copy_stream, failure);
+  }
+  return event.release();
 }
 
 void SynchronizeCopyEvent(CopyEvent* event) {

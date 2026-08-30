@@ -1012,6 +1012,7 @@ struct FusionSession {
     c10::impl::VirtualGuardImpl guard_impl(plan->device.type());
     allocation_ready = std::make_unique<c10::Event>(plan->device.type());
     allocation_ready->record(guard_impl.getStream(plan->device));
+    retained_inputs.reserve(static_cast<std::size_t>(plan->input_count));
   }
 
   void WaitForAllocation(int32_t buffer_index, const c10::Stream& stream) {
@@ -1040,12 +1041,34 @@ struct FusionSession {
     completion.synchronize();
   }
 
+  void RetainIncompleteSubmission(
+      const c10::Stream& stream, const int64_t* input_handles, std::size_t input_count) {
+    retained_inputs.clear();
+    for (std::size_t index = 0; index < input_count; ++index) {
+      const auto* input = reinterpret_cast<const torch::Tensor*>(input_handles[index]);
+      retained_inputs.emplace_back(*input);
+    }
+    incomplete_submission_stream = stream;
+    poisoned = true;
+  }
+
+  void DrainIncompleteSubmission() {
+    TORCH_CHECK(incomplete_submission_stream.has_value(),
+        "poisoned fusion session has no incomplete submission stream");
+    incomplete_submission_stream->synchronize();
+    retained_inputs.clear();
+    incomplete_submission_stream.reset();
+    poisoned = false;
+  }
+
   std::shared_ptr<const FusionExecutableData> executable;
   std::vector<std::vector<torch::Tensor>> storages;
   std::unique_ptr<c10::Event> allocation_ready;
   std::vector<bool> allocation_waited;
   std::vector<bool> binding_waited;
   std::vector<std::optional<c10::Stream>> submission_streams;
+  std::vector<torch::Tensor> retained_inputs;
+  std::optional<c10::Stream> incomplete_submission_stream;
   bool poisoned = false;
 };
 
@@ -1421,12 +1444,11 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
   } catch (...) {
     const std::exception_ptr submission_failure = std::current_exception();
     if (work_submitted) {
+      session->RetainIncompleteSubmission(
+          submission_stream, input_handles, input_count);
       try {
-        c10::Event completion(plan->device.type());
-        completion.record(submission_stream);
-        completion.synchronize();
+        session->DrainIncompleteSubmission();
       } catch (...) {
-        session->poisoned = true;
         TORCH_CHECK(false,
             "fusion session is poisoned because completion of a failed submission "
             "could not be established");
@@ -1458,6 +1480,9 @@ void DeleteFusionExecutable(FusionExecutable* executable) {
 }
 
 void DeleteFusionSession(FusionSession* session) {
+  if (session != nullptr && session->poisoned) {
+    session->DrainIncompleteSubmission();
+  }
   delete session;
 }
 

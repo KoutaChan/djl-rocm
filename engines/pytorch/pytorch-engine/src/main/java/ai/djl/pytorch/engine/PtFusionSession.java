@@ -116,24 +116,30 @@ final class PtFusionSession extends NativeResource<Long> implements FusionSessio
         } catch (RuntimeException | Error e) {
             failure = e;
         }
-        Long pointer = handle.getAndSet(null);
+        Long pointer = handle.get();
         if (pointer != null) {
-            failure = closeOutputs(failure);
             try {
                 JniUtils.deleteFusionSession(pointer);
             } catch (RuntimeException | Error e) {
                 failure = addFailure(failure, e);
+                throwFailure(failure);
+                return;
             }
+            handle.set(null);
         }
+        failure = closeOutputs(failure);
         throwFailure(failure);
     }
 
     private Throwable closeOutputs(Throwable failure) {
-        for (PtNDArray[] buffer : outputs) {
-            for (PtNDArray output : buffer) {
+        for (int bufferIndex = 0; bufferIndex < outputs.length; ++bufferIndex) {
+            PtNDArray[] buffer = outputs[bufferIndex];
+            for (int outputIndex = 0; outputIndex < buffer.length; ++outputIndex) {
+                PtNDArray output = buffer[outputIndex];
                 if (output != null) {
                     try {
                         output.close();
+                        buffer[outputIndex] = null;
                     } catch (RuntimeException | Error e) {
                         failure = addFailure(failure, e);
                     }
