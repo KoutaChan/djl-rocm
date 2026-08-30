@@ -959,6 +959,15 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchMaskedSoftmax(logits.getHandle(), mask.getHandle(), axis));
     }
 
+    /** Pools values with independently masked softmax weights for several groups. */
+    public static PtNDArray groupedMaskedSoftmaxPool(
+            PtNDArray logits, PtNDArray mask, PtNDArray values) {
+        return new PtNDArray(
+                logits.getManager(),
+                PyTorchLibrary.LIB.torchGroupedMaskedSoftmaxPool(
+                        logits.getHandle(), mask.getHandle(), values.getHandle()));
+    }
+
     /** Returns the float32 log normalizer over legal mask entries. */
     public static PtNDArray maskedLogSumExp(PtNDArray logits, PtNDArray mask, long axis) {
         return new PtNDArray(

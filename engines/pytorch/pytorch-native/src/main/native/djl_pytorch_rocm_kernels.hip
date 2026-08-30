@@ -162,6 +162,62 @@ __global__ void masked_categorical_forward_subwave_kernel(const scalar_t* logits
   }
 }
 
+template <typename logit_t, typename value_t>
+__global__ void grouped_masked_softmax_pool_kernel(const logit_t* logits, const bool* mask,
+    const value_t* values, float* output, int64_t row_count, int64_t choice_count,
+    int64_t group_count, int64_t feature_count) {
+  extern __shared__ float probabilities[];
+  __shared__ int has_choice;
+  const int lane = threadIdx.x % warpSize;
+  const int64_t pool_count = row_count * group_count;
+  for (int64_t pool = blockIdx.x; pool < pool_count; pool += gridDim.x) {
+    const int64_t row = pool / group_count;
+    const int64_t group = pool % group_count;
+    if (threadIdx.x < warpSize) {
+      const bool selected = lane < choice_count &&
+          mask[(row * choice_count + lane) * group_count + group];
+      const float logit = selected
+          ? static_cast<float>(logits[row * choice_count + lane])
+          : -INFINITY;
+      float maximum = logit;
+      int selected_count = selected ? 1 : 0;
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        maximum = maximum_propagating_nan(maximum, __shfl_down(maximum, offset));
+        selected_count += __shfl_down(selected_count, offset);
+      }
+      maximum = __shfl(maximum, 0);
+      selected_count = __shfl(selected_count, 0);
+      float exponential = selected && selected_count > 0 ? expf(logit - maximum) : 0.0f;
+      float denominator = exponential;
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        denominator += __shfl_down(denominator, offset);
+      }
+      denominator = __shfl(denominator, 0);
+      if (lane == 0) {
+        has_choice = selected_count > 0;
+      }
+      if (lane < choice_count) {
+        probabilities[lane] = selected_count > 0 ? exponential / denominator : 0.0f;
+      }
+    }
+    __syncthreads();
+    // Keep each group in one contiguous slab. Consumers commonly select one group before
+    // submitting it to another fused operation, so a group-major backing layout avoids a copy.
+    const int64_t output_offset = (group * row_count + row) * feature_count;
+    for (int64_t feature = threadIdx.x; feature < feature_count; feature += blockDim.x) {
+      float pooled = 0.0f;
+      if (has_choice) {
+        for (int64_t choice = 0; choice < choice_count; ++choice) {
+          pooled += probabilities[choice] * static_cast<float>(
+              values[(row * choice_count + choice) * feature_count + feature]);
+        }
+      }
+      output[output_offset + feature] = pooled;
+    }
+    __syncthreads();
+  }
+}
+
 template <typename scalar_t>
 __global__ void masked_softmax_backward_kernel(const float* gradient_output,
     const float* probabilities, const bool* mask, scalar_t* gradient_input,
@@ -1260,6 +1316,27 @@ bool supports_masked_categorical(
          logits.size(-1) > 0 && axis == logits.dim() - 1;
 }
 
+bool supports_grouped_masked_softmax_pool(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
+  if (!logits.is_cuda() || !logits.is_contiguous() || !mask.is_contiguous() ||
+      !values.is_contiguous() || !is_fused_floating(logits) ||
+      !is_fused_floating(values) || mask.scalar_type() != torch::kBool ||
+      logits.device() != mask.device() || logits.device() != values.device() ||
+      logits.dim() == 0 || mask.dim() != logits.dim() + 1 ||
+      values.dim() != logits.dim() + 1 || logits.size(-1) <= 0 ||
+      mask.size(-2) != logits.size(-1) || values.size(-2) != logits.size(-1) ||
+      mask.size(-1) <= 0 || values.size(-1) <= 0) {
+    return false;
+  }
+  for (int64_t dimension = 0; dimension < logits.dim() - 1; ++dimension) {
+    if (mask.size(dimension) != logits.size(dimension) ||
+        values.size(dimension) != logits.size(dimension)) {
+      return false;
+    }
+  }
+  return logits.size(-1) <= device_properties(logits.get_device()).warpSize;
+}
+
 bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices) {
   return rows.is_cuda() && rows.is_contiguous() && is_fused_floating(rows) &&
          row_indices.is_cuda() && row_indices.is_contiguous() &&
@@ -1331,6 +1408,61 @@ torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::T
         }
       });
   check_hip_kernel_launch("masked_softmax");
+  return output;
+}
+
+torch::Tensor grouped_masked_softmax_pool_forward(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
+  TORCH_CHECK(supports_grouped_masked_softmax_pool(logits, mask, values),
+      "grouped masked softmax pool received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(logits.device());
+  const int64_t choice_count = logits.size(-1);
+  const int64_t row_count = logits.numel() / choice_count;
+  const int64_t group_count = mask.size(-1);
+  const int64_t feature_count = values.size(-1);
+  auto output_shape = logits.sizes().vec();
+  output_shape.pop_back();
+  output_shape.insert(output_shape.begin(), group_count);
+  output_shape.push_back(feature_count);
+  auto output = torch::empty(output_shape, logits.options().dtype(torch::kFloat32));
+  if (row_count == 0) {
+    return output;
+  }
+  const auto& properties = device_properties(logits.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().masked_categorical_threads_per_block,
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
+  const int64_t pool_count = row_count * group_count;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(pool_count, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, logits.scalar_type(), "grouped_masked_softmax_pool_logits", [&] {
+        using logit_t = scalar_t;
+        switch (values.scalar_type()) {
+          case torch::kFloat32:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_masked_softmax_pool_kernel<logit_t, float>),
+                dim3(blocks), dim3(threads_per_block), choice_count * sizeof(float), stream,
+                logits.data_ptr<logit_t>(), mask.data_ptr<bool>(), values.data_ptr<float>(),
+                output.data_ptr<float>(), row_count, choice_count, group_count, feature_count);
+            break;
+          case torch::kFloat16:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_masked_softmax_pool_kernel<logit_t, c10::Half>),
+                dim3(blocks), dim3(threads_per_block), choice_count * sizeof(float), stream,
+                logits.data_ptr<logit_t>(), mask.data_ptr<bool>(), values.data_ptr<c10::Half>(),
+                output.data_ptr<float>(), row_count, choice_count, group_count, feature_count);
+            break;
+          case torch::kBFloat16:
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_masked_softmax_pool_kernel<logit_t, c10::BFloat16>),
+                dim3(blocks), dim3(threads_per_block), choice_count * sizeof(float), stream,
+                logits.data_ptr<logit_t>(), mask.data_ptr<bool>(), values.data_ptr<c10::BFloat16>(),
+                output.data_ptr<float>(), row_count, choice_count, group_count, feature_count);
+            break;
+          default:
+            TORCH_CHECK(false, "unsupported grouped masked softmax pool value data type");
+        }
+      });
+  check_hip_kernel_launch("grouped_masked_softmax_pool");
   return output;
 }
 

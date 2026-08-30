@@ -292,6 +292,8 @@ final class PyTorchLibrary {
 
     native long torchMaskedSoftmax(long logits, long mask, long axis);
 
+    native long torchGroupedMaskedSoftmaxPool(long logits, long mask, long values);
+
     native long torchMaskedLogSumExp(long logits, long mask, long axis);
 
     native long torchScaledDotProductAttention(

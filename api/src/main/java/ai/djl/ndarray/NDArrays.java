@@ -68,6 +68,28 @@ public final class NDArrays {
     }
 
     /**
+     * Pools values with independently masked softmax weights for several groups.
+     *
+     * <p>The logits are shaped {@code [..., choices]}, the mask is shaped {@code [..., choices,
+     * groups]}, and the values are shaped {@code [..., choices, features]}. The returned tensor is
+     * group-major with shape {@code [groups, ..., features]}. Each group normalizes the shared
+     * logits over its nonzero mask entries. A group with no selected choice returns zeros. The
+     * group-major layout keeps each independently consumed group contiguous.
+     *
+     * <p>Softmax evaluation, accumulation, and output use {@link DataType#FLOAT32}. Engines may
+     * fuse normalization and pooling while retaining a differentiable fallback with identical
+     * semantics.
+     *
+     * @param logits unnormalized scores shared by all groups
+     * @param mask nonzero entries identify the choices in each group
+     * @param values values pooled along the choice axis
+     * @return independently pooled group values
+     */
+    public static NDArray groupedMaskedSoftmaxPool(NDArray logits, NDArray mask, NDArray values) {
+        return logits.getNDArrayInternal().groupedMaskedSoftmaxPool(mask, values);
+    }
+
+    /**
      * Computes the log normalizer over legal elements.
      *
      * <p>Computation and output use {@link DataType#FLOAT32}; the reduced axis is retained with

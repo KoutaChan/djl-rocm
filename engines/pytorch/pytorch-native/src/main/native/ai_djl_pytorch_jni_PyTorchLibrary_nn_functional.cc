@@ -202,6 +202,18 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchM
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGroupedMaskedSoftmaxPool(
+    JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jvalues) {
+  API_BEGIN()
+  const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto& values = *reinterpret_cast<torch::Tensor*>(jvalues);
+  const auto* result =
+      new torch::Tensor(djl::pytorch::grouped_masked_softmax_pool(logits, mask, values));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedLogSumExp(
     JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
   API_BEGIN()

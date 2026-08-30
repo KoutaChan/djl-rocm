@@ -23,6 +23,12 @@ torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,
     const torch::Tensor& probabilities, const torch::Tensor& mask,
     torch::ScalarType input_type);
 
+bool supports_grouped_masked_softmax_pool(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values);
+
+torch::Tensor grouped_masked_softmax_pool_forward(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values);
+
 torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torch::Tensor& mask);
 
 torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,

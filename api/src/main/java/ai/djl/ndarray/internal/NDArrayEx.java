@@ -85,6 +85,26 @@ public interface NDArrayEx {
         return NDArrays.where(floatMask, masked.softmax(axis), logits.zerosLike());
     }
 
+    /** Pools values with independently masked softmax weights for several groups. */
+    default NDArray groupedMaskedSoftmaxPool(NDArray mask, NDArray values) {
+        NDArray logits = getArray();
+        int choiceAxis = logits.getShape().dimension() - 1;
+        NDArray expandedLogits = logits.expandDims(-1).broadcast(mask.getShape());
+        NDArray weights = NDArrays.maskedSoftmax(expandedLogits, mask, choiceAxis);
+        NDArray pooled =
+                weights.expandDims(-1)
+                        .mul(values.toType(DataType.FLOAT32, false).expandDims(-2))
+                        .sum(new int[] {choiceAxis});
+        NDArray present = mask.neq(0).sum(new int[] {choiceAxis}).gt(0).expandDims(-1);
+        NDArray masked = NDArrays.where(present, pooled, pooled.zerosLike());
+        long groupCount = mask.getShape().get(mask.getShape().dimension() - 1);
+        NDList groups = new NDList(Math.toIntExact(groupCount));
+        for (int group = 0; group < groupCount; ++group) {
+            groups.add(masked.get("...,{},:", group));
+        }
+        return NDArrays.stack(groups, 0);
+    }
+
     /** Returns the float32 log normalizer over nonzero mask entries, retaining the reduced axis. */
     default NDArray maskedLogSumExp(NDArray mask, int axis) {
         NDArray logits = getArray().toType(DataType.FLOAT32, false);

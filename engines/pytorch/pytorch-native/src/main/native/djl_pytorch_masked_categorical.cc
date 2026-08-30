@@ -68,6 +68,42 @@ torch::Tensor masked_log_sum_exp_reference(
   return torch::where(reduction.has_choice, normalizers, torch::zeros_like(normalizers));
 }
 
+void validate_grouped_pool_shapes(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
+  TORCH_CHECK(logits.dim() > 0, "grouped masked softmax logits must have at least one dimension");
+  TORCH_CHECK(mask.dim() == logits.dim() + 1,
+      "grouped masked softmax mask must add a trailing group dimension");
+  TORCH_CHECK(values.dim() == logits.dim() + 1,
+      "grouped masked softmax values must add a trailing feature dimension");
+  for (int64_t dimension = 0; dimension < logits.dim() - 1; ++dimension) {
+    TORCH_CHECK(mask.size(dimension) == logits.size(dimension) &&
+            values.size(dimension) == logits.size(dimension),
+        "grouped masked softmax leading dimensions must match");
+  }
+  const int64_t choices = logits.size(-1);
+  TORCH_CHECK(choices > 0 && mask.size(-2) == choices && values.size(-2) == choices,
+      "grouped masked softmax choice dimensions must match and be non-empty");
+  TORCH_CHECK(mask.size(-1) > 0, "grouped masked softmax requires at least one group");
+  TORCH_CHECK(values.size(-1) > 0, "grouped masked softmax requires at least one feature");
+  TORCH_CHECK(mask.device() == logits.device() && values.device() == logits.device(),
+      "grouped masked softmax tensors must use the same device");
+}
+
+torch::Tensor grouped_masked_softmax_pool_reference(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
+  const int64_t choice_axis = logits.dim() - 1;
+  auto float_logits = logits.to(torch::kFloat32);
+  auto boolean_mask = mask.to(torch::kBool);
+  auto expanded_logits = float_logits.unsqueeze(-1).expand_as(boolean_mask);
+  auto weights = masked_softmax_reference(expanded_logits, boolean_mask, choice_axis);
+  auto pooled =
+      weights.unsqueeze(-1).mul(values.to(torch::kFloat32).unsqueeze(-2)).sum(choice_axis);
+  auto present = boolean_mask.any(choice_axis).unsqueeze(-1);
+  return torch::where(present, pooled, torch::zeros_like(pooled))
+      .movedim(choice_axis, 0)
+      .contiguous();
+}
+
 #if defined(DJL_USE_ROCM_KERNELS)
 
 class MaskedSoftmaxFunction : public torch::autograd::Function<MaskedSoftmaxFunction> {
@@ -126,6 +162,24 @@ torch::Tensor masked_softmax(
   }
 #endif
   return masked_softmax_reference(logits, boolean_mask, normalized_axis);
+}
+
+torch::Tensor grouped_masked_softmax_pool(
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
+  validate_grouped_pool_shapes(logits, mask, values);
+  auto boolean_mask = mask.to(torch::kBool).contiguous();
+#if defined(DJL_USE_ROCM_KERNELS)
+  auto contiguous_logits = logits.contiguous();
+  auto contiguous_values = values.contiguous();
+  if ((!at::GradMode::is_enabled() ||
+          (!logits.requires_grad() && !values.requires_grad())) &&
+      rocm::supports_grouped_masked_softmax_pool(
+          contiguous_logits, boolean_mask, contiguous_values)) {
+    return rocm::grouped_masked_softmax_pool_forward(
+        contiguous_logits, boolean_mask, contiguous_values);
+  }
+#endif
+  return grouped_masked_softmax_pool_reference(logits, boolean_mask, values);
 }
 
 torch::Tensor masked_log_sum_exp(

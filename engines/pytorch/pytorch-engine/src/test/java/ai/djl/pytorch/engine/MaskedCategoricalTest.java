@@ -70,6 +70,15 @@ public class MaskedCategoricalTest {
     }
 
     @Test
+    public void groupedMaskedSoftmaxPoolMatchesPortableSemantics() {
+        Engine engine = Engine.getInstance();
+        verifyGroupedPool(engine, Device.cpu(), DataType.FLOAT32, 1e-6f);
+        if (engine.getGpuCount() > 0) {
+            verifyGroupedPool(engine, Device.gpu(), DataType.FLOAT16, 2e-3f);
+        }
+    }
+
+    @Test
     public void nativeForwardAndBackwardMatchCpuReference() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -143,6 +152,65 @@ public class MaskedCategoricalTest {
             Assert.assertTrue(Float.isNaN(probabilities[1]));
             Assert.assertEquals(probabilities[2], 0f);
             Assert.assertTrue(Float.isNaN(normalizer));
+        }
+    }
+
+    private static void verifyGroupedPool(
+            Engine engine, Device device, DataType dataType, float tolerance) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray logits =
+                    manager.create(
+                                    new float[] {
+                                        0f, (float) Math.log(2), (float) Math.log(3),
+                                        1f, 2f, 3f,
+                                        4f, 5f, 6f
+                                    },
+                                    new Shape(3, 3))
+                            .toType(dataType, false);
+            NDArray mask =
+                    manager.create(
+                            new int[] {
+                                1, 0, 0, 1, 1, 0,
+                                0, 1, 0, 0, 0, 1,
+                                0, 0, 0, 0, 0, 0
+                            },
+                            new Shape(3, 3, 2));
+            NDArray values =
+                    manager.create(
+                                    new float[] {
+                                        1f,
+                                        2f,
+                                        3f,
+                                        4f,
+                                        5f,
+                                        6f,
+                                        7f,
+                                        8f,
+                                        9f,
+                                        10f,
+                                        11f,
+                                        12f,
+                                        Float.NaN,
+                                        Float.POSITIVE_INFINITY,
+                                        13f,
+                                        14f,
+                                        15f,
+                                        16f
+                                    },
+                                    new Shape(3, 3, 2))
+                            .toType(dataType, false);
+
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+
+            Assert.assertEquals(pooled.getShape(), new Shape(2, 3, 2));
+            Assert.assertEquals(pooled.getDataType(), DataType.FLOAT32);
+            assertClose(
+                    pooled.toFloatArray(),
+                    new float[] {
+                        4f, 5f, 0f, 0f, 0f, 0f,
+                        3f, 4f, 10.523188f, 11.523188f, 0f, 0f
+                    },
+                    tolerance);
         }
     }
 
