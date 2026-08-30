@@ -520,3 +520,25 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCudaEmptyCach
   djl_pytorch::accel::EmptyCache();
   API_END()
 }
+
+JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetMemoryStats(
+    JNIEnv* env, jobject jthis, jint jdevice_id) {
+  API_BEGIN()
+  const auto stats =
+      djl_pytorch::accel::GetMemoryStats(static_cast<c10::DeviceIndex>(jdevice_id));
+  const jlong values[] = {static_cast<jlong>(stats.allocated_bytes),
+      static_cast<jlong>(stats.peak_allocated_bytes), static_cast<jlong>(stats.reserved_bytes),
+      static_cast<jlong>(stats.peak_reserved_bytes), static_cast<jlong>(stats.active_bytes),
+      static_cast<jlong>(stats.peak_active_bytes)};
+  jlongArray result = env->NewLongArray(6);
+  env->SetLongArrayRegion(result, 0, 6, values);
+  return result;
+  API_END_RETURN()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchResetPeakMemoryStats(
+    JNIEnv* env, jobject jthis, jint jdevice_id) {
+  API_BEGIN()
+  djl_pytorch::accel::ResetPeakMemoryStats(static_cast<c10::DeviceIndex>(jdevice_id));
+  API_END()
+}

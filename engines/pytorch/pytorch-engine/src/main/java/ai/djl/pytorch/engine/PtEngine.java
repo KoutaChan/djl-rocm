@@ -148,6 +148,39 @@ public final class PtEngine extends Engine {
         return JniUtils.getGpuCount();
     }
 
+    /**
+     * Returns PyTorch caching allocator memory statistics for a GPU device.
+     *
+     * <p>The returned values describe memory managed by the PyTorch allocator, not total process or
+     * device memory.
+     *
+     * @param device the GPU device
+     * @return an immutable snapshot of allocator memory statistics
+     * @throws IllegalArgumentException if the device is not a GPU device
+     */
+    public PtMemoryStats getMemoryStats(Device device) {
+        if (!device.isGpu()) {
+            throw new IllegalArgumentException("Memory statistics require a GPU device.");
+        }
+        return new PtMemoryStats(JniUtils.getMemoryStats(device.getDeviceId()));
+    }
+
+    /**
+     * Resets PyTorch caching allocator peak memory statistics for a GPU device.
+     *
+     * <p>Each peak is reset to the corresponding current value. This method does not synchronize
+     * the device or release cached memory.
+     *
+     * @param device the GPU device
+     * @throws IllegalArgumentException if the device is not a GPU device
+     */
+    public void resetPeakMemoryStats(Device device) {
+        if (!device.isGpu()) {
+            throw new IllegalArgumentException("Memory statistics require a GPU device.");
+        }
+        JniUtils.resetPeakMemoryStats(device.getDeviceId());
+    }
+
     /** {@inheritDoc} */
     @Override
     public SymbolBlock newSymbolBlock(NDManager manager) {

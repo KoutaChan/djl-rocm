@@ -27,6 +27,15 @@ struct HostBuffer;
 struct AcceleratorGraph;
 struct StreamScope;
 
+struct DeviceMemoryStats {
+  int64_t allocated_bytes;
+  int64_t peak_allocated_bytes;
+  int64_t reserved_bytes;
+  int64_t peak_reserved_bytes;
+  int64_t active_bytes;
+  int64_t peak_active_bytes;
+};
+
 bool IsAvailable();
 
 HostBuffer* AllocateHostBuffer(int64_t size, torch::ScalarType dtype);
@@ -65,6 +74,8 @@ void EndAcceleratorGraphCapture(AcceleratorGraph* graph);
 void ReplayAcceleratorGraph(AcceleratorGraph* graph);
 void DeleteAcceleratorGraph(AcceleratorGraph* graph);
 
+DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device);
+void ResetPeakMemoryStats(c10::DeviceIndex device);
 void EmptyCache();
 
 }  // namespace accel

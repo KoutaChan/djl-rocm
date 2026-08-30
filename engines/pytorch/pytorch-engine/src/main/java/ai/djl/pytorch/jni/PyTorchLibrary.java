@@ -117,6 +117,10 @@ final class PyTorchLibrary {
 
     native int torchGetGpuCount();
 
+    native long[] torchGetMemoryStats(int deviceId);
+
+    native void torchResetPeakMemoryStats(int deviceId);
+
     native void torchStartProfile(boolean useCuda, boolean recordShape, boolean profileMemory);
 
     native void torchStopProfile(String outputFile);

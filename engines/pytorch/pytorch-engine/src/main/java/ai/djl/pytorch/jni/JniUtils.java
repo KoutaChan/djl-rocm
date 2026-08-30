@@ -319,6 +319,14 @@ public final class JniUtils {
         return PyTorchLibrary.LIB.torchGetGpuCount();
     }
 
+    public static long[] getMemoryStats(int deviceId) {
+        return PyTorchLibrary.LIB.torchGetMemoryStats(deviceId);
+    }
+
+    public static void resetPeakMemoryStats(int deviceId) {
+        PyTorchLibrary.LIB.torchResetPeakMemoryStats(deviceId);
+    }
+
     public static void setSeed(long seed) {
         PyTorchLibrary.LIB.torchManualSeed(seed);
     }

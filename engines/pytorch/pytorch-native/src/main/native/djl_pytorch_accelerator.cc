@@ -18,14 +18,15 @@
 #include <ATen/cuda/CUDAGraph.h>
 #endif
 
+#include <ATen/Context.h>
 #if __has_include(<ATen/DeviceAccelerator.h>)
 #include <ATen/DeviceAccelerator.h>
 #define DJL_HAS_DEVICE_ACCELERATOR 1
 #else
-#include <ATen/Context.h>
 #define DJL_HAS_DEVICE_ACCELERATOR 0
 #endif
 
+#include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
@@ -140,6 +141,15 @@ bool IsAvailable() {
   return torch::cuda::is_available();
 #endif
 }
+
+namespace {
+
+void InitializeAccelerator() {
+  TORCH_CHECK(IsAvailable(), "accelerator is unavailable");
+  at::globalContext().lazyInitDevice(GetAcceleratorType().value());
+}
+
+}  // namespace
 
 bool IsAcceleratorDevice(c10::Device device) {
 #if DJL_HAS_DEVICE_ACCELERATOR
@@ -447,6 +457,34 @@ void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
   }
 #else
   delete graph;
+#endif
+}
+
+DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
+  InitializeAccelerator();
+  c10::CachingDeviceAllocator::DeviceStats stats;
+#if defined(USE_ROCM)
+  stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+#elif DJL_HAS_DEVICE_ACCELERATOR
+  stats = at::accelerator::getDeviceStats(device);
+#else
+  stats = at::getDeviceAllocator(c10::DeviceType::CUDA)->getDeviceStats(device);
+#endif
+  constexpr auto aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+  const auto& allocated = stats.allocated_bytes[aggregate];
+  const auto& reserved = stats.reserved_bytes[aggregate];
+  const auto& active = stats.active_bytes[aggregate];
+  return {allocated.current, allocated.peak, reserved.current, reserved.peak, active.current, active.peak};
+}
+
+void ResetPeakMemoryStats(c10::DeviceIndex device) {
+  InitializeAccelerator();
+#if defined(USE_ROCM)
+  c10::cuda::CUDACachingAllocator::resetPeakStats(device);
+#elif DJL_HAS_DEVICE_ACCELERATOR
+  at::accelerator::resetPeakStats(device);
+#else
+  at::getDeviceAllocator(c10::DeviceType::CUDA)->resetPeakStats(device);
 #endif
 }
 
