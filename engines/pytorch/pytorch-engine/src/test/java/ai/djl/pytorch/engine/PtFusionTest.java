@@ -839,19 +839,25 @@ public class PtFusionTest {
                 try (FusionInvocation invocation = session.acquire()) {
                     fixture.setInputs(invocation, indices, state, branch, 2, 6, 3);
                     try (FusionOutputLease lease = invocation.submit()) {
-                        float[] actual = lease.get(fixture.output).toFloatArray();
-                        float[] expected = indexedAffineReference();
-                        for (int index = 0; index < expected.length; ++index) {
-                            Assert.assertEquals(actual[index], expected[index], tolerance);
+                        try (NDArray floatOutput =
+                                lease.get(fixture.output).toType(DataType.FLOAT32, true)) {
+                            float[] actual = floatOutput.toFloatArray();
+                            float[] expected = indexedAffineReference();
+                            for (int index = 0; index < expected.length; ++index) {
+                                Assert.assertEquals(actual[index], expected[index], tolerance);
+                            }
                         }
                     }
                 }
                 try (FusionInvocation invocation = session.acquire()) {
                     fixture.setInputs(invocation, indices, state, branch, 2, 6, 0);
                     try (FusionOutputLease lease = invocation.submit()) {
-                        float[] actual = lease.get(fixture.output).toFloatArray();
-                        for (int index = 0; index < 6; ++index) {
-                            Assert.assertEquals(actual[index], 0f);
+                        try (NDArray floatOutput =
+                                lease.get(fixture.output).toType(DataType.FLOAT32, true)) {
+                            float[] actual = floatOutput.toFloatArray();
+                            for (int index = 0; index < 6; ++index) {
+                                Assert.assertEquals(actual[index], 0f);
+                            }
                         }
                     }
                 }
@@ -934,11 +940,7 @@ public class PtFusionTest {
                                 new float[] {1f, 0f, 0f, 1f},
                                 new Shape(2, 2));
                 NDArray secondWeight =
-                        typed(
-                                constants,
-                                DataType.FLOAT16,
-                                new float[] {2f, -1f},
-                                new Shape(2, 1));
+                        typed(constants, DataType.FLOAT16, new float[] {2f, -1f}, new Shape(2, 1));
                 NDArray fixed = constants.create(new float[] {10f, -4f}, new Shape(1, 2, 1));
                 NDArray fixedWeight =
                         typed(
