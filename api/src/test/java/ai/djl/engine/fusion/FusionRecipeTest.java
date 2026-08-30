@@ -148,6 +148,41 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void affineSumUsesWeightDataTypeForMixedSources() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("mixed-affine-sum");
+        FusionRecipe.Dimension rows = builder.addDimension("rows", 16);
+        FusionRecipe.Input single =
+                builder.addInput(
+                        "single", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 2, 3));
+        FusionRecipe.Input half =
+                builder.addInput("half", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 2, 1));
+        FusionRecipe.Constant singleWeight =
+                builder.addConstant(
+                        "singleWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 4, 3));
+        FusionRecipe.Constant halfWeight =
+                builder.addConstant(
+                        "halfWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 4, 1));
+        FusionRecipe.Constant bias =
+                builder.addConstant("bias", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 4));
+
+        FusionRecipe.AffineSum affine =
+                builder.affineSum("hidden", 4)
+                        .addTerm(single, singleWeight)
+                        .addTerm(half, halfWeight)
+                        .optBias(bias)
+                        .build();
+        builder.addOutput("output", affine);
+        builder.build();
+
+        Assert.assertEquals(affine.getSpec().getDataType(), DataType.BFLOAT16);
+        Assert.assertEquals(affine.getSpec().getInnerShape(), new long[] {2, 4});
+        Assert.assertEquals(
+                affine.getTerms().get(0).getInput().getSpec().getDataType(), DataType.FLOAT32);
+        Assert.assertEquals(
+                affine.getTerms().get(1).getInput().getSpec().getDataType(), DataType.FLOAT16);
+    }
+
+    @Test
     public void affineSumRejectsInvalidTerms() {
         FusionRecipe.Builder empty = FusionRecipe.builder("empty-affine");
         Assert.assertThrows(
@@ -178,15 +213,38 @@ public class FusionRecipeTest {
 
         FusionRecipe.Builder badWeight = FusionRecipe.builder("bad-weight-affine");
         FusionRecipe.Dimension samples = badWeight.addDimension("samples", 8);
-        FusionRecipe.Input input =
+        FusionRecipe.Input first =
                 badWeight.addInput(
-                        "input", FusionRecipe.TensorSpec.of(DataType.FLOAT16, samples, 3));
-        FusionRecipe.Constant weight =
+                        "first", FusionRecipe.TensorSpec.of(DataType.FLOAT32, samples, 3));
+        FusionRecipe.Input second =
+                badWeight.addInput(
+                        "second", FusionRecipe.TensorSpec.of(DataType.FLOAT16, samples, 2));
+        FusionRecipe.Constant firstWeight =
                 badWeight.addConstant(
-                        "weight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 5, 3));
+                        "firstWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 5, 3));
+        FusionRecipe.Constant secondWeight =
+                badWeight.addConstant(
+                        "secondWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 2));
         Assert.assertThrows(
                 IllegalArgumentException.class,
-                () -> badWeight.affineSum("hidden", 5).addTerm(input, weight).build());
+                () ->
+                        badWeight
+                                .affineSum("hidden", 5)
+                                .addTerm(first, firstWeight)
+                                .addTerm(second, secondWeight)
+                                .build());
+
+        FusionRecipe.Builder badSource = FusionRecipe.builder("bad-source-affine");
+        FusionRecipe.Dimension badSourceRows = badSource.addDimension("rows", 8);
+        FusionRecipe.Input integral =
+                badSource.addInput(
+                        "integral", FusionRecipe.TensorSpec.of(DataType.INT32, badSourceRows, 3));
+        FusionRecipe.Constant projection =
+                badSource.addConstant(
+                        "projection", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 3));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> badSource.affineSum("hidden", 5).addTerm(integral, projection).build());
     }
 
     @Test

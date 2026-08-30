@@ -17,10 +17,11 @@
  * <p>A recipe declares a closed set of inference stages rather than an arbitrary operator graph.
  * {@link ai.djl.engine.fusion.FusionRecipe.AffineSum AffineSum} projects and sums dynamic values,
  * fixed singleton-leading values, and an optional bias before applying a supported activation. A
- * fixed value shaped {@code [1, ..., featureWidth]} broadcasts over the active leading extent;
- * backends may project constant fixed values once when constants are bound. {@link
- * ai.djl.engine.fusion.FusionRecipe.OutputPack OutputPack} writes several score values into one
- * persistent FLOAT32 output.
+ * fixed value shaped {@code [1, ..., featureWidth]} broadcasts over the active leading extent; each
+ * source may independently use FLOAT16, BFLOAT16, or FLOAT32 while weights select the common
+ * projection and output data type. Backends may convert and project constant fixed values once when
+ * constants are bound. {@link ai.djl.engine.fusion.FusionRecipe.OutputPack OutputPack} writes
+ * several score values into one persistent FLOAT32 output.
  *
  * <p>The lifecycle is {@code recipe -> plan -> executable -> session -> invocation -> output
  * lease}. Preparation validates shapes and builds a bounded command plan. Binding retains caller

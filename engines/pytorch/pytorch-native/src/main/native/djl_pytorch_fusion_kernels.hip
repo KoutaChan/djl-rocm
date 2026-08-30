@@ -51,6 +51,7 @@ struct AffineInputPackArguments {
   const void* sources[kMaximumAffineTerms];
   int64_t widths[kMaximumAffineTerms];
   int64_t destination_offsets[kMaximumAffineTerms];
+  int32_t data_types[kMaximumAffineTerms];
   void* output;
   int64_t row_count;
   int64_t output_width;
@@ -104,11 +105,11 @@ __global__ void output_pack_kernel(OutputPackArguments arguments) {
   }
 }
 
-template <typename scalar_t>
-__global__ void affine_input_pack_kernel(AffineInputPackArguments arguments) {
-  const int32_t source_index = static_cast<int32_t>(blockIdx.y);
-  const auto* source = static_cast<const scalar_t*>(arguments.sources[source_index]);
-  auto* output = static_cast<scalar_t*>(arguments.output);
+template <typename output_t, typename input_t>
+__device__ void pack_affine_source(
+    const AffineInputPackArguments& arguments, int32_t source_index) {
+  const auto* source = static_cast<const input_t*>(arguments.sources[source_index]);
+  auto* output = static_cast<output_t*>(arguments.output);
   const int64_t width = arguments.widths[source_index];
   const int64_t element_count = arguments.row_count * width;
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -117,7 +118,26 @@ __global__ void affine_input_pack_kernel(AffineInputPackArguments arguments) {
     const int64_t row = index / width;
     const int64_t column = index - row * width;
     output[row * arguments.output_width +
-        arguments.destination_offsets[source_index] + column] = source[index];
+        arguments.destination_offsets[source_index] + column] =
+        static_cast<output_t>(static_cast<float>(source[index]));
+  }
+}
+
+template <typename output_t>
+__global__ void affine_input_pack_kernel(AffineInputPackArguments arguments) {
+  const int32_t source_index = static_cast<int32_t>(blockIdx.y);
+  switch (static_cast<torch::ScalarType>(arguments.data_types[source_index])) {
+    case torch::kFloat16:
+      pack_affine_source<output_t, c10::Half>(arguments, source_index);
+      break;
+    case torch::kBFloat16:
+      pack_affine_source<output_t, c10::BFloat16>(arguments, source_index);
+      break;
+    case torch::kFloat32:
+      pack_affine_source<output_t, float>(arguments, source_index);
+      break;
+    default:
+      break;
   }
 }
 
@@ -210,6 +230,7 @@ void LaunchAffineInputPack(const AffineInputPackSource* sources,
     arguments.sources[source_index] = source.data;
     arguments.widths[source_index] = source.width;
     arguments.destination_offsets[source_index] = source.destination_offset;
+    arguments.data_types[source_index] = static_cast<int32_t>(source.data_type);
     maximum_width = std::max(maximum_width, source.width);
   }
 

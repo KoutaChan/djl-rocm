@@ -36,6 +36,7 @@ void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
 
 struct AffineInputPackSource {
   const void* data;
+  torch::ScalarType data_type;
   int64_t width;
   int64_t destination_offset;
 };

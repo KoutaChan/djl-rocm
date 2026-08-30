@@ -257,7 +257,7 @@ final class PtFusionDescriptor {
                     continue;
                 }
                 long rowCount = affineRows(affineSum, group);
-                if (group.termCount > 1) {
+                if (group.requiresInputPack) {
                     bytes =
                             Math.addExact(
                                     bytes,
@@ -295,6 +295,10 @@ final class PtFusionDescriptor {
             if (group == null) {
                 group = new AffineGroup(prefix, dynamicLeading, precomputeAtBind);
                 groups.add(group);
+            }
+            if (group.termCount != 0
+                    || inputSpec.getDataType() != affineSum.getSpec().getDataType()) {
+                group.requiresInputPack = true;
             }
             group.inputWidth = Math.addExact(group.inputWidth, inputInner[inputInner.length - 1]);
             ++group.termCount;
@@ -467,6 +471,7 @@ final class PtFusionDescriptor {
         private final boolean precomputeAtBind;
         private long inputWidth;
         private int termCount;
+        private boolean requiresInputPack;
 
         private AffineGroup(long[] prefix, boolean dynamicLeading, boolean precomputeAtBind) {
             this.prefix = prefix;

@@ -124,6 +124,7 @@ struct AffineTermSpec {
   int32_t input_value_index;
   int32_t weight_value_index;
   int32_t weight_binding_index;
+  torch::ScalarType input_data_type;
   int64_t input_width;
 };
 
@@ -135,6 +136,7 @@ struct AffineGroupSpec {
   int64_t packed_input_width = 0;
   int32_t packed_input_storage_index = -1;
   int32_t product_storage_index = -1;
+  bool requires_input_pack = false;
   std::array<int64_t, kMaximumAffinePrefixRank> output_strides{};
   std::vector<AffineTermSpec> terms;
 };
@@ -269,7 +271,7 @@ torch::ScalarType ScalarTypeFromWireCode(int64_t code) {
   }
 }
 
-bool IsOutputPackDataType(torch::ScalarType data_type) {
+bool IsFusionFloatingDataType(torch::ScalarType data_type) {
   return data_type == torch::kFloat16 || data_type == torch::kBFloat16 ||
       data_type == torch::kFloat32;
 }
@@ -404,7 +406,7 @@ OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
     const ValueSpec& operand = plan.values[operand_index];
     TORCH_CHECK(operand.kind != ValueKind::kUnbound,
         "fusion command operand is not topologically available");
-    TORCH_CHECK(IsOutputPackDataType(operand.data_type),
+    TORCH_CHECK(IsFusionFloatingDataType(operand.data_type),
         "OUTPUT_PACK_V1 supports FLOAT16, BFLOAT16, and FLOAT32 operands");
     TORCH_CHECK(operand.dimension_index == command.extent_index &&
             operand.inner_shape.size() == 1,
@@ -521,7 +523,7 @@ AffineSumCommandSpec BuildAffineSumCommand(FusionPlanData& plan,
   ValueSpec& result = plan.values[result_index];
   TORCH_CHECK(result.kind == ValueKind::kUnbound,
       "fusion command result already has a producer or binding");
-  TORCH_CHECK(IsOutputPackDataType(result.data_type),
+  TORCH_CHECK(IsFusionFloatingDataType(result.data_type),
       "AFFINE_SUM_V1 supports FLOAT16, BFLOAT16, and FLOAT32");
   TORCH_CHECK(result.dimension_index >= 0 && !result.inner_shape.empty(),
       "AFFINE_SUM_V1 result requires a leading dimension and feature axis");
@@ -557,7 +559,7 @@ AffineSumCommandSpec BuildAffineSumCommand(FusionPlanData& plan,
     has_dynamic_input = has_dynamic_input || dynamic_leading;
     const bool fixed_leading = input.dimension_index < 0 &&
         input.inner_shape.size() >= 2 && input.inner_shape[0] == 1;
-    TORCH_CHECK(input.data_type == result.data_type &&
+    TORCH_CHECK(IsFusionFloatingDataType(input.data_type) &&
             (dynamic_leading || fixed_leading) && !input.inner_shape.empty(),
         "AFFINE_SUM_V1 input metadata does not match the result");
     TORCH_CHECK(weight.kind == ValueKind::kConstant &&
@@ -589,8 +591,11 @@ AffineSumCommandSpec BuildAffineSumCommand(FusionPlanData& plan,
     TORCH_CHECK(input_width <= std::numeric_limits<int64_t>::max() -
             group->packed_input_width,
         "AFFINE_SUM_V1 packed input width exceeds the supported range");
-    group->terms.push_back(AffineTermSpec{
-        input_index, weight_index, weight.binding_index, input_width});
+    if (!group->terms.empty() || input.data_type != result.data_type) {
+      group->requires_input_pack = true;
+    }
+    group->terms.push_back(AffineTermSpec{input_index, weight_index,
+        weight.binding_index, input.data_type, input_width});
     group->packed_input_width += input_width;
   }
   TORCH_CHECK(has_dynamic_input,
@@ -626,7 +631,7 @@ AffineSumCommandSpec BuildAffineSumCommand(FusionPlanData& plan,
       group_shape.push_back(group.dynamic_leading ? command.maximum_batches : 1);
       group_shape.insert(
           group_shape.end(), group.prefix_shape.begin(), group.prefix_shape.end());
-      if (group.terms.size() > 1) {
+      if (group.requires_input_pack) {
         std::vector<int64_t> packed_shape = group_shape;
         packed_shape.push_back(group.packed_input_width);
         TensorPayloadBytes(packed_shape, result.data_type,
@@ -1217,7 +1222,9 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
     }
     const int64_t matrix_batch_count = group.dynamic_leading ? batch_count : 1;
     const torch::Tensor* group_input;
-    if (group.terms.size() == 1) {
+    if (!group.requires_input_pack) {
+      TORCH_CHECK(group.terms.size() == 1,
+          "AFFINE_SUM_V1 unpacked group must contain exactly one term");
       group_input = &ResolveValue(session, buffer_index, input_handles,
           group.terms[0].input_value_index);
       RecordCurrentStream(*group_input);
@@ -1230,8 +1237,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
         const auto& term = group.terms[term_index];
         const torch::Tensor& input = ResolveValue(
             session, buffer_index, input_handles, term.input_value_index);
-        pack_sources[term_index] = AffineInputPackSource{
-            input.data_ptr(), term.input_width, destination_offset};
+        pack_sources[term_index] = AffineInputPackSource{input.data_ptr(),
+            term.input_data_type, term.input_width, destination_offset};
         destination_offset += term.input_width;
         RecordCurrentStream(input);
       }
@@ -1328,6 +1335,8 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
     auto& product_groups = data->affine_products[command_index];
     packed_groups.resize(command->groups.size());
     product_groups.resize(command->groups.size());
+    const torch::ScalarType projection_data_type =
+        plan->data->values[command->result_value_index].data_type;
     for (std::size_t group_index = 0;
          group_index < command->groups.size(); ++group_index) {
       const auto& group = command->groups[group_index];
@@ -1355,7 +1364,11 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
             "AFFINE_SUM_V1 precomputed input must be constant");
         const torch::Tensor& input = data->constants[input_spec.binding_index];
         RecordCurrentStream(input);
-        constant_inputs.push_back(input);
+        torch::Tensor converted_input = input.scalar_type() == projection_data_type
+            ? input
+            : input.to(projection_data_type);
+        RecordCurrentStream(converted_input);
+        constant_inputs.push_back(std::move(converted_input));
       }
       torch::Tensor packed_input = constant_inputs.size() == 1
           ? constant_inputs[0]

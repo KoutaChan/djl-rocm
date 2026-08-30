@@ -391,9 +391,12 @@ public final class FusionRecipe {
      * use a singleton first axis, which is broadcast over the active leading extent. Including that
      * singleton axis, each fixed input has the same rank as the output. Dimensions between the
      * leading dimension and feature width follow standard fixed-shape broadcasting rules; no input
-     * is expanded in the recipe. Inputs, weights, bias, and output use one floating-point data
-     * type. The numerical contract permits rounding to that data type at backend GEMM or
-     * projection-group boundaries before the projected values are added.
+     * is expanded in the recipe. Source values may independently use FLOAT16, BFLOAT16, or FLOAT32.
+     * All weights and the optional bias use one projection data type, inferred from the weights,
+     * and the output uses that projection data type. A backend converts each source to the
+     * projection data type before GEMM. The numerical contract permits rounding to that data type
+     * at source-conversion, backend GEMM, or projection-group boundaries before the projected
+     * values are added.
      */
     public static final class AffineSum extends Value {
 
@@ -780,9 +783,11 @@ public final class FusionRecipe {
         /**
          * Adds a projected value to the sum.
          *
-         * @param input a dynamic value, or a fixed value whose singleton first axis is included in
-         *     the output rank, whose last axis is the input feature width
-         * @param weight a fixed {@code [outputWidth, inputWidth]} constant
+         * @param input a FLOAT16, BFLOAT16, or FLOAT32 dynamic value, or a fixed value whose
+         *     singleton first axis is included in the output rank, whose last axis is the input
+         *     feature width
+         * @param weight a fixed {@code [outputWidth, inputWidth]} constant whose data type selects
+         *     the common projection data type
          * @return this builder
          */
         public AffineSumBuilder addTerm(Value input, Constant weight) {
@@ -830,7 +835,7 @@ public final class FusionRecipe {
                 throw new IllegalStateException("An affine sum requires at least one term.");
             }
 
-            DataType dataType = null;
+            DataType projectionDataType = null;
             Dimension leadingDimension = null;
             long[] outputPrefix = new long[0];
             for (AffineTerm term : terms) {
@@ -847,13 +852,7 @@ public final class FusionRecipe {
                 }
                 if (!Builder.isAffineDataType(inputSpec.dataType)) {
                     throw new IllegalArgumentException(
-                            "Affine sums only support FLOAT16, BFLOAT16, and FLOAT32.");
-                }
-                if (dataType == null) {
-                    dataType = inputSpec.dataType;
-                } else if (dataType != inputSpec.dataType) {
-                    throw new IllegalArgumentException(
-                            "Affine inputs and constants must use one data type.");
+                            "Affine sources only support FLOAT16, BFLOAT16, and FLOAT32.");
                 }
                 if (dynamicLeading) {
                     if (leadingDimension == null) {
@@ -867,12 +866,21 @@ public final class FusionRecipe {
                     throw new IllegalArgumentException(
                             "Affine weights must have a fixed two-dimensional shape.");
                 }
-                if (weightSpec.dataType != dataType
-                        || weightSpec.innerShape[0] != outputWidth
+                if (!Builder.isAffineDataType(weightSpec.dataType)) {
+                    throw new IllegalArgumentException(
+                            "Affine weights only support FLOAT16, BFLOAT16, and FLOAT32.");
+                }
+                if (projectionDataType == null) {
+                    projectionDataType = weightSpec.dataType;
+                } else if (projectionDataType != weightSpec.dataType) {
+                    throw new IllegalArgumentException(
+                            "Affine weights must use one projection data type.");
+                }
+                if (weightSpec.innerShape[0] != outputWidth
                         || weightSpec.innerShape[1]
                                 != inputSpec.innerShape[inputSpec.innerShape.length - 1]) {
                     throw new IllegalArgumentException(
-                            "Affine weight shape or data type does not match its term.");
+                            "Affine weight shape does not match its term.");
                 }
                 outputPrefix =
                         broadcastShape(
@@ -897,7 +905,7 @@ public final class FusionRecipe {
             if (bias != null) {
                 TensorSpec biasSpec = bias.getSpec();
                 if (biasSpec.leadingDimension != null
-                        || biasSpec.dataType != dataType
+                        || biasSpec.dataType != projectionDataType
                         || biasSpec.innerShape.length != 1
                         || biasSpec.innerShape[0] != outputWidth) {
                     throw new IllegalArgumentException(
@@ -915,7 +923,7 @@ public final class FusionRecipe {
                             recipeBuilder.owner,
                             recipeBuilder.values.size(),
                             checkedName,
-                            TensorSpec.of(dataType, leadingDimension, outputInnerShape),
+                            TensorSpec.of(projectionDataType, leadingDimension, outputInnerShape),
                             terms,
                             bias,
                             activation);

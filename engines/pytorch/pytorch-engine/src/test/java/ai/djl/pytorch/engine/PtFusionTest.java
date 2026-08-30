@@ -205,6 +205,11 @@ public class PtFusionTest {
         Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(direct.recipe), 96L);
         Assert.assertEquals(PtFusionDescriptor.workspaceBytes(direct.recipe), 0L);
 
+        MixedDirectAffineFixture mixedDirect = new MixedDirectAffineFixture(DataType.FLOAT16);
+        Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(mixedDirect.recipe), 12L);
+        Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(mixedDirect.recipe), 80L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(mixedDirect.recipe), 32L);
+
         FixedRuntimeAffineFixture fixedRuntime = new FixedRuntimeAffineFixture();
         Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(fixedRuntime.recipe), 16L);
         Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(fixedRuntime.recipe), 40L);
@@ -472,6 +477,120 @@ public class PtFusionTest {
     }
 
     @Test
+    public void rocmAffineSumConvertsSingleDynamicSourceToProjectionDataType() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        for (DataType projectionDataType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+            MixedDirectAffineFixture fixture = new MixedDirectAffineFixture(projectionDataType);
+            Device device = Device.gpu(0);
+            try (NDManager manager = engine.newBaseManager(device);
+                    NDArray input =
+                            manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(1, 2, 2));
+                    NDArray weight =
+                            typed(
+                                    manager,
+                                    projectionDataType,
+                                    new float[] {1f, 0f, 0f, 1f, 1f, 1f},
+                                    new Shape(3, 2));
+                    FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                    FusionExecutable executable =
+                            plan.bind(
+                                    FusionConstantBindings.builder(fixture.recipe)
+                                            .bind(fixture.weight, weight)
+                                            .build());
+                    FusionSession session =
+                            executable.newSession(manager, FusionSessionConfig.defaults());
+                    FusionInvocation invocation = session.acquire()) {
+                invocation.setInput(fixture.input, input);
+                invocation.setDimension(fixture.rows, 1);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    lease.synchronize();
+                    try (NDArray floatOutput =
+                            lease.get(fixture.output).toType(DataType.FLOAT32, false)) {
+                        float[] actual = floatOutput.toFloatArray();
+                        float[] expected = {1f, 2f, 3f, 3f, 4f, 7f};
+                        for (int index = 0; index < expected.length; ++index) {
+                            Assert.assertEquals(actual[index], expected[index], 2e-2f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void rocmAffineSumConvertsMixedSourcesAndFixedPrecomputeInputs() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        for (DataType projectionDataType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+            MixedSourceAffineFixture fixture = new MixedSourceAffineFixture(projectionDataType);
+            Device device = Device.gpu(0);
+            try (NDManager manager = engine.newBaseManager(device);
+                    NDArray first =
+                            manager.create(
+                                    new float[] {1f, 2f, 3f, 4f, -1f, 2f, 0.5f, -2f},
+                                    new Shape(2, 2, 2));
+                    NDArray second =
+                            typed(
+                                    manager,
+                                    DataType.FLOAT16,
+                                    new float[] {0.5f, -1f, 2f, 1.5f},
+                                    new Shape(2, 2, 1));
+                    NDArray fixed = manager.create(new float[] {10f, -4f}, new Shape(1, 2, 1));
+                    NDArray firstWeight =
+                            typed(
+                                    manager,
+                                    projectionDataType,
+                                    new float[] {1f, 0f, 0f, 1f},
+                                    new Shape(2, 2));
+                    NDArray secondWeight =
+                            typed(
+                                    manager,
+                                    projectionDataType,
+                                    new float[] {2f, -1f},
+                                    new Shape(2, 1));
+                    NDArray fixedWeight =
+                            typed(
+                                    manager,
+                                    projectionDataType,
+                                    new float[] {0.5f, 1.5f},
+                                    new Shape(2, 1));
+                    NDArray bias =
+                            typed(
+                                    manager,
+                                    projectionDataType,
+                                    new float[] {0.25f, -0.5f},
+                                    new Shape(2));
+                    FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                    FusionExecutable executable =
+                            plan.bind(
+                                    fixture.bindings(
+                                            firstWeight, secondWeight, fixed, fixedWeight, bias));
+                    FusionSession session =
+                            executable.newSession(manager, FusionSessionConfig.defaults());
+                    FusionInvocation invocation = session.acquire()) {
+                fixture.setInputs(invocation, first, second, 2);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    lease.synchronize();
+                    try (NDArray floatOutput =
+                            lease.get(fixture.output).toType(DataType.FLOAT32, false)) {
+                        float[] actual = floatOutput.toFloatArray();
+                        float[] expected = {7.25f, 16f, -0.75f, -1.5f, 8.25f, 14.5f, 1.75f, -10f};
+                        float tolerance = projectionDataType == DataType.FLOAT16 ? 2e-2f : 8e-2f;
+                        for (int index = 0; index < expected.length; ++index) {
+                            Assert.assertEquals(actual[index], expected[index], tolerance);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     public void rocmAffineSumUsesDirectOutputForOneUnbiasedTerm() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -621,6 +740,82 @@ public class PtFusionTest {
                     float[] actual = lease.get(fixture.output).toFloatArray();
                     for (int index = 0; index < 6; ++index) {
                         Assert.assertEquals(actual[index], expected, 1e-5f);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void rocmMixedAffineBindKeepsFixedSourceAliveAcrossStreams() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        MixedSourceAffineFixture fixture = new MixedSourceAffineFixture(DataType.FLOAT16);
+        Device device = Device.gpu(0);
+        try (PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                NDArray blocker = manager.ones(new Shape(2048, 2048), DataType.FLOAT32);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                PtStream bindingStream = engine.newStream(device);
+                PtEvent inputsReady = bindingStream.newEvent();
+                PtEvent bindingComplete = bindingStream.newEvent()) {
+            FusionExecutable executable;
+            try (PtNDManager constants = (PtNDManager) engine.newBaseManager(device)) {
+                NDArray firstWeight =
+                        typed(
+                                constants,
+                                DataType.FLOAT16,
+                                new float[] {1f, 0f, 0f, 1f},
+                                new Shape(2, 2));
+                NDArray secondWeight =
+                        typed(
+                                constants,
+                                DataType.FLOAT16,
+                                new float[] {2f, -1f},
+                                new Shape(2, 1));
+                NDArray fixed = constants.create(new float[] {10f, -4f}, new Shape(1, 2, 1));
+                NDArray fixedWeight =
+                        typed(
+                                constants,
+                                DataType.FLOAT16,
+                                new float[] {0.5f, 1.5f},
+                                new Shape(2, 1));
+                NDArray bias =
+                        typed(
+                                constants,
+                                DataType.FLOAT16,
+                                new float[] {0.25f, -0.5f},
+                                new Shape(2));
+                inputsReady.record();
+                try (PtStreamScope ignored = bindingStream.openScope()) {
+                    inputsReady.waitOnStream();
+                    for (int iteration = 0; iteration < 32; ++iteration) {
+                        try (NDArray ignoredProduct = blocker.matMul(blocker)) {
+                            // Keep the bind work queued while its caller-owned constants close.
+                        }
+                    }
+                    executable =
+                            plan.bind(
+                                    fixture.bindings(
+                                            firstWeight, secondWeight, fixed, fixedWeight, bias));
+                    bindingComplete.record();
+                }
+            }
+            executable.close();
+
+            NDArray[] churn = new NDArray[64];
+            try {
+                for (int index = 0; index < churn.length; ++index) {
+                    churn[index] = manager.zeros(new Shape(1, 2, 1), DataType.FLOAT32);
+                }
+                bindingComplete.synchronize();
+                Assert.assertTrue(bindingComplete.isComplete());
+            } finally {
+                for (NDArray array : churn) {
+                    if (array != null) {
+                        array.close();
                     }
                 }
             }
@@ -1241,6 +1436,102 @@ public class PtFusionTest {
                     builder.affineSum("affine", 3).addTerm(input, weight).build();
             output = builder.addOutput("output", value);
             recipe = builder.build();
+        }
+    }
+
+    private static final class MixedDirectAffineFixture {
+
+        private final FusionRecipe.Dimension rows;
+        private final FusionRecipe.Input input;
+        private final FusionRecipe.Constant weight;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private MixedDirectAffineFixture(DataType projectionDataType) {
+            FusionRecipe.Builder builder = FusionRecipe.builder("mixed-direct-affine-test");
+            rows = builder.addDimension("rows", 4);
+            input =
+                    builder.addInput(
+                            "input", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 2, 2));
+            weight =
+                    builder.addConstant(
+                            "weight", FusionRecipe.TensorSpec.fixed(projectionDataType, 3, 2));
+            FusionRecipe.AffineSum value =
+                    builder.affineSum("affine", 3).addTerm(input, weight).build();
+            output = builder.addOutput("output", value);
+            recipe = builder.build();
+        }
+    }
+
+    private static final class MixedSourceAffineFixture {
+
+        private final FusionRecipe.Dimension rows;
+        private final FusionRecipe.Input first;
+        private final FusionRecipe.Input second;
+        private final FusionRecipe.Constant firstWeight;
+        private final FusionRecipe.Constant secondWeight;
+        private final FusionRecipe.Constant fixed;
+        private final FusionRecipe.Constant fixedWeight;
+        private final FusionRecipe.Constant bias;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private MixedSourceAffineFixture(DataType projectionDataType) {
+            FusionRecipe.Builder builder = FusionRecipe.builder("mixed-source-affine-test");
+            rows = builder.addDimension("rows", 4);
+            first =
+                    builder.addInput(
+                            "first", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 2, 2));
+            second =
+                    builder.addInput(
+                            "second", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 2, 1));
+            firstWeight =
+                    builder.addConstant(
+                            "firstWeight", FusionRecipe.TensorSpec.fixed(projectionDataType, 2, 2));
+            secondWeight =
+                    builder.addConstant(
+                            "secondWeight",
+                            FusionRecipe.TensorSpec.fixed(projectionDataType, 2, 1));
+            fixed =
+                    builder.addConstant(
+                            "fixed", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 1, 2, 1));
+            fixedWeight =
+                    builder.addConstant(
+                            "fixedWeight", FusionRecipe.TensorSpec.fixed(projectionDataType, 2, 1));
+            bias =
+                    builder.addConstant(
+                            "bias", FusionRecipe.TensorSpec.fixed(projectionDataType, 2));
+            FusionRecipe.AffineSum value =
+                    builder.affineSum("affine", 2)
+                            .addTerm(first, firstWeight)
+                            .addTerm(second, secondWeight)
+                            .addTerm(fixed, fixedWeight)
+                            .optBias(bias)
+                            .build();
+            output = builder.addOutput("output", value);
+            recipe = builder.build();
+        }
+
+        private FusionConstantBindings bindings(
+                NDArray firstWeightArray,
+                NDArray secondWeightArray,
+                NDArray fixedArray,
+                NDArray fixedWeightArray,
+                NDArray biasArray) {
+            return FusionConstantBindings.builder(recipe)
+                    .bind(firstWeight, firstWeightArray)
+                    .bind(secondWeight, secondWeightArray)
+                    .bind(fixed, fixedArray)
+                    .bind(fixedWeight, fixedWeightArray)
+                    .bind(bias, biasArray)
+                    .build();
+        }
+
+        private void setInputs(
+                FusionInvocation invocation, NDArray firstArray, NDArray secondArray, long extent) {
+            invocation.setInput(first, firstArray);
+            invocation.setInput(second, secondArray);
+            invocation.setDimension(rows, extent);
         }
     }
 
