@@ -182,6 +182,32 @@ public class PtFusionTest {
     }
 
     @Test
+    public void indexedAffineDescriptorUsesDivisorVector() {
+        IndexedAffineFixture fixture = new IndexedAffineFixture(DataType.FLOAT32);
+        ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.INDEXED_AFFINE_V1);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 3) * Long.BYTES), 1L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 7L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 5) * Long.BYTES), 5L);
+        int firstAttribute = commandOffset + 14;
+        Assert.assertEquals(
+                descriptor.getLong((firstAttribute + 1) * Long.BYTES),
+                PtFusionDescriptor.INDEXED_SOURCE_COUNT);
+        Assert.assertEquals(descriptor.getLong((firstAttribute + 4) * Long.BYTES), 2L);
+        int divisorsAttribute = firstAttribute + 4 * PtFusionDescriptor.SCALAR_ATTRIBUTE_WORDS;
+        Assert.assertEquals(
+                descriptor.getLong((divisorsAttribute + 1) * Long.BYTES),
+                PtFusionDescriptor.INDEXED_SOURCE_DIVISORS);
+        Assert.assertEquals(descriptor.getLong((divisorsAttribute + 3) * Long.BYTES), 2L);
+        Assert.assertEquals(descriptor.getLong((divisorsAttribute + 4) * Long.BYTES), 3L);
+        Assert.assertEquals(descriptor.getLong((divisorsAttribute + 5) * Long.BYTES), 1L);
+    }
+
+    @Test
     public void fusionDescriptorReportsPersistentStorageBytes() {
         FusionFixture fixture = new FusionFixture();
         Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(fixture.recipe), 96L);
@@ -214,6 +240,11 @@ public class PtFusionTest {
         Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(fixedRuntime.recipe), 16L);
         Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(fixedRuntime.recipe), 40L);
         Assert.assertEquals(PtFusionDescriptor.workspaceBytes(fixedRuntime.recipe), 8L);
+
+        IndexedAffineFixture indexed = new IndexedAffineFixture(DataType.FLOAT32);
+        Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(indexed.recipe), 32L);
+        Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(indexed.recipe), 120L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(indexed.recipe), 96L);
     }
 
     @Test
@@ -305,6 +336,21 @@ public class PtFusionTest {
         ByteBuffer invalidActivation = copyDescriptor(affine, affineWords);
         invalidActivation.putLong((affineActivationAttribute + 4) * Long.BYTES, 99);
         assertPreparationFails(Device.gpu(0), invalidActivation);
+
+        ByteBuffer indexed =
+                PtFusionDescriptor.encode(new IndexedAffineFixture(DataType.FLOAT32).recipe);
+        int indexedWords = indexed.capacity() / Long.BYTES;
+        int indexedCommandOffset = Math.toIntExact(indexed.getLong(14 * Long.BYTES));
+        int indexedOperandCount =
+                Math.toIntExact(indexed.getLong((indexedCommandOffset + 4) * Long.BYTES));
+        int indexedDivisorsAttribute =
+                indexedCommandOffset
+                        + 7
+                        + indexedOperandCount
+                        + 4 * PtFusionDescriptor.SCALAR_ATTRIBUTE_WORDS;
+        ByteBuffer invalidDivisor = copyDescriptor(indexed, indexedWords);
+        invalidDivisor.putLong((indexedDivisorsAttribute + 4) * Long.BYTES, 0);
+        assertPreparationFails(Device.gpu(0), invalidDivisor);
 
         ByteBuffer excessiveElementCount = copyDescriptor(valid, totalWords);
         excessiveElementCount.putLong(18 * Long.BYTES, Long.MAX_VALUE);
@@ -741,6 +787,124 @@ public class PtFusionTest {
                     for (int index = 0; index < 6; ++index) {
                         Assert.assertEquals(actual[index], expected, 1e-5f);
                     }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void rocmIndexedAffineGathersProjectsScattersAndClearsAcrossDataTypes() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            IndexedAffineFixture fixture = new IndexedAffineFixture(dataType);
+            float tolerance = dataType == DataType.FLOAT32 ? 1e-4f : 8e-2f;
+            try (NDManager manager = engine.newBaseManager(device);
+                    NDArray indices = manager.create(new int[] {0, 2, 4}, new Shape(3));
+                    NDArray state = manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2));
+                    NDArray branch =
+                            typed(
+                                    manager,
+                                    DataType.FLOAT16,
+                                    new float[] {
+                                        10f, 20f, 21f, 22f, 30f, 40f,
+                                        41f, 42f, 50f, 60f, 61f, 62f
+                                    },
+                                    new Shape(6, 2));
+                    NDArray hiddenWeight =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    new float[] {1f, 0f, 1f, 0f, 0f, 1f, 0f, 1f},
+                                    new Shape(2, 4));
+                    NDArray hiddenBias =
+                            typed(manager, dataType, new float[] {0.1f, -0.2f}, new Shape(2));
+                    NDArray outputWeight =
+                            typed(manager, dataType, new float[] {0.5f, -1f}, new Shape(1, 2));
+                    NDArray outputBias =
+                            typed(manager, dataType, new float[] {0.25f}, new Shape(1));
+                    FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                    FusionExecutable executable =
+                            plan.bind(
+                                    fixture.bindings(
+                                            hiddenWeight, hiddenBias, outputWeight, outputBias));
+                    FusionSession session =
+                            executable.newSession(
+                                    manager,
+                                    FusionSessionConfig.builder().optBufferCount(1).build())) {
+                try (FusionInvocation invocation = session.acquire()) {
+                    fixture.setInputs(invocation, indices, state, branch, 2, 6, 3);
+                    try (FusionOutputLease lease = invocation.submit()) {
+                        float[] actual = lease.get(fixture.output).toFloatArray();
+                        float[] expected = indexedAffineReference();
+                        for (int index = 0; index < expected.length; ++index) {
+                            Assert.assertEquals(actual[index], expected[index], tolerance);
+                        }
+                    }
+                }
+                try (FusionInvocation invocation = session.acquire()) {
+                    fixture.setInputs(invocation, indices, state, branch, 2, 6, 0);
+                    try (FusionOutputLease lease = invocation.submit()) {
+                        float[] actual = lease.get(fixture.output).toFloatArray();
+                        for (int index = 0; index < 6; ++index) {
+                            Assert.assertEquals(actual[index], 0f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void rocmIndexedAffineSupportsWideUnbiasedInt64InvocationReuse() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        WideIndexedAffineFixture fixture = new WideIndexedAffineFixture();
+        Device device = Device.gpu(0);
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray firstIndices = manager.create(new long[] {1, 5}, new Shape(2));
+                NDArray secondIndices = manager.create(new long[] {2}, new Shape(1));
+                NDArray state =
+                        typed(manager, DataType.BFLOAT16, new float[] {1f, 2f}, new Shape(2, 1));
+                NDArray branch =
+                        manager.create(
+                                new float[] {10f, 20f, 30f, 40f, 50f, 60f}, new Shape(6, 1));
+                NDArray hiddenWeight =
+                        manager.create(new float[] {1f, 0f, 0f, 1f}, new Shape(2, 2));
+                NDArray outputWeight =
+                        manager.create(new float[] {1f, 0f, 0f, 1f}, new Shape(2, 2));
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(fixture.bindings(hiddenWeight, outputWeight));
+                FusionSession session =
+                        executable.newSession(
+                                manager, FusionSessionConfig.builder().optBufferCount(1).build())) {
+            try (FusionInvocation invocation = session.acquire()) {
+                fixture.setInputs(invocation, firstIndices, state, branch, 2);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    float[] actual = lease.get(fixture.output).toFloatArray();
+                    float[] expected = {
+                        0f, 0f, 1f, 20f, 0f, 0f,
+                        0f, 0f, 0f, 0f, 2f, 60f
+                    };
+                    Assert.assertEquals(actual, expected);
+                }
+            }
+            try (FusionInvocation invocation = session.acquire()) {
+                fixture.setInputs(invocation, secondIndices, state, branch, 1);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    float[] actual = lease.get(fixture.output).toFloatArray();
+                    float[] expected = {
+                        0f, 0f, 0f, 0f, 1f, 30f,
+                        0f, 0f, 0f, 0f, 0f, 0f
+                    };
+                    Assert.assertEquals(actual, expected);
                 }
             }
         }
@@ -1257,6 +1421,27 @@ public class PtFusionTest {
         }
     }
 
+    private static float[] indexedAffineReference() {
+        float[] output = new float[6];
+        float[][] state = {{1f, 2f}, {3f, 4f}};
+        float[][] branch = {
+            {10f, 20f}, {21f, 22f}, {30f, 40f},
+            {41f, 42f}, {50f, 60f}, {61f, 62f}
+        };
+        int[] destinations = {0, 2, 4};
+        for (int destination : destinations) {
+            int stateRow = destination / 3;
+            float first = silu(state[stateRow][0] + branch[destination][0] + 0.1f);
+            float second = silu(state[stateRow][1] + branch[destination][1] - 0.2f);
+            output[destination] = 0.25f + 0.5f * first - second;
+        }
+        return output;
+    }
+
+    private static float silu(float value) {
+        return (float) (value / (1.0 + Math.exp(-value)));
+    }
+
     private static ByteBuffer copyDescriptor(ByteBuffer source, int words) {
         ByteBuffer copy =
                 ByteBuffer.allocateDirect(Math.multiplyExact(words, Long.BYTES))
@@ -1412,6 +1597,158 @@ public class PtFusionTest {
             invocation.setInput(tile, tileArray);
             invocation.setInput(context, contextArray);
             invocation.setDimension(rows, extent);
+        }
+    }
+
+    private static final class IndexedAffineFixture {
+
+        private final FusionRecipe.Dimension sourceRows;
+        private final FusionRecipe.Dimension destinationRows;
+        private final FusionRecipe.Dimension activeRows;
+        private final FusionRecipe.Input indices;
+        private final FusionRecipe.Input state;
+        private final FusionRecipe.Input branch;
+        private final FusionRecipe.Constant hiddenWeight;
+        private final FusionRecipe.Constant hiddenBias;
+        private final FusionRecipe.Constant outputWeight;
+        private final FusionRecipe.Constant outputBias;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private IndexedAffineFixture(DataType dataType) {
+            FusionRecipe.Builder builder = FusionRecipe.builder("indexed-affine-test");
+            sourceRows = builder.addDimension("sourceRows", 2);
+            destinationRows = builder.addDimension("destinationRows", 6);
+            activeRows = builder.addDimension("activeRows", 4);
+            indices =
+                    builder.addInput(
+                            "indices", FusionRecipe.TensorSpec.of(DataType.INT32, activeRows));
+            state =
+                    builder.addInput(
+                            "state", FusionRecipe.TensorSpec.of(DataType.FLOAT32, sourceRows, 2));
+            branch =
+                    builder.addInput(
+                            "branch",
+                            FusionRecipe.TensorSpec.of(DataType.FLOAT16, destinationRows, 2));
+            hiddenWeight =
+                    builder.addConstant(
+                            "hiddenWeight", FusionRecipe.TensorSpec.fixed(dataType, 2, 4));
+            hiddenBias =
+                    builder.addConstant("hiddenBias", FusionRecipe.TensorSpec.fixed(dataType, 2));
+            outputWeight =
+                    builder.addConstant(
+                            "outputWeight", FusionRecipe.TensorSpec.fixed(dataType, 1, 2));
+            outputBias =
+                    builder.addConstant("outputBias", FusionRecipe.TensorSpec.fixed(dataType, 1));
+            FusionRecipe.IndexedAffine indexed =
+                    builder.indexedAffine("scores", indices, destinationRows)
+                            .addSource(state, 3)
+                            .addSource(branch, 1)
+                            .setHiddenWeight(hiddenWeight)
+                            .optHiddenBias(hiddenBias)
+                            .optActivation(FusionRecipe.Activation.SILU)
+                            .setOutputWeight(outputWeight)
+                            .optOutputBias(outputBias)
+                            .build();
+            output = builder.addOutput("output", indexed);
+            recipe = builder.build();
+        }
+
+        private FusionConstantBindings bindings(
+                NDArray hiddenWeightArray,
+                NDArray hiddenBiasArray,
+                NDArray outputWeightArray,
+                NDArray outputBiasArray) {
+            return FusionConstantBindings.builder(recipe)
+                    .bind(hiddenWeight, hiddenWeightArray)
+                    .bind(hiddenBias, hiddenBiasArray)
+                    .bind(outputWeight, outputWeightArray)
+                    .bind(outputBias, outputBiasArray)
+                    .build();
+        }
+
+        private void setInputs(
+                FusionInvocation invocation,
+                NDArray indicesArray,
+                NDArray stateArray,
+                NDArray branchArray,
+                long sourceRowCount,
+                long destinationRowCount,
+                long activeRowCount) {
+            invocation.setInput(indices, indicesArray);
+            invocation.setInput(state, stateArray);
+            invocation.setInput(branch, branchArray);
+            invocation.setDimension(sourceRows, sourceRowCount);
+            invocation.setDimension(destinationRows, destinationRowCount);
+            invocation.setDimension(activeRows, activeRowCount);
+        }
+    }
+
+    private static final class WideIndexedAffineFixture {
+
+        private final FusionRecipe.Dimension sourceRows;
+        private final FusionRecipe.Dimension destinationRows;
+        private final FusionRecipe.Dimension activeRows;
+        private final FusionRecipe.Input indices;
+        private final FusionRecipe.Input state;
+        private final FusionRecipe.Input branch;
+        private final FusionRecipe.Constant hiddenWeight;
+        private final FusionRecipe.Constant outputWeight;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private WideIndexedAffineFixture() {
+            FusionRecipe.Builder builder = FusionRecipe.builder("wide-indexed-affine-test");
+            sourceRows = builder.addDimension("sourceRows", 2);
+            destinationRows = builder.addDimension("destinationRows", 6);
+            activeRows = builder.addDimension("activeRows", 4);
+            indices =
+                    builder.addInput(
+                            "indices", FusionRecipe.TensorSpec.of(DataType.INT64, activeRows));
+            state =
+                    builder.addInput(
+                            "state", FusionRecipe.TensorSpec.of(DataType.BFLOAT16, sourceRows, 1));
+            branch =
+                    builder.addInput(
+                            "branch",
+                            FusionRecipe.TensorSpec.of(DataType.FLOAT32, destinationRows, 1));
+            hiddenWeight =
+                    builder.addConstant(
+                            "hiddenWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 2, 2));
+            outputWeight =
+                    builder.addConstant(
+                            "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 2, 2));
+            FusionRecipe.IndexedAffine indexed =
+                    builder.indexedAffine("scores", indices, destinationRows)
+                            .addSource(state, 3)
+                            .addSource(branch, 1)
+                            .setHiddenWeight(hiddenWeight)
+                            .setOutputWeight(outputWeight)
+                            .build();
+            output = builder.addOutput("output", indexed);
+            recipe = builder.build();
+        }
+
+        private FusionConstantBindings bindings(
+                NDArray hiddenWeightArray, NDArray outputWeightArray) {
+            return FusionConstantBindings.builder(recipe)
+                    .bind(hiddenWeight, hiddenWeightArray)
+                    .bind(outputWeight, outputWeightArray)
+                    .build();
+        }
+
+        private void setInputs(
+                FusionInvocation invocation,
+                NDArray indicesArray,
+                NDArray stateArray,
+                NDArray branchArray,
+                long activeRowCount) {
+            invocation.setInput(indices, indicesArray);
+            invocation.setInput(state, stateArray);
+            invocation.setInput(branch, branchArray);
+            invocation.setDimension(sourceRows, 2);
+            invocation.setDimension(destinationRows, 6);
+            invocation.setDimension(activeRows, activeRowCount);
         }
     }
 

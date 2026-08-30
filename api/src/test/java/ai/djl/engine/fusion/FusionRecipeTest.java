@@ -248,6 +248,112 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void indexedAffineBuildsMixedGatherProjection() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("indexed-affine");
+        FusionRecipe.Dimension batches = builder.addDimension("batches", 4);
+        FusionRecipe.Dimension destinations = builder.addDimension("destinations", 16);
+        FusionRecipe.Dimension active = builder.addDimension("active", 8);
+        FusionRecipe.Input indices =
+                builder.addInput("indices", FusionRecipe.TensorSpec.of(DataType.INT32, active));
+        FusionRecipe.Input state =
+                builder.addInput("state", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batches, 2));
+        FusionRecipe.Input branch =
+                builder.addInput(
+                        "branch", FusionRecipe.TensorSpec.of(DataType.FLOAT16, destinations, 4));
+        FusionRecipe.Constant hiddenWeight =
+                builder.addConstant(
+                        "hiddenWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 5, 6));
+        FusionRecipe.Constant hiddenBias =
+                builder.addConstant(
+                        "hiddenBias", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 5));
+        FusionRecipe.Constant outputWeight =
+                builder.addConstant(
+                        "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 2, 5));
+        FusionRecipe.Constant outputBias =
+                builder.addConstant(
+                        "outputBias", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 2));
+
+        FusionRecipe.IndexedAffine indexed =
+                builder.indexedAffine("scores", indices, destinations)
+                        .addSource(state, 4)
+                        .addSource(branch, 1)
+                        .setHiddenWeight(hiddenWeight)
+                        .optHiddenBias(hiddenBias)
+                        .optActivation(FusionRecipe.Activation.SILU)
+                        .setOutputWeight(outputWeight)
+                        .optOutputBias(outputBias)
+                        .build();
+        builder.addOutput("output", indexed);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertEquals(recipe.getValues().get(indexed.getIndex()), indexed);
+        Assert.assertEquals(indexed.getSpec().getDataType(), DataType.BFLOAT16);
+        Assert.assertSame(indexed.getSpec().getLeadingDimension(), destinations);
+        Assert.assertEquals(indexed.getSpec().getInnerShape(), new long[] {2});
+        Assert.assertSame(indexed.getIndices(), indices);
+        Assert.assertEquals(indexed.getSources().size(), 2);
+        Assert.assertSame(indexed.getSources().get(0).getInput(), state);
+        Assert.assertEquals(indexed.getSources().get(0).getIndexDivisor(), 4L);
+        Assert.assertSame(indexed.getHiddenWeight(), hiddenWeight);
+        Assert.assertSame(indexed.getHiddenBias(), hiddenBias);
+        Assert.assertEquals(indexed.getActivation(), FusionRecipe.Activation.SILU);
+        Assert.assertSame(indexed.getOutputWeight(), outputWeight);
+        Assert.assertSame(indexed.getOutputBias(), outputBias);
+    }
+
+    @Test
+    public void indexedAffineRejectsInvalidMetadata() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("bad-indexed-affine");
+        FusionRecipe.Dimension rows = builder.addDimension("rows", 8);
+        FusionRecipe.Dimension active = builder.addDimension("active", 4);
+        FusionRecipe.Input indices =
+                builder.addInput("indices", FusionRecipe.TensorSpec.of(DataType.INT64, active));
+        FusionRecipe.Input source =
+                builder.addInput("source", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 3));
+        FusionRecipe.Constant hiddenWeight =
+                builder.addConstant(
+                        "hiddenWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 3));
+        FusionRecipe.Constant outputWeight =
+                builder.addConstant(
+                        "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 1, 5));
+
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.indexedAffine("zeroDivisor", indices, rows).addSource(source, 0));
+        Assert.assertThrows(
+                IllegalStateException.class,
+                () ->
+                        builder.indexedAffine("missingWeights", indices, rows)
+                                .addSource(source, 1)
+                                .build());
+
+        FusionRecipe.Builder badIndices = FusionRecipe.builder("bad-indices");
+        FusionRecipe.Dimension badRows = badIndices.addDimension("rows", 8);
+        FusionRecipe.Dimension badActive = badIndices.addDimension("active", 4);
+        FusionRecipe.Input floatingIndices =
+                badIndices.addInput(
+                        "indices", FusionRecipe.TensorSpec.of(DataType.FLOAT32, badActive));
+        FusionRecipe.Input badSource =
+                badIndices.addInput(
+                        "source", FusionRecipe.TensorSpec.of(DataType.FLOAT16, badRows, 3));
+        FusionRecipe.Constant badHidden =
+                badIndices.addConstant(
+                        "hidden", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 5, 3));
+        FusionRecipe.Constant badOutput =
+                badIndices.addConstant(
+                        "output", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 1, 5));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        badIndices
+                                .indexedAffine("scores", floatingIndices, badRows)
+                                .addSource(badSource, 1)
+                                .setHiddenWeight(badHidden)
+                                .setOutputWeight(badOutput)
+                                .build());
+    }
+
+    @Test
     public void builderRejectsForeignHandlesAndMutationAfterBuild() {
         FusionRecipe.Builder first = FusionRecipe.builder("first");
         FusionRecipe.Dimension firstRows = first.addDimension("rows", 4);

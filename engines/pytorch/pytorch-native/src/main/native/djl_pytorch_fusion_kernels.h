@@ -23,6 +23,8 @@ inline constexpr int32_t kMaximumOutputPackSources = 32;
 inline constexpr int32_t kMaximumAffineTerms = 32;
 inline constexpr int32_t kMaximumAffineGroups = 32;
 inline constexpr int32_t kMaximumAffinePrefixRank = 8;
+inline constexpr int32_t kMaximumIndexedAffineSources = 32;
+inline constexpr int32_t kMaximumIndexedAffineOutputWidth = 32;
 
 struct OutputPackSource {
   const void* data;
@@ -49,6 +51,26 @@ enum class AffineActivation : int32_t {
   kNone = 0,
   kSilu = 1,
 };
+
+struct IndexedAffineSource {
+  const void* data;
+  torch::ScalarType data_type;
+  int64_t width;
+  int64_t destination_offset;
+  int64_t index_divisor;
+  int64_t row_count;
+};
+
+void LaunchIndexedAffineInputPack(const IndexedAffineSource* sources,
+    int32_t source_count, const void* indices, torch::ScalarType index_data_type,
+    torch::Tensor& output, int64_t active_rows, int64_t destination_rows,
+    int64_t output_width);
+
+void LaunchIndexedAffineFinalize(const void* indices,
+    torch::ScalarType index_data_type, const torch::Tensor& hidden,
+    const void* hidden_bias, const void* output_weight, const void* output_bias,
+    torch::Tensor& output, int64_t active_rows, int64_t destination_rows,
+    int64_t hidden_width, int64_t output_width, AffineActivation activation);
 
 struct AffineSumSource {
   const void* data;

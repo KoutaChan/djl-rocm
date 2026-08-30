@@ -56,12 +56,18 @@ final class PtFusionDescriptor {
     static final long DTYPE_FLOAT64 = 10;
     static final long OUTPUT_PACK_V1 = 1;
     static final long AFFINE_SUM_V1 = 2;
+    static final long INDEXED_AFFINE_V1 = 3;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
     static final long AFFINE_TERM_COUNT = 1;
     static final long AFFINE_ACTIVATION = 2;
     static final long AFFINE_HAS_BIAS = 3;
+    static final long INDEXED_SOURCE_COUNT = 1;
+    static final long INDEXED_ACTIVATION = 2;
+    static final long INDEXED_HAS_HIDDEN_BIAS = 3;
+    static final long INDEXED_HAS_OUTPUT_BIAS = 4;
+    static final long INDEXED_SOURCE_DIVISORS = 5;
     static final long ACTIVATION_NONE = 0;
     static final long ACTIVATION_SILU = 1;
 
@@ -101,6 +107,11 @@ final class PtFusionDescriptor {
                         Math.addExact(
                                 commandWords,
                                 affineSumCommandWords((FusionRecipe.AffineSum) value));
+            } else if (value instanceof FusionRecipe.IndexedAffine) {
+                commandWords =
+                        Math.addExact(
+                                commandWords,
+                                indexedAffineCommandWords((FusionRecipe.IndexedAffine) value));
             } else if (!(value instanceof FusionRecipe.Input)
                     && !(value instanceof FusionRecipe.Constant)) {
                 throw new UnsupportedOperationException(
@@ -159,6 +170,8 @@ final class PtFusionDescriptor {
                 putOutputPackCommand(descriptor, (FusionRecipe.OutputPack) value);
             } else if (value instanceof FusionRecipe.AffineSum) {
                 putAffineSumCommand(descriptor, (FusionRecipe.AffineSum) value);
+            } else if (value instanceof FusionRecipe.IndexedAffine) {
+                putIndexedAffineCommand(descriptor, (FusionRecipe.IndexedAffine) value);
             }
         }
         for (FusionRecipe.Output output : recipe.getOutputs()) {
@@ -179,6 +192,8 @@ final class PtFusionDescriptor {
                 ++count;
             } else if (value instanceof FusionRecipe.AffineSum) {
                 ++count;
+            } else if (value instanceof FusionRecipe.IndexedAffine) {
+                ++count;
             }
         }
         return count;
@@ -192,6 +207,7 @@ final class PtFusionDescriptor {
             }
         }
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -207,6 +223,7 @@ final class PtFusionDescriptor {
             }
         }
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -235,11 +252,50 @@ final class PtFusionDescriptor {
                 }
             }
         }
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.IndexedAffine)) {
+                continue;
+            }
+            FusionRecipe.IndexedAffine indexed = (FusionRecipe.IndexedAffine) value;
+            bytes = Math.addExact(bytes, storageBytes(indexed.getHiddenWeight()));
+        }
         return bytes;
     }
 
     private static boolean isComputed(FusionRecipe.Value value) {
-        return value instanceof FusionRecipe.OutputPack || value instanceof FusionRecipe.AffineSum;
+        return value instanceof FusionRecipe.OutputPack
+                || value instanceof FusionRecipe.AffineSum
+                || value instanceof FusionRecipe.IndexedAffine;
+    }
+
+    private static long indexedAffineWorkspaceBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.IndexedAffine)) {
+                continue;
+            }
+            FusionRecipe.IndexedAffine indexed = (FusionRecipe.IndexedAffine) value;
+            long activeRows =
+                    indexed.getIndices().getSpec().getLeadingDimension().getMaximumExtent();
+            long inputWidth = 0;
+            for (FusionRecipe.IndexedAffineSource source : indexed.getSources()) {
+                inputWidth =
+                        Math.addExact(inputWidth, source.getInput().getSpec().getInnerShape()[0]);
+            }
+            long hiddenWidth = indexed.getHiddenWeight().getSpec().getInnerShape()[0];
+            int elementBytes = indexed.getSpec().getDataType().getNumOfBytes();
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    Math.multiplyExact(activeRows, inputWidth), elementBytes));
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    Math.multiplyExact(activeRows, hiddenWidth), elementBytes));
+        }
+        return bytes;
     }
 
     private static long affineWorkspaceBytes(FusionRecipe recipe) {
@@ -442,6 +498,63 @@ final class PtFusionDescriptor {
         putScalarAttribute(
                 descriptor, AFFINE_ACTIVATION, activationCode(affineSum.getActivation()));
         putScalarAttribute(descriptor, AFFINE_HAS_BIAS, affineSum.getBias() == null ? 0 : 1);
+    }
+
+    private static int indexedAffineCommandWords(FusionRecipe.IndexedAffine indexed) {
+        int operandCount = Math.addExact(indexed.getSources().size(), 3);
+        if (indexed.getHiddenBias() != null) {
+            ++operandCount;
+        }
+        if (indexed.getOutputBias() != null) {
+            ++operandCount;
+        }
+        int divisorWords = Math.addExact(4, indexed.getSources().size());
+        return Math.addExact(
+                Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, operandCount),
+                Math.addExact(Math.multiplyExact(4, SCALAR_ATTRIBUTE_WORDS), divisorWords));
+    }
+
+    private static void putIndexedAffineCommand(
+            ByteBuffer descriptor, FusionRecipe.IndexedAffine indexed) {
+        int operandCount = Math.addExact(indexed.getSources().size(), 3);
+        if (indexed.getHiddenBias() != null) {
+            ++operandCount;
+        }
+        if (indexed.getOutputBias() != null) {
+            ++operandCount;
+        }
+        descriptor.putLong(indexedAffineCommandWords(indexed));
+        descriptor.putLong(INDEXED_AFFINE_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(operandCount);
+        descriptor.putLong(5);
+        descriptor.putLong(indexed.getIndex());
+        descriptor.putLong(indexed.getIndices().getIndex());
+        for (FusionRecipe.IndexedAffineSource source : indexed.getSources()) {
+            descriptor.putLong(source.getInput().getIndex());
+        }
+        descriptor.putLong(indexed.getHiddenWeight().getIndex());
+        if (indexed.getHiddenBias() != null) {
+            descriptor.putLong(indexed.getHiddenBias().getIndex());
+        }
+        descriptor.putLong(indexed.getOutputWeight().getIndex());
+        if (indexed.getOutputBias() != null) {
+            descriptor.putLong(indexed.getOutputBias().getIndex());
+        }
+        putScalarAttribute(descriptor, INDEXED_SOURCE_COUNT, indexed.getSources().size());
+        putScalarAttribute(descriptor, INDEXED_ACTIVATION, activationCode(indexed.getActivation()));
+        putScalarAttribute(
+                descriptor, INDEXED_HAS_HIDDEN_BIAS, indexed.getHiddenBias() == null ? 0 : 1);
+        putScalarAttribute(
+                descriptor, INDEXED_HAS_OUTPUT_BIAS, indexed.getOutputBias() == null ? 0 : 1);
+        descriptor.putLong(Math.addExact(4, indexed.getSources().size()));
+        descriptor.putLong(INDEXED_SOURCE_DIVISORS);
+        descriptor.putLong(ATTRIBUTE_INT64);
+        descriptor.putLong(indexed.getSources().size());
+        for (FusionRecipe.IndexedAffineSource source : indexed.getSources()) {
+            descriptor.putLong(source.getIndexDivisor());
+        }
     }
 
     private static void putScalarAttribute(ByteBuffer descriptor, long key, long value) {

@@ -21,7 +21,10 @@
  * source may independently use FLOAT16, BFLOAT16, or FLOAT32 while weights select the common
  * projection and output data type. Backends may convert and project constant fixed values once when
  * constants are bound. {@link ai.djl.engine.fusion.FusionRecipe.OutputPack OutputPack} writes
- * several score values into one persistent FLOAT32 output.
+ * several score values into one persistent FLOAT32 output. {@link
+ * ai.djl.engine.fusion.FusionRecipe.IndexedAffine IndexedAffine} gathers selected rows from mixed
+ * floating-point sources, evaluates a fixed two-layer projection, and scatters the results into a
+ * zero-filled dense output without materializing individual gather or concatenation values.
  *
  * <p>The lifecycle is {@code recipe -> plan -> executable -> session -> invocation -> output
  * lease}. Preparation validates shapes and builds a bounded command plan. Binding retains caller

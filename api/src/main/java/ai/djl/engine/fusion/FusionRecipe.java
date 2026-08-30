@@ -32,9 +32,11 @@ import java.util.Set;
  *
  * <p>The API exposes a closed set of inference stages. {@link AffineSum} projects several values
  * into one width, adds the projected values with fixed-shape broadcasting, and optionally applies
- * an activation. {@link OutputPack} concatenates two-dimensional floating-point values along their
- * last axis and converts them into a contiguous {@link DataType#FLOAT32} value. Additional value
- * types can be added without changing the lifecycle of prepared plans and sessions.
+ * an activation. {@link IndexedAffine} gathers selected rows from several values, evaluates a
+ * bounded two-layer projection, and scatters the selected results into a dense value. {@link
+ * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
+ * them into a contiguous {@link DataType#FLOAT32} value. Additional value types can be added
+ * without changing the lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
 
@@ -344,7 +346,7 @@ public final class FusionRecipe {
         }
     }
 
-    /** An activation supported by an {@link AffineSum} stage. */
+    /** An activation supported by affine fusion stages. */
     public enum Activation {
         /** Leaves the affine sum unchanged. */
         NONE,
@@ -443,6 +445,147 @@ public final class FusionRecipe {
          */
         public Activation getActivation() {
             return activation;
+        }
+    }
+
+    /** One row-gather source in an {@link IndexedAffine} stage. */
+    public static final class IndexedAffineSource {
+
+        private final Value input;
+        private final long indexDivisor;
+
+        private IndexedAffineSource(Value input, long indexDivisor) {
+            this.input = input;
+            this.indexDivisor = indexDivisor;
+        }
+
+        /**
+         * Returns the two-dimensional floating-point source value.
+         *
+         * @return the source value
+         */
+        public Value getInput() {
+            return input;
+        }
+
+        /**
+         * Returns the divisor applied to each destination index before gathering this source.
+         *
+         * @return the positive index divisor
+         */
+        public long getIndexDivisor() {
+            return indexDivisor;
+        }
+    }
+
+    /**
+     * A bounded indexed two-layer affine projection with a dense scatter result.
+     *
+     * <p>For each active row {@code p}, the stage reads a unique destination index {@code d} and
+     * gathers row {@code floor(d / divisor_i)} from every source {@code X_i}. The gathered rows are
+     * concatenated into {@code x}, and the stage computes {@code y = W_o activation(W_h x + b_h) +
+     * b_o}. The row {@code y} is written to destination row {@code d}; unselected destination rows
+     * are zero. Destination indices must be unique and within the active destination extent. Each
+     * divided index must be within the active leading extent of its source.
+     *
+     * <p>Sources may independently use FLOAT16, BFLOAT16, or FLOAT32. Both weights, both optional
+     * biases, and the result use one projection data type. A backend converts gathered sources to
+     * that type before the hidden projection. Numerical results may round at source conversion,
+     * GEMM, activation, or output-projection boundaries.
+     */
+    public static final class IndexedAffine extends Value {
+
+        private final Value indices;
+        private final List<IndexedAffineSource> sources;
+        private final Constant hiddenWeight;
+        private final Constant hiddenBias;
+        private final Activation activation;
+        private final Constant outputWeight;
+        private final Constant outputBias;
+
+        private IndexedAffine(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                Value indices,
+                List<IndexedAffineSource> sources,
+                Constant hiddenWeight,
+                Constant hiddenBias,
+                Activation activation,
+                Constant outputWeight,
+                Constant outputBias) {
+            super(owner, index, name, spec);
+            this.indices = indices;
+            this.sources = immutableCopy(sources);
+            this.hiddenWeight = hiddenWeight;
+            this.hiddenBias = hiddenBias;
+            this.activation = activation;
+            this.outputWeight = outputWeight;
+            this.outputBias = outputBias;
+        }
+
+        /**
+         * Returns the one-dimensional INT32 or INT64 destination indices.
+         *
+         * @return the destination indices
+         */
+        public Value getIndices() {
+            return indices;
+        }
+
+        /**
+         * Returns the gathered sources in concatenation order.
+         *
+         * @return the gathered sources
+         */
+        public List<IndexedAffineSource> getSources() {
+            return sources;
+        }
+
+        /**
+         * Returns the {@code [hiddenWidth, concatenatedWidth]} hidden weight.
+         *
+         * @return the hidden weight
+         */
+        public Constant getHiddenWeight() {
+            return hiddenWeight;
+        }
+
+        /**
+         * Returns the optional {@code [hiddenWidth]} hidden bias.
+         *
+         * @return the hidden bias, or {@code null}
+         */
+        public Constant getHiddenBias() {
+            return hiddenBias;
+        }
+
+        /**
+         * Returns the activation applied to the hidden projection.
+         *
+         * @return the hidden activation
+         */
+        public Activation getActivation() {
+            return activation;
+        }
+
+        /**
+         * Returns the {@code [outputWidth, hiddenWidth]} output weight.
+         *
+         * @return the output weight
+         */
+        public Constant getOutputWeight() {
+            return outputWeight;
+        }
+
+        /**
+         * Returns the optional {@code [outputWidth]} output bias.
+         *
+         * @return the output bias, or {@code null}
+         */
+        public Constant getOutputBias() {
+            return outputBias;
         }
     }
 
@@ -625,6 +768,32 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException("The affine output width must be positive.");
             }
             return new AffineSumBuilder(this, requireName(name, "value"), outputWidth);
+        }
+
+        /**
+         * Starts an indexed-affine stage.
+         *
+         * <p>The indices use their own bounded leading dimension. The result uses {@code
+         * destinationDimension} and has the output width declared by the output projection. The
+         * returned builder validates and inserts the value when {@link
+         * IndexedAffineBuilder#build()} is called.
+         *
+         * @param name the value name
+         * @param indices one-dimensional INT32 or INT64 destination indices
+         * @param destinationDimension the bounded leading dimension of the dense result
+         * @return a builder for the indexed-affine value
+         */
+        public IndexedAffineBuilder indexedAffine(
+                String name, Value indices, Dimension destinationDimension) {
+            checkMutable();
+            checkValue(indices);
+            Objects.requireNonNull(destinationDimension, "destinationDimension");
+            if (destinationDimension.owner != owner) {
+                throw new IllegalArgumentException(
+                        "The destination dimension belongs to a different recipe builder.");
+            }
+            return new IndexedAffineBuilder(
+                    this, requireName(name, "value"), indices, destinationDimension);
         }
 
         /**
@@ -954,6 +1123,230 @@ public final class FusionRecipe {
                 result[resultAxis] = Math.max(leftExtent, rightExtent);
             }
             return result;
+        }
+    }
+
+    /** Builds one {@link IndexedAffine} value within a {@link Builder}. */
+    public static final class IndexedAffineBuilder {
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final Value indices;
+        private final Dimension destinationDimension;
+        private final List<IndexedAffineSource> sources;
+        private Constant hiddenWeight;
+        private Constant hiddenBias;
+        private Activation activation;
+        private Constant outputWeight;
+        private Constant outputBias;
+        private boolean built;
+
+        private IndexedAffineBuilder(
+                Builder recipeBuilder, String name, Value indices, Dimension destinationDimension) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.indices = indices;
+            this.destinationDimension = destinationDimension;
+            sources = new ArrayList<>();
+            activation = Activation.NONE;
+        }
+
+        /**
+         * Adds a source gathered with the common destination indices.
+         *
+         * @param input a two-dimensional, dynamically bounded floating-point value
+         * @param indexDivisor the positive divisor applied to destination indices before gathering
+         * @return this builder
+         */
+        public IndexedAffineBuilder addSource(Value input, long indexDivisor) {
+            checkMutable();
+            recipeBuilder.checkValue(input);
+            if (indexDivisor <= 0) {
+                throw new IllegalArgumentException("The index divisor must be positive.");
+            }
+            sources.add(new IndexedAffineSource(input, indexDivisor));
+            return this;
+        }
+
+        /**
+         * Sets the required hidden projection weight.
+         *
+         * @param weight a fixed {@code [hiddenWidth, concatenatedWidth]} constant
+         * @return this builder
+         */
+        public IndexedAffineBuilder setHiddenWeight(Constant weight) {
+            checkMutable();
+            recipeBuilder.checkValue(weight);
+            hiddenWeight = weight;
+            return this;
+        }
+
+        /**
+         * Sets the optional hidden projection bias.
+         *
+         * @param bias a fixed {@code [hiddenWidth]} constant
+         * @return this builder
+         */
+        public IndexedAffineBuilder optHiddenBias(Constant bias) {
+            checkMutable();
+            recipeBuilder.checkValue(bias);
+            hiddenBias = bias;
+            return this;
+        }
+
+        /**
+         * Sets the activation applied after the hidden projection.
+         *
+         * @param activation the hidden activation
+         * @return this builder
+         */
+        public IndexedAffineBuilder optActivation(Activation activation) {
+            checkMutable();
+            this.activation = Objects.requireNonNull(activation, "activation");
+            return this;
+        }
+
+        /**
+         * Sets the required output projection weight.
+         *
+         * @param weight a fixed {@code [outputWidth, hiddenWidth]} constant
+         * @return this builder
+         */
+        public IndexedAffineBuilder setOutputWeight(Constant weight) {
+            checkMutable();
+            recipeBuilder.checkValue(weight);
+            outputWeight = weight;
+            return this;
+        }
+
+        /**
+         * Sets the optional output projection bias.
+         *
+         * @param bias a fixed {@code [outputWidth]} constant
+         * @return this builder
+         */
+        public IndexedAffineBuilder optOutputBias(Constant bias) {
+            checkMutable();
+            recipeBuilder.checkValue(bias);
+            outputBias = bias;
+            return this;
+        }
+
+        /**
+         * Adds the immutable indexed-affine value to its recipe.
+         *
+         * @return the indexed-affine value
+         */
+        public IndexedAffine build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            TensorSpec indexSpec = indices.spec;
+            if (indexSpec.leadingDimension == null
+                    || indexSpec.innerShape.length != 0
+                    || (indexSpec.dataType != DataType.INT32
+                            && indexSpec.dataType != DataType.INT64)) {
+                throw new IllegalArgumentException(
+                        "Indexed affine indices must be a dynamically bounded INT32 or INT64"
+                                + " vector.");
+            }
+            if (indexSpec.leadingDimension.maximumExtent > destinationDimension.maximumExtent) {
+                throw new IllegalArgumentException(
+                        "Indexed affine active capacity must not exceed destination capacity.");
+            }
+            if (sources.isEmpty()) {
+                throw new IllegalStateException("An indexed affine requires at least one source.");
+            }
+            if (hiddenWeight == null || outputWeight == null) {
+                throw new IllegalStateException(
+                        "An indexed affine requires hidden and output weights.");
+            }
+
+            long inputWidth = 0;
+            for (IndexedAffineSource source : sources) {
+                TensorSpec sourceSpec = source.input.spec;
+                if (sourceSpec.leadingDimension == null || sourceSpec.innerShape.length != 1) {
+                    throw new IllegalArgumentException(
+                            "Indexed affine sources must have one leading and one feature"
+                                    + " dimension.");
+                }
+                if (!Builder.isAffineDataType(sourceSpec.dataType)) {
+                    throw new IllegalArgumentException(
+                            "Indexed affine sources only support FLOAT16, BFLOAT16, and FLOAT32.");
+                }
+                long requiredSourceRows =
+                        (destinationDimension.maximumExtent - 1) / source.indexDivisor + 1;
+                if (sourceSpec.leadingDimension.maximumExtent < requiredSourceRows) {
+                    throw new IllegalArgumentException(
+                            "Indexed affine source capacity does not cover divided destination"
+                                    + " indices.");
+                }
+                inputWidth = Math.addExact(inputWidth, sourceSpec.innerShape[0]);
+            }
+
+            TensorSpec hiddenWeightSpec = hiddenWeight.getSpec();
+            if (hiddenWeightSpec.leadingDimension != null
+                    || hiddenWeightSpec.innerShape.length != 2
+                    || !Builder.isAffineDataType(hiddenWeightSpec.dataType)
+                    || hiddenWeightSpec.innerShape[1] != inputWidth) {
+                throw new IllegalArgumentException(
+                        "Indexed affine hidden weight must have fixed shape"
+                                + " [hiddenWidth, concatenatedWidth].");
+            }
+            long hiddenWidth = hiddenWeightSpec.innerShape[0];
+            DataType projectionDataType = hiddenWeightSpec.dataType;
+            checkBias(hiddenBias, hiddenWidth, projectionDataType, "hidden");
+
+            TensorSpec outputWeightSpec = outputWeight.getSpec();
+            if (outputWeightSpec.leadingDimension != null
+                    || outputWeightSpec.innerShape.length != 2
+                    || outputWeightSpec.dataType != projectionDataType
+                    || outputWeightSpec.innerShape[1] != hiddenWidth) {
+                throw new IllegalArgumentException(
+                        "Indexed affine output weight must have fixed shape"
+                                + " [outputWidth, hiddenWidth] and matching data type.");
+            }
+            long outputWidth = outputWeightSpec.innerShape[0];
+            checkBias(outputBias, outputWidth, projectionDataType, "output");
+
+            String checkedName = recipeBuilder.addValueName(name);
+            IndexedAffine value =
+                    new IndexedAffine(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            TensorSpec.of(projectionDataType, destinationDimension, outputWidth),
+                            indices,
+                            sources,
+                            hiddenWeight,
+                            hiddenBias,
+                            activation,
+                            outputWeight,
+                            outputBias);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private static void checkBias(Constant bias, long width, DataType dataType, String kind) {
+            if (bias == null) {
+                return;
+            }
+            TensorSpec spec = bias.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.innerShape.length != 1
+                    || spec.dataType != dataType
+                    || spec.innerShape[0] != width) {
+                throw new IllegalArgumentException(
+                        "Indexed affine "
+                                + kind
+                                + " bias must have fixed matching shape and data type.");
+            }
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException("The indexed affine has already been built.");
+            }
         }
     }
 }
