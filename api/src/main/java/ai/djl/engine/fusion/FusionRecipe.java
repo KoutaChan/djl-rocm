@@ -2962,7 +2962,8 @@ public final class FusionRecipe {
                             feedForwardProjectionWeight,
                             feedForwardProjectionBias,
                             outputWeight,
-                            outputBias);
+                            outputBias,
+                            null);
             return this;
         }
 
