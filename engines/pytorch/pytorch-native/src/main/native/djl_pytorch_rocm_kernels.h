@@ -3,6 +3,8 @@
 
 #include <torch/torch.h>
 
+#include <vector>
+
 namespace djl::pytorch::rocm {
 
 bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor& gradient,
@@ -113,6 +115,14 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
 
 torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, const torch::Tensor& update,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon);
+
+bool supports_masked_embedding_residual_to_owned_tokens(const torch::Tensor& tokens,
+    const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
+    const torch::Tensor& valid_mask);
+
+torch::Tensor add_masked_embedding_residual_to_owned_tokens(torch::Tensor& tokens,
+    const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
+    const torch::Tensor& valid_mask, int64_t padding_index, bool mean_valid);
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, at::IntArrayRef normalized_shape);

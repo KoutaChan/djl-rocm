@@ -20,6 +20,8 @@ namespace {
 // Bound register-backed specializations; wider rows retain the original two-pass kernel.
 constexpr int kResidualCachedValuesPerLaneLimit = 16;
 constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
+constexpr int kMaskedEmbeddingMaximumIndices = 2;
+constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 
 void check_hip_kernel_launch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
@@ -420,6 +422,96 @@ __global__ void segmented_lookup_sum_kernel(const scalar_t* lookup_table,
         }
         output[output_row * row_width + column] = static_cast<scalar_t>(total);
       }
+    }
+    __syncthreads();
+  }
+}
+
+struct MaskedEmbeddingResidualArguments {
+  void* tokens;
+  const void* embedding_table;
+  const void* stored_indices[kMaskedEmbeddingMaximumIndices];
+  int64_t index_row_strides[kMaskedEmbeddingMaximumIndices];
+  int64_t index_token_strides[kMaskedEmbeddingMaximumIndices];
+  PaddedBatchGatherIndexType index_types[kMaskedEmbeddingMaximumIndices];
+  const void* valid_mask;
+  int64_t valid_mask_row_stride;
+  int64_t valid_mask_token_stride;
+  PaddedBatchGatherIndexType valid_mask_type;
+  void* converted_valid_mask;
+  int64_t row_count;
+  int64_t tokens_per_batch;
+  int64_t width;
+  int64_t vocabulary_size;
+  int64_t padding_index;
+  int32_t index_count;
+  bool mean_valid;
+};
+
+template <typename scalar_t>
+__device__ float round_masked_embedding_value(float value) {
+  return static_cast<float>(static_cast<scalar_t>(value));
+}
+
+template <typename scalar_t>
+__global__ void masked_embedding_residual_to_owned_tokens_kernel(
+    MaskedEmbeddingResidualArguments arguments) {
+  auto* tokens = static_cast<scalar_t*>(arguments.tokens);
+  const auto* embedding_table = static_cast<const scalar_t*>(arguments.embedding_table);
+  auto* converted_valid_mask = static_cast<scalar_t*>(arguments.converted_valid_mask);
+  __shared__ int64_t table_rows[kMaskedEmbeddingMaximumIndices];
+  __shared__ int64_t valid_mask_value;
+  __shared__ int32_t valid_index_count;
+  __shared__ bool invalid_index;
+  for (int64_t row = blockIdx.x; row < arguments.row_count; row += gridDim.x) {
+    const int64_t batch = row / arguments.tokens_per_batch;
+    const int64_t token = row - batch * arguments.tokens_per_batch;
+    if (threadIdx.x == 0) {
+      valid_mask_value = padded_batch_gather_index_value(arguments.valid_mask,
+          batch * arguments.valid_mask_row_stride + token * arguments.valid_mask_token_stride,
+          arguments.valid_mask_type);
+      valid_index_count = 0;
+      invalid_index = false;
+      for (int32_t source = 0; source < arguments.index_count; ++source) {
+        const int64_t table_row = padded_batch_gather_index_value(arguments.stored_indices[source],
+            batch * arguments.index_row_strides[source] + token * arguments.index_token_strides[source],
+            arguments.index_types[source]);
+        table_rows[source] = table_row;
+        if (table_row != arguments.padding_index) {
+          ++valid_index_count;
+          invalid_index |= table_row < 0 || table_row >= arguments.vocabulary_size;
+        }
+      }
+      converted_valid_mask[row] = static_cast<scalar_t>(valid_mask_value);
+    }
+    __syncthreads();
+    const int64_t row_offset = row * arguments.width;
+    for (int64_t column = threadIdx.x; column < arguments.width; column += blockDim.x) {
+      if (invalid_index) {
+        tokens[row_offset + column] = static_cast<scalar_t>(NAN);
+        continue;
+      }
+      if (valid_mask_value == 0) {
+        tokens[row_offset + column] = static_cast<scalar_t>(0.0f);
+        continue;
+      }
+      float identity = 0.0f;
+      for (int32_t source = 0; source < arguments.index_count; ++source) {
+        const int64_t table_row = table_rows[source];
+        if (table_row == arguments.padding_index || invalid_index) {
+          continue;
+        }
+        identity = round_masked_embedding_value<scalar_t>(identity +
+            static_cast<float>(embedding_table[table_row * arguments.width + column]));
+      }
+      if (arguments.mean_valid && valid_index_count > 0) {
+        identity = round_masked_embedding_value<scalar_t>(
+            identity / static_cast<float>(valid_index_count));
+      }
+      const float updated = round_masked_embedding_value<scalar_t>(
+          static_cast<float>(tokens[row_offset + column]) + identity);
+      tokens[row_offset + column] =
+          static_cast<scalar_t>(updated * static_cast<float>(valid_mask_value));
     }
     __syncthreads();
   }
@@ -1703,6 +1795,15 @@ torch::Tensor launch_segmented_lookup_sum(
   return output;
 }
 
+bool has_supported_masked_embedding_index_layout(
+    const torch::Tensor& indices, const torch::Tensor& tokens) {
+  return indices.is_cuda() && indices.device() == tokens.device() && indices.dim() == 2 &&
+      indices.size(0) == tokens.size(0) && indices.size(1) == tokens.size(1) &&
+      indices.stride(0) >= 0 && indices.stride(1) >= 0 &&
+      (indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
+          indices.scalar_type() == torch::kInt64);
+}
+
 }  // namespace
 
 bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
@@ -1778,6 +1879,70 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
              residual.scalar_type(), update.scalar_type(), weight.scalar_type()) &&
          update.device() == residual.device() && weight.device() == residual.device() &&
          bias.device() == residual.device();
+}
+
+bool supports_masked_embedding_residual_to_owned_tokens(const torch::Tensor& tokens,
+    const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
+    const torch::Tensor& valid_mask) {
+  if (!tokens.is_cuda() || !tokens.is_contiguous() || tokens.dim() != 3 || tokens.size(2) <= 0 ||
+      !is_fused_floating(tokens) || !embedding_table.is_cuda() || !embedding_table.is_contiguous() ||
+      embedding_table.dim() != 2 || embedding_table.size(1) != tokens.size(2) ||
+      embedding_table.scalar_type() != tokens.scalar_type() || embedding_table.device() != tokens.device() ||
+      stored_indices.empty() || stored_indices.size() > kMaskedEmbeddingMaximumIndices ||
+      !has_supported_masked_embedding_index_layout(valid_mask, tokens)) {
+    return false;
+  }
+  return std::all_of(stored_indices.begin(), stored_indices.end(), [&](const torch::Tensor& indices) {
+    return has_supported_masked_embedding_index_layout(indices, tokens);
+  });
+}
+
+torch::Tensor add_masked_embedding_residual_to_owned_tokens(torch::Tensor& tokens,
+    const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
+    const torch::Tensor& valid_mask, int64_t padding_index, bool mean_valid) {
+  TORCH_CHECK(supports_masked_embedding_residual_to_owned_tokens(
+                  tokens, stored_indices, embedding_table, valid_mask),
+      "masked embedding residual received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(tokens.device());
+  torch::Tensor converted_valid_mask = torch::empty(valid_mask.sizes(),
+      tokens.options().memory_format(torch::MemoryFormat::Contiguous));
+  const int64_t row_count = tokens.size(0) * tokens.size(1);
+  if (row_count == 0) {
+    return converted_valid_mask;
+  }
+
+  MaskedEmbeddingResidualArguments arguments{};
+  arguments.tokens = tokens.data_ptr();
+  arguments.embedding_table = embedding_table.data_ptr();
+  arguments.valid_mask = valid_mask.data_ptr();
+  arguments.valid_mask_row_stride = valid_mask.stride(0);
+  arguments.valid_mask_token_stride = valid_mask.stride(1);
+  arguments.valid_mask_type = padded_batch_gather_index_type(valid_mask);
+  arguments.converted_valid_mask = converted_valid_mask.data_ptr();
+  arguments.row_count = row_count;
+  arguments.tokens_per_batch = tokens.size(1);
+  arguments.width = tokens.size(2);
+  arguments.vocabulary_size = embedding_table.size(0);
+  arguments.padding_index = padding_index;
+  arguments.index_count = static_cast<int32_t>(stored_indices.size());
+  arguments.mean_valid = mean_valid;
+  for (int32_t index = 0; index < arguments.index_count; ++index) {
+    arguments.stored_indices[index] = stored_indices[index].data_ptr();
+    arguments.index_row_strides[index] = stored_indices[index].stride(0);
+    arguments.index_token_strides[index] = stored_indices[index].stride(1);
+    arguments.index_types[index] = padded_batch_gather_index_type(stored_indices[index]);
+  }
+
+  const uint32_t block_count =
+      static_cast<uint32_t>(std::min<int64_t>(row_count, 65535));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(tokens.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, tokens.scalar_type(), "masked_embedding_residual_to_owned_tokens", [&] {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<scalar_t>),
+            dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+      });
+  check_hip_kernel_launch("masked embedding residual to owned tokens");
+  return converted_valid_mask;
 }
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,

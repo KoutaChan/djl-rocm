@@ -53,6 +53,35 @@ torch::Tensor scaled_dot_product_attention_preserving_mask_autograd(const torch:
   return at::scaled_dot_product_attention(query, key, value, mask, dropout, causal, scale);
 }
 
+torch::Tensor add_masked_embedding_residual_to_owned_tokens_fallback(torch::Tensor& tokens,
+    const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
+    const torch::Tensor& valid_mask, int64_t padding_index, bool mean_valid) {
+  torch::NoGradGuard no_grad;
+  torch::Tensor converted_valid_mask = valid_mask.to(tokens.scalar_type()).contiguous();
+  torch::Tensor identity;
+  torch::Tensor valid_count;
+  for (const torch::Tensor& stored_index : stored_indices) {
+    const torch::Tensor present = stored_index.ne(padding_index).to(tokens.scalar_type());
+    const torch::Tensor embedding_index =
+        stored_index.scalar_type() == torch::kInt32 || stored_index.scalar_type() == torch::kInt64
+        ? stored_index
+        : stored_index.to(torch::kInt64);
+    const torch::Tensor embedded = torch::nn::functional::embedding(
+        embedding_index, embedding_table, torch::nn::functional::EmbeddingFuncOptions());
+    const torch::Tensor masked = embedded.mul(present.unsqueeze(-1));
+    identity = identity.defined() ? identity.add(masked) : masked;
+    if (mean_valid) {
+      valid_count = valid_count.defined() ? valid_count.add(present) : present;
+    }
+  }
+  if (mean_valid) {
+    identity = identity.div(valid_count.clamp_min(1).unsqueeze(-1));
+  }
+  tokens.add_(identity);
+  tokens.mul_(converted_valid_mask.unsqueeze(-1));
+  return converted_valid_mask;
+}
+
 }  // namespace
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPad(
@@ -258,6 +287,68 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchA
                            .eps(jepsilon));
   }
   const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddMaskedEmbeddingResidualToOwnedTokens(JNIEnv* env,
+    jobject jthis, jlong jtokens, jlongArray jstored_indices, jlong jembedding_table,
+    jlong jvalid_mask, jlong jpadding_index, jint jreduction) {
+  API_BEGIN()
+  auto* tokens_ptr = reinterpret_cast<torch::Tensor*>(jtokens);
+  const auto* embedding_table_ptr = reinterpret_cast<torch::Tensor*>(jembedding_table);
+  const auto* valid_mask_ptr = reinterpret_cast<torch::Tensor*>(jvalid_mask);
+  const auto index_handles = djl::utils::jni::GetVecFromJLongArray(env, jstored_indices);
+  TORCH_CHECK(index_handles.size() >= 1 && index_handles.size() <= 2,
+      "masked embedding residual requires one or two index arrays");
+  std::vector<torch::Tensor> stored_indices;
+  stored_indices.reserve(index_handles.size());
+  for (int64_t handle : index_handles) {
+    TORCH_CHECK(handle != 0, "masked embedding residual index handle is null");
+    stored_indices.emplace_back(*reinterpret_cast<torch::Tensor*>(handle));
+  }
+  TORCH_CHECK(jreduction == 0 || jreduction == 1, "masked embedding residual reduction is unsupported");
+  TORCH_CHECK(!requires_autograd({tokens_ptr, embedding_table_ptr}),
+      "owned masked embedding residual is an inference operation and does not support automatic differentiation");
+  TORCH_CHECK(tokens_ptr->dim() == 3 && tokens_ptr->size(2) > 0,
+      "tokens must have shape [batch, tokens, features]");
+  TORCH_CHECK(tokens_ptr->is_floating_point(), "tokens must use a floating-point data type");
+  TORCH_CHECK(embedding_table_ptr->dim() == 2 && embedding_table_ptr->size(1) == tokens_ptr->size(2),
+      "embedding table width must match the token width");
+  TORCH_CHECK(embedding_table_ptr->scalar_type() == tokens_ptr->scalar_type(),
+      "embedding table and tokens must have the same data type");
+  TORCH_CHECK(valid_mask_ptr->dim() == 2 && valid_mask_ptr->size(0) == tokens_ptr->size(0) &&
+          valid_mask_ptr->size(1) == tokens_ptr->size(1),
+      "valid mask must match the leading token dimensions");
+  TORCH_CHECK(jpadding_index >= 0 && jpadding_index < embedding_table_ptr->size(0),
+      "padding index must identify an embedding-table row");
+  TORCH_CHECK(embedding_table_ptr->device() == tokens_ptr->device() &&
+          valid_mask_ptr->device() == tokens_ptr->device(),
+      "masked embedding residual inputs must be on the same device");
+  for (const torch::Tensor& stored_index : stored_indices) {
+    TORCH_CHECK(stored_index.dim() == 2 && stored_index.size(0) == tokens_ptr->size(0) &&
+            stored_index.size(1) == tokens_ptr->size(1),
+        "stored indices must match the leading token dimensions");
+    TORCH_CHECK(stored_index.device() == tokens_ptr->device(),
+        "masked embedding residual inputs must be on the same device");
+  }
+
+  torch::Tensor converted_valid_mask;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (djl::pytorch::rocm::supports_masked_embedding_residual_to_owned_tokens(
+          *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr)) {
+    converted_valid_mask = djl::pytorch::rocm::add_masked_embedding_residual_to_owned_tokens(
+        *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr,
+        static_cast<int64_t>(jpadding_index), jreduction == 1);
+  } else
+#endif
+  {
+    converted_valid_mask = add_masked_embedding_residual_to_owned_tokens_fallback(
+        *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr,
+        static_cast<int64_t>(jpadding_index), jreduction == 1);
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(converted_valid_mask));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }

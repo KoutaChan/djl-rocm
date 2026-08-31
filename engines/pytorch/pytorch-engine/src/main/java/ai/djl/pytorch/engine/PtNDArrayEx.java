@@ -21,6 +21,7 @@ import ai.djl.ndarray.NDUtils;
 import ai.djl.ndarray.index.NDArrayIndexer;
 import ai.djl.ndarray.internal.NDArrayEx;
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.recurrent.RNN;
@@ -1007,6 +1008,24 @@ public class PtNDArrayEx implements NDArrayEx {
         PtNDManager manager = array.getManager();
         return JniUtils.addToOwnedResidualAndLayerNorm(
                 array, manager.from(update), manager.from(weight), manager.from(bias), eps);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray addMaskedEmbeddingResidualToOwnedTokens(
+            NDList storedIndices,
+            NDArray embeddingTable,
+            NDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.addMaskedEmbeddingResidualToOwnedTokens(
+                array,
+                storedIndices,
+                manager.from(embeddingTable),
+                manager.from(validMask),
+                paddingIndex,
+                reduction);
     }
 
     /** {@inheritDoc} */

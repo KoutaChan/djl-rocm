@@ -26,6 +26,7 @@ import ai.djl.ndarray.index.dim.NDIndexSlice;
 import ai.djl.ndarray.index.dim.NDIndexTake;
 import ai.djl.ndarray.index.full.NDIndexFullPick;
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.recurrent.RNN;
@@ -1096,6 +1097,41 @@ public final class JniUtils {
                         weight.getHandle(),
                         bias.getHandle(),
                         epsilon));
+    }
+
+    /** Adds masked embedding rows to an owned token buffer and returns its converted mask. */
+    public static PtNDArray addMaskedEmbeddingResidualToOwnedTokens(
+            PtNDArray tokens,
+            NDList storedIndices,
+            PtNDArray embeddingTable,
+            PtNDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        long[] indexHandles = new long[storedIndices.size()];
+        PtNDManager manager = tokens.getManager();
+        for (int index = 0; index < indexHandles.length; ++index) {
+            indexHandles[index] = manager.from(storedIndices.get(index)).getHandle();
+        }
+        int reductionValue;
+        switch (reduction) {
+            case SUM:
+                reductionValue = 0;
+                break;
+            case MEAN_VALID:
+                reductionValue = 1;
+                break;
+            default:
+                throw new AssertionError("Unsupported embedding reduction: " + reduction);
+        }
+        return new PtNDArray(
+                manager,
+                PyTorchLibrary.LIB.torchAddMaskedEmbeddingResidualToOwnedTokens(
+                        tokens.getHandle(),
+                        indexHandles,
+                        embeddingTable.getHandle(),
+                        validMask.getHandle(),
+                        paddingIndex,
+                        reductionValue));
     }
 
     public static PtNDArray rmsNorm(

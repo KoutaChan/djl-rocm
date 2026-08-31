@@ -18,9 +18,11 @@ import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.index.NDArrayIndexer;
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.Activation;
+import ai.djl.nn.core.Embedding;
 import ai.djl.nn.recurrent.RNN;
 
 import java.util.List;
@@ -1272,6 +1274,57 @@ public interface NDArrayEx {
                             .get(0);
             outputManager.attachAll(result);
             return result;
+        }
+    }
+
+    /**
+     * Adds masked embedding rows to an owned token buffer and applies its token mask in place.
+     *
+     * @param storedIndices one or two stored-index arrays
+     * @param embeddingTable embedding lookup table
+     * @param validMask token-validity mask containing zero or one
+     * @param paddingIndex index excluded from the embedding reduction
+     * @param reduction reduction applied to valid embedding rows
+     * @return the valid mask cast to the token data type
+     */
+    default NDArray addMaskedEmbeddingResidualToOwnedTokens(
+            NDList storedIndices,
+            NDArray embeddingTable,
+            NDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        NDArray tokens = getArray();
+        NDManager outputManager = tokens.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(tokens, embeddingTable, storedIndices, validMask);
+            NDArray convertedValidMask =
+                    validMask.toType(tokens.getDataType(), false).stopGradient();
+            NDArray identity = null;
+            NDArray validCount = null;
+            for (NDArray storedIndex : storedIndices) {
+                NDArray present =
+                        storedIndex
+                                .neq(paddingIndex)
+                                .toType(tokens.getDataType(), false)
+                                .stopGradient();
+                NDArray embedded =
+                        Embedding.embedding(
+                                        storedIndex.toType(DataType.INT32, false),
+                                        embeddingTable,
+                                        SparseFormat.DENSE)
+                                .singletonOrThrow()
+                                .mul(present.expandDims(2));
+                identity = identity == null ? embedded : identity.add(embedded);
+                if (reduction == EmbeddingReduction.MEAN_VALID) {
+                    validCount = validCount == null ? present : validCount.add(present);
+                }
+            }
+            if (reduction == EmbeddingReduction.MEAN_VALID) {
+                identity = identity.div(validCount.maximum(1.0f).expandDims(2).stopGradient());
+            }
+            tokens.addi(identity).muli(convertedValidMask.expandDims(2));
+            outputManager.attachAll(convertedValidMask);
+            return convertedValidMask;
         }
     }
 

@@ -320,6 +320,14 @@ final class PyTorchLibrary {
     native long torchAddToOwnedResidualAndLayerNorm(
             long residual, long update, long weight, long bias, float epsilon);
 
+    native long torchAddMaskedEmbeddingResidualToOwnedTokens(
+            long tokens,
+            long[] storedIndices,
+            long embeddingTable,
+            long validMask,
+            long paddingIndex,
+            int reduction);
+
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
 
     native long torchArgMax(long handle);

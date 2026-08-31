@@ -13,6 +13,7 @@
 package ai.djl.ndarray;
 
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.util.Preconditions;
 
@@ -412,6 +413,42 @@ public final class NDArrays {
             NDArray residual, NDArray update, NDArray weight, NDArray bias, float eps) {
         return residual.getNDArrayInternal()
                 .addToOwnedResidualAndLayerNorm(update, weight, bias, eps);
+    }
+
+    /**
+     * Adds masked embedding rows to an owned token buffer and applies its token mask in place.
+     *
+     * <p>The token buffer must be shaped {@code [batch, tokens, features]}, the embedding table
+     * {@code [vocabulary, features]}, and every index and the valid mask {@code [batch, tokens]}.
+     * One or two index arrays are accepted. For every token, this operation computes {@code (tokens
+     * + reduce(table[index], index != paddingIndex)) * cast(validMask)[..., None]}. The valid mask
+     * must contain integer zero or one values. The embedding table and token buffer must use the
+     * same floating-point data type. The returned mask is contiguous and cast to that data type.
+     *
+     * <p>This operation mutates {@code tokens}. It is intended for inference graphs where the
+     * caller exclusively owns that buffer and does not support automatic differentiation.
+     *
+     * @param tokens owned token buffer to update
+     * @param storedIndices one or two stored-index arrays
+     * @param embeddingTable embedding lookup table
+     * @param validMask token-validity mask containing zero or one
+     * @param paddingIndex index excluded from the embedding reduction
+     * @param reduction reduction applied to valid embedding rows
+     * @return the valid mask cast to the token data type
+     */
+    public static NDArray addMaskedEmbeddingResidualToOwnedTokens(
+            NDArray tokens,
+            NDList storedIndices,
+            NDArray embeddingTable,
+            NDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        Preconditions.checkArgument(
+                !storedIndices.isEmpty() && storedIndices.size() <= 2,
+                "storedIndices must contain one or two arrays");
+        return tokens.getNDArrayInternal()
+                .addMaskedEmbeddingResidualToOwnedTokens(
+                        storedIndices, embeddingTable, validMask, paddingIndex, reduction);
     }
 
     private static NDArray canonicalRelationKeys(
