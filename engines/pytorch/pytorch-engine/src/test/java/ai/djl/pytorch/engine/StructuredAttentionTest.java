@@ -27,6 +27,8 @@ import org.testng.annotations.Test;
 /** Verifies portable structured-operation semantics and native PyTorch parity. */
 public class StructuredAttentionTest {
 
+    private static final int[] MAPPED_ATTENTION_SEEDS = {20260901, 20260903, 20260907, 20260909};
+
     @Test
     public void relationAttentionUsesPairwiseBias() {
         try (NDManager manager = NDManager.newBaseManager()) {
@@ -271,22 +273,90 @@ public class StructuredAttentionTest {
     }
 
     @Test
-    public void mappedGroupedAttentionCoversNativeAndIndexFallbackAcrossDtypes() {
+    public void mappedGroupedAttentionNativeInt32MatchesReferenceAcrossDtypes() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             return;
         }
-        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
-            for (DataType dataType :
-                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
-                verifyMappedGroupedAttentionIndexFallback(manager, dataType);
-                verifyMappedGroupedAttentionGradients(engine, Device.gpu(), dataType);
-                System.out.printf(
-                        "MAPPED_GROUPED_ATTENTION_PARITY dtype=%s mask=ZERO_PADDED"
-                                + " indices=INT32_NATIVE,INT64_FALLBACK autograd=EAGER%n",
-                        dataType);
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (int seed : MAPPED_ATTENTION_SEEDS) {
+                engine.setRandomSeed(seed);
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    AttentionComparison comparison =
+                            verifyMappedGroupedAttentionForward(
+                                    manager, dataType, MappedAttentionPath.INT32_NATIVE);
+                    printMappedAttentionComparison(dataType, seed, comparison);
+                }
             }
         }
+    }
+
+    @Test
+    public void mappedGroupedAttentionInt64FallbackMatchesReferenceAcrossDtypes() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (int seed : MAPPED_ATTENTION_SEEDS) {
+                engine.setRandomSeed(seed);
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    AttentionComparison comparison =
+                            verifyMappedGroupedAttentionForward(
+                                    manager, dataType, MappedAttentionPath.INT64_EAGER_FALLBACK);
+                    printMappedAttentionComparison(dataType, seed, comparison);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void mappedGroupedAttentionAutogradFallbackMatchesReferenceAcrossDtypes() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            engine.setRandomSeed(20260911);
+            verifyMappedGroupedAttentionGradients(engine, Device.gpu(), dataType);
+            System.out.printf(
+                    "MAPPED_GROUPED_ATTENTION_AUTOGRAD dtype=%s path=EAGER seed=20260911%n",
+                    dataType);
+        }
+    }
+
+    @Test
+    public void bfloat16FallbackComparisonDoesNotRelaxNativeTolerance() {
+        float[] actualAtQuantizationBoundary = {1.53125f};
+        float[] expected = {1.5625f};
+        Assert.expectThrows(
+                AssertionError.class,
+                () ->
+                        assertMappedAttentionClose(
+                                actualAtQuantizationBoundary,
+                                expected,
+                                DataType.BFLOAT16,
+                                MappedAttentionPath.INT32_NATIVE));
+
+        AttentionComparison comparison =
+                assertMappedAttentionClose(
+                        actualAtQuantizationBoundary,
+                        expected,
+                        DataType.BFLOAT16,
+                        MappedAttentionPath.INT64_EAGER_FALLBACK);
+        Assert.assertEquals(comparison.maximumBfloat16Ulps, 4);
+
+        Assert.expectThrows(
+                AssertionError.class,
+                () ->
+                        assertMappedAttentionClose(
+                                new float[] {1.484375f},
+                                expected,
+                                DataType.BFLOAT16,
+                                MappedAttentionPath.INT64_EAGER_FALLBACK));
     }
 
     @Test
@@ -865,8 +935,8 @@ public class StructuredAttentionTest {
         assertClose(actual.toFloatArray(), expected.toFloatArray(), 2e-4f);
     }
 
-    private static void verifyMappedGroupedAttentionIndexFallback(
-            NDManager manager, DataType dataType) {
+    private static AttentionComparison verifyMappedGroupedAttentionForward(
+            NDManager manager, DataType dataType, MappedAttentionPath path) {
         int queries = 7;
         int heads = 4;
         int keyFeatures = 8;
@@ -903,43 +973,24 @@ public class StructuredAttentionTest {
                         indexedDeltas,
                         storedIndexedIds,
                         scale);
-        NDArray nativeResult =
+        boolean useLongIndices = path == MappedAttentionPath.INT64_EAGER_FALLBACK;
+        NDArray actual =
                 NDArrays.mappedGroupedIndexedScaledDotProductAttention(
                         query,
                         shared,
-                        groups,
+                        useLongIndices ? groups.toType(DataType.INT64, false) : groups,
                         deltaTable,
-                        deltas,
+                        useLongIndices ? deltas.toType(DataType.INT64, false) : deltas,
                         indexedDeltas,
-                        storedIndexedIds,
+                        useLongIndices
+                                ? storedIndexedIds.toType(DataType.INT64, false)
+                                : storedIndexedIds,
                         scale);
-        NDArray indexFallback =
-                NDArrays.mappedGroupedIndexedScaledDotProductAttention(
-                        query,
-                        shared,
-                        groups.toType(DataType.INT64, false),
-                        deltaTable,
-                        deltas.toType(DataType.INT64, false),
-                        indexedDeltas,
-                        storedIndexedIds.toType(DataType.INT64, false),
-                        scale);
-
-        float tolerance;
-        if (dataType == DataType.FLOAT32) {
-            tolerance = 3e-4f;
-        } else if (dataType == DataType.FLOAT16) {
-            tolerance = 6e-3f;
-        } else {
-            tolerance = 3e-2f;
-        }
-        assertClose(
-                nativeResult.toType(DataType.FLOAT32, false).toFloatArray(),
+        return assertMappedAttentionClose(
+                actual.toType(DataType.FLOAT32, false).toFloatArray(),
                 expected.toType(DataType.FLOAT32, false).toFloatArray(),
-                tolerance);
-        assertClose(
-                indexFallback.toType(DataType.FLOAT32, false).toFloatArray(),
-                expected.toType(DataType.FLOAT32, false).toFloatArray(),
-                tolerance);
+                dataType,
+                path);
     }
 
     private static void verifyGroupedAttentionShape(
@@ -1343,6 +1394,117 @@ public class StructuredAttentionTest {
             }
         }
         return normalized;
+    }
+
+    private static AttentionComparison assertMappedAttentionClose(
+            float[] actual, float[] expected, DataType dataType, MappedAttentionPath path) {
+        Assert.assertEquals(actual.length, expected.length);
+        float absoluteTolerance;
+        if (dataType == DataType.FLOAT32) {
+            absoluteTolerance = 3e-4f;
+        } else if (dataType == DataType.FLOAT16) {
+            absoluteTolerance = 6e-3f;
+        } else {
+            absoluteTolerance = path == MappedAttentionPath.INT32_NATIVE ? 3e-2f : 0.015625f;
+        }
+        float relativeTolerance =
+                dataType == DataType.BFLOAT16 && path == MappedAttentionPath.INT64_EAGER_FALLBACK
+                        ? 2e-2f
+                        : 0f;
+        int maximumBfloat16Ulps = 0;
+        float maximumAbsoluteError = 0f;
+        float maximumRelativeError = 0f;
+        for (int index = 0; index < actual.length; ++index) {
+            Assert.assertTrue(Float.isFinite(actual[index]), "non-finite actual element " + index);
+            Assert.assertTrue(
+                    Float.isFinite(expected[index]), "non-finite expected element " + index);
+            float absoluteError = Math.abs(actual[index] - expected[index]);
+            float relativeError = absoluteError / Math.max(Math.abs(expected[index]), 1e-12f);
+            float allowedError = absoluteTolerance + relativeTolerance * Math.abs(expected[index]);
+            Assert.assertTrue(
+                    absoluteError <= allowedError,
+                    "element "
+                            + index
+                            + " path="
+                            + path
+                            + " dtype="
+                            + dataType
+                            + " actual="
+                            + actual[index]
+                            + " expected="
+                            + expected[index]
+                            + " absoluteError="
+                            + absoluteError
+                            + " allowedError="
+                            + allowedError);
+            if (dataType == DataType.BFLOAT16
+                    && path == MappedAttentionPath.INT64_EAGER_FALLBACK
+                    && Math.abs(expected[index]) >= 0.25f) {
+                int ulps = bfloat16UlpDistance(actual[index], expected[index]);
+                Assert.assertTrue(
+                        ulps <= 8,
+                        "element "
+                                + index
+                                + " BF16 fallback differs by "
+                                + ulps
+                                + " ULPs; actual="
+                                + actual[index]
+                                + " expected="
+                                + expected[index]);
+                maximumBfloat16Ulps = Math.max(maximumBfloat16Ulps, ulps);
+            }
+            maximumAbsoluteError = Math.max(maximumAbsoluteError, absoluteError);
+            maximumRelativeError = Math.max(maximumRelativeError, relativeError);
+        }
+        return new AttentionComparison(
+                path, maximumAbsoluteError, maximumRelativeError, maximumBfloat16Ulps);
+    }
+
+    private static int bfloat16UlpDistance(float left, float right) {
+        int leftBits = Float.floatToRawIntBits(left) >>> 16;
+        int rightBits = Float.floatToRawIntBits(right) >>> 16;
+        return Math.abs(orderedBfloat16(leftBits) - orderedBfloat16(rightBits));
+    }
+
+    private static int orderedBfloat16(int bits) {
+        return (bits & 0x8000) == 0 ? 0x8000 + bits : 0x8000 - (bits & 0x7fff);
+    }
+
+    private static void printMappedAttentionComparison(
+            DataType dataType, int seed, AttentionComparison comparison) {
+        System.out.printf(
+                "MAPPED_GROUPED_ATTENTION_FORWARD dtype=%s path=%s seed=%d"
+                        + " maxAbs=%g maxRel=%g maxBf16Ulps=%d mask=ZERO_PADDED%n",
+                dataType,
+                comparison.path,
+                seed,
+                comparison.maximumAbsoluteError,
+                comparison.maximumRelativeError,
+                comparison.maximumBfloat16Ulps);
+    }
+
+    private enum MappedAttentionPath {
+        INT32_NATIVE,
+        INT64_EAGER_FALLBACK
+    }
+
+    private static final class AttentionComparison {
+
+        private final MappedAttentionPath path;
+        private final float maximumAbsoluteError;
+        private final float maximumRelativeError;
+        private final int maximumBfloat16Ulps;
+
+        private AttentionComparison(
+                MappedAttentionPath path,
+                float maximumAbsoluteError,
+                float maximumRelativeError,
+                int maximumBfloat16Ulps) {
+            this.path = path;
+            this.maximumAbsoluteError = maximumAbsoluteError;
+            this.maximumRelativeError = maximumRelativeError;
+            this.maximumBfloat16Ulps = maximumBfloat16Ulps;
+        }
     }
 
     private static void assertClose(float[] actual, float[] expected, float tolerance) {
