@@ -38,6 +38,48 @@ public final class NDArrays {
      * @return embeddings selected by {@code rawIds + offsets}
      */
     public static NDArray embeddingWithOffsets(NDArray rawIds, NDArray offsets, NDArray table) {
+        validateEmbeddingWithOffsets(rawIds, offsets, table);
+        return rawIds.getNDArrayInternal().embeddingWithOffsets(offsets, table);
+    }
+
+    /**
+     * Packs offset embedding fields and trailing dense features without intermediate tensors.
+     *
+     * <p>{@code rawIds} is shaped {@code [rows, fields]}, {@code offsets} is broadcastable to that
+     * shape, {@code table} is shaped {@code [entries, embeddingSize]}, and {@code features} is
+     * shaped {@code [rows, featureSize]}. The result is {@code [rows, fields * embeddingSize +
+     * featureSize]} and uses the common floating-point data type of {@code table} and {@code
+     * features}. Engines may fuse offset addition, embedding lookup, flattening, and concatenation;
+     * the portable path remains differentiable.
+     *
+     * @param rawIds unoffset integer IDs shaped {@code [rows, fields]}
+     * @param offsets integer namespace offsets broadcastable to {@code rawIds}
+     * @param table dense embedding table shaped {@code [entries, embeddingSize]}
+     * @param features dense trailing features shaped {@code [rows, featureSize]}
+     * @return packed embedded fields followed by the dense features
+     */
+    public static NDArray embeddingFeaturePack(
+            NDArray rawIds, NDArray offsets, NDArray table, NDArray features) {
+        validateEmbeddingWithOffsets(rawIds, offsets, table);
+        Shape rawShape = rawIds.getShape();
+        Shape featureShape = features.getShape();
+        if (rawShape.dimension() != 2
+                || featureShape.dimension() != 2
+                || featureShape.get(0) != rawShape.get(0)
+                || featureShape.get(1) <= 0) {
+            throw new IllegalArgumentException(
+                    "embedding feature pack requires IDs [rows, fields] and features [rows,"
+                        + " width]");
+        }
+        if (!features.getDataType().isFloating() || features.getDataType() != table.getDataType()) {
+            throw new IllegalArgumentException(
+                    "embedding table and features must use one floating-point data type");
+        }
+        return rawIds.getNDArrayInternal().embeddingFeaturePack(offsets, table, features);
+    }
+
+    private static void validateEmbeddingWithOffsets(
+            NDArray rawIds, NDArray offsets, NDArray table) {
         DataType rawType = rawIds.getDataType();
         DataType offsetType = offsets.getDataType();
         if (!isEmbeddingIndexType(rawType) || !isEmbeddingIndexType(offsetType)) {
@@ -63,7 +105,6 @@ public final class NDArrays {
             throw new IllegalArgumentException(
                     "embedding table must be a rank-two floating-point tensor");
         }
-        return rawIds.getNDArrayInternal().embeddingWithOffsets(offsets, table);
     }
 
     private static boolean isEmbeddingIndexType(DataType dataType) {

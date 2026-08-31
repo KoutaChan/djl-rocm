@@ -41,6 +41,16 @@ public interface NDArrayEx {
         return Embedding.embedding(indices, table, SparseFormat.DENSE).singletonOrThrow();
     }
 
+    /** Packs flattened offset embedding fields followed by dense features. */
+    default NDArray embeddingFeaturePack(NDArray offsets, NDArray table, NDArray features) {
+        NDArray rawIds = getArray();
+        long rows = rawIds.getShape().get(0);
+        long packedEmbeddingWidth =
+                Math.multiplyExact(rawIds.getShape().get(1), table.getShape().get(1));
+        NDArray embeddings = embeddingWithOffsets(offsets, table);
+        return embeddings.reshape(rows, packedEmbeddingWidth).concat(features, 1);
+    }
+
     /** Selects leading-axis rows while preserving all trailing dimensions. */
     default NDArray gatherRows(NDArray rowIndices) {
         NDArray rows = getArray();
