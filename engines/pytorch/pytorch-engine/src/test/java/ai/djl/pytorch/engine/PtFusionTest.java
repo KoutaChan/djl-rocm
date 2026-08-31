@@ -228,6 +228,26 @@ public class PtFusionTest {
     }
 
     @Test
+    public void indexedLocalTransformerDescriptorReportsAliasedTileWorkspace() {
+        IndexedLocalTransformerFixture fixture =
+                new IndexedLocalTransformerFixture(DataType.FLOAT16, 4096);
+        ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.INDEXED_LOCAL_TRANSFORMER_ENCODER_V1);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 3) * Long.BYTES), 1L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 17L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 5) * Long.BYTES), 4L);
+        Assert.assertEquals(PtFusionDescriptor.commandCount(fixture.recipe), 1);
+        Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(fixture.recipe), 262_144L);
+        Assert.assertEquals(
+                PtFusionDescriptor.persistentStorageBytes(fixture.recipe), 459_276_288L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(fixture.recipe), 216_006_656L);
+    }
+
+    @Test
     public void binaryBranchBlendDescriptorUsesClosedOperandOrder() {
         BinaryBranchBlendFixture fixture = new BinaryBranchBlendFixture();
         ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
@@ -406,6 +426,76 @@ public class PtFusionTest {
                                         dataType,
                                         deviceIndex,
                                         "value");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void rocmIndexedLocalTransformerMatchesSparseReferenceAcrossDevicesAndTypes() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        int maximumBatch = 384;
+        int[] batches = {1, 31, 256, 384};
+        IndexedLocalPattern pattern = indexedLocalPattern(maximumBatch);
+        int deviceCount = Math.min(2, engine.getGpuCount());
+        for (int deviceIndex = 0; deviceIndex < deviceCount; ++deviceIndex) {
+            Device device = Device.gpu(deviceIndex);
+            for (DataType dataType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                IndexedLocalTransformerFixture fixture =
+                        new IndexedLocalTransformerFixture(dataType, maximumBatch);
+                try (NDManager manager = engine.newBaseManager(device);
+                        BoundIndexedLocalTransformer bound = fixture.bind(manager);
+                        NDArray maximumInput =
+                                patternedArray(
+                                        manager,
+                                        dataType,
+                                        new Shape(maximumBatch, 4, 29, 256),
+                                        61,
+                                        30,
+                                        0.015f);
+                        NDArray maximumMask =
+                                manager.create(pattern.mask, new Shape(maximumBatch, 4, 29));
+                        NDArray maximumIndices =
+                                manager.create(pattern.indices, new Shape(pattern.indices.length));
+                        FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                        FusionExecutable executable = plan.bind(bound.bindings);
+                        FusionSession session =
+                                executable.newSession(
+                                        manager,
+                                        FusionSessionConfig.builder().optBufferCount(2).build())) {
+                    for (int batchCount : batches) {
+                        int activeRows = pattern.presentCount(batchCount);
+                        try (NDArray input = maximumInput.get("0:" + batchCount);
+                                NDArray mask = maximumMask.get("0:" + batchCount);
+                                NDArray indices = maximumIndices.get("0:" + activeRows);
+                                FusionInvocation invocation = session.acquire()) {
+                            invocation.setInput(fixture.input, input);
+                            invocation.setInput(fixture.indices, indices);
+                            invocation.setDimension(fixture.batch, batchCount);
+                            invocation.setDimension(fixture.active, activeRows);
+                            try (FusionOutputLease lease = invocation.submit();
+                                    NDArray expected =
+                                            indexedLocalTransformerReference(
+                                                    input, indices, mask, bound)) {
+                                lease.synchronize();
+                                try (NDArray actual =
+                                        lease.get(fixture.output).get("0:" + batchCount)) {
+                                    assertIndexedLocalTransformerClose(
+                                            actual,
+                                            expected,
+                                            outputTolerance(dataType),
+                                            deviceIndex,
+                                            dataType,
+                                            batchCount,
+                                            activeRows);
+                                }
                             }
                         }
                     }
@@ -1976,6 +2066,139 @@ public class PtFusionTest {
                         + tolerance);
     }
 
+    private static IndexedLocalPattern indexedLocalPattern(int maximumBatch) {
+        int denseRows = maximumBatch * 4 * 29;
+        float[] mask = new float[denseRows];
+        int[] temporaryIndices = new int[denseRows];
+        int activeRows = 0;
+        for (int denseRow = 0; denseRow < denseRows; ++denseRow) {
+            int token = denseRow % 29;
+            int group = denseRow / 29;
+            boolean present = token == 0 || Math.floorMod(group * 131 + token * 47, 1000) < 234;
+            if (present) {
+                mask[denseRow] = 1f;
+                temporaryIndices[activeRows++] = denseRow;
+            }
+        }
+        int[] indices = new int[activeRows];
+        System.arraycopy(temporaryIndices, 0, indices, 0, activeRows);
+        return new IndexedLocalPattern(mask, indices);
+    }
+
+    private static NDArray indexedLocalTransformerReference(
+            NDArray input, NDArray indices, NDArray mask, BoundIndexedLocalTransformer weights) {
+        try (NDScope scope = new NDScope()) {
+            scope.suppressNotUsedWarning();
+            long batchCount = input.getShape().get(0);
+            long denseRows = batchCount * 4L * 29L;
+            long activeRows = indices.getShape().get(0);
+            NDArray selectedInput = NDArrays.gatherRows(input.reshape(denseRows, 256), indices);
+            NDArray state =
+                    mixedPrecisionLayerNormReference(
+                            selectedInput, weights.inputNormWeight, weights.inputNormBias);
+            NDArray normalized =
+                    mixedPrecisionLayerNormReference(
+                            state, weights.attentionInputWeight, weights.attentionInputBias);
+            NDArray selectedQueryKeyValue = normalized.matMul(weights.queryKeyValue.transpose());
+            NDArray queryKeyValue =
+                    NDArrays.scatterRows(selectedQueryKeyValue, indices, denseRows)
+                            .reshape(batchCount * 4L, 29, 192);
+            NDArray queries =
+                    queryKeyValue
+                            .get("...,0:64")
+                            .reshape(batchCount * 4L, 29, 4, 16)
+                            .swapAxes(1, 2);
+            NDArray keys =
+                    queryKeyValue
+                            .get("...,64:128")
+                            .reshape(batchCount * 4L, 29, 4, 16)
+                            .swapAxes(1, 2);
+            NDArray values =
+                    queryKeyValue
+                            .get("...,128:192")
+                            .reshape(batchCount * 4L, 29, 4, 16)
+                            .swapAxes(1, 2);
+            NDArray attentionMask =
+                    mask.reshape(batchCount * 4L, 1, 1, 29)
+                            .toType(input.getDataType(), false)
+                            .neg()
+                            .add(1f)
+                            .mul(-1.0e9f);
+            NDArray context =
+                    queries.getNDArrayInternal()
+                            .scaledDotProductAttention(keys, values, attentionMask, 0.0, false)
+                            .swapAxes(1, 2)
+                            .reshape(denseRows, 64);
+            NDArray selectedContext = NDArrays.gatherRows(context, indices);
+            NDArray attentionUpdate =
+                    selectedContext
+                            .matMul(weights.attentionOutput.transpose())
+                            .add(weights.attentionOutputBias);
+            state = state.add(attentionUpdate);
+            normalized =
+                    mixedPrecisionLayerNormReference(
+                            state, weights.feedForwardInputWeight, weights.feedForwardInputBias);
+            NDArray expanded =
+                    normalized.matMul(weights.expansion.transpose()).add(weights.expansionBias);
+            NDArray projected =
+                    expanded.mul(Activation.sigmoid(expanded))
+                            .matMul(weights.projection.transpose())
+                            .add(weights.projectionBias);
+            NDArray encoded =
+                    mixedPrecisionLayerNormReference(
+                            state.add(projected), weights.outputWeight, weights.outputBias);
+            NDArray result =
+                    NDArrays.scatterRows(encoded.reshape(activeRows, 256), indices, denseRows)
+                            .reshape(input.getShape());
+            NDScope.unregister(result);
+            return result;
+        }
+    }
+
+    private static void assertIndexedLocalTransformerClose(
+            NDArray actual,
+            NDArray expected,
+            float tolerance,
+            int deviceIndex,
+            DataType dataType,
+            int batchCount,
+            int activeRows) {
+        float[] actualValues = actual.toType(DataType.FLOAT32, false).toFloatArray();
+        float[] expectedValues = expected.toType(DataType.FLOAT32, false).toFloatArray();
+        Assert.assertEquals(actualValues.length, expectedValues.length);
+        float maximum = 0f;
+        double total = 0.0;
+        for (int index = 0; index < actualValues.length; ++index) {
+            Assert.assertTrue(
+                    Float.isFinite(actualValues[index]) && Float.isFinite(expectedValues[index]),
+                    "Non-finite indexed local transformer value at index " + index);
+            float difference = Math.abs(actualValues[index] - expectedValues[index]);
+            maximum = Math.max(maximum, difference);
+            total += difference;
+        }
+        double mean = total / actualValues.length;
+        System.out.printf(
+                "indexed-local-transformer-parity device=%d dtype=%s batch=%d active=%d "
+                        + "maxAbs=%.9g meanAbs=%.9g tolerance=%.9g%n",
+                deviceIndex, dataType, batchCount, activeRows, maximum, mean, tolerance);
+        Assert.assertTrue(
+                maximum <= tolerance,
+                "Indexed local transformer parity exceeded its fixed tolerance: device="
+                        + deviceIndex
+                        + ", dtype="
+                        + dataType
+                        + ", batch="
+                        + batchCount
+                        + ", active="
+                        + activeRows
+                        + ", maxAbs="
+                        + maximum
+                        + ", meanAbs="
+                        + mean
+                        + ", tolerance="
+                        + tolerance);
+    }
+
     private static NDArray transformerEncoderReference(
             NDArray input,
             NDArray attentionInputWeight,
@@ -2681,6 +2904,278 @@ public class PtFusionTest {
             firstOutput = builder.addOutput("first", pack);
             secondOutput = builder.addOutput("second", pack);
             recipe = builder.build();
+        }
+    }
+
+    private static final class IndexedLocalTransformerFixture {
+
+        private final FusionRecipe.Dimension batch;
+        private final FusionRecipe.Dimension active;
+        private final FusionRecipe.Input input;
+        private final FusionRecipe.Input indices;
+        private final FusionRecipe.Constant inputNormWeight;
+        private final FusionRecipe.Constant inputNormBias;
+        private final FusionRecipe.Constant attentionInputWeight;
+        private final FusionRecipe.Constant attentionInputBias;
+        private final FusionRecipe.Constant queryKeyValue;
+        private final FusionRecipe.Constant attentionOutput;
+        private final FusionRecipe.Constant attentionOutputBias;
+        private final FusionRecipe.Constant feedForwardInputWeight;
+        private final FusionRecipe.Constant feedForwardInputBias;
+        private final FusionRecipe.Constant expansion;
+        private final FusionRecipe.Constant expansionBias;
+        private final FusionRecipe.Constant projection;
+        private final FusionRecipe.Constant projectionBias;
+        private final FusionRecipe.Constant outputWeight;
+        private final FusionRecipe.Constant outputBias;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private IndexedLocalTransformerFixture(DataType dataType, int maximumBatch) {
+            long maximumActiveRows = Math.multiplyExact((long) maximumBatch, 4L * 29L);
+            FusionRecipe.Builder builder = FusionRecipe.builder("indexed-local-transformer");
+            batch = builder.addDimension("batch", maximumBatch);
+            active = builder.addDimension("active", maximumActiveRows);
+            input =
+                    builder.addInput(
+                            "input", FusionRecipe.TensorSpec.of(dataType, batch, 4, 29, 256));
+            indices =
+                    builder.addInput("indices", FusionRecipe.TensorSpec.of(DataType.INT32, active));
+            inputNormWeight = vector(builder, "inputNormWeight", 256, DataType.FLOAT32);
+            inputNormBias = vector(builder, "inputNormBias", 256, DataType.FLOAT32);
+            attentionInputWeight = vector(builder, "attentionInputWeight", 256, DataType.FLOAT32);
+            attentionInputBias = vector(builder, "attentionInputBias", 256, DataType.FLOAT32);
+            queryKeyValue = matrix(builder, "qkv", 192, 256, dataType);
+            attentionOutput = matrix(builder, "attentionOutput", 256, 64, dataType);
+            attentionOutputBias = vector(builder, "attentionOutputBias", 256, dataType);
+            feedForwardInputWeight =
+                    vector(builder, "feedForwardInputWeight", 256, DataType.FLOAT32);
+            feedForwardInputBias = vector(builder, "feedForwardInputBias", 256, DataType.FLOAT32);
+            expansion = matrix(builder, "expansion", 128, 256, dataType);
+            expansionBias = vector(builder, "expansionBias", 128, dataType);
+            projection = matrix(builder, "projection", 256, 128, dataType);
+            projectionBias = vector(builder, "projectionBias", 256, dataType);
+            outputWeight = vector(builder, "outputWeight", 256, DataType.FLOAT32);
+            outputBias = vector(builder, "outputBias", 256, DataType.FLOAT32);
+            FusionRecipe.IndexedLocalTransformerEncoder encoder =
+                    builder.indexedLocalTransformerEncoder("encoder", input, indices, 4, 64, 128)
+                            .setInputNormalization(inputNormWeight, inputNormBias)
+                            .setBlock(
+                                    attentionInputWeight,
+                                    attentionInputBias,
+                                    queryKeyValue,
+                                    attentionOutput,
+                                    attentionOutputBias,
+                                    feedForwardInputWeight,
+                                    feedForwardInputBias,
+                                    expansion,
+                                    expansionBias,
+                                    projection,
+                                    projectionBias,
+                                    outputWeight,
+                                    outputBias)
+                            .build();
+            output = builder.addOutput("output", encoder);
+            recipe = builder.build();
+        }
+
+        private BoundIndexedLocalTransformer bind(NDManager manager) {
+            NDList resources = new NDList();
+            NDArray inputNormWeightArray = parameter(manager, inputNormWeight, 29, 14, 0.004f, 1f);
+            NDArray inputNormBiasArray = parameter(manager, inputNormBias, 31, 15, 0.001f, 0f);
+            NDArray attentionInputWeightArray =
+                    parameter(manager, attentionInputWeight, 23, 11, 0.004f, 1f);
+            NDArray attentionInputBiasArray =
+                    parameter(manager, attentionInputBias, 19, 9, 0.001f, 0f);
+            NDArray queryKeyValueArray = parameter(manager, queryKeyValue, 37, 18, 0.0015f, 0f);
+            NDArray attentionOutputArray = parameter(manager, attentionOutput, 41, 20, 0.0015f, 0f);
+            NDArray attentionOutputBiasArray =
+                    parameter(manager, attentionOutputBias, 17, 8, 0.001f, 0f);
+            NDArray feedForwardInputWeightArray =
+                    parameter(manager, feedForwardInputWeight, 27, 13, 0.004f, 1f);
+            NDArray feedForwardInputBiasArray =
+                    parameter(manager, feedForwardInputBias, 21, 10, 0.001f, 0f);
+            NDArray expansionArray = parameter(manager, expansion, 43, 21, 0.0015f, 0f);
+            NDArray expansionBiasArray = parameter(manager, expansionBias, 13, 6, 0.001f, 0f);
+            NDArray projectionArray = parameter(manager, projection, 47, 23, 0.0015f, 0f);
+            NDArray projectionBiasArray = parameter(manager, projectionBias, 25, 12, 0.001f, 0f);
+            NDArray outputWeightArray = parameter(manager, outputWeight, 33, 16, 0.004f, 1f);
+            NDArray outputBiasArray = parameter(manager, outputBias, 35, 17, 0.001f, 0f);
+            resources.addAll(
+                    new NDList(
+                            inputNormWeightArray,
+                            inputNormBiasArray,
+                            attentionInputWeightArray,
+                            attentionInputBiasArray,
+                            queryKeyValueArray,
+                            attentionOutputArray,
+                            attentionOutputBiasArray,
+                            feedForwardInputWeightArray,
+                            feedForwardInputBiasArray,
+                            expansionArray,
+                            expansionBiasArray,
+                            projectionArray,
+                            projectionBiasArray,
+                            outputWeightArray,
+                            outputBiasArray));
+            FusionConstantBindings bindings =
+                    FusionConstantBindings.builder(recipe)
+                            .bind(inputNormWeight, inputNormWeightArray)
+                            .bind(inputNormBias, inputNormBiasArray)
+                            .bind(attentionInputWeight, attentionInputWeightArray)
+                            .bind(attentionInputBias, attentionInputBiasArray)
+                            .bind(queryKeyValue, queryKeyValueArray)
+                            .bind(attentionOutput, attentionOutputArray)
+                            .bind(attentionOutputBias, attentionOutputBiasArray)
+                            .bind(feedForwardInputWeight, feedForwardInputWeightArray)
+                            .bind(feedForwardInputBias, feedForwardInputBiasArray)
+                            .bind(expansion, expansionArray)
+                            .bind(expansionBias, expansionBiasArray)
+                            .bind(projection, projectionArray)
+                            .bind(projectionBias, projectionBiasArray)
+                            .bind(outputWeight, outputWeightArray)
+                            .bind(outputBias, outputBiasArray)
+                            .build();
+            return new BoundIndexedLocalTransformer(
+                    bindings,
+                    resources,
+                    inputNormWeightArray,
+                    inputNormBiasArray,
+                    attentionInputWeightArray,
+                    attentionInputBiasArray,
+                    queryKeyValueArray,
+                    attentionOutputArray,
+                    attentionOutputBiasArray,
+                    feedForwardInputWeightArray,
+                    feedForwardInputBiasArray,
+                    expansionArray,
+                    expansionBiasArray,
+                    projectionArray,
+                    projectionBiasArray,
+                    outputWeightArray,
+                    outputBiasArray);
+        }
+
+        private static NDArray parameter(
+                NDManager manager,
+                FusionRecipe.Constant constant,
+                int period,
+                int center,
+                float scale,
+                float offset) {
+            NDArray value =
+                    patternedArray(
+                            manager,
+                            constant.getSpec().getDataType(),
+                            constant.getSpec().getMaximumShape(),
+                            period,
+                            center,
+                            scale);
+            return offset == 0f ? value : value.add(offset);
+        }
+
+        private static FusionRecipe.Constant vector(
+                FusionRecipe.Builder builder, String name, int width, DataType dataType) {
+            return builder.addConstant(name, FusionRecipe.TensorSpec.fixed(dataType, width));
+        }
+
+        private static FusionRecipe.Constant matrix(
+                FusionRecipe.Builder builder,
+                String name,
+                int rows,
+                int columns,
+                DataType dataType) {
+            return builder.addConstant(
+                    name, FusionRecipe.TensorSpec.fixed(dataType, rows, columns));
+        }
+    }
+
+    private static final class BoundIndexedLocalTransformer implements AutoCloseable {
+
+        private final FusionConstantBindings bindings;
+        private final NDList resources;
+        private final NDArray inputNormWeight;
+        private final NDArray inputNormBias;
+        private final NDArray attentionInputWeight;
+        private final NDArray attentionInputBias;
+        private final NDArray queryKeyValue;
+        private final NDArray attentionOutput;
+        private final NDArray attentionOutputBias;
+        private final NDArray feedForwardInputWeight;
+        private final NDArray feedForwardInputBias;
+        private final NDArray expansion;
+        private final NDArray expansionBias;
+        private final NDArray projection;
+        private final NDArray projectionBias;
+        private final NDArray outputWeight;
+        private final NDArray outputBias;
+
+        private BoundIndexedLocalTransformer(
+                FusionConstantBindings bindings,
+                NDList resources,
+                NDArray inputNormWeight,
+                NDArray inputNormBias,
+                NDArray attentionInputWeight,
+                NDArray attentionInputBias,
+                NDArray queryKeyValue,
+                NDArray attentionOutput,
+                NDArray attentionOutputBias,
+                NDArray feedForwardInputWeight,
+                NDArray feedForwardInputBias,
+                NDArray expansion,
+                NDArray expansionBias,
+                NDArray projection,
+                NDArray projectionBias,
+                NDArray outputWeight,
+                NDArray outputBias) {
+            this.bindings = bindings;
+            this.resources = resources;
+            this.inputNormWeight = inputNormWeight;
+            this.inputNormBias = inputNormBias;
+            this.attentionInputWeight = attentionInputWeight;
+            this.attentionInputBias = attentionInputBias;
+            this.queryKeyValue = queryKeyValue;
+            this.attentionOutput = attentionOutput;
+            this.attentionOutputBias = attentionOutputBias;
+            this.feedForwardInputWeight = feedForwardInputWeight;
+            this.feedForwardInputBias = feedForwardInputBias;
+            this.expansion = expansion;
+            this.expansionBias = expansionBias;
+            this.projection = projection;
+            this.projectionBias = projectionBias;
+            this.outputWeight = outputWeight;
+            this.outputBias = outputBias;
+        }
+
+        @Override
+        public void close() {
+            resources.close();
+        }
+    }
+
+    private static final class IndexedLocalPattern {
+
+        private final float[] mask;
+        private final int[] indices;
+
+        private IndexedLocalPattern(float[] mask, int[] indices) {
+            this.mask = mask;
+            this.indices = indices;
+        }
+
+        private int presentCount(int batchCount) {
+            int denseRows = batchCount * 4 * 29;
+            int low = 0;
+            int high = indices.length;
+            while (low < high) {
+                int middle = low + (high - low) / 2;
+                if (indices[middle] < denseRows) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            return low;
         }
     }
 

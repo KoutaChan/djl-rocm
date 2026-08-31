@@ -65,6 +65,8 @@ constexpr int64_t kIndexedAffineV1 = 3;
 constexpr int64_t kTransformerEncoderStackV1 = 4;
 constexpr int64_t kBinaryBranchBlendV1 = 5;
 constexpr int64_t kSingleQueryCrossAttentionReadoutGroupV1 = 6;
+// Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
+constexpr int64_t kIndexedLocalTransformerEncoderV1 = 8;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
 
@@ -93,6 +95,11 @@ constexpr int64_t kReadoutMaximumFeedForwardWidth = 4;
 constexpr int64_t kReadoutEpsilon = 5;
 constexpr int64_t kReadoutFeedForwardWidths = 6;
 constexpr int64_t kReadoutQueryIndex = 7;
+constexpr int64_t kLocalTransformerAttentionHeads = 1;
+constexpr int64_t kLocalTransformerAttentionWidth = 2;
+constexpr int64_t kLocalTransformerFeedForwardWidth = 3;
+constexpr int64_t kLocalTransformerEpsilon = 4;
+constexpr int64_t kIndexedLocalTransformerTileRows = 65536;
 constexpr int64_t kActivationNone = 0;
 constexpr int64_t kActivationSilu = 1;
 
@@ -285,9 +292,37 @@ struct SingleQueryReadoutGroupCommandSpec {
   std::vector<SingleQueryReadoutSpec> readouts;
 };
 
-using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec,
-    IndexedAffineCommandSpec, TransformerEncoderStackCommandSpec,
-    BinaryBranchBlendCommandSpec, SingleQueryReadoutGroupCommandSpec>;
+struct IndexedLocalTransformerCommandSpec {
+  std::array<int32_t, 15> value_indices;
+  int32_t result_value_index;
+  int32_t result_storage_index;
+  int32_t input_value_index;
+  int32_t indices_value_index;
+  int32_t batch_extent_index;
+  int32_t active_extent_index;
+  int32_t normalized_storage_index;
+  int32_t query_key_value_storage_index;
+  int32_t query_key_value_weight_binding_index;
+  int32_t attention_output_weight_binding_index;
+  int32_t feed_forward_expansion_weight_binding_index;
+  int32_t feed_forward_projection_weight_binding_index;
+  int64_t maximum_batches;
+  int64_t maximum_active_rows;
+  int64_t tile_rows;
+  int64_t group_count;
+  int64_t token_count;
+  int64_t hidden_width;
+  int64_t attention_heads;
+  int64_t attention_width;
+  int64_t feed_forward_width;
+  float epsilon;
+  torch::ScalarType index_data_type;
+  std::vector<int32_t> operand_value_indices;
+};
+
+using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec, IndexedAffineCommandSpec,
+    TransformerEncoderStackCommandSpec, BinaryBranchBlendCommandSpec, SingleQueryReadoutGroupCommandSpec,
+    IndexedLocalTransformerCommandSpec>;
 
 struct SingleQueryReadoutGroupWeights {
   torch::Tensor query_seed_weight;
@@ -334,6 +369,7 @@ struct FusionExecutableData {
   std::vector<std::vector<std::array<torch::Tensor, 4>>>
       transformer_encoder_weights;
   std::vector<SingleQueryReadoutGroupWeights> single_query_readout_weights;
+  std::vector<std::array<torch::Tensor, 4>> indexed_local_transformer_weights;
   std::unique_ptr<c10::Event> binding_ready;
 };
 
@@ -1251,10 +1287,124 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
   return command;
 }
 
-SingleQueryReadoutGroupCommandSpec BuildSingleQueryReadoutGroupCommand(
-    FusionPlanData& plan, int32_t command_index,
-    const std::vector<int32_t>& results,
-    const std::vector<int32_t>& operands, int64_t flags,
+IndexedLocalTransformerCommandSpec BuildIndexedLocalTransformerCommand(FusionPlanData& plan, int32_t command_index,
+    const std::vector<int32_t>& results, const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0, "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 does not support command flags");
+  TORCH_CHECK(results.size() == 1, "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 requires exactly one result");
+  TORCH_CHECK(operands.size() == 17, "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 requires exactly seventeen operands");
+  TORCH_CHECK(attributes.size() == 4, "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 requires exactly four attributes");
+
+  IndexedLocalTransformerCommandSpec command;
+  command.result_value_index = results[0];
+  command.input_value_index = operands[0];
+  command.indices_value_index = operands[1];
+  command.attention_heads =
+      GetRequiredInt64Scalar(attributes, kLocalTransformerAttentionHeads, "indexed local transformer attention heads");
+  command.attention_width =
+      GetRequiredInt64Scalar(attributes, kLocalTransformerAttentionWidth, "indexed local transformer attention width");
+  command.feed_forward_width = GetRequiredInt64Scalar(
+      attributes, kLocalTransformerFeedForwardWidth, "indexed local transformer feed-forward width");
+  const double epsilon =
+      GetRequiredFloat64Scalar(attributes, kLocalTransformerEpsilon, "indexed local transformer epsilon");
+  TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0 && epsilon <= std::numeric_limits<float>::max(),
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 epsilon must be finite and positive");
+  command.epsilon = static_cast<float>(epsilon);
+  command.operand_value_indices = operands;
+
+  ValueSpec& result = plan.values[command.result_value_index];
+  const ValueSpec& input = plan.values[command.input_value_index];
+  const ValueSpec& indices = plan.values[command.indices_value_index];
+  TORCH_CHECK(result.kind == ValueKind::kUnbound && input.kind != ValueKind::kUnbound && input.dimension_index >= 0 &&
+                  IsFusionFloatingDataType(input.data_type) && input.inner_shape.size() == 3 &&
+                  result.data_type == input.data_type && result.dimension_index == input.dimension_index &&
+                  result.inner_shape == input.inner_shape,
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 input and result metadata must match");
+  TORCH_CHECK(indices.kind != ValueKind::kUnbound && indices.dimension_index >= 0 && indices.inner_shape.empty() &&
+                  (indices.data_type == torch::kInt32 || indices.data_type == torch::kInt64),
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 indices must be bounded INT32 or INT64 rows");
+  command.batch_extent_index = input.dimension_index;
+  command.active_extent_index = indices.dimension_index;
+  command.maximum_batches = plan.dimensions[command.batch_extent_index].maximum_extent;
+  command.maximum_active_rows = plan.dimensions[command.active_extent_index].maximum_extent;
+  command.group_count = input.inner_shape[0];
+  command.token_count = input.inner_shape[1];
+  command.hidden_width = input.inner_shape[2];
+  command.index_data_type = indices.data_type;
+  TORCH_CHECK(command.hidden_width == 256 && command.group_count == 4 && command.token_count > 0 &&
+                  command.token_count <= 32 && command.attention_heads == 4 && command.attention_width == 64 &&
+                  command.feed_forward_width == 128,
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 native lowering requires hidden=256, "
+      "groups=4, tokens<=32, heads=4, attention=64, and feed-forward=128");
+  const int64_t maximum_dense_rows = CheckedMultiply(command.maximum_batches,
+      CheckedMultiply(command.group_count, command.token_count, "indexed local transformer rows per batch"),
+      "indexed local transformer dense row capacity");
+  TORCH_CHECK(command.maximum_active_rows <= maximum_dense_rows,
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 active capacity exceeds dense rows");
+
+  const auto require_vector = [&](int32_t value_index, int64_t width, bool allow_float32, const char* name) {
+    const ValueSpec& value = plan.values[value_index];
+    TORCH_CHECK(value.kind == ValueKind::kConstant && value.dimension_index < 0 && value.inner_shape.size() == 1 &&
+                    value.inner_shape[0] == width &&
+                    (value.data_type == result.data_type || (allow_float32 && value.data_type == torch::kFloat32)),
+        "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 ", name, " metadata does not match the encoder");
+  };
+  const auto require_projection = [&](int32_t value_index, int64_t rows, int64_t columns, const char* name) {
+    const ValueSpec& value = plan.values[value_index];
+    TORCH_CHECK(value.kind == ValueKind::kConstant && value.dimension_index < 0 && value.inner_shape.size() == 2 &&
+                    value.inner_shape[0] == rows && value.inner_shape[1] == columns &&
+                    value.data_type == result.data_type,
+        "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 ", name, " metadata does not match the encoder");
+  };
+
+  for (int32_t index = 0; index < 15; ++index) {
+    command.value_indices[index] = operands[static_cast<std::size_t>(index) + 2];
+  }
+  require_vector(command.value_indices[0], command.hidden_width, true, "input norm weight");
+  require_vector(command.value_indices[1], command.hidden_width, true, "input norm bias");
+  require_vector(command.value_indices[2], command.hidden_width, true, "attention-input norm weight");
+  require_vector(command.value_indices[3], command.hidden_width, true, "attention-input norm bias");
+  TORCH_CHECK(plan.values[command.value_indices[0]].data_type == plan.values[command.value_indices[1]].data_type &&
+                  plan.values[command.value_indices[2]].data_type == plan.values[command.value_indices[3]].data_type,
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 norm pair types must match");
+  require_projection(command.value_indices[4], 3 * command.attention_width, command.hidden_width, "QKV weight");
+  require_projection(
+      command.value_indices[5], command.hidden_width, command.attention_width, "attention output weight");
+  require_vector(command.value_indices[6], command.hidden_width, false, "attention output bias");
+  require_vector(command.value_indices[7], command.hidden_width, true, "feed-forward-input norm weight");
+  require_vector(command.value_indices[8], command.hidden_width, true, "feed-forward-input norm bias");
+  TORCH_CHECK(plan.values[command.value_indices[7]].data_type == plan.values[command.value_indices[8]].data_type,
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 feed-forward norm types must match");
+  require_projection(
+      command.value_indices[9], command.feed_forward_width, command.hidden_width, "feed-forward expansion weight");
+  require_vector(command.value_indices[10], command.feed_forward_width, false, "feed-forward expansion bias");
+  require_projection(
+      command.value_indices[11], command.hidden_width, command.feed_forward_width, "feed-forward projection weight");
+  require_vector(command.value_indices[12], command.hidden_width, false, "feed-forward projection bias");
+  require_vector(command.value_indices[13], command.hidden_width, true, "output norm weight");
+  require_vector(command.value_indices[14], command.hidden_width, true, "output norm bias");
+  TORCH_CHECK(plan.values[command.value_indices[13]].data_type == plan.values[command.value_indices[14]].data_type,
+      "INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 output norm types must match");
+  command.query_key_value_weight_binding_index = plan.values[command.value_indices[4]].binding_index;
+  command.attention_output_weight_binding_index = plan.values[command.value_indices[5]].binding_index;
+  command.feed_forward_expansion_weight_binding_index = plan.values[command.value_indices[9]].binding_index;
+  command.feed_forward_projection_weight_binding_index = plan.values[command.value_indices[11]].binding_index;
+
+  result.kind = ValueKind::kComputed;
+  result.producer_index = command_index;
+  command.result_storage_index = NextStorageIndex(plan);
+  result.storage_index = command.result_storage_index;
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+  command.tile_rows = std::min(command.maximum_active_rows, kIndexedLocalTransformerTileRows);
+  command.normalized_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{result.data_type, {command.tile_rows, command.hidden_width}});
+  command.query_key_value_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{result.data_type, {command.maximum_active_rows, 3 * command.attention_width}});
+  return command;
+}
+
+SingleQueryReadoutGroupCommandSpec BuildSingleQueryReadoutGroupCommand(FusionPlanData& plan, int32_t command_index,
+    const std::vector<int32_t>& results, const std::vector<int32_t>& operands, int64_t flags,
     const CommandAttributes& attributes) {
   TORCH_CHECK(flags == 0,
       "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 does not support command flags");
@@ -1773,6 +1923,10 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         plan->commands.emplace_back(BuildSingleQueryReadoutGroupCommand(
             *plan, command_index, results, operands, flags, attributes));
         break;
+      case kIndexedLocalTransformerEncoderV1:
+        plan->commands.emplace_back(
+            BuildIndexedLocalTransformerCommand(*plan, command_index, results, operands, flags, attributes));
+        break;
       default:
         TORCH_CHECK(false, "unsupported fusion command opcode: ", opcode);
     }
@@ -2051,8 +2205,22 @@ void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_inde
   }
 }
 
-void ValidateSubmission(const FusionSession& session, int32_t buffer_index,
-    const int64_t* input_handles, const int64_t* dimensions) {
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
+    const int64_t* dimensions, const IndexedLocalTransformerCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  const torch::Tensor& input = ResolveValue(session, buffer_index, input_handles, command.input_value_index);
+  ValidateTensorMetadata(
+      input, plan, plan.values[command.input_value_index], dimensions, false, "indexed local transformer input");
+  const torch::Tensor& indices = ResolveValue(session, buffer_index, input_handles, command.indices_value_index);
+  ValidateTensorMetadata(
+      indices, plan, plan.values[command.indices_value_index], dimensions, false, "indexed local transformer indices");
+  const torch::Tensor& result = session.storages[buffer_index][command.result_storage_index];
+  ValidateTensorMetadata(result, plan, plan.values[command.result_value_index], dimensions, true,
+      "indexed local transformer result storage");
+}
+
+void ValidateSubmission(
+    const FusionSession& session, int32_t buffer_index, const int64_t* input_handles, const int64_t* dimensions) {
   const auto& plan = *session.executable->plan;
   for (std::size_t index = 0; index < plan.dimensions.size(); ++index) {
     TORCH_CHECK(dimensions[index] >= 0 &&
@@ -2431,10 +2599,106 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   }
 }
 
-void ExecuteCommand(FusionSession& session, int32_t buffer_index,
-    const int64_t* input_handles, const int64_t* dimensions,
-    const SingleQueryReadoutGroupCommandSpec& command,
-    std::size_t command_index, bool& work_submitted) {
+void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
+    const int64_t* dimensions, const IndexedLocalTransformerCommandSpec& command, std::size_t command_index,
+    bool& work_submitted) {
+  const int64_t batch_count = dimensions[command.batch_extent_index];
+  const int64_t active_rows = dimensions[command.active_extent_index];
+  if (batch_count == 0) {
+    TORCH_CHECK(active_rows == 0, "indexed local transformer has active rows without a batch");
+    return;
+  }
+  const int64_t dense_rows = CheckedMultiply(batch_count,
+      CheckedMultiply(command.group_count, command.token_count, "indexed local transformer rows per batch"),
+      "indexed local transformer active dense rows");
+  TORCH_CHECK(active_rows <= dense_rows, "indexed local transformer active rows exceed dense rows");
+  work_submitted = true;
+
+  const torch::Tensor& input = ResolveValue(session, buffer_index, input_handles, command.input_value_index);
+  const torch::Tensor& indices = ResolveValue(session, buffer_index, input_handles, command.indices_value_index);
+  torch::Tensor& result = session.storages[buffer_index][command.result_storage_index];
+  torch::Tensor& normalized = session.storages[buffer_index][command.normalized_storage_index];
+  torch::Tensor& query_key_value = session.storages[buffer_index][command.query_key_value_storage_index];
+  const auto& weights = session.executable->indexed_local_transformer_weights[command_index];
+
+  RecordCurrentStream(input);
+  RecordCurrentStream(indices);
+  RecordCurrentStream(result);
+  RecordCurrentStream(normalized);
+  RecordCurrentStream(query_key_value);
+  for (const torch::Tensor& weight : weights) {
+    RecordCurrentStream(weight);
+  }
+  for (int32_t value_index : command.value_indices) {
+    RecordCurrentStream(ResolveValue(session, buffer_index, input_handles, value_index));
+  }
+
+  const torch::Tensor& input_norm_weight = ResolveValue(session, buffer_index, input_handles, command.value_indices[0]);
+  const torch::Tensor& input_norm_bias = ResolveValue(session, buffer_index, input_handles, command.value_indices[1]);
+  const torch::Tensor& attention_norm_weight =
+      ResolveValue(session, buffer_index, input_handles, command.value_indices[2]);
+  const torch::Tensor& attention_norm_bias =
+      ResolveValue(session, buffer_index, input_handles, command.value_indices[3]);
+  LaunchIndexedLocalTransformerClear(result, dense_rows, command.hidden_width);
+  for (int64_t active_offset = 0; active_offset < active_rows; active_offset += command.tile_rows) {
+    const int64_t tile_rows = std::min(command.tile_rows, active_rows - active_offset);
+    torch::Tensor normalized_matrix = normalized.narrow(0, 0, tile_rows);
+    torch::Tensor query_key_value_matrix = query_key_value.narrow(0, active_offset, tile_rows);
+    LaunchIndexedLocalTransformerGatherNormalize(input, indices, command.index_data_type, input_norm_weight,
+        input_norm_bias, attention_norm_weight, attention_norm_bias, result, normalized, active_offset, tile_rows,
+        dense_rows, command.hidden_width, command.epsilon);
+    at::mm_out(query_key_value_matrix, normalized_matrix, weights[0]);
+  }
+
+  if (active_rows != 0) {
+    LaunchIndexedLocalTransformerAttention(query_key_value, indices, command.index_data_type, active_rows, dense_rows,
+        command.token_count, command.attention_heads, command.attention_width);
+
+    const torch::Tensor& attention_output_bias =
+        ResolveValue(session, buffer_index, input_handles, command.value_indices[6]);
+    const torch::Tensor& feed_forward_norm_weight =
+        ResolveValue(session, buffer_index, input_handles, command.value_indices[7]);
+    const torch::Tensor& feed_forward_norm_bias =
+        ResolveValue(session, buffer_index, input_handles, command.value_indices[8]);
+    const torch::Tensor& expansion_bias = ResolveValue(session, buffer_index, input_handles, command.value_indices[10]);
+    const torch::Tensor& projection_bias =
+        ResolveValue(session, buffer_index, input_handles, command.value_indices[12]);
+    const torch::Tensor& output_norm_weight =
+        ResolveValue(session, buffer_index, input_handles, command.value_indices[13]);
+    const torch::Tensor& output_norm_bias =
+        ResolveValue(session, buffer_index, input_handles, command.value_indices[14]);
+    for (int64_t active_offset = 0; active_offset < active_rows; active_offset += command.tile_rows) {
+      const int64_t tile_rows = std::min(command.tile_rows, active_rows - active_offset);
+      torch::Tensor normalized_matrix = normalized.narrow(0, 0, tile_rows);
+      // Attention replaces each compact Q row with its context. Preserve the 192-element
+      // leading dimension so rocBLAS can consume the view without packing it.
+      torch::Tensor context = query_key_value.narrow(0, active_offset, tile_rows)
+                                  .as_strided({tile_rows, command.attention_width}, {3 * command.attention_width, 1});
+      at::mm_out(normalized_matrix, context, weights[1]);
+      LaunchIndexedLocalTransformerResidualLayerNorm(result, normalized_matrix, attention_output_bias, indices,
+          command.index_data_type, feed_forward_norm_weight, feed_forward_norm_bias, normalized, active_offset,
+          tile_rows, dense_rows, command.hidden_width, command.epsilon);
+
+      // All attention groups have completed before this loop. The consumed QKV prefix can
+      // therefore back the narrower feed-forward expansion without another persistent tensor.
+      torch::Tensor expanded_matrix = query_key_value.flatten()
+                                          .narrow(0, 0,
+                                              CheckedMultiply(tile_rows, command.feed_forward_width,
+                                                  "indexed local transformer expansion elements"))
+                                          .view({tile_rows, command.feed_forward_width});
+      at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
+      LaunchIndexedLocalTransformerBiasSilu(expanded_matrix, expansion_bias, tile_rows, command.feed_forward_width);
+      at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
+      LaunchIndexedLocalTransformerFinalize(result, normalized_matrix, indices, command.index_data_type,
+          projection_bias, output_norm_weight, output_norm_bias, active_offset, tile_rows, dense_rows,
+          command.hidden_width, command.epsilon);
+    }
+  }
+}
+
+void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
+    const int64_t* dimensions, const SingleQueryReadoutGroupCommandSpec& command, std::size_t command_index,
+    bool& work_submitted) {
   const int64_t batch_count = dimensions[command.extent_index];
   if (batch_count == 0) {
     return;
@@ -2592,10 +2856,9 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
   data->indexed_affine_weights.resize(plan->data->commands.size());
   data->transformer_encoder_weights.resize(plan->data->commands.size());
   data->single_query_readout_weights.resize(plan->data->commands.size());
-  for (std::size_t command_index = 0;
-       command_index < plan->data->commands.size(); ++command_index) {
-    const auto* command = std::get_if<AffineSumCommandSpec>(
-        &plan->data->commands[command_index]);
+  data->indexed_local_transformer_weights.resize(plan->data->commands.size());
+  for (std::size_t command_index = 0; command_index < plan->data->commands.size(); ++command_index) {
+    const auto* command = std::get_if<AffineSumCommandSpec>(&plan->data->commands[command_index]);
     if (command == nullptr) {
       const auto* indexed_command = std::get_if<IndexedAffineCommandSpec>(
           &plan->data->commands[command_index]);
@@ -2737,6 +3000,21 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
         RecordCurrentStream(packed.feed_forward_expansion_bias);
         RecordCurrentStream(packed.feed_forward_projection_weight);
       }
+      const auto* local_transformer_command =
+          std::get_if<IndexedLocalTransformerCommandSpec>(&plan->data->commands[command_index]);
+      if (local_transformer_command != nullptr) {
+        auto& packed = data->indexed_local_transformer_weights[command_index];
+        const std::array<int32_t, 4> binding_indices{local_transformer_command->query_key_value_weight_binding_index,
+            local_transformer_command->attention_output_weight_binding_index,
+            local_transformer_command->feed_forward_expansion_weight_binding_index,
+            local_transformer_command->feed_forward_projection_weight_binding_index};
+        for (std::size_t index = 0; index < binding_indices.size(); ++index) {
+          const torch::Tensor& weight = data->constants[binding_indices[index]];
+          RecordCurrentStream(weight);
+          packed[index] = weight.transpose(0, 1).contiguous();
+          RecordCurrentStream(packed[index]);
+        }
+      }
       continue;
     }
     auto& packed_groups = data->affine_weights[command_index];
@@ -2854,30 +3132,20 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
          command_index < plan->commands.size(); ++command_index) {
       const auto& fusion_command = plan->commands[command_index];
       if (const auto* command = std::get_if<OutputPackCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            *command, work_submitted);
-      } else if (const auto* command =
-                     std::get_if<AffineSumCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            *command, command_index, work_submitted);
-      } else if (const auto* command =
-                     std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            *command, command_index, work_submitted);
-      } else if (const auto* command =
-                     std::get_if<TransformerEncoderStackCommandSpec>(
-                         &fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            *command, command_index, work_submitted);
-      } else if (const auto* command =
-                     std::get_if<BinaryBranchBlendCommandSpec>(
-                         &fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            *command, work_submitted);
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, work_submitted);
+      } else if (const auto* command = std::get_if<AffineSumCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
+      } else if (const auto* command = std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
+      } else if (const auto* command = std::get_if<TransformerEncoderStackCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
+      } else if (const auto* command = std::get_if<BinaryBranchBlendCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, work_submitted);
+      } else if (const auto* command = std::get_if<SingleQueryReadoutGroupCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
       } else {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            std::get<SingleQueryReadoutGroupCommandSpec>(fusion_command),
-            command_index, work_submitted);
+            std::get<IndexedLocalTransformerCommandSpec>(fusion_command), command_index, work_submitted);
       }
     }
   } catch (...) {

@@ -40,8 +40,9 @@ import java.util.Set;
  * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
  * blocks over a short dense sequence. {@link SingleQueryCrossAttentionReadoutGroup} evaluates
  * several purpose-specific single-query readouts over one shared masked memory without
- * materializing projected keys and values. Additional value types can be added without changing the
- * lifecycle of prepared plans and sessions.
+ * materializing projected keys and values. {@link IndexedLocalTransformerEncoder} evaluates one
+ * transformer block over compact rows selected from fixed-size local groups. Additional value types
+ * can be added without changing the lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
 
@@ -1155,6 +1156,124 @@ public final class FusionRecipe {
         }
     }
 
+    /**
+     * One indexed transformer encoder block applied independently to fixed-size local groups.
+     *
+     * <p>The input has shape {@code [batch, groups, tokens, hiddenWidth]}. The one-dimensional
+     * integer index contains the unique, ascending, zero-based rows selected from the flattened
+     * {@code [batch, groups, tokens]} prefix. Each selected token is first normalized by the input
+     * LayerNorm. The encoder then applies one pre-normalized self-attention block and one SiLU
+     * feed-forward block within its local group. Unselected output tokens are zero and never
+     * participate as attention keys or queries.
+     *
+     * <p>The index uses an independent bounded leading dimension so an invocation can bind a view
+     * over a larger packed index slab without copying it. This stage preserves the real-number
+     * semantics of gathering selected rows, encoding compact rows, and scattering the result back
+     * into the dense layout. FLOAT16 and BFLOAT16 implementations accumulate reductions and
+     * LayerNorm statistics in FLOAT32 and may round at projection and residual boundaries.
+     */
+    public static final class IndexedLocalTransformerEncoder extends Value {
+
+        private final Value input;
+        private final Value indices;
+        private final Constant inputNormWeight;
+        private final Constant inputNormBias;
+        private final TransformerEncoderBlock block;
+        private final int attentionHeads;
+        private final int attentionWidth;
+        private final int feedForwardWidth;
+        private final float epsilon;
+
+        private IndexedLocalTransformerEncoder(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                Value input,
+                Value indices,
+                Constant inputNormWeight,
+                Constant inputNormBias,
+                TransformerEncoderBlock block,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth,
+                float epsilon) {
+            super(owner, index, name, spec);
+            this.input = input;
+            this.indices = indices;
+            this.inputNormWeight = inputNormWeight;
+            this.inputNormBias = inputNormBias;
+            this.block = block;
+            this.attentionHeads = attentionHeads;
+            this.attentionWidth = attentionWidth;
+            this.feedForwardWidth = feedForwardWidth;
+            this.epsilon = epsilon;
+        }
+
+        /**
+         * @return the dense local-group input
+         */
+        public Value getInput() {
+            return input;
+        }
+
+        /**
+         * @return the ascending flattened token indices
+         */
+        public Value getIndices() {
+            return indices;
+        }
+
+        /**
+         * @return the input LayerNorm scale
+         */
+        public Constant getInputNormWeight() {
+            return inputNormWeight;
+        }
+
+        /**
+         * @return the input LayerNorm bias
+         */
+        public Constant getInputNormBias() {
+            return inputNormBias;
+        }
+
+        /**
+         * @return the transformer block parameters
+         */
+        public TransformerEncoderBlock getBlock() {
+            return block;
+        }
+
+        /**
+         * @return the attention head count
+         */
+        public int getAttentionHeads() {
+            return attentionHeads;
+        }
+
+        /**
+         * @return the concatenated attention width
+         */
+        public int getAttentionWidth() {
+            return attentionWidth;
+        }
+
+        /**
+         * @return the feed-forward hidden width
+         */
+        public int getFeedForwardWidth() {
+            return feedForwardWidth;
+        }
+
+        /**
+         * @return the LayerNorm epsilon
+         */
+        public float getEpsilon() {
+            return epsilon;
+        }
+    }
+
     /** The immutable parameters of one block in a {@link TransformerEncoderStack}. */
     public static final class TransformerEncoderBlock {
 
@@ -1579,6 +1698,37 @@ public final class FusionRecipe {
                     querySource,
                     validMask,
                     attentionHeads);
+        }
+
+        /**
+         * Starts an indexed transformer encoder over fixed-size local groups.
+         *
+         * @param name the value name
+         * @param input a bounded {@code [batch, groups, tokens, hiddenWidth]} floating-point value
+         * @param indices bounded, ascending, flattened INT32 or INT64 token indices
+         * @param attentionHeads the attention head count
+         * @param attentionWidth the concatenated Q, K, and V feature width
+         * @param feedForwardWidth the SiLU feed-forward hidden width
+         * @return a builder for the indexed local transformer encoder
+         */
+        public IndexedLocalTransformerEncoderBuilder indexedLocalTransformerEncoder(
+                String name,
+                Value input,
+                Value indices,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth) {
+            checkMutable();
+            checkValue(input);
+            checkValue(indices);
+            return new IndexedLocalTransformerEncoderBuilder(
+                    this,
+                    requireName(name, "value"),
+                    input,
+                    indices,
+                    attentionHeads,
+                    attentionWidth,
+                    feedForwardWidth);
         }
 
         /**
@@ -2247,6 +2397,331 @@ public final class FusionRecipe {
         private void checkMutable() {
             if (built) {
                 throw new IllegalStateException("The single-query readout group has been built.");
+            }
+        }
+    }
+
+    /** Builds one {@link IndexedLocalTransformerEncoder} value within a {@link Builder}. */
+    public static final class IndexedLocalTransformerEncoderBuilder {
+
+        private static final float DEFAULT_EPSILON = 1.0e-5f;
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final Value input;
+        private final Value indices;
+        private final int attentionHeads;
+        private final int attentionWidth;
+        private final int feedForwardWidth;
+        private Constant inputNormWeight;
+        private Constant inputNormBias;
+        private TransformerEncoderBlock block;
+        private float epsilon;
+        private boolean built;
+
+        private IndexedLocalTransformerEncoderBuilder(
+                Builder recipeBuilder,
+                String name,
+                Value input,
+                Value indices,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.input = input;
+            this.indices = indices;
+            this.attentionHeads = attentionHeads;
+            this.attentionWidth = attentionWidth;
+            this.feedForwardWidth = feedForwardWidth;
+            epsilon = DEFAULT_EPSILON;
+        }
+
+        /**
+         * Sets the LayerNorm applied immediately after selected rows are gathered.
+         *
+         * @param weight the input LayerNorm scale
+         * @param bias the input LayerNorm bias
+         * @return this builder
+         */
+        public IndexedLocalTransformerEncoderBuilder setInputNormalization(
+                Constant weight, Constant bias) {
+            checkMutable();
+            recipeBuilder.checkValue(weight);
+            recipeBuilder.checkValue(bias);
+            inputNormWeight = weight;
+            inputNormBias = bias;
+            return this;
+        }
+
+        /**
+         * Sets the pre-normalized attention and SiLU feed-forward block.
+         *
+         * @param attentionInputWeight attention-input LayerNorm scale
+         * @param attentionInputBias attention-input LayerNorm bias
+         * @param queryKeyValueWeight combined QKV projection weight
+         * @param attentionOutputWeight attention output projection weight
+         * @param attentionOutputBias attention output projection bias
+         * @param feedForwardInputWeight feed-forward-input LayerNorm scale
+         * @param feedForwardInputBias feed-forward-input LayerNorm bias
+         * @param feedForwardExpansionWeight feed-forward expansion weight
+         * @param feedForwardExpansionBias feed-forward expansion bias
+         * @param feedForwardProjectionWeight feed-forward projection weight
+         * @param feedForwardProjectionBias feed-forward projection bias
+         * @param outputWeight output LayerNorm scale
+         * @param outputBias output LayerNorm bias
+         * @return this builder
+         */
+        public IndexedLocalTransformerEncoderBuilder setBlock(
+                Constant attentionInputWeight,
+                Constant attentionInputBias,
+                Constant queryKeyValueWeight,
+                Constant attentionOutputWeight,
+                Constant attentionOutputBias,
+                Constant feedForwardInputWeight,
+                Constant feedForwardInputBias,
+                Constant feedForwardExpansionWeight,
+                Constant feedForwardExpansionBias,
+                Constant feedForwardProjectionWeight,
+                Constant feedForwardProjectionBias,
+                Constant outputWeight,
+                Constant outputBias) {
+            checkMutable();
+            Constant[] constants = {
+                attentionInputWeight,
+                attentionInputBias,
+                queryKeyValueWeight,
+                attentionOutputWeight,
+                attentionOutputBias,
+                feedForwardInputWeight,
+                feedForwardInputBias,
+                feedForwardExpansionWeight,
+                feedForwardExpansionBias,
+                feedForwardProjectionWeight,
+                feedForwardProjectionBias,
+                outputWeight,
+                outputBias
+            };
+            for (Constant constant : constants) {
+                recipeBuilder.checkValue(constant);
+            }
+            block =
+                    new TransformerEncoderBlock(
+                            attentionInputWeight,
+                            attentionInputBias,
+                            queryKeyValueWeight,
+                            attentionOutputWeight,
+                            attentionOutputBias,
+                            feedForwardInputWeight,
+                            feedForwardInputBias,
+                            feedForwardExpansionWeight,
+                            feedForwardExpansionBias,
+                            feedForwardProjectionWeight,
+                            feedForwardProjectionBias,
+                            outputWeight,
+                            outputBias);
+            return this;
+        }
+
+        /**
+         * Sets the epsilon used by every LayerNorm in this encoder.
+         *
+         * @param epsilon the finite positive epsilon
+         * @return this builder
+         */
+        public IndexedLocalTransformerEncoderBuilder optEpsilon(float epsilon) {
+            checkMutable();
+            if (!(epsilon > 0.0f) || !Float.isFinite(epsilon)) {
+                throw new IllegalArgumentException(
+                        "LayerNorm epsilon must be finite and positive.");
+            }
+            this.epsilon = epsilon;
+            return this;
+        }
+
+        /**
+         * Adds the indexed local transformer encoder to its recipe.
+         *
+         * @return the indexed local transformer encoder value
+         */
+        public IndexedLocalTransformerEncoder build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            TensorSpec inputSpec = input.getSpec();
+            TensorSpec indexSpec = indices.getSpec();
+            if (inputSpec.leadingDimension == null || inputSpec.innerShape.length != 3) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer input must have shape "
+                                + "[bounded batch, groups, tokens, hiddenWidth].");
+            }
+            if (!Builder.isAffineDataType(inputSpec.dataType)) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer input must be floating point.");
+            }
+            if (indexSpec.leadingDimension == null
+                    || indexSpec.innerShape.length != 0
+                    || (indexSpec.dataType != DataType.INT32
+                            && indexSpec.dataType != DataType.INT64)) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer indices must be bounded INT32 or INT64 rows.");
+            }
+            long hiddenWidth = inputSpec.innerShape[2];
+            long maximumDenseRows =
+                    Math.multiplyExact(
+                            inputSpec.leadingDimension.maximumExtent,
+                            Math.multiplyExact(inputSpec.innerShape[0], inputSpec.innerShape[1]));
+            if (indexSpec.leadingDimension.maximumExtent > maximumDenseRows) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer index capacity exceeds the dense input.");
+            }
+            if (inputSpec.innerShape[0] <= 0
+                    || inputSpec.innerShape[1] <= 0
+                    || attentionHeads <= 0
+                    || attentionWidth <= 0
+                    || attentionWidth % attentionHeads != 0
+                    || feedForwardWidth <= 0) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer dimensions must be positive and divisible.");
+            }
+            if (inputNormWeight == null || inputNormBias == null || block == null) {
+                throw new IllegalStateException(
+                        "Indexed local transformer normalization and block must be set.");
+            }
+            requireNormPair(
+                    inputNormWeight,
+                    inputNormBias,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "input LayerNorm");
+            requireNormPair(
+                    block.attentionInputWeight,
+                    block.attentionInputBias,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "attention-input LayerNorm");
+            requireProjection(
+                    block.queryKeyValueWeight,
+                    3L * attentionWidth,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "QKV weight");
+            requireProjection(
+                    block.attentionOutputWeight,
+                    hiddenWidth,
+                    attentionWidth,
+                    inputSpec.dataType,
+                    "attention output weight");
+            requireVector(
+                    block.attentionOutputBias,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "attention output bias");
+            requireNormPair(
+                    block.feedForwardInputWeight,
+                    block.feedForwardInputBias,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "feed-forward-input LayerNorm");
+            requireProjection(
+                    block.feedForwardExpansionWeight,
+                    feedForwardWidth,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "feed-forward expansion weight");
+            requireVector(
+                    block.feedForwardExpansionBias,
+                    feedForwardWidth,
+                    inputSpec.dataType,
+                    "feed-forward expansion bias");
+            requireProjection(
+                    block.feedForwardProjectionWeight,
+                    hiddenWidth,
+                    feedForwardWidth,
+                    inputSpec.dataType,
+                    "feed-forward projection weight");
+            requireVector(
+                    block.feedForwardProjectionBias,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "feed-forward projection bias");
+            requireNormPair(
+                    block.outputWeight,
+                    block.outputBias,
+                    hiddenWidth,
+                    inputSpec.dataType,
+                    "output LayerNorm");
+
+            String checkedName = recipeBuilder.addValueName(name);
+            IndexedLocalTransformerEncoder value =
+                    new IndexedLocalTransformerEncoder(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            TensorSpec.of(
+                                    inputSpec.dataType,
+                                    inputSpec.leadingDimension,
+                                    inputSpec.innerShape),
+                            input,
+                            indices,
+                            inputNormWeight,
+                            inputNormBias,
+                            block,
+                            attentionHeads,
+                            attentionWidth,
+                            feedForwardWidth,
+                            epsilon);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private static void requireProjection(
+                Constant constant, long rows, long columns, DataType dataType, String name) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.dataType != dataType
+                    || spec.innerShape.length != 2
+                    || spec.innerShape[0] != rows
+                    || spec.innerShape[1] != columns) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer " + name + " shape or type mismatch.");
+            }
+        }
+
+        private static void requireVector(
+                Constant constant, long width, DataType dataType, String name) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.dataType != dataType
+                    || spec.innerShape.length != 1
+                    || spec.innerShape[0] != width) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer " + name + " shape or type mismatch.");
+            }
+        }
+
+        private static void requireNormPair(
+                Constant weight, Constant bias, long width, DataType valueDataType, String name) {
+            TensorSpec weightSpec = weight.getSpec();
+            TensorSpec biasSpec = bias.getSpec();
+            if (weightSpec.leadingDimension != null
+                    || biasSpec.leadingDimension != null
+                    || weightSpec.innerShape.length != 1
+                    || biasSpec.innerShape.length != 1
+                    || weightSpec.innerShape[0] != width
+                    || biasSpec.innerShape[0] != width
+                    || weightSpec.dataType != biasSpec.dataType
+                    || (weightSpec.dataType != valueDataType
+                            && weightSpec.dataType != DataType.FLOAT32)) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer " + name + " shape or type mismatch.");
+            }
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException(
+                        "The indexed local transformer encoder has been built.");
             }
         }
     }

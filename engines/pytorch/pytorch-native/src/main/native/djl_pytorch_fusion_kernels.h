@@ -138,6 +138,31 @@ void LaunchSingleQueryReadoutBiasSilu(torch::Tensor& values,
     const torch::Tensor& bias, int64_t batch_count, int64_t readout_count,
     int64_t width);
 
+void LaunchIndexedLocalTransformerClear(torch::Tensor& output, int64_t dense_rows, int64_t hidden_width);
+
+void LaunchIndexedLocalTransformerGatherNormalize(const torch::Tensor& input, const torch::Tensor& indices,
+    torch::ScalarType index_data_type, const torch::Tensor& input_norm_weight, const torch::Tensor& input_norm_bias,
+    const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
+    torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t hidden_width,
+    float epsilon);
+
+void LaunchIndexedLocalTransformerAttention(torch::Tensor& query_key_value, const torch::Tensor& indices,
+    torch::ScalarType index_data_type, int64_t active_rows, int64_t dense_rows, int64_t token_count,
+    int64_t attention_heads, int64_t attention_width);
+
+void LaunchIndexedLocalTransformerResidualLayerNorm(torch::Tensor& output, const torch::Tensor& update,
+    const torch::Tensor& update_bias, const torch::Tensor& indices, torch::ScalarType index_data_type,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias, torch::Tensor& normalized, int64_t active_offset,
+    int64_t active_rows, int64_t dense_rows, int64_t hidden_width, float epsilon);
+
+void LaunchIndexedLocalTransformerBiasSilu(
+    torch::Tensor& values, const torch::Tensor& bias, int64_t active_rows, int64_t width);
+
+void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::Tensor& update,
+    const torch::Tensor& indices, torch::ScalarType index_data_type, const torch::Tensor& update_bias,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias, int64_t active_offset, int64_t active_rows,
+    int64_t dense_rows, int64_t hidden_width, float epsilon);
+
 }  // namespace djl::pytorch::fusion
 
 #endif  // DJL_TORCH_DJL_PYTORCH_FUSION_KERNELS_H

@@ -60,6 +60,8 @@ final class PtFusionDescriptor {
     static final long TRANSFORMER_ENCODER_STACK_V1 = 4;
     static final long BINARY_BRANCH_BLEND_V1 = 5;
     static final long SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 = 6;
+    // Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
+    static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 = 8;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
@@ -84,6 +86,11 @@ final class PtFusionDescriptor {
     static final long READOUT_EPSILON = 5;
     static final long READOUT_FEED_FORWARD_WIDTHS = 6;
     static final long READOUT_QUERY_INDEX = 7;
+    static final long LOCAL_TRANSFORMER_ATTENTION_HEADS = 1;
+    static final long LOCAL_TRANSFORMER_ATTENTION_WIDTH = 2;
+    static final long LOCAL_TRANSFORMER_FEED_FORWARD_WIDTH = 3;
+    static final long LOCAL_TRANSFORMER_EPSILON = 4;
+    static final long INDEXED_LOCAL_TRANSFORMER_TILE_ROWS = 65_536;
     static final long ACTIVATION_NONE = 0;
     static final long ACTIVATION_SILU = 1;
 
@@ -134,6 +141,8 @@ final class PtFusionDescriptor {
                                 commandWords,
                                 transformerEncoderStackCommandWords(
                                         (FusionRecipe.TransformerEncoderStack) value));
+            } else if (value instanceof FusionRecipe.IndexedLocalTransformerEncoder) {
+                commandWords = Math.addExact(commandWords, indexedLocalTransformerCommandWords());
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 commandWords = Math.addExact(commandWords, binaryBranchBlendCommandWords());
             } else if (isFirstSingleQueryReadoutState(value)) {
@@ -207,6 +216,9 @@ final class PtFusionDescriptor {
             } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
                 putTransformerEncoderStackCommand(
                         descriptor, (FusionRecipe.TransformerEncoderStack) value);
+            } else if (value instanceof FusionRecipe.IndexedLocalTransformerEncoder) {
+                putIndexedLocalTransformerCommand(
+                        descriptor, (FusionRecipe.IndexedLocalTransformerEncoder) value);
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 putBinaryBranchBlendCommand(descriptor, (FusionRecipe.BinaryBranchBlend) value);
             } else if (isFirstSingleQueryReadoutState(value)) {
@@ -235,6 +247,8 @@ final class PtFusionDescriptor {
                 ++count;
             } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
                 ++count;
+            } else if (value instanceof FusionRecipe.IndexedLocalTransformerEncoder) {
+                ++count;
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 ++count;
             } else if (isFirstSingleQueryReadoutState(value)) {
@@ -254,6 +268,7 @@ final class PtFusionDescriptor {
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, indexedLocalTransformerWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, singleQueryReadoutWorkspaceBytes(recipe));
         return bytes;
     }
@@ -272,6 +287,7 @@ final class PtFusionDescriptor {
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, indexedLocalTransformerWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, singleQueryReadoutWorkspaceBytes(recipe));
         return bytes;
     }
@@ -333,6 +349,26 @@ final class PtFusionDescriptor {
                                 storageElements(block.getFeedForwardProjectionWeight()));
             }
             bytes = Math.addExact(bytes, Math.multiplyExact(blockElements, elementBytes));
+        }
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.IndexedLocalTransformerEncoder)) {
+                continue;
+            }
+            FusionRecipe.IndexedLocalTransformerEncoder encoder =
+                    (FusionRecipe.IndexedLocalTransformerEncoder) value;
+            FusionRecipe.TransformerEncoderBlock block = encoder.getBlock();
+            long elements = storageElements(block.getQueryKeyValueWeight());
+            elements = Math.addExact(elements, storageElements(block.getAttentionOutputWeight()));
+            elements =
+                    Math.addExact(elements, storageElements(block.getFeedForwardExpansionWeight()));
+            elements =
+                    Math.addExact(
+                            elements, storageElements(block.getFeedForwardProjectionWeight()));
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    elements, encoder.getSpec().getDataType().getNumOfBytes()));
         }
         for (FusionRecipe.Value value : recipe.getValues()) {
             if (!isFirstSingleQueryReadoutState(value)) {
@@ -398,6 +434,7 @@ final class PtFusionDescriptor {
                 || value instanceof FusionRecipe.AffineSum
                 || value instanceof FusionRecipe.IndexedAffine
                 || value instanceof FusionRecipe.TransformerEncoderStack
+                || value instanceof FusionRecipe.IndexedLocalTransformerEncoder
                 || value instanceof FusionRecipe.BinaryBranchBlend
                 || value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState;
     }
@@ -472,6 +509,29 @@ final class PtFusionDescriptor {
                             bytes,
                             Math.multiplyExact(
                                     elements, stack.getSpec().getDataType().getNumOfBytes()));
+        }
+        return bytes;
+    }
+
+    private static long indexedLocalTransformerWorkspaceBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.IndexedLocalTransformerEncoder)) {
+                continue;
+            }
+            FusionRecipe.IndexedLocalTransformerEncoder encoder =
+                    (FusionRecipe.IndexedLocalTransformerEncoder) value;
+            long activeRows =
+                    encoder.getIndices().getSpec().getLeadingDimension().getMaximumExtent();
+            long hiddenWidth = encoder.getSpec().getInnerShape()[2];
+            long tileRows = Math.min(activeRows, INDEXED_LOCAL_TRANSFORMER_TILE_ROWS);
+            long elements = Math.multiplyExact(activeRows, 3L * encoder.getAttentionWidth());
+            elements = Math.addExact(elements, Math.multiplyExact(tileRows, hiddenWidth));
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    elements, encoder.getSpec().getDataType().getNumOfBytes()));
         }
         return bytes;
     }
@@ -809,6 +869,49 @@ final class PtFusionDescriptor {
         putScalarAttribute(descriptor, TRANSFORMER_ATTENTION_WIDTH, stack.getAttentionWidth());
         putScalarAttribute(descriptor, TRANSFORMER_FEED_FORWARD_WIDTH, stack.getFeedForwardWidth());
         putFloatAttribute(descriptor, TRANSFORMER_EPSILON, stack.getEpsilon());
+    }
+
+    private static int indexedLocalTransformerCommandWords() {
+        int operandCount = 17;
+        return Math.addExact(
+                COMMAND_RECORD_HEADER_WORDS + 1 + operandCount,
+                Math.multiplyExact(4, SCALAR_ATTRIBUTE_WORDS));
+    }
+
+    private static void putIndexedLocalTransformerCommand(
+            ByteBuffer descriptor, FusionRecipe.IndexedLocalTransformerEncoder encoder) {
+        FusionRecipe.TransformerEncoderBlock block = encoder.getBlock();
+        descriptor.putLong(indexedLocalTransformerCommandWords());
+        descriptor.putLong(INDEXED_LOCAL_TRANSFORMER_ENCODER_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(17);
+        descriptor.putLong(4);
+        descriptor.putLong(encoder.getIndex());
+        descriptor.putLong(encoder.getInput().getIndex());
+        descriptor.putLong(encoder.getIndices().getIndex());
+        descriptor.putLong(encoder.getInputNormWeight().getIndex());
+        descriptor.putLong(encoder.getInputNormBias().getIndex());
+        descriptor.putLong(block.getAttentionInputWeight().getIndex());
+        descriptor.putLong(block.getAttentionInputBias().getIndex());
+        descriptor.putLong(block.getQueryKeyValueWeight().getIndex());
+        descriptor.putLong(block.getAttentionOutputWeight().getIndex());
+        descriptor.putLong(block.getAttentionOutputBias().getIndex());
+        descriptor.putLong(block.getFeedForwardInputWeight().getIndex());
+        descriptor.putLong(block.getFeedForwardInputBias().getIndex());
+        descriptor.putLong(block.getFeedForwardExpansionWeight().getIndex());
+        descriptor.putLong(block.getFeedForwardExpansionBias().getIndex());
+        descriptor.putLong(block.getFeedForwardProjectionWeight().getIndex());
+        descriptor.putLong(block.getFeedForwardProjectionBias().getIndex());
+        descriptor.putLong(block.getOutputWeight().getIndex());
+        descriptor.putLong(block.getOutputBias().getIndex());
+        putScalarAttribute(
+                descriptor, LOCAL_TRANSFORMER_ATTENTION_HEADS, encoder.getAttentionHeads());
+        putScalarAttribute(
+                descriptor, LOCAL_TRANSFORMER_ATTENTION_WIDTH, encoder.getAttentionWidth());
+        putScalarAttribute(
+                descriptor, LOCAL_TRANSFORMER_FEED_FORWARD_WIDTH, encoder.getFeedForwardWidth());
+        putFloatAttribute(descriptor, LOCAL_TRANSFORMER_EPSILON, encoder.getEpsilon());
     }
 
     private static int binaryBranchBlendCommandWords() {

@@ -520,6 +520,66 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void indexedLocalTransformerBuildsIndependentExtentGraph() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("indexed-local-transformer");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
+        FusionRecipe.Dimension active = builder.addDimension("active", 24_576);
+        FusionRecipe.Input input =
+                builder.addInput(
+                        "tokens", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 29, 256));
+        FusionRecipe.Input indices =
+                builder.addInput("indices", FusionRecipe.TensorSpec.of(DataType.INT32, active));
+        FusionRecipe.Constant inputNormWeight = vector(builder, "inputNormWeight", 256, true);
+        FusionRecipe.Constant inputNormBias = vector(builder, "inputNormBias", 256, true);
+        FusionRecipe.Constant attentionInputWeight = vector(builder, "attnNormWeight", 256, true);
+        FusionRecipe.Constant attentionInputBias = vector(builder, "attnNormBias", 256, true);
+        FusionRecipe.Constant queryKeyValue = matrix(builder, "qkv", 192, 256);
+        FusionRecipe.Constant attentionOutput = matrix(builder, "attentionOutput", 256, 64);
+        FusionRecipe.Constant attentionOutputBias =
+                vector(builder, "attentionOutputBias", 256, false);
+        FusionRecipe.Constant feedForwardInputWeight = vector(builder, "ffNormWeight", 256, true);
+        FusionRecipe.Constant feedForwardInputBias = vector(builder, "ffNormBias", 256, true);
+        FusionRecipe.Constant expansion = matrix(builder, "expansion", 128, 256);
+        FusionRecipe.Constant expansionBias = vector(builder, "expansionBias", 128, false);
+        FusionRecipe.Constant projection = matrix(builder, "projection", 256, 128);
+        FusionRecipe.Constant projectionBias = vector(builder, "projectionBias", 256, false);
+        FusionRecipe.Constant outputWeight = vector(builder, "outputNormWeight", 256, true);
+        FusionRecipe.Constant outputBias = vector(builder, "outputNormBias", 256, true);
+
+        FusionRecipe.IndexedLocalTransformerEncoder encoder =
+                builder.indexedLocalTransformerEncoder("encoded", input, indices, 4, 64, 128)
+                        .setInputNormalization(inputNormWeight, inputNormBias)
+                        .setBlock(
+                                attentionInputWeight,
+                                attentionInputBias,
+                                queryKeyValue,
+                                attentionOutput,
+                                attentionOutputBias,
+                                feedForwardInputWeight,
+                                feedForwardInputBias,
+                                expansion,
+                                expansionBias,
+                                projection,
+                                projectionBias,
+                                outputWeight,
+                                outputBias)
+                        .build();
+        builder.addOutput("output", encoder);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertSame(encoder.getInput(), input);
+        Assert.assertSame(encoder.getIndices(), indices);
+        Assert.assertSame(encoder.getInputNormWeight(), inputNormWeight);
+        Assert.assertSame(encoder.getBlock().getQueryKeyValueWeight(), queryKeyValue);
+        Assert.assertEquals(encoder.getAttentionHeads(), 4);
+        Assert.assertEquals(encoder.getAttentionWidth(), 64);
+        Assert.assertEquals(encoder.getFeedForwardWidth(), 128);
+        Assert.assertEquals(
+                encoder.getSpec().getMaximumShape().getShape(), new long[] {384, 4, 29, 256});
+        Assert.assertSame(recipe.getOutputs().get(0).getValue(), encoder);
+    }
+
+    @Test
     public void singleQueryReadoutGroupBuildsSharedMemoryGraph() {
         FusionRecipe.Builder builder = FusionRecipe.builder("single-query-readouts");
         FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
