@@ -54,6 +54,14 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray embeddingFeaturePack(NDArray offsets, NDArray table, NDArray features) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.embeddingFeaturePack(
+                array, manager.from(offsets), manager.from(table), manager.from(features));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray gatherRows(NDArray rowIndices) {
         PtNDManager manager = array.getManager();
         return JniUtils.gatherRows(array, manager.from(rowIndices));

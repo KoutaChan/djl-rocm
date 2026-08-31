@@ -825,6 +825,18 @@ public final class JniUtils {
                         rawIds.getHandle(), offsets.getHandle(), table.getHandle()));
     }
 
+    /** Packs flattened offset embedding fields followed by dense features. */
+    public static PtNDArray embeddingFeaturePack(
+            PtNDArray rawIds, PtNDArray offsets, PtNDArray table, PtNDArray features) {
+        return new PtNDArray(
+                rawIds.getManager(),
+                PyTorchLibrary.LIB.torchEmbeddingFeaturePack(
+                        rawIds.getHandle(),
+                        offsets.getHandle(),
+                        table.getHandle(),
+                        features.getHandle()));
+    }
+
     /** Selects leading-axis rows with a one-dimensional index tensor. */
     public static PtNDArray gatherRows(PtNDArray rows, PtNDArray rowIndices) {
         if (rowIndices.getDataType() != DataType.INT64) {

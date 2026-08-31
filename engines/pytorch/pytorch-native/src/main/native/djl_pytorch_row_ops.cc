@@ -74,6 +74,14 @@ torch::Tensor embedding_with_offsets_reference(const torch::Tensor& raw_ids,
   return at::embedding(table, raw_ids.add(offsets));
 }
 
+torch::Tensor embedding_feature_pack_reference(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features) {
+  auto embeddings = embedding_with_offsets_reference(raw_ids, offsets, table);
+  return torch::cat(
+      {embeddings.reshape({raw_ids.size(0), -1}), features}, 1);
+}
+
 std::vector<int64_t> padded_gather_output_shape(
     const torch::Tensor& source, const torch::Tensor& stored_indices, int64_t indexed_dimensions) {
   auto output_shape = stored_indices.sizes().vec();
@@ -192,6 +200,38 @@ torch::Tensor embedding_with_offsets(const torch::Tensor& raw_ids,
   }
 #endif
   return embedding_with_offsets_reference(raw_ids, offsets, table);
+}
+
+torch::Tensor embedding_feature_pack(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features) {
+  TORCH_CHECK(raw_ids.dim() == 2,
+      "embedding feature pack IDs must be shaped [rows, fields]");
+  TORCH_CHECK(features.dim() == 2 && features.size(0) == raw_ids.size(0) &&
+          features.size(1) > 0,
+      "embedding feature pack features must be shaped [rows, width]");
+  TORCH_CHECK(features.scalar_type() == table.scalar_type() && features.is_floating_point(),
+      "embedding feature pack table and features must use one floating-point type");
+  TORCH_CHECK(features.device() == raw_ids.device(),
+      "embedding feature pack inputs must use the same device");
+  TORCH_CHECK(is_index_type(raw_ids), "raw IDs must be int16, int32, or int64");
+  TORCH_CHECK(is_index_type(offsets), "offsets must be int16, int32, or int64");
+  TORCH_CHECK(!(raw_ids.scalar_type() == torch::kInt16 &&
+                  offsets.scalar_type() == torch::kInt16),
+      "raw IDs and offsets cannot both be int16");
+  TORCH_CHECK(broadcasts_to(offsets, raw_ids),
+      "offsets must be broadcastable to raw IDs");
+  TORCH_CHECK(table.dim() == 2 && table.is_floating_point(),
+      "embedding table must be a rank-two floating-point tensor");
+  TORCH_CHECK(raw_ids.device() == offsets.device() && raw_ids.device() == table.device(),
+      "raw IDs, offsets, table, and features must use the same device");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (rocm::supports_embedding_feature_pack(raw_ids, offsets, table, features) &&
+      !(at::GradMode::is_enabled() && (table.requires_grad() || features.requires_grad()))) {
+    return rocm::embedding_feature_pack_forward(raw_ids, offsets, table, features);
+  }
+#endif
+  return embedding_feature_pack_reference(raw_ids, offsets, table, features);
 }
 
 torch::Tensor scatter_rows(

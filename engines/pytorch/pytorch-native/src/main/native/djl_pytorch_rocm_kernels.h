@@ -23,6 +23,14 @@ bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
 torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
     const torch::Tensor& offsets, const torch::Tensor& table);
 
+bool supports_embedding_feature_pack(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features);
+
+torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features);
+
 bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices);
 
 bool supports_segmented_lookup_sum(

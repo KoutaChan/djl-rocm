@@ -178,6 +178,39 @@ __global__ void embedding_with_offsets_kernel(const raw_t* raw_ids,
   }
 }
 
+template <typename raw_t, typename offset_t, typename scalar_t>
+__global__ void embedding_feature_pack_kernel(const raw_t* raw_ids,
+    const offset_t* offsets, const scalar_t* table, const scalar_t* features,
+    scalar_t* output, int64_t output_elements, int64_t raw_columns,
+    int64_t offset_rows, int64_t offset_columns, int64_t table_rows,
+    int64_t embedding_width, int64_t feature_width, int64_t output_width) {
+  for (int64_t output_index =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       output_index < output_elements;
+       output_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t row = output_index / output_width;
+    const int64_t column = output_index % output_width;
+    const int64_t embedded_width = raw_columns * embedding_width;
+    if (column >= embedded_width) {
+      output[output_index] = features[row * feature_width + column - embedded_width];
+      continue;
+    }
+    const int64_t raw_column = column / embedding_width;
+    const int64_t embedding_column = column % embedding_width;
+    const int64_t raw_index = row * raw_columns + raw_column;
+    const int64_t offset_row = offset_rows == 1 ? 0 : row;
+    const int64_t offset_column = offset_columns == 1 ? 0 : raw_column;
+    const int64_t offset_index = offset_row * offset_columns + offset_column;
+    const int64_t table_row =
+        static_cast<int64_t>(raw_ids[raw_index]) +
+        static_cast<int64_t>(offsets[offset_index]);
+    assert(table_row >= 0 && table_row < table_rows);
+    output[output_index] = table_row >= 0 && table_row < table_rows
+        ? table[table_row * embedding_width + embedding_column]
+        : static_cast<scalar_t>(0);
+  }
+}
+
 template <typename scalar_t, bool write_probabilities>
 __global__ void masked_categorical_forward_kernel(const scalar_t* logits, const bool* mask,
     float* output, int64_t row_count, int64_t width) {
@@ -2176,6 +2209,16 @@ bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
       (offsets.size(1) == 1 || offsets.size(1) == raw_ids.size(1));
 }
 
+bool supports_embedding_feature_pack(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features) {
+  return supports_embedding_with_offsets(raw_ids, offsets, table) &&
+      features.is_cuda() && features.is_contiguous() &&
+      features.device() == raw_ids.device() && features.dim() == 2 &&
+      features.size(0) == raw_ids.size(0) && features.size(1) > 0 &&
+      features.scalar_type() == table.scalar_type();
+}
+
 bool supports_grouped_masked_softmax_pool(
     const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
   if (!logits.is_cuda() || !logits.is_contiguous() || !mask.is_contiguous() ||
@@ -2294,6 +2337,54 @@ torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
             });
       });
   check_hip_kernel_launch("embedding_with_offsets");
+  return output;
+}
+
+torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features) {
+  TORCH_CHECK(supports_embedding_feature_pack(raw_ids, offsets, table, features),
+      "embedding feature pack received an unsupported ROCm tensor layout");
+  const int64_t output_width =
+      raw_ids.size(1) * table.size(1) + features.size(1);
+  auto output = torch::empty({raw_ids.size(0), output_width}, table.options());
+  const int64_t output_elements = output.numel();
+  if (output_elements == 0) {
+    return output;
+  }
+
+  c10::DeviceGuard device_guard(table.device());
+  const auto& properties = device_properties(table.get_device());
+  const int threads_per_block = std::min(256, properties.maxThreadsPerBlock);
+  const int64_t required_blocks =
+      (output_elements + threads_per_block - 1) / threads_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(table.get_device()).stream();
+  AT_DISPATCH_INTEGRAL_TYPES(
+      raw_ids.scalar_type(), "embedding_feature_pack_raw_ids", [&] {
+        using raw_t = scalar_t;
+        AT_DISPATCH_INTEGRAL_TYPES(
+            offsets.scalar_type(), "embedding_feature_pack_offsets", [&] {
+              using offset_t = scalar_t;
+              AT_DISPATCH_FLOATING_TYPES_AND2(
+                  torch::kHalf, torch::kBFloat16, table.scalar_type(),
+                  "embedding_feature_pack_values", [&] {
+                    using value_t = scalar_t;
+                    hipLaunchKernelGGL(
+                        HIP_KERNEL_NAME(
+                            embedding_feature_pack_kernel<raw_t, offset_t, value_t>),
+                        dim3(blocks), dim3(threads_per_block), 0, stream,
+                        raw_ids.data_ptr<raw_t>(), offsets.data_ptr<offset_t>(),
+                        table.data_ptr<value_t>(), features.data_ptr<value_t>(),
+                        output.data_ptr<value_t>(), output_elements, raw_ids.size(1),
+                        offsets.size(0), offsets.size(1), table.size(0), table.size(1),
+                        features.size(1), output_width);
+                  });
+            });
+      });
+  check_hip_kernel_launch("embedding_feature_pack");
   return output;
 }
 

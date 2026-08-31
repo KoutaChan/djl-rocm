@@ -427,6 +427,8 @@ final class PyTorchLibrary {
 
     native long torchEmbeddingWithOffsets(long rawIds, long offsets, long table);
 
+    native long torchEmbeddingFeaturePack(long rawIds, long offsets, long table, long features);
+
     native long torchGatherRows(long handle, long index);
 
     native long torchScatterRows(long handle, long index, long rowCount);

@@ -44,6 +44,7 @@ public class EmbeddingWithOffsetsTest {
                     }
                     for (DataType tableType : tableTypes) {
                         verifyGpuParity(manager, rawType, offsetType, tableType);
+                        verifyGpuFeaturePackParity(manager, rawType, offsetType, tableType);
                     }
                 }
             }
@@ -87,6 +88,52 @@ public class EmbeddingWithOffsetsTest {
         }
     }
 
+    @Test
+    public void testEmbeddingFeaturePackMatchesPortableReference() {
+        try (NDManager manager = Engine.getInstance().newBaseManager()) {
+            NDArray rawIds =
+                    manager.create(new int[] {0, 1, 0, 1, 0, 1})
+                            .toType(DataType.INT16, false)
+                            .reshape(2, 3);
+            NDArray offsets = manager.create(new int[] {0, 2, 4}).reshape(1, 3);
+            NDArray table = manager.arange(12).reshape(6, 2).toType(DataType.FLOAT32, false);
+            NDArray features = manager.create(new float[] {-1, -2, -3, -4}).reshape(2, 2);
+
+            NDArray actual = NDArrays.embeddingFeaturePack(rawIds, offsets, table, features);
+            NDArray expected =
+                    NDArrays.embeddingWithOffsets(rawIds, offsets, table)
+                            .reshape(2, 6)
+                            .concat(features, 1);
+
+            Assert.assertEquals(actual.getShape(), new Shape(2, 8));
+            Assert.assertEquals(actual.getDataType(), DataType.FLOAT32);
+            assertClose(actual.toFloatArray(), expected.toFloatArray());
+        }
+    }
+
+    @Test
+    public void testEmbeddingFeaturePackGradient() {
+        try (NDManager manager = Engine.getInstance().newBaseManager()) {
+            NDArray rawIds = manager.create(new long[] {0, 1, 3, 1}).reshape(2, 2);
+            NDArray offsets =
+                    manager.create(new int[] {0, 2}).toType(DataType.INT16, false).reshape(1, 2);
+            NDArray table = manager.arange(8).toType(DataType.FLOAT32, false).reshape(4, 2);
+            NDArray features = manager.arange(6).toType(DataType.FLOAT32, false).reshape(2, 3);
+            table.setRequiresGradient(true);
+            features.setRequiresGradient(true);
+
+            try (GradientCollector collector = Engine.getInstance().newGradientCollector()) {
+                collector.backward(
+                        NDArrays.embeddingFeaturePack(rawIds, offsets, table, features).sum());
+            }
+
+            Assert.assertEquals(
+                    table.getGradient().toFloatArray(), new float[] {1, 1, 0, 0, 0, 0, 3, 3});
+            Assert.assertEquals(
+                    features.getGradient().toFloatArray(), new float[] {1, 1, 1, 1, 1, 1});
+        }
+    }
+
     @Test(expectedExceptions = IllegalArgumentException.class)
     public void testRejectsNonBroadcastOffsets() {
         try (NDManager manager = Engine.getInstance().newBaseManager()) {
@@ -126,7 +173,39 @@ public class EmbeddingWithOffsetsTest {
                         actual.toType(DataType.FLOAT32, false).toFloatArray(),
                         expected.toType(DataType.FLOAT32, false).toFloatArray());
         System.out.printf(
-                "EMBEDDING_WITH_OFFSETS_PARITY rawDtype=%s offsetDtype=%s tableDtype=%s maxAbs=%s%n",
+                "EMBEDDING_WITH_OFFSETS_PARITY rawDtype=%s offsetDtype=%s tableDtype=%s"
+                    + " maxAbs=%s%n",
+                rawType, offsetType, tableType, maxAbs);
+    }
+
+    private static void verifyGpuFeaturePackParity(
+            NDManager manager, DataType rawType, DataType offsetType, DataType tableType) {
+        NDArray rawIds =
+                manager.create(new int[] {0, 1, 0, 1, 0, 1}, new Shape(2, 3))
+                        .toType(rawType, false);
+        NDArray offsets =
+                manager.create(new int[] {0, 2, 4}, new Shape(1, 3)).toType(offsetType, false);
+        NDArray table = manager.arange(24).reshape(12, 2).toType(tableType, false);
+        NDArray features =
+                manager.create(new float[] {-1, -2, -3, -4}, new Shape(2, 2))
+                        .toType(tableType, false);
+
+        NDArray actual = NDArrays.embeddingFeaturePack(rawIds, offsets, table, features);
+        NDArray expected =
+                Embedding.embedding(rawIds.add(offsets), table, SparseFormat.DENSE)
+                        .singletonOrThrow()
+                        .reshape(2, 6)
+                        .concat(features, 1);
+
+        Assert.assertEquals(actual.getShape(), new Shape(2, 8));
+        Assert.assertEquals(actual.getDataType(), tableType);
+        float maxAbs =
+                assertClose(
+                        actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                        expected.toType(DataType.FLOAT32, false).toFloatArray());
+        System.out.printf(
+                "EMBEDDING_FEATURE_PACK_PARITY rawDtype=%s offsetDtype=%s valueDtype=%s"
+                    + " maxAbs=%s%n",
                 rawType, offsetType, tableType, maxAbs);
     }
 
