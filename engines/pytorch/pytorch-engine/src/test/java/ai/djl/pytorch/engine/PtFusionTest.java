@@ -275,6 +275,33 @@ public class PtFusionTest {
     }
 
     @Test
+    public void segmentedOutputPackDescriptorPreservesSourceTypeAndStorage() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("segmented-output-pack-descriptor");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 4);
+        FusionRecipe.Input first =
+                builder.addInput(
+                        "first", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 1, 3));
+        FusionRecipe.Input second =
+                builder.addInput(
+                        "second", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 3));
+        FusionRecipe.SegmentedOutputPack pack =
+                builder.segmentedOutputPack("pack", first, second);
+        builder.addOutput("output", pack);
+        FusionRecipe recipe = builder.build();
+        ByteBuffer descriptor = PtFusionDescriptor.encode(recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.SEGMENTED_OUTPUT_PACK_V1);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 3) * Long.BYTES), 1L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 2L);
+        Assert.assertEquals(PtFusionDescriptor.commandCount(recipe), 1);
+        Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(recipe), 72L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(recipe), 0L);
+    }
+
+    @Test
     public void binaryBranchBlendDescriptorUsesClosedOperandOrder() {
         BinaryBranchBlendFixture fixture = new BinaryBranchBlendFixture();
         ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
@@ -965,6 +992,74 @@ public class PtFusionTest {
                 assertRows(reused.get(fixture.output).toFloatArray());
             }
             second.close();
+        }
+    }
+
+    @Test
+    public void rocmSegmentedOutputPackIsBitExactAcrossTypesAndSlots() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT16, DataType.BFLOAT16, DataType.FLOAT32}) {
+            FusionRecipe.Builder builder = FusionRecipe.builder("segmented-output-pack-test");
+            FusionRecipe.Dimension batch = builder.addDimension("batch", 4);
+            FusionRecipe.Input roundInput =
+                    builder.addInput(
+                            "round", FusionRecipe.TensorSpec.of(dataType, batch, 1, 3));
+            FusionRecipe.Input playerInput =
+                    builder.addInput(
+                            "players", FusionRecipe.TensorSpec.of(dataType, batch, 2, 3));
+            FusionRecipe.Input tileInput =
+                    builder.addInput(
+                            "tiles", FusionRecipe.TensorSpec.of(dataType, batch, 3, 3));
+            FusionRecipe.SegmentedOutputPack pack =
+                    builder.segmentedOutputPack("memory", roundInput, playerInput, tileInput);
+            FusionRecipe.Output output = builder.addOutput("memory", pack);
+            FusionRecipe recipe = builder.build();
+
+            try (NDManager manager = engine.newBaseManager(device);
+                    NDArray round =
+                            patternedArray(manager, dataType, new Shape(4, 1, 3), 11, 5, 0.125f);
+                    NDArray players =
+                            patternedArray(manager, dataType, new Shape(4, 2, 3), 13, 6, 0.125f);
+                    NDArray tiles =
+                            patternedArray(manager, dataType, new Shape(4, 3, 3), 17, 8, 0.125f);
+                    NDArray expected = NDArrays.concat(new NDList(round, players, tiles), 1);
+                    FusionPlan plan = engine.newFusionCompiler(device).prepare(recipe);
+                    FusionExecutable executable =
+                            plan.bind(FusionConstantBindings.builder(recipe).build());
+                    FusionSession session =
+                            executable.newSession(
+                                    manager,
+                                    FusionSessionConfig.builder().optBufferCount(2).build())) {
+                FusionOutputLease firstLease;
+                try (FusionInvocation invocation = session.acquire()) {
+                    invocation.setInput(roundInput, round);
+                    invocation.setInput(playerInput, players);
+                    invocation.setInput(tileInput, tiles);
+                    invocation.setDimension(batch, 4);
+                    firstLease = invocation.submit();
+                }
+                try (firstLease;
+                        FusionInvocation invocation = session.acquire()) {
+                    invocation.setInput(roundInput, round);
+                    invocation.setInput(playerInput, players);
+                    invocation.setInput(tileInput, tiles);
+                    invocation.setDimension(batch, 2);
+                    try (FusionOutputLease secondLease = invocation.submit()) {
+                        secondLease.synchronize();
+                        Assert.assertEquals(
+                                secondLease.get(output).get("0:2").toByteBuffer(),
+                                expected.get("0:2").toByteBuffer());
+                    }
+                    firstLease.synchronize();
+                    Assert.assertEquals(
+                            firstLease.get(output).toByteBuffer(), expected.toByteBuffer());
+                }
+            }
         }
     }
 

@@ -101,6 +101,76 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void segmentedOutputPackPreservesTypeAndTrailingShape() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("segmented-output-pack");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 16);
+        FusionRecipe.Input round =
+                builder.addInput(
+                        "round", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 1, 256));
+        FusionRecipe.Input players =
+                builder.addInput(
+                        "players", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 256));
+        FusionRecipe.Input tiles =
+                builder.addInput(
+                        "tiles", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 34, 256));
+
+        FusionRecipe.SegmentedOutputPack packed =
+                builder.segmentedOutputPack("memory", round, players, tiles);
+        builder.addOutput("memory", packed);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertEquals(packed.getSpec().getDataType(), DataType.FLOAT16);
+        Assert.assertSame(packed.getSpec().getLeadingDimension(), batch);
+        Assert.assertEquals(packed.getSpec().getInnerShape(), new long[] {39, 256});
+        Assert.assertEquals(
+                packed.getSpec().getMaximumShape().getShape(), new long[] {16, 39, 256});
+        Assert.assertEquals(packed.getSources(), Arrays.asList(round, players, tiles));
+        Assert.assertSame(recipe.getOutputs().get(0).getValue(), packed);
+        Assert.assertThrows(UnsupportedOperationException.class, () -> packed.getSources().clear());
+    }
+
+    @Test
+    public void segmentedOutputPackRejectsIncompatibleSources() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("invalid-segmented-output-pack");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 8);
+        FusionRecipe.Dimension otherBatch = builder.addDimension("otherBatch", 8);
+        FusionRecipe.Input valid =
+                builder.addInput(
+                        "valid", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 4));
+        FusionRecipe.Input wrongRows =
+                builder.addInput(
+                        "wrongRows",
+                        FusionRecipe.TensorSpec.of(DataType.FLOAT16, otherBatch, 2, 4));
+        FusionRecipe.Input wrongType =
+                builder.addInput(
+                        "wrongType", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 2, 4));
+        FusionRecipe.Input wrongWidth =
+                builder.addInput(
+                        "wrongWidth", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 5));
+        FusionRecipe.Input rankTwo =
+                builder.addInput(
+                        "rankTwo", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4));
+
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.segmentedOutputPack("wrongRowsPack", valid, wrongRows));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.segmentedOutputPack("wrongTypePack", valid, wrongType));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.segmentedOutputPack("wrongWidthPack", valid, wrongWidth));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.segmentedOutputPack("rankTwoPack", rankTwo));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        builder.segmentedOutputPack(
+                                "emptyPack", new FusionRecipe.Value[0]));
+    }
+
+    @Test
     public void binaryBranchBlendBuildsPresenceAwareGraph() {
         FusionRecipe.Builder builder = FusionRecipe.builder("binary-branch-blend");
         FusionRecipe.Dimension rows = builder.addDimension("rows", 32);
