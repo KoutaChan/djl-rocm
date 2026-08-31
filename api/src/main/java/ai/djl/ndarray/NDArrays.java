@@ -45,17 +45,18 @@ public final class NDArrays {
     /**
      * Packs offset embedding fields and trailing dense features without intermediate tensors.
      *
-     * <p>{@code rawIds} is shaped {@code [rows, fields]}, {@code offsets} is broadcastable to that
+     * <p>{@code rawIds} is shaped {@code [..., fields]}, {@code offsets} is broadcastable to that
      * shape, {@code table} is shaped {@code [entries, embeddingSize]}, and {@code features} is
-     * shaped {@code [rows, featureSize]}. The result is {@code [rows, fields * embeddingSize +
-     * featureSize]} and uses the common floating-point data type of {@code table} and {@code
-     * features}. Engines may fuse offset addition, embedding lookup, flattening, and concatenation;
-     * the portable path remains differentiable.
+     * shaped {@code [..., featureSize]} with the same leading dimensions as {@code rawIds}. The
+     * result is {@code [..., fields * embeddingSize + featureSize]} and uses the common
+     * floating-point data type of {@code table} and {@code features}. Engines may fuse offset
+     * addition, embedding lookup, flattening, and concatenation; the portable path remains
+     * differentiable. Strided leading dimensions are supported.
      *
-     * @param rawIds unoffset integer IDs shaped {@code [rows, fields]}
+     * @param rawIds unoffset integer IDs shaped {@code [..., fields]}
      * @param offsets integer namespace offsets broadcastable to {@code rawIds}
      * @param table dense embedding table shaped {@code [entries, embeddingSize]}
-     * @param features dense trailing features shaped {@code [rows, featureSize]}
+     * @param features dense trailing features shaped {@code [..., featureSize]}
      * @return packed embedded fields followed by the dense features
      */
     public static NDArray embeddingFeaturePack(
@@ -63,13 +64,15 @@ public final class NDArrays {
         validateEmbeddingWithOffsets(rawIds, offsets, table);
         Shape rawShape = rawIds.getShape();
         Shape featureShape = features.getShape();
-        if (rawShape.dimension() != 2
-                || featureShape.dimension() != 2
-                || featureShape.get(0) != rawShape.get(0)
-                || featureShape.get(1) <= 0) {
+        int dimensions = rawShape.dimension();
+        if (dimensions < 2
+                || featureShape.dimension() != dimensions
+                || featureShape.get(dimensions - 1) <= 0
+                || !rawShape.slice(0, dimensions - 1)
+                        .equals(featureShape.slice(0, dimensions - 1))) {
             throw new IllegalArgumentException(
-                    "embedding feature pack requires IDs [rows, fields] and features [rows,"
-                        + " width]");
+                    "embedding feature pack requires IDs [..., fields] and features [..., width]"
+                            + " with identical leading dimensions");
         }
         if (!features.getDataType().isFloating() || features.getDataType() != table.getDataType()) {
             throw new IllegalArgumentException(

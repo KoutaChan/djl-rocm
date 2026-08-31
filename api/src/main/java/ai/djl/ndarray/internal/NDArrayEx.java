@@ -44,11 +44,14 @@ public interface NDArrayEx {
     /** Packs flattened offset embedding fields followed by dense features. */
     default NDArray embeddingFeaturePack(NDArray offsets, NDArray table, NDArray features) {
         NDArray rawIds = getArray();
-        long rows = rawIds.getShape().get(0);
+        Shape rawShape = rawIds.getShape();
+        int dimensions = rawShape.dimension();
         long packedEmbeddingWidth =
-                Math.multiplyExact(rawIds.getShape().get(1), table.getShape().get(1));
+                Math.multiplyExact(rawShape.get(dimensions - 1), table.getShape().get(1));
+        long[] packedShape = rawShape.getShape().clone();
+        packedShape[dimensions - 1] = packedEmbeddingWidth;
         NDArray embeddings = embeddingWithOffsets(offsets, table);
-        return embeddings.reshape(rows, packedEmbeddingWidth).concat(features, 1);
+        return embeddings.reshape(new Shape(packedShape)).concat(features, dimensions - 1);
     }
 
     /** Selects leading-axis rows while preserving all trailing dimensions. */
