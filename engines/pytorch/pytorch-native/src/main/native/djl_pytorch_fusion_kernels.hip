@@ -2566,6 +2566,8 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
   }
 #undef LAUNCH_INDEXED_LOCAL_FINALIZE
   CheckHipLaunch("fusion indexed local transformer finalize");
+}
+
 template <typename score_t, typename mask_t, typename value_t>
 void LaunchMappedGroupedMaskedSoftmaxPoolTyped(
     const torch::Tensor& scores, const torch::Tensor& masks,
