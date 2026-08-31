@@ -37,7 +37,17 @@ struct OutputPackSource {
 void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
     torch::Tensor& output, int64_t row_count, int64_t output_width);
 
-void LaunchSegmentedOutputPack(const OutputPackSource* sources,
+struct SegmentedOutputPackSource {
+  const void* data;
+  int64_t source_prefix_count;
+  int64_t source_token_count;
+  int64_t token_offset;
+  int64_t token_count;
+  int64_t hidden_width;
+  int64_t destination_offset;
+};
+
+void LaunchSegmentedOutputPack(const SegmentedOutputPackSource* sources,
     int32_t source_count, torch::Tensor& output, int64_t row_count,
     int64_t output_width);
 

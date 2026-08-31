@@ -78,6 +78,7 @@ final class PtFusionDescriptor {
     static final long INDEXED_HAS_HIDDEN_BIAS = 3;
     static final long INDEXED_HAS_OUTPUT_BIAS = 4;
     static final long INDEXED_SOURCE_DIVISORS = 5;
+    static final long SEGMENTED_OUTPUT_PACK_SOURCE_SLICES = 1;
     static final long TRANSFORMER_BLOCK_COUNT = 1;
     static final long TRANSFORMER_ATTENTION_HEADS = 2;
     static final long TRANSFORMER_ATTENTION_WIDTH = 3;
@@ -844,7 +845,10 @@ final class PtFusionDescriptor {
 
     private static int segmentedOutputPackCommandWords(
             FusionRecipe.SegmentedOutputPack outputPack) {
-        return Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, outputPack.getSources().size());
+        int sliceWords = Math.addExact(4, Math.multiplyExact(2, outputPack.getSources().size()));
+        return Math.addExact(
+                Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, outputPack.getSources().size()),
+                sliceWords);
     }
 
     private static void putSegmentedOutputPackCommand(
@@ -854,10 +858,20 @@ final class PtFusionDescriptor {
         descriptor.putLong(0);
         descriptor.putLong(1);
         descriptor.putLong(outputPack.getSources().size());
-        descriptor.putLong(0);
+        descriptor.putLong(1);
         descriptor.putLong(outputPack.getIndex());
         for (FusionRecipe.Value source : outputPack.getSources()) {
             descriptor.putLong(source.getIndex());
+        }
+        long[] offsets = outputPack.getSourceTokenOffsets();
+        long[] counts = outputPack.getSourceTokenCounts();
+        descriptor.putLong(Math.addExact(4, Math.multiplyExact(2, offsets.length)));
+        descriptor.putLong(SEGMENTED_OUTPUT_PACK_SOURCE_SLICES);
+        descriptor.putLong(ATTRIBUTE_INT64);
+        descriptor.putLong(Math.multiplyExact(2, offsets.length));
+        for (int index = 0; index < offsets.length; index++) {
+            descriptor.putLong(offsets[index]);
+            descriptor.putLong(counts[index]);
         }
     }
 

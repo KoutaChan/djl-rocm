@@ -636,11 +636,21 @@ public final class FusionRecipe {
     public static final class SegmentedOutputPack extends Value {
 
         private final List<Value> sources;
+        private final long[] sourceTokenOffsets;
+        private final long[] sourceTokenCounts;
 
         private SegmentedOutputPack(
-                Object owner, int index, String name, TensorSpec spec, List<Value> sources) {
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                List<Value> sources,
+                long[] sourceTokenOffsets,
+                long[] sourceTokenCounts) {
             super(owner, index, name, spec);
             this.sources = immutableCopy(sources);
+            this.sourceTokenOffsets = sourceTokenOffsets.clone();
+            this.sourceTokenCounts = sourceTokenCounts.clone();
         }
 
         /**
@@ -650,6 +660,24 @@ public final class FusionRecipe {
          */
         public List<Value> getSources() {
             return sources;
+        }
+
+        /**
+         * Returns the first token selected from each source's penultimate axis.
+         *
+         * @return a copy of the source token offsets
+         */
+        public long[] getSourceTokenOffsets() {
+            return sourceTokenOffsets.clone();
+        }
+
+        /**
+         * Returns the number of tokens selected from each source group.
+         *
+         * @return a copy of the source token counts
+         */
+        public long[] getSourceTokenCounts() {
+            return sourceTokenCounts.clone();
         }
     }
 
@@ -2220,60 +2248,23 @@ public final class FusionRecipe {
          * @return the packed value
          */
         public SegmentedOutputPack segmentedOutputPack(String name, Value... sources) {
-            checkMutable();
             Objects.requireNonNull(sources, "sources");
-            if (sources.length == 0) {
-                throw new IllegalArgumentException(
-                        "Segmented output pack requires at least one source.");
-            }
-
-            List<Value> checkedSources = new ArrayList<>(sources.length);
-            TensorSpec firstSpec = null;
-            long segmentCount = 0;
+            SegmentedOutputPackBuilder outputPack = segmentedOutputPack(name);
             for (Value source : sources) {
-                checkValue(source);
-                TensorSpec spec = source.spec;
-                if (spec.leadingDimension == null || spec.innerShape.length < 2) {
-                    throw new IllegalArgumentException(
-                            "Segmented output pack sources must have one leading and at least two"
-                                    + " inner dimensions.");
-                }
-                if (!isFloatingDataType(spec.dataType)) {
-                    throw new IllegalArgumentException(
-                            "Segmented output pack only supports FLOAT16, BFLOAT16, and FLOAT32"
-                                    + " sources.");
-                }
-                if (firstSpec == null) {
-                    firstSpec = spec;
-                } else if (firstSpec.leadingDimension != spec.leadingDimension
-                        || firstSpec.dataType != spec.dataType
-                        || firstSpec.innerShape.length != spec.innerShape.length) {
-                    throw new IllegalArgumentException(
-                            "Segmented output pack sources must share the leading dimension, data"
-                                    + " type, and rank.");
-                } else {
-                    for (int axis = 1; axis < spec.innerShape.length; axis++) {
-                        if (firstSpec.innerShape[axis] != spec.innerShape[axis]) {
-                            throw new IllegalArgumentException(
-                                    "Segmented output pack sources must share their trailing inner"
-                                            + " shape.");
-                        }
-                    }
-                }
-                segmentCount = Math.addExact(segmentCount, spec.innerShape[0]);
-                checkedSources.add(source);
+                outputPack.addSource(source);
             }
+            return outputPack.build();
+        }
 
-            long[] outputInnerShape = firstSpec.innerShape.clone();
-            outputInnerShape[0] = segmentCount;
-            String checkedName = addValueName(name);
-            TensorSpec outputSpec =
-                    TensorSpec.of(firstSpec.dataType, firstSpec.leadingDimension, outputInnerShape);
-            SegmentedOutputPack value =
-                    new SegmentedOutputPack(
-                            owner, values.size(), checkedName, outputSpec, checkedSources);
-            values.add(value);
-            return value;
+        /**
+         * Starts a segmented output-pack stage with optional grouped source slices.
+         *
+         * @param name the value name
+         * @return a builder for the segmented output pack
+         */
+        public SegmentedOutputPackBuilder segmentedOutputPack(String name) {
+            checkMutable();
+            return new SegmentedOutputPackBuilder(this, requireName(name, "value"));
         }
 
         /**
@@ -2378,6 +2369,141 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException("The " + kind + " name must not be empty.");
             }
             return name;
+        }
+    }
+
+    /** Builds one {@link SegmentedOutputPack} within a {@link Builder}. */
+    public static final class SegmentedOutputPackBuilder {
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final List<Value> sources = new ArrayList<>();
+        private final List<Long> tokenOffsets = new ArrayList<>();
+        private final List<Long> tokenCounts = new ArrayList<>();
+        private boolean built;
+
+        private SegmentedOutputPackBuilder(Builder recipeBuilder, String name) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+        }
+
+        /**
+         * Appends every token from a batch-major source.
+         *
+         * @param source a {@code [batch, ..., tokens, width]} value
+         * @return this builder
+         */
+        public SegmentedOutputPackBuilder addSource(Value source) {
+            recipeBuilder.checkValue(source);
+            long[] innerShape = source.spec.innerShape;
+            if (innerShape.length < 2) {
+                throw new IllegalArgumentException(
+                        "A segmented output-pack source must have token and width axes.");
+            }
+            return addSourceSlice(source, 0, innerShape[innerShape.length - 2]);
+        }
+
+        /**
+         * Appends one fixed slice from each source group.
+         *
+         * <p>All inner axes preceding the penultimate token axis are flattened in their existing
+         * row-major order. This allows a grouped {@code [batch, groups, tokens, width]} memory to
+         * contribute one token range without first materializing a contiguous view.
+         *
+         * @param source a {@code [batch, ..., tokens, width]} value
+         * @param tokenOffset the first token selected within every group
+         * @param tokenCount the number of selected tokens per group
+         * @return this builder
+         */
+        public SegmentedOutputPackBuilder addSourceSlice(
+                Value source, long tokenOffset, long tokenCount) {
+            checkMutable();
+            recipeBuilder.checkValue(source);
+            long[] innerShape = source.spec.innerShape;
+            if (source.spec.leadingDimension == null
+                    || innerShape.length < 2
+                    || !Builder.isFloatingDataType(source.spec.dataType)) {
+                throw new IllegalArgumentException(
+                        "A segmented output-pack source must be a batch-major floating-point"
+                                + " tensor with token and width axes.");
+            }
+            long availableTokens = innerShape[innerShape.length - 2];
+            if (tokenOffset < 0
+                    || tokenCount <= 0
+                    || tokenOffset > availableTokens - tokenCount) {
+                throw new IllegalArgumentException(
+                        "The segmented output-pack token slice is outside the source range.");
+            }
+            sources.add(source);
+            tokenOffsets.add(tokenOffset);
+            tokenCounts.add(tokenCount);
+            return this;
+        }
+
+        /**
+         * Validates and inserts the segmented output-pack value.
+         *
+         * @return the packed value
+         */
+        public SegmentedOutputPack build() {
+            checkMutable();
+            if (sources.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Segmented output pack requires at least one source.");
+            }
+            Value first = sources.get(0);
+            TensorSpec firstSpec = first.spec;
+            long hiddenWidth = firstSpec.innerShape[firstSpec.innerShape.length - 1];
+            long outputTokens = 0;
+            long[] offsets = new long[sources.size()];
+            long[] counts = new long[sources.size()];
+            for (int index = 0; index < sources.size(); index++) {
+                TensorSpec spec = sources.get(index).spec;
+                long[] innerShape = spec.innerShape;
+                if (spec.leadingDimension != firstSpec.leadingDimension
+                        || spec.dataType != firstSpec.dataType
+                        || innerShape[innerShape.length - 1] != hiddenWidth) {
+                    throw new IllegalArgumentException(
+                            "Segmented output-pack sources must share the leading dimension, data"
+                                    + " type, and hidden width.");
+                }
+                long prefixCount = 1;
+                for (int axis = 0; axis < innerShape.length - 2; axis++) {
+                    prefixCount = Math.multiplyExact(prefixCount, innerShape[axis]);
+                }
+                offsets[index] = tokenOffsets.get(index);
+                counts[index] = tokenCounts.get(index);
+                outputTokens =
+                        Math.addExact(
+                                outputTokens, Math.multiplyExact(prefixCount, counts[index]));
+            }
+
+            String checkedName = recipeBuilder.addValueName(name);
+            TensorSpec outputSpec =
+                    TensorSpec.of(
+                            firstSpec.dataType,
+                            firstSpec.leadingDimension,
+                            outputTokens,
+                            hiddenWidth);
+            SegmentedOutputPack value =
+                    new SegmentedOutputPack(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            outputSpec,
+                            sources,
+                            offsets,
+                            counts);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private void checkMutable() {
+            recipeBuilder.checkMutable();
+            if (built) {
+                throw new IllegalStateException("The segmented output pack is already built.");
+            }
         }
     }
 

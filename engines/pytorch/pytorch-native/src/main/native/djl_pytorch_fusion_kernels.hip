@@ -49,7 +49,11 @@ struct OutputPackArguments {
 
 struct SegmentedOutputPackArguments {
   const void* sources[kMaximumOutputPackSources];
-  int64_t widths[kMaximumOutputPackSources];
+  int64_t source_prefix_counts[kMaximumOutputPackSources];
+  int64_t source_token_counts[kMaximumOutputPackSources];
+  int64_t token_offsets[kMaximumOutputPackSources];
+  int64_t token_counts[kMaximumOutputPackSources];
+  int64_t hidden_widths[kMaximumOutputPackSources];
   int64_t destination_offsets[kMaximumOutputPackSources];
   void* output;
   int64_t row_count;
@@ -159,19 +163,33 @@ __global__ void output_pack_kernel(OutputPackArguments arguments) {
 template <typename scalar_t>
 __global__ void segmented_output_pack_kernel(
     SegmentedOutputPackArguments arguments) {
-  const int32_t source_index = static_cast<int32_t>(blockIdx.y);
+  const int32_t segment_index = static_cast<int32_t>(blockIdx.y);
   const auto* source =
-      static_cast<const scalar_t*>(arguments.sources[source_index]);
+      static_cast<const scalar_t*>(arguments.sources[segment_index]);
   auto* output = static_cast<scalar_t*>(arguments.output);
-  const int64_t width = arguments.widths[source_index];
+  const int64_t prefix_count = arguments.source_prefix_counts[segment_index];
+  const int64_t source_token_count =
+      arguments.source_token_counts[segment_index];
+  const int64_t token_offset = arguments.token_offsets[segment_index];
+  const int64_t token_count = arguments.token_counts[segment_index];
+  const int64_t hidden_width = arguments.hidden_widths[segment_index];
+  const int64_t width = prefix_count * token_count * hidden_width;
   const int64_t element_count = arguments.row_count * width;
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        index < element_count;
        index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t row = index / width;
     const int64_t column = index - row * width;
+    const int64_t destination_token = column / hidden_width;
+    const int64_t feature = column - destination_token * hidden_width;
+    const int64_t prefix = destination_token / token_count;
+    const int64_t token = destination_token - prefix * token_count + token_offset;
+    const int64_t source_element =
+        ((row * prefix_count + prefix) * source_token_count + token) *
+            hidden_width +
+        feature;
     output[row * arguments.output_width +
-        arguments.destination_offsets[source_index] + column] = source[index];
+        arguments.destination_offsets[segment_index] + column] = source[source_element];
   }
 }
 
@@ -1526,7 +1544,7 @@ void LaunchSegmentedOutputPackTyped(
       arguments);
 }
 
-void LaunchSegmentedOutputPack(const OutputPackSource* sources,
+void LaunchSegmentedOutputPack(const SegmentedOutputPackSource* sources,
     int32_t source_count, torch::Tensor& output, int64_t row_count,
     int64_t output_width) {
   if (row_count == 0) {
@@ -1539,12 +1557,18 @@ void LaunchSegmentedOutputPack(const OutputPackSource* sources,
   int64_t maximum_width = 0;
   for (int32_t source_index = 0; source_index < source_count; ++source_index) {
     const auto& source = sources[source_index];
-    TORCH_CHECK(source.data_type == output.scalar_type(),
-        "segmented output-pack source data type does not match the output");
     arguments.sources[source_index] = source.data;
-    arguments.widths[source_index] = source.width;
+    arguments.source_prefix_counts[source_index] = source.source_prefix_count;
+    arguments.source_token_counts[source_index] = source.source_token_count;
+    arguments.token_offsets[source_index] = source.token_offset;
+    arguments.token_counts[source_index] = source.token_count;
+    arguments.hidden_widths[source_index] = source.hidden_width;
     arguments.destination_offsets[source_index] = source.destination_offset;
-    maximum_width = std::max(maximum_width, source.width);
+    const int64_t width = CheckedMultiply(
+        CheckedMultiply(source.source_prefix_count, source.token_count,
+            "fusion segmented output-pack source tokens"),
+        source.hidden_width, "fusion segmented output-pack source width");
+    maximum_width = std::max(maximum_width, width);
   }
 
   const int64_t maximum_elements = CheckedMultiply(

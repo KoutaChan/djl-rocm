@@ -89,6 +89,7 @@ constexpr int64_t kIndexedActivation = 2;
 constexpr int64_t kIndexedHasHiddenBias = 3;
 constexpr int64_t kIndexedHasOutputBias = 4;
 constexpr int64_t kIndexedSourceDivisors = 5;
+constexpr int64_t kSegmentedOutputPackSourceSlices = 1;
 constexpr int64_t kTransformerBlockCount = 1;
 constexpr int64_t kTransformerAttentionHeads = 2;
 constexpr int64_t kTransformerAttentionWidth = 3;
@@ -152,6 +153,16 @@ struct OutputPackSourceSpec {
   int64_t destination_offset;
 };
 
+struct SegmentedOutputPackSourceSpec {
+  int32_t value_index;
+  int64_t source_prefix_count;
+  int64_t source_token_count;
+  int64_t token_offset;
+  int64_t token_count;
+  int64_t hidden_width;
+  int64_t destination_offset;
+};
+
 struct OutputPackCommandSpec {
   int32_t result_value_index;
   int32_t result_storage_index;
@@ -160,6 +171,7 @@ struct OutputPackCommandSpec {
   int64_t output_width;
   std::vector<int32_t> operand_value_indices;
   std::vector<OutputPackSourceSpec> sources;
+  std::vector<SegmentedOutputPackSourceSpec> segmented_sources;
   bool preserve_data_type = false;
 };
 
@@ -713,15 +725,18 @@ OutputPackCommandSpec BuildSegmentedOutputPackCommand(FusionPlanData& plan,
       "SEGMENTED_OUTPUT_PACK_V1 requires exactly one result");
   TORCH_CHECK(!operands.empty() && operands.size() <= kMaximumOutputPackSources,
       "SEGMENTED_OUTPUT_PACK_V1 operand count exceeds the native limit");
-  TORCH_CHECK(attributes.empty(),
-      "SEGMENTED_OUTPUT_PACK_V1 does not support attributes");
+  const std::vector<int64_t>& source_slices = GetRequiredInt64Vector(
+      attributes, kSegmentedOutputPackSourceSlices, operands.size() * 2,
+      "SEGMENTED_OUTPUT_PACK_V1 source slices");
+  TORCH_CHECK(attributes.size() == 1,
+      "SEGMENTED_OUTPUT_PACK_V1 contains unknown attributes");
 
   const int32_t result_index = results[0];
   ValueSpec& result = plan.values[result_index];
   TORCH_CHECK(result.kind == ValueKind::kUnbound,
       "fusion command result already has a producer or binding");
   TORCH_CHECK(IsFusionFloatingDataType(result.data_type) &&
-          result.dimension_index >= 0 && result.inner_shape.size() >= 2,
+          result.dimension_index >= 0 && result.inner_shape.size() == 2,
       "SEGMENTED_OUTPUT_PACK_V1 result must be a batch-major floating-point tensor");
 
   OutputPackCommandSpec command;
@@ -736,32 +751,48 @@ OutputPackCommandSpec BuildSegmentedOutputPackCommand(FusionPlanData& plan,
     command.output_width *= extent;
   }
   command.operand_value_indices = operands;
-  command.sources.reserve(operands.size());
+  command.segmented_sources.reserve(operands.size());
   command.preserve_data_type = true;
 
   int64_t destination_offset = 0;
-  for (int32_t operand_index : operands) {
+  for (std::size_t source_index = 0; source_index < operands.size(); ++source_index) {
+    const int32_t operand_index = operands[source_index];
     const ValueSpec& operand = plan.values[operand_index];
     TORCH_CHECK(operand.kind != ValueKind::kUnbound,
         "fusion command operand is not topologically available");
     TORCH_CHECK(operand.data_type == result.data_type &&
             operand.dimension_index == command.extent_index &&
-            operand.inner_shape.size() == result.inner_shape.size(),
-        "SEGMENTED_OUTPUT_PACK_V1 operands must share the result dimension, type, and rank");
-    for (std::size_t axis = 1; axis < result.inner_shape.size(); ++axis) {
-      TORCH_CHECK(operand.inner_shape[axis] == result.inner_shape[axis],
-          "SEGMENTED_OUTPUT_PACK_V1 operands must share the trailing result shape");
+            operand.inner_shape.size() >= 2,
+        "SEGMENTED_OUTPUT_PACK_V1 operands must share the result dimension and type");
+    const int64_t source_token_count =
+        operand.inner_shape[operand.inner_shape.size() - 2];
+    const int64_t hidden_width = operand.inner_shape.back();
+    TORCH_CHECK(hidden_width == result.inner_shape.back(),
+        "SEGMENTED_OUTPUT_PACK_V1 operands must share the result hidden width");
+    const int64_t token_offset = source_slices[source_index * 2];
+    const int64_t token_count = source_slices[source_index * 2 + 1];
+    TORCH_CHECK(token_offset >= 0 && token_count > 0 &&
+            token_offset <= source_token_count - token_count,
+        "SEGMENTED_OUTPUT_PACK_V1 source slice is outside the token range");
+    int64_t source_prefix_count = 1;
+    for (std::size_t axis = 0; axis + 2 < operand.inner_shape.size(); ++axis) {
+      TORCH_CHECK(operand.inner_shape[axis] <=
+              std::numeric_limits<int64_t>::max() / source_prefix_count,
+          "SEGMENTED_OUTPUT_PACK_V1 source prefix exceeds the supported range");
+      source_prefix_count *= operand.inner_shape[axis];
     }
-    int64_t width = 1;
-    for (int64_t extent : operand.inner_shape) {
-      TORCH_CHECK(extent <= std::numeric_limits<int64_t>::max() / width,
-          "SEGMENTED_OUTPUT_PACK_V1 operand width exceeds the supported range");
-      width *= extent;
-    }
+    int64_t width = source_prefix_count;
+    TORCH_CHECK(token_count <= std::numeric_limits<int64_t>::max() / width,
+        "SEGMENTED_OUTPUT_PACK_V1 operand token count exceeds the supported range");
+    width *= token_count;
+    TORCH_CHECK(hidden_width <= std::numeric_limits<int64_t>::max() / width,
+        "SEGMENTED_OUTPUT_PACK_V1 operand width exceeds the supported range");
+    width *= hidden_width;
     TORCH_CHECK(width <= std::numeric_limits<int64_t>::max() - destination_offset,
         "SEGMENTED_OUTPUT_PACK_V1 width exceeds the supported range");
-    command.sources.push_back(OutputPackSourceSpec{
-        operand_index, operand.data_type, width, destination_offset});
+    command.segmented_sources.push_back(SegmentedOutputPackSourceSpec{
+        operand_index, source_prefix_count, source_token_count, token_offset,
+        token_count, hidden_width, destination_offset});
     destination_offset += width;
   }
   TORCH_CHECK(destination_offset == command.output_width,
@@ -2486,6 +2517,13 @@ void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_inde
     ValidateTensorMetadata(tensor, plan, source_spec, dimensions,
         source_spec.kind == ValueKind::kComputed, "operand");
   }
+  for (const auto& source : command.segmented_sources) {
+    const torch::Tensor& tensor = ResolveValue(
+        session, buffer_index, input_handles, source.value_index);
+    const ValueSpec& source_spec = plan.values[source.value_index];
+    ValidateTensorMetadata(tensor, plan, source_spec, dimensions,
+        source_spec.kind == ValueKind::kComputed, "operand");
+  }
   const torch::Tensor& result = session.storages[buffer_index]
       [command.result_storage_index];
   ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
@@ -2675,8 +2713,22 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
     work_submitted = true;
   }
   if (command.preserve_data_type) {
+    std::array<SegmentedOutputPackSource, kMaximumOutputPackSources>
+        segmented_sources;
+    for (std::size_t source_index = 0;
+         source_index < command.segmented_sources.size(); ++source_index) {
+      const auto& source = command.segmented_sources[source_index];
+      const torch::Tensor& tensor = ResolveValue(
+          session, buffer_index, input_handles, source.value_index);
+      segmented_sources[source_index] = SegmentedOutputPackSource{
+          tensor.data_ptr(), source.source_prefix_count,
+          source.source_token_count, source.token_offset, source.token_count,
+          source.hidden_width, source.destination_offset};
+      RecordCurrentStream(tensor);
+    }
     LaunchSegmentedOutputPack(
-        launch_sources.data(), static_cast<int32_t>(command.sources.size()),
+        segmented_sources.data(),
+        static_cast<int32_t>(command.segmented_sources.size()),
         result, row_count, command.output_width);
   } else {
     LaunchOutputPack(launch_sources.data(), static_cast<int32_t>(command.sources.size()),
