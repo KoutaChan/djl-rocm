@@ -30,7 +30,11 @@
  * keeps each block's unnormalized attention residual available to the feed-forward branch, while
  * allowing a backend to combine attention, projection, residual, activation, and normalization
  * boundaries into a bounded set of native launches. Projection parameters use the stack data type;
- * normalization parameters may additionally remain FLOAT32 for mixed-precision inference.
+ * normalization parameters may additionally remain FLOAT32 for mixed-precision inference. {@link
+ * ai.djl.engine.fusion.FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroup
+ * MappedGroupedMaskedSoftmaxPoolGroup} applies several masked softmax pools to one candidate memory
+ * and writes multiple destination-mapped context and presence sets in one stage. Each set remains
+ * contiguous, repeated source groups are allowed, and a {@code -1} destination is zero.
  *
  * <p>The lifecycle is {@code recipe -> plan -> executable -> session -> invocation -> output
  * lease}. Preparation validates shapes and builds a bounded command plan. Binding retains caller

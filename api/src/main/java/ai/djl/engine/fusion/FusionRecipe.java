@@ -41,8 +41,10 @@ import java.util.Set;
  * blocks over a short dense sequence. {@link SingleQueryCrossAttentionReadoutGroup} evaluates
  * several purpose-specific single-query readouts over one shared masked memory without
  * materializing projected keys and values. {@link IndexedLocalTransformerEncoder} evaluates one
- * transformer block over compact rows selected from fixed-size local groups. Additional value types
- * can be added without changing the lifecycle of prepared plans and sessions.
+ * transformer block over compact rows selected from fixed-size local groups. {@link
+ * MappedGroupedMaskedSoftmaxPoolGroup} pools one candidate memory into several independently
+ * mapped, contiguous output sets. Additional value types can be added without changing the
+ * lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
 
@@ -711,6 +713,227 @@ public final class FusionRecipe {
         public Value getSelectedPresence() {
             return selectedPresence;
         }
+    }
+
+    /**
+     * One contiguous pair of context and presence values produced by a {@link
+     * MappedGroupedMaskedSoftmaxPoolGroup}.
+     *
+     * <p>The fixed destination mapping contains source group indices. A value of {@code -1}
+     * produces a zero context and zero presence. Source groups may be repeated. The contexts use
+     * FLOAT32 and have shape {@code [batch, destinations, width]}; presence uses the mask data type
+     * and has shape {@code [batch, destinations]}.
+     */
+    public static final class MappedGroupedMaskedSoftmaxPoolOutputSet {
+
+        private final MappedGroupedMaskedSoftmaxPoolGroup group;
+        private final int outputSetIndex;
+        private final Constant destinationGroupIndices;
+        private final MappedGroupedMaskedSoftmaxPoolResult contexts;
+        private final MappedGroupedMaskedSoftmaxPoolResult presence;
+
+        private MappedGroupedMaskedSoftmaxPoolOutputSet(
+                Object owner,
+                int firstValueIndex,
+                String contextsName,
+                String presenceName,
+                TensorSpec contextsSpec,
+                TensorSpec presenceSpec,
+                MappedGroupedMaskedSoftmaxPoolGroup group,
+                int outputSetIndex,
+                Constant destinationGroupIndices) {
+            this.group = group;
+            this.outputSetIndex = outputSetIndex;
+            this.destinationGroupIndices = destinationGroupIndices;
+            contexts =
+                    new MappedGroupedMaskedSoftmaxPoolResult(
+                            owner,
+                            firstValueIndex,
+                            contextsName,
+                            contextsSpec,
+                            this,
+                            MappedGroupedMaskedSoftmaxPoolResultKind.CONTEXTS);
+            presence =
+                    new MappedGroupedMaskedSoftmaxPoolResult(
+                            owner,
+                            firstValueIndex + 1,
+                            presenceName,
+                            presenceSpec,
+                            this,
+                            MappedGroupedMaskedSoftmaxPoolResultKind.PRESENCE);
+        }
+
+        /**
+         * Returns this set's index in declaration order.
+         *
+         * @return the zero-based output-set index
+         */
+        public int getOutputSetIndex() {
+            return outputSetIndex;
+        }
+
+        /**
+         * Returns the group that computes this output set.
+         *
+         * @return the mapped pool group
+         */
+        public MappedGroupedMaskedSoftmaxPoolGroup getGroup() {
+            return group;
+        }
+
+        /**
+         * Returns the fixed source-group mapping for this set.
+         *
+         * @return the INT32 or INT64 destination mapping
+         */
+        public Constant getDestinationGroupIndices() {
+            return destinationGroupIndices;
+        }
+
+        /**
+         * Returns the contiguous FLOAT32 pooled contexts.
+         *
+         * @return the {@code [batch, destinations, width]} contexts
+         */
+        public MappedGroupedMaskedSoftmaxPoolResult getContexts() {
+            return contexts;
+        }
+
+        /**
+         * Returns the contiguous presence values.
+         *
+         * @return the {@code [batch, destinations]} presence values
+         */
+        public MappedGroupedMaskedSoftmaxPoolResult getPresence() {
+            return presence;
+        }
+    }
+
+    /**
+     * A mapped collection of grouped masked-softmax pools over one candidate memory.
+     *
+     * <p>For scores {@code [batch, candidates]}, masks {@code [batch, candidates, groups]}, and
+     * values {@code [batch, candidates, width]}, each destination selects one source group. The
+     * stage applies a masked softmax across candidates and computes a FLOAT32 weighted sum of the
+     * values. A nonzero mask element is valid. Presence is one when at least one candidate is valid
+     * and zero otherwise. A destination mapped to {@code -1} is zero without reading a source
+     * group.
+     *
+     * <p>All output sets are evaluated by one stage. Each set is contiguous and can therefore be
+     * passed to a later Fusion recipe without a transpose, gather, or stack. Implementations may
+     * store all contexts in one backing allocation and all presence values in another, while
+     * exposing each set as an alias. FLOAT16 and BFLOAT16 inputs are converted to FLOAT32 for the
+     * softmax reduction and weighted accumulation. The returned contexts are FLOAT32; presence
+     * retains the mask data type.
+     */
+    public static final class MappedGroupedMaskedSoftmaxPoolGroup {
+
+        private final Value scores;
+        private final Value masks;
+        private final Value values;
+        private List<MappedGroupedMaskedSoftmaxPoolOutputSet> outputSets;
+
+        private MappedGroupedMaskedSoftmaxPoolGroup(Value scores, Value masks, Value values) {
+            this.scores = scores;
+            this.masks = masks;
+            this.values = values;
+        }
+
+        private void setOutputSets(List<MappedGroupedMaskedSoftmaxPoolOutputSet> outputSets) {
+            this.outputSets = immutableCopy(outputSets);
+        }
+
+        /**
+         * Returns the shared {@code [batch, candidates]} score value.
+         *
+         * @return the scores
+         */
+        public Value getScores() {
+            return scores;
+        }
+
+        /**
+         * Returns the shared {@code [batch, candidates, groups]} mask value.
+         *
+         * @return the masks
+         */
+        public Value getMasks() {
+            return masks;
+        }
+
+        /**
+         * Returns the shared {@code [batch, candidates, width]} value memory.
+         *
+         * @return the values
+         */
+        public Value getValues() {
+            return values;
+        }
+
+        /**
+         * Returns one output set by declaration index.
+         *
+         * @param index the output-set index
+         * @return the output set
+         */
+        public MappedGroupedMaskedSoftmaxPoolOutputSet getOutputSet(int index) {
+            return outputSets.get(index);
+        }
+
+        /**
+         * Returns the output sets in declaration order.
+         *
+         * @return the immutable output-set list
+         */
+        public List<MappedGroupedMaskedSoftmaxPoolOutputSet> getOutputSets() {
+            return outputSets;
+        }
+    }
+
+    /** One computed value produced by a {@link MappedGroupedMaskedSoftmaxPoolGroup}. */
+    public static final class MappedGroupedMaskedSoftmaxPoolResult extends Value {
+
+        private final MappedGroupedMaskedSoftmaxPoolOutputSet outputSet;
+        private final MappedGroupedMaskedSoftmaxPoolResultKind kind;
+
+        private MappedGroupedMaskedSoftmaxPoolResult(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                MappedGroupedMaskedSoftmaxPoolOutputSet outputSet,
+                MappedGroupedMaskedSoftmaxPoolResultKind kind) {
+            super(owner, index, name, spec);
+            this.outputSet = outputSet;
+            this.kind = kind;
+        }
+
+        /**
+         * Returns the output set containing this result.
+         *
+         * @return the output set
+         */
+        public MappedGroupedMaskedSoftmaxPoolOutputSet getOutputSet() {
+            return outputSet;
+        }
+
+        /**
+         * Returns whether this value contains contexts or presence values.
+         *
+         * @return the result kind
+         */
+        public MappedGroupedMaskedSoftmaxPoolResultKind getKind() {
+            return kind;
+        }
+    }
+
+    /** The two result kinds returned by a mapped grouped masked-softmax pool output set. */
+    public enum MappedGroupedMaskedSoftmaxPoolResultKind {
+        /** FLOAT32 pooled contexts. */
+        CONTEXTS,
+
+        /** Presence values using the mask data type. */
+        PRESENCE
     }
 
     /**
@@ -1695,6 +1918,29 @@ public final class FusionRecipe {
         }
 
         /**
+         * Starts a mapped grouped masked-softmax pool stage.
+         *
+         * <p>The returned builder accepts one or more fixed destination mappings and inserts two
+         * computed values per output set when {@link
+         * MappedGroupedMaskedSoftmaxPoolGroupBuilder#build()} is called.
+         *
+         * @param name the diagnostic group name
+         * @param scores a bounded {@code [batch, candidates]} floating-point value
+         * @param masks a bounded {@code [batch, candidates, groups]} floating-point value
+         * @param values a bounded {@code [batch, candidates, width]} floating-point value
+         * @return a builder for the mapped pool group
+         */
+        public MappedGroupedMaskedSoftmaxPoolGroupBuilder mappedGroupedMaskedSoftmaxPoolGroup(
+                String name, Value scores, Value masks, Value values) {
+            checkMutable();
+            checkValue(scores);
+            checkValue(masks);
+            checkValue(values);
+            return new MappedGroupedMaskedSoftmaxPoolGroupBuilder(
+                    this, requireName(name, "value"), scores, masks, values);
+        }
+
+        /**
          * Starts a group of single-query cross-attention readouts.
          *
          * @param name the value name
@@ -2040,6 +2286,146 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException("The " + kind + " name must not be empty.");
             }
             return name;
+        }
+    }
+
+    /** Builds one {@link MappedGroupedMaskedSoftmaxPoolGroup} within a {@link Builder}. */
+    public static final class MappedGroupedMaskedSoftmaxPoolGroupBuilder {
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final Value scores;
+        private final Value masks;
+        private final Value values;
+        private final List<String> outputSetNames;
+        private final List<Constant> destinationGroupIndices;
+        private boolean built;
+
+        private MappedGroupedMaskedSoftmaxPoolGroupBuilder(
+                Builder recipeBuilder, String name, Value scores, Value masks, Value values) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.scores = scores;
+            this.masks = masks;
+            this.values = values;
+            outputSetNames = new ArrayList<>();
+            destinationGroupIndices = new ArrayList<>();
+        }
+
+        /**
+         * Adds one independently contiguous output set.
+         *
+         * <p>The mapping must be a fixed one-dimensional INT32 or INT64 constant. Its values are
+         * validated when an executable is bound. {@code -1} produces zero; values from zero to the
+         * source group count minus one select a group. Repeated source groups are allowed.
+         *
+         * @param name the output-set name, unique within this group
+         * @param destinationGroupIndices fixed source-group indices in destination order
+         * @return this builder
+         */
+        public MappedGroupedMaskedSoftmaxPoolGroupBuilder addOutputSet(
+                String name, Constant destinationGroupIndices) {
+            checkMutable();
+            recipeBuilder.checkValue(destinationGroupIndices);
+            String checkedName = Builder.requireName(name, "output set");
+            if (outputSetNames.contains(checkedName)) {
+                throw new IllegalArgumentException("Duplicate output-set name: " + checkedName);
+            }
+            TensorSpec mappingSpec = destinationGroupIndices.getSpec();
+            if (mappingSpec.getLeadingDimension() != null
+                    || mappingSpec.getInnerShape().length != 1
+                    || (mappingSpec.getDataType() != DataType.INT32
+                            && mappingSpec.getDataType() != DataType.INT64)) {
+                throw new IllegalArgumentException(
+                        "Destination group indices must be a fixed one-dimensional INT32 or INT64"
+                                + " constant.");
+            }
+            outputSetNames.add(checkedName);
+            this.destinationGroupIndices.add(destinationGroupIndices);
+            return this;
+        }
+
+        /**
+         * Adds the mapped pool group to its recipe.
+         *
+         * @return the immutable mapped pool group
+         */
+        public MappedGroupedMaskedSoftmaxPoolGroup build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            TensorSpec scoreSpec = scores.getSpec();
+            TensorSpec maskSpec = masks.getSpec();
+            TensorSpec valueSpec = values.getSpec();
+            if (!Builder.isFloatingDataType(scoreSpec.dataType)
+                    || scoreSpec.leadingDimension == null
+                    || scoreSpec.innerShape.length != 1) {
+                throw new IllegalArgumentException(
+                        "Mapped pool scores must be a floating-point [batch, candidates] value.");
+            }
+            long candidates = scoreSpec.innerShape[0];
+            if (!Builder.isFloatingDataType(maskSpec.dataType)
+                    || maskSpec.leadingDimension != scoreSpec.leadingDimension
+                    || maskSpec.innerShape.length != 2
+                    || maskSpec.innerShape[0] != candidates) {
+                throw new IllegalArgumentException(
+                        "Mapped pool masks must be a floating-point [batch, candidates, groups]"
+                                + " value using the score batch dimension.");
+            }
+            if (!Builder.isFloatingDataType(valueSpec.dataType)
+                    || valueSpec.leadingDimension != scoreSpec.leadingDimension
+                    || valueSpec.innerShape.length != 2
+                    || valueSpec.innerShape[0] != candidates) {
+                throw new IllegalArgumentException(
+                        "Mapped pool values must be a floating-point [batch, candidates, width]"
+                                + " value using the score batch dimension.");
+            }
+            if (outputSetNames.isEmpty()) {
+                throw new IllegalStateException("A mapped pool group requires an output set.");
+            }
+
+            MappedGroupedMaskedSoftmaxPoolGroup group =
+                    new MappedGroupedMaskedSoftmaxPoolGroup(scores, masks, values);
+            List<MappedGroupedMaskedSoftmaxPoolOutputSet> outputSets =
+                    new ArrayList<>(outputSetNames.size());
+            for (int index = 0; index < outputSetNames.size(); ++index) {
+                String outputSetName = outputSetNames.get(index);
+                Constant mapping = destinationGroupIndices.get(index);
+                long destinations = mapping.getSpec().innerShape[0];
+                String contextsName =
+                        recipeBuilder.addValueName(name + '[' + outputSetName + "].contexts");
+                String presenceName =
+                        recipeBuilder.addValueName(name + '[' + outputSetName + "].presence");
+                MappedGroupedMaskedSoftmaxPoolOutputSet outputSet =
+                        new MappedGroupedMaskedSoftmaxPoolOutputSet(
+                                recipeBuilder.owner,
+                                recipeBuilder.values.size(),
+                                contextsName,
+                                presenceName,
+                                TensorSpec.of(
+                                        DataType.FLOAT32,
+                                        scoreSpec.leadingDimension,
+                                        destinations,
+                                        valueSpec.innerShape[1]),
+                                TensorSpec.of(
+                                        maskSpec.dataType,
+                                        scoreSpec.leadingDimension,
+                                        destinations),
+                                group,
+                                index,
+                                mapping);
+                outputSets.add(outputSet);
+                recipeBuilder.values.add(outputSet.contexts);
+                recipeBuilder.values.add(outputSet.presence);
+            }
+            group.setOutputSets(outputSets);
+            built = true;
+            return group;
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException("The mapped pool group has already been built.");
+            }
         }
     }
 

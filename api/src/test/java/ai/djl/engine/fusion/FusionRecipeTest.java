@@ -691,6 +691,92 @@ public class FusionRecipeTest {
         Assert.assertThrows(UnsupportedOperationException.class, () -> group.getReadouts().clear());
     }
 
+    @Test
+    public void mappedGroupedMaskedSoftmaxPoolBuildsContiguousOutputSets() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("mapped-candidate-pool");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
+        FusionRecipe.Input scores =
+                builder.addInput("scores", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 16));
+        FusionRecipe.Input masks =
+                builder.addInput(
+                        "masks", FusionRecipe.TensorSpec.of(DataType.BFLOAT16, batch, 16, 11));
+        FusionRecipe.Input values =
+                builder.addInput(
+                        "values", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 16, 256));
+        FusionRecipe.Constant alternatives =
+                builder.addConstant(
+                        "alternatives", FusionRecipe.TensorSpec.fixed(DataType.INT32, 10));
+        FusionRecipe.Constant pass =
+                builder.addConstant("pass", FusionRecipe.TensorSpec.fixed(DataType.INT64, 1));
+        FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroup group =
+                builder.mappedGroupedMaskedSoftmaxPoolGroup("candidateTypes", scores, masks, values)
+                        .addOutputSet("alternatives", alternatives)
+                        .addOutputSet("pass", pass)
+                        .build();
+        builder.addOutput("alternativeContexts", group.getOutputSet(0).getContexts());
+        builder.addOutput("alternativePresence", group.getOutputSet(0).getPresence());
+        builder.addOutput("passContext", group.getOutputSet(1).getContexts());
+        builder.addOutput("passPresence", group.getOutputSet(1).getPresence());
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertSame(group.getScores(), scores);
+        Assert.assertSame(group.getMasks(), masks);
+        Assert.assertSame(group.getValues(), values);
+        Assert.assertEquals(group.getOutputSets().size(), 2);
+        Assert.assertSame(group.getOutputSet(0).getDestinationGroupIndices(), alternatives);
+        Assert.assertSame(group.getOutputSet(1).getDestinationGroupIndices(), pass);
+        Assert.assertEquals(
+                group.getOutputSet(0).getContexts().getSpec().getMaximumShape().getShape(),
+                new long[] {384, 10, 256});
+        Assert.assertEquals(
+                group.getOutputSet(0).getContexts().getSpec().getDataType(), DataType.FLOAT32);
+        Assert.assertEquals(
+                group.getOutputSet(0).getPresence().getSpec().getMaximumShape().getShape(),
+                new long[] {384, 10});
+        Assert.assertEquals(
+                group.getOutputSet(0).getPresence().getSpec().getDataType(), DataType.BFLOAT16);
+        Assert.assertEquals(
+                group.getOutputSet(1).getContexts().getSpec().getMaximumShape().getShape(),
+                new long[] {384, 1, 256});
+        Assert.assertEquals(
+                group.getOutputSet(1).getPresence().getSpec().getMaximumShape().getShape(),
+                new long[] {384, 1});
+        Assert.assertEquals(recipe.getOutputs().size(), 4);
+        Assert.assertThrows(
+                UnsupportedOperationException.class, () -> group.getOutputSets().clear());
+    }
+
+    @Test
+    public void mappedGroupedMaskedSoftmaxPoolRejectsInvalidSchema() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("invalid-mapped-pool");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 8);
+        FusionRecipe.Input scores =
+                builder.addInput("scores", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 4));
+        FusionRecipe.Input masks =
+                builder.addInput(
+                        "masks", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 4, 3));
+        FusionRecipe.Input values =
+                builder.addInput(
+                        "values", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 4, 6));
+        FusionRecipe.Constant mapping =
+                builder.addConstant("mapping", FusionRecipe.TensorSpec.fixed(DataType.INT32, 3));
+        FusionRecipe.Constant floatingMapping =
+                builder.addConstant(
+                        "floatingMapping", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 3));
+
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        builder.mappedGroupedMaskedSoftmaxPoolGroup(
+                                        "badMapping", scores, masks, values)
+                                .addOutputSet("set", floatingMapping));
+        FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroupBuilder groupBuilder =
+                builder.mappedGroupedMaskedSoftmaxPoolGroup("pool", scores, masks, values)
+                        .addOutputSet("set", mapping);
+        Assert.assertThrows(
+                IllegalArgumentException.class, () -> groupBuilder.addOutputSet("set", mapping));
+    }
+
     private static void addReadout(
             FusionRecipe.Builder builder,
             FusionRecipe.SingleQueryCrossAttentionReadoutGroupBuilder group,

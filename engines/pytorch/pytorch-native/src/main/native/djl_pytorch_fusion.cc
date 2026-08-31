@@ -67,7 +67,7 @@ constexpr int64_t kBinaryBranchBlendV1 = 5;
 constexpr int64_t kSingleQueryCrossAttentionReadoutGroupV1 = 6;
 // Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
 constexpr int64_t kIndexedLocalTransformerEncoderV1 = 8;
-// Opcodes 9 through 12 are reserved for independently validated candidates.
+constexpr int64_t kMappedGroupedMaskedSoftmaxPoolGroupV1 = 12;
 constexpr int64_t kIndexedLocalTransformerEncoderSegmentedV2 = 13;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
@@ -324,9 +324,40 @@ struct IndexedLocalTransformerCommandSpec {
   std::vector<int32_t> operand_value_indices;
 };
 
-using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec, IndexedAffineCommandSpec,
-    TransformerEncoderStackCommandSpec, BinaryBranchBlendCommandSpec, SingleQueryReadoutGroupCommandSpec,
-    IndexedLocalTransformerCommandSpec>;
+struct MappedGroupedMaskedSoftmaxPoolOutputSetSpec {
+  int32_t contexts_value_index;
+  int32_t presence_value_index;
+  int32_t mapping_value_index;
+  int32_t contexts_storage_index;
+  int32_t presence_storage_index;
+  int64_t destination_count;
+  int64_t backing_row_offset;
+};
+
+struct MappedGroupedMaskedSoftmaxPoolGroupCommandSpec {
+  int32_t scores_value_index;
+  int32_t masks_value_index;
+  int32_t values_value_index;
+  int32_t extent_index;
+  int32_t contexts_backing_storage_index;
+  int32_t presence_backing_storage_index;
+  int64_t maximum_batches;
+  int64_t candidate_count;
+  int64_t group_count;
+  int64_t width;
+  int64_t total_destination_count;
+  torch::ScalarType score_data_type;
+  torch::ScalarType mask_data_type;
+  torch::ScalarType value_data_type;
+  std::vector<int32_t> operand_value_indices;
+  std::vector<MappedGroupedMaskedSoftmaxPoolOutputSetSpec> output_sets;
+};
+
+using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec,
+    IndexedAffineCommandSpec, TransformerEncoderStackCommandSpec,
+    BinaryBranchBlendCommandSpec, SingleQueryReadoutGroupCommandSpec,
+    IndexedLocalTransformerCommandSpec,
+    MappedGroupedMaskedSoftmaxPoolGroupCommandSpec>;
 
 struct SingleQueryReadoutGroupWeights {
   torch::Tensor query_seed_weight;
@@ -374,6 +405,7 @@ struct FusionExecutableData {
       transformer_encoder_weights;
   std::vector<SingleQueryReadoutGroupWeights> single_query_readout_weights;
   std::vector<std::array<torch::Tensor, 4>> indexed_local_transformer_weights;
+  std::vector<torch::Tensor> mapped_grouped_pool_mappings;
   std::unique_ptr<c10::Event> binding_ready;
 };
 
@@ -1674,6 +1706,132 @@ SingleQueryReadoutGroupCommandSpec BuildSingleQueryReadoutGroupCommand(FusionPla
   return command;
 }
 
+MappedGroupedMaskedSoftmaxPoolGroupCommandSpec
+BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(FusionPlanData& plan,
+    int32_t command_index, const std::vector<int32_t>& results,
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 does not support command flags");
+  TORCH_CHECK(attributes.empty(),
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 does not support attributes");
+  TORCH_CHECK(operands.size() >= 4,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 requires three inputs and at least one mapping");
+  const std::size_t output_set_count = operands.size() - 3;
+  TORCH_CHECK(results.size() == 2 * output_set_count,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 requires a context and presence result per mapping");
+
+  MappedGroupedMaskedSoftmaxPoolGroupCommandSpec command;
+  command.scores_value_index = operands[0];
+  command.masks_value_index = operands[1];
+  command.values_value_index = operands[2];
+  command.operand_value_indices = operands;
+
+  const ValueSpec& scores = plan.values[command.scores_value_index];
+  const ValueSpec& masks = plan.values[command.masks_value_index];
+  const ValueSpec& values = plan.values[command.values_value_index];
+  TORCH_CHECK(scores.kind != ValueKind::kUnbound &&
+          scores.dimension_index >= 0 &&
+          IsFusionFloatingDataType(scores.data_type) &&
+          scores.inner_shape.size() == 1,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 scores must be floating-point [batch, candidates]");
+  command.extent_index = scores.dimension_index;
+  command.maximum_batches = plan.dimensions[command.extent_index].maximum_extent;
+  command.candidate_count = scores.inner_shape[0];
+  TORCH_CHECK(masks.kind != ValueKind::kUnbound &&
+          masks.dimension_index == command.extent_index &&
+          IsFusionFloatingDataType(masks.data_type) &&
+          masks.inner_shape.size() == 2 &&
+          masks.inner_shape[0] == command.candidate_count,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 masks must be floating-point [batch, candidates, groups]");
+  TORCH_CHECK(values.kind != ValueKind::kUnbound &&
+          values.dimension_index == command.extent_index &&
+          IsFusionFloatingDataType(values.data_type) &&
+          values.inner_shape.size() == 2 &&
+          values.inner_shape[0] == command.candidate_count,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 values must be floating-point [batch, candidates, width]");
+  command.group_count = masks.inner_shape[1];
+  command.width = values.inner_shape[1];
+  command.score_data_type = scores.data_type;
+  command.mask_data_type = masks.data_type;
+  command.value_data_type = values.data_type;
+  TORCH_CHECK(command.candidate_count > 0 && command.candidate_count <= 256 &&
+          command.group_count > 0 && command.width > 0,
+      "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 requires candidates<=256 and positive groups and width");
+
+  command.output_sets.reserve(output_set_count);
+  int64_t backing_row_offset = 0;
+  for (std::size_t output_set_index = 0;
+       output_set_index < output_set_count; ++output_set_index) {
+    const int32_t contexts_index = results[2 * output_set_index];
+    const int32_t presence_index = results[2 * output_set_index + 1];
+    const int32_t mapping_index = operands[3 + output_set_index];
+    ValueSpec& contexts = plan.values[contexts_index];
+    ValueSpec& presence = plan.values[presence_index];
+    const ValueSpec& mapping = plan.values[mapping_index];
+    TORCH_CHECK(contexts.kind == ValueKind::kUnbound &&
+            contexts.data_type == torch::kFloat32 &&
+            contexts.dimension_index == command.extent_index &&
+            contexts.inner_shape.size() == 2 &&
+            contexts.inner_shape[1] == command.width,
+        "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 context result metadata is invalid");
+    const int64_t destination_count = contexts.inner_shape[0];
+    TORCH_CHECK(presence.kind == ValueKind::kUnbound &&
+            presence.data_type == command.mask_data_type &&
+            presence.dimension_index == command.extent_index &&
+            presence.inner_shape == std::vector<int64_t>{destination_count},
+        "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 presence result metadata is invalid");
+    TORCH_CHECK(mapping.kind == ValueKind::kConstant &&
+            mapping.dimension_index < 0 &&
+            (mapping.data_type == torch::kInt32 ||
+                mapping.data_type == torch::kInt64) &&
+            mapping.inner_shape == std::vector<int64_t>{destination_count},
+        "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 mapping must be a matching fixed INT32 or INT64 constant");
+    command.output_sets.push_back(
+        MappedGroupedMaskedSoftmaxPoolOutputSetSpec{contexts_index,
+            presence_index, mapping_index, -1, -1, destination_count,
+            backing_row_offset});
+    backing_row_offset = CheckedAdd(backing_row_offset,
+        CheckedMultiply(command.maximum_batches, destination_count,
+            "mapped grouped pool output-set capacity"),
+        "mapped grouped pool result capacity");
+  }
+  command.total_destination_count = 0;
+  for (const auto& output_set : command.output_sets) {
+    command.total_destination_count = CheckedAdd(
+        command.total_destination_count, output_set.destination_count,
+        "mapped grouped pool destination count");
+  }
+
+  command.contexts_backing_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{torch::kFloat32,
+      {backing_row_offset, command.width}});
+  command.presence_backing_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{command.mask_data_type,
+      {backing_row_offset}});
+  for (auto& output_set : command.output_sets) {
+    ValueSpec& contexts = plan.values[output_set.contexts_value_index];
+    contexts.kind = ValueKind::kComputed;
+    contexts.producer_index = command_index;
+    output_set.contexts_storage_index = NextStorageIndex(plan);
+    contexts.storage_index = output_set.contexts_storage_index;
+    plan.storages.push_back(StorageSpec{contexts.data_type,
+        contexts.maximum_shape, command.contexts_backing_storage_index,
+        CheckedMultiply(output_set.backing_row_offset, command.width,
+            "mapped grouped pool context alias offset")});
+
+    ValueSpec& presence = plan.values[output_set.presence_value_index];
+    presence.kind = ValueKind::kComputed;
+    presence.producer_index = command_index;
+    output_set.presence_storage_index = NextStorageIndex(plan);
+    presence.storage_index = output_set.presence_storage_index;
+    plan.storages.push_back(StorageSpec{presence.data_type,
+        presence.maximum_shape, command.presence_backing_storage_index,
+        output_set.backing_row_offset});
+  }
+  return command;
+}
+
 void ValidateOutputReachability(const FusionPlanData& plan) {
   std::vector<bool> reachable_values(plan.values.size(), false);
   std::vector<bool> reachable_commands(plan.commands.size(), false);
@@ -1965,6 +2123,11 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
       case kIndexedLocalTransformerEncoderSegmentedV2:
         plan->commands.emplace_back(
             BuildIndexedLocalTransformerCommand(*plan, command_index, results, operands, flags, attributes, true));
+        break;
+      case kMappedGroupedMaskedSoftmaxPoolGroupV1:
+        plan->commands.emplace_back(
+            BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(
+                *plan, command_index, results, operands, flags, attributes));
         break;
       default:
         TORCH_CHECK(false, "unsupported fusion command opcode: ", opcode);
@@ -2260,8 +2423,37 @@ void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_inde
       "indexed local transformer result storage");
 }
 
-void ValidateSubmission(
-    const FusionSession& session, int32_t buffer_index, const int64_t* input_handles, const int64_t* dimensions) {
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const MappedGroupedMaskedSoftmaxPoolGroupCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  const std::array<std::pair<int32_t, const char*>, 3> inputs{{
+      {command.scores_value_index, "mapped grouped pool scores"},
+      {command.masks_value_index, "mapped grouped pool masks"},
+      {command.values_value_index, "mapped grouped pool values"}}};
+  for (const auto& input_spec : inputs) {
+    const torch::Tensor& input = ResolveValue(
+        session, buffer_index, input_handles, input_spec.first);
+    const ValueSpec& value_spec = plan.values[input_spec.first];
+    ValidateTensorMetadata(input, plan, value_spec, dimensions,
+        value_spec.kind == ValueKind::kComputed, input_spec.second);
+  }
+  for (const auto& output_set : command.output_sets) {
+    const torch::Tensor& contexts = session.storages[buffer_index]
+        [output_set.contexts_storage_index];
+    ValidateTensorMetadata(contexts, plan,
+        plan.values[output_set.contexts_value_index], dimensions, true,
+        "mapped grouped pool context storage");
+    const torch::Tensor& presence = session.storages[buffer_index]
+        [output_set.presence_storage_index];
+    ValidateTensorMetadata(presence, plan,
+        plan.values[output_set.presence_value_index], dimensions, true,
+        "mapped grouped pool presence storage");
+  }
+}
+
+void ValidateSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions) {
   const auto& plan = *session.executable->plan;
   for (std::size_t index = 0; index < plan.dimensions.size(); ++index) {
     TORCH_CHECK(dimensions[index] >= 0 &&
@@ -2878,6 +3070,38 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
       command.hidden_width, command.maximum_batches, command.epsilon, true);
 }
 
+void ExecuteCommand(FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const MappedGroupedMaskedSoftmaxPoolGroupCommandSpec& command,
+    std::size_t command_index, bool& work_submitted) {
+  const int64_t batch_count = dimensions[command.extent_index];
+  if (batch_count == 0) {
+    return;
+  }
+  work_submitted = true;
+  const torch::Tensor& scores = ResolveValue(
+      session, buffer_index, input_handles, command.scores_value_index);
+  const torch::Tensor& masks = ResolveValue(
+      session, buffer_index, input_handles, command.masks_value_index);
+  const torch::Tensor& values = ResolveValue(
+      session, buffer_index, input_handles, command.values_value_index);
+  const torch::Tensor& mapping =
+      session.executable->mapped_grouped_pool_mappings[command_index];
+  torch::Tensor& contexts = session.storages[buffer_index]
+      [command.contexts_backing_storage_index];
+  torch::Tensor& presence = session.storages[buffer_index]
+      [command.presence_backing_storage_index];
+  RecordCurrentStream(scores);
+  RecordCurrentStream(masks);
+  RecordCurrentStream(values);
+  RecordCurrentStream(mapping);
+  RecordCurrentStream(contexts);
+  RecordCurrentStream(presence);
+  LaunchMappedGroupedMaskedSoftmaxPool(scores, masks, values, mapping,
+      contexts, presence, batch_count, command.candidate_count,
+      command.group_count, command.width, command.total_destination_count);
+}
+
 }  // namespace
 
 FusionPlan* PrepareFusionPlan(
@@ -2914,8 +3138,11 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
   data->transformer_encoder_weights.resize(plan->data->commands.size());
   data->single_query_readout_weights.resize(plan->data->commands.size());
   data->indexed_local_transformer_weights.resize(plan->data->commands.size());
-  for (std::size_t command_index = 0; command_index < plan->data->commands.size(); ++command_index) {
-    const auto* command = std::get_if<AffineSumCommandSpec>(&plan->data->commands[command_index]);
+  data->mapped_grouped_pool_mappings.resize(plan->data->commands.size());
+  for (std::size_t command_index = 0;
+       command_index < plan->data->commands.size(); ++command_index) {
+    const auto* command = std::get_if<AffineSumCommandSpec>(
+        &plan->data->commands[command_index]);
     if (command == nullptr) {
       const auto* indexed_command = std::get_if<IndexedAffineCommandSpec>(
           &plan->data->commands[command_index]);
@@ -3072,6 +3299,60 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
           RecordCurrentStream(packed[index]);
         }
       }
+      const auto* mapped_pool_command =
+          std::get_if<MappedGroupedMaskedSoftmaxPoolGroupCommandSpec>(
+              &plan->data->commands[command_index]);
+      if (mapped_pool_command != nullptr) {
+        std::vector<int32_t> metadata;
+        metadata.reserve(static_cast<std::size_t>(
+            CheckedMultiply(mapped_pool_command->total_destination_count, 4,
+                "mapped grouped pool metadata capacity")));
+        int64_t observed_destinations = 0;
+        for (const auto& output_set : mapped_pool_command->output_sets) {
+          const ValueSpec& mapping_spec =
+              plan->data->values[output_set.mapping_value_index];
+          const torch::Tensor& mapping =
+              data->constants[mapping_spec.binding_index];
+          RecordCurrentStream(mapping);
+          torch::Tensor host_mapping =
+              mapping.to(torch::kCPU).contiguous();
+          for (int64_t local_destination = 0;
+               local_destination < output_set.destination_count;
+               ++local_destination) {
+            const int64_t source_group =
+                mapping_spec.data_type == torch::kInt32
+                    ? static_cast<int64_t>(
+                          host_mapping.data_ptr<int32_t>()[local_destination])
+                    : host_mapping.data_ptr<int64_t>()[local_destination];
+            TORCH_CHECK(source_group >= -1 &&
+                    source_group < mapped_pool_command->group_count,
+                "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 mapping value is outside [-1, groupCount)");
+            TORCH_CHECK(output_set.destination_count <=
+                    std::numeric_limits<int32_t>::max() &&
+                    output_set.backing_row_offset <=
+                    std::numeric_limits<int32_t>::max() &&
+                    local_destination <= std::numeric_limits<int32_t>::max(),
+                "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 metadata exceeds INT32");
+            metadata.push_back(static_cast<int32_t>(source_group));
+            metadata.push_back(
+                static_cast<int32_t>(output_set.destination_count));
+            metadata.push_back(
+                static_cast<int32_t>(output_set.backing_row_offset));
+            metadata.push_back(static_cast<int32_t>(local_destination));
+            ++observed_destinations;
+          }
+        }
+        TORCH_CHECK(observed_destinations ==
+                mapped_pool_command->total_destination_count,
+            "mapped grouped pool metadata construction is inconsistent");
+        torch::Tensor host_metadata = torch::from_blob(metadata.data(),
+            {mapped_pool_command->total_destination_count, 4},
+            torch::TensorOptions().dtype(torch::kInt32)).clone();
+        data->mapped_grouped_pool_mappings[command_index] =
+            host_metadata.to(plan->data->device);
+        RecordCurrentStream(
+            data->mapped_grouped_pool_mappings[command_index]);
+      }
       continue;
     }
     auto& packed_groups = data->affine_weights[command_index];
@@ -3189,17 +3470,36 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
          command_index < plan->commands.size(); ++command_index) {
       const auto& fusion_command = plan->commands[command_index];
       if (const auto* command = std::get_if<OutputPackCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, work_submitted);
-      } else if (const auto* command = std::get_if<AffineSumCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
-      } else if (const auto* command = std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
-      } else if (const auto* command = std::get_if<TransformerEncoderStackCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
-      } else if (const auto* command = std::get_if<BinaryBranchBlendCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, work_submitted);
-      } else if (const auto* command = std::get_if<SingleQueryReadoutGroupCommandSpec>(&fusion_command)) {
-        ExecuteCommand(*session, buffer_index, input_handles, dimensions, *command, command_index, work_submitted);
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<AffineSumCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<TransformerEncoderStackCommandSpec>(
+                         &fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
+      } else if (const auto* command =
+                      std::get_if<BinaryBranchBlendCommandSpec>(
+                          &fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<SingleQueryReadoutGroupCommandSpec>(
+                         &fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
+      } else if (const auto* command =
+                      std::get_if<MappedGroupedMaskedSoftmaxPoolGroupCommandSpec>(
+                         &fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
       } else {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
             std::get<IndexedLocalTransformerCommandSpec>(fusion_command), command_index, work_submitted);

@@ -161,6 +161,114 @@ __device__ float load_fusion_float(
   }
 }
 
+template <typename score_t, typename mask_t, typename value_t>
+__global__ void mapped_grouped_masked_softmax_pool_kernel(
+    const score_t* scores, const mask_t* masks, const value_t* values,
+    const int32_t* destination_metadata, float* contexts,
+    mask_t* presence, int64_t batch_count, int64_t candidate_count,
+    int64_t group_count, int64_t width, int64_t destination_count) {
+  __shared__ float probabilities[256];
+  __shared__ int32_t has_values;
+  const int64_t row_count = batch_count * destination_count;
+  for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x) {
+    const int64_t batch = row / destination_count;
+    const int64_t destination = row - batch * destination_count;
+    const int32_t* metadata = destination_metadata + destination * 4;
+    const int32_t source_group = metadata[0];
+    const int64_t output_row =
+        static_cast<int64_t>(metadata[2]) +
+        batch * static_cast<int64_t>(metadata[1]) + metadata[3];
+    if (source_group < 0) {
+      if (threadIdx.x == 0) {
+        presence[output_row] = static_cast<mask_t>(0.0f);
+      }
+      for (int64_t column = threadIdx.x; column < width;
+           column += blockDim.x) {
+        contexts[output_row * width + column] = 0.0f;
+      }
+      continue;
+    }
+
+    if (threadIdx.x < warpSize) {
+      const int lane = threadIdx.x;
+      float maximum = -INFINITY;
+      int selected_count = 0;
+      for (int64_t candidate = lane; candidate < candidate_count;
+           candidate += warpSize) {
+        const int64_t mask_index =
+            (batch * candidate_count + candidate) * group_count +
+            source_group;
+        if (static_cast<float>(masks[mask_index]) != 0.0f) {
+          const float score = static_cast<float>(
+              scores[batch * candidate_count + candidate]);
+          maximum = isnan(maximum) || isnan(score)
+              ? NAN
+              : fmaxf(maximum, score);
+          ++selected_count;
+        }
+      }
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        const float other_maximum = __shfl_down(maximum, offset);
+        maximum = isnan(maximum) || isnan(other_maximum)
+            ? NAN
+            : fmaxf(maximum, other_maximum);
+        selected_count += __shfl_down(selected_count, offset);
+      }
+      maximum = __shfl(maximum, 0);
+      selected_count = __shfl(selected_count, 0);
+
+      float local_denominator = 0.0f;
+      for (int64_t candidate = lane; candidate < candidate_count;
+           candidate += warpSize) {
+        const int64_t mask_index =
+            (batch * candidate_count + candidate) * group_count +
+            source_group;
+        const float probability =
+            selected_count > 0 &&
+                    static_cast<float>(masks[mask_index]) != 0.0f
+                ? expf(static_cast<float>(
+                           scores[batch * candidate_count + candidate]) -
+                      maximum)
+                : 0.0f;
+        probabilities[candidate] = probability;
+        local_denominator += probability;
+      }
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        local_denominator += __shfl_down(local_denominator, offset);
+      }
+      const float denominator = __shfl(local_denominator, 0);
+      for (int64_t candidate = lane; candidate < candidate_count;
+           candidate += warpSize) {
+        if (probabilities[candidate] != 0.0f) {
+          probabilities[candidate] /= denominator;
+        }
+      }
+      if (lane == 0) {
+        has_values = selected_count > 0;
+        presence[output_row] = static_cast<mask_t>(
+            selected_count > 0 ? 1.0f : 0.0f);
+      }
+    }
+    __syncthreads();
+    for (int64_t column = threadIdx.x; column < width;
+         column += blockDim.x) {
+      float sum = 0.0f;
+      for (int64_t candidate = 0; candidate < candidate_count;
+           ++candidate) {
+        const float probability = probabilities[candidate];
+        if (probability != 0.0f) {
+          sum += probability *
+              static_cast<float>(
+                  values[(batch * candidate_count + candidate) * width +
+                      column]);
+        }
+      }
+      contexts[output_row * width + column] = sum;
+    }
+    __syncthreads();
+  }
+}
+
 template <typename baseline_t, typename selected_t>
 __global__ void binary_branch_blend_kernel(
     BinaryBranchBlendArguments arguments) {
@@ -2458,6 +2566,98 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
   }
 #undef LAUNCH_INDEXED_LOCAL_FINALIZE
   CheckHipLaunch("fusion indexed local transformer finalize");
+template <typename score_t, typename mask_t, typename value_t>
+void LaunchMappedGroupedMaskedSoftmaxPoolTyped(
+    const torch::Tensor& scores, const torch::Tensor& masks,
+    const torch::Tensor& values, const torch::Tensor& destination_metadata,
+    torch::Tensor& contexts, torch::Tensor& presence, int64_t batch_count,
+    int64_t candidate_count, int64_t group_count, int64_t width,
+    int64_t destination_count, hipStream_t stream) {
+  const int64_t row_count = CheckedMultiply(
+      batch_count, destination_count, "mapped grouped pool row count");
+  const uint32_t block_count = static_cast<uint32_t>(
+      std::min<int64_t>(row_count, 65535));
+  hipLaunchKernelGGL(
+      (mapped_grouped_masked_softmax_pool_kernel<
+          score_t, mask_t, value_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
+      scores.data_ptr<score_t>(), masks.data_ptr<mask_t>(),
+      values.data_ptr<value_t>(), destination_metadata.data_ptr<int32_t>(),
+      contexts.data_ptr<float>(), presence.data_ptr<mask_t>(), batch_count,
+      candidate_count, group_count, width, destination_count);
+}
+
+void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
+    const torch::Tensor& masks, const torch::Tensor& values,
+    const torch::Tensor& destination_metadata, torch::Tensor& contexts,
+    torch::Tensor& presence, int64_t batch_count, int64_t candidate_count,
+    int64_t group_count, int64_t width, int64_t destination_count) {
+  TORCH_CHECK(candidate_count > 0 && candidate_count <= 256 &&
+          group_count > 0 && width > 0 && destination_count > 0,
+      "mapped grouped pool metadata is unsupported");
+  TORCH_CHECK(destination_metadata.scalar_type() == torch::kInt32 &&
+          destination_metadata.is_contiguous() &&
+          destination_metadata.dim() == 2 &&
+          destination_metadata.size(0) == destination_count &&
+          destination_metadata.size(1) == 4,
+      "mapped grouped pool destination metadata is invalid");
+  TORCH_CHECK(contexts.scalar_type() == torch::kFloat32 &&
+          presence.scalar_type() == masks.scalar_type(),
+      "mapped grouped pool result data types are invalid");
+  if (batch_count == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(scores.get_device());
+#define LAUNCH_MAPPED_POOL(score_type, mask_type, value_type) \
+  LaunchMappedGroupedMaskedSoftmaxPoolTyped<score_type, mask_type, value_type>( \
+      scores, masks, values, destination_metadata, contexts, presence, \
+      batch_count, candidate_count, group_count, width, destination_count, \
+      stream.stream())
+#define DISPATCH_MAPPED_POOL_VALUE(score_type, mask_type) \
+  switch (values.scalar_type()) { \
+    case torch::kFloat16: \
+      LAUNCH_MAPPED_POOL(score_type, mask_type, c10::Half); \
+      break; \
+    case torch::kBFloat16: \
+      LAUNCH_MAPPED_POOL(score_type, mask_type, c10::BFloat16); \
+      break; \
+    case torch::kFloat32: \
+      LAUNCH_MAPPED_POOL(score_type, mask_type, float); \
+      break; \
+    default: \
+      TORCH_CHECK(false, "unsupported mapped grouped pool value data type"); \
+  }
+#define DISPATCH_MAPPED_POOL_MASK(score_type) \
+  switch (masks.scalar_type()) { \
+    case torch::kFloat16: \
+      DISPATCH_MAPPED_POOL_VALUE(score_type, c10::Half); \
+      break; \
+    case torch::kBFloat16: \
+      DISPATCH_MAPPED_POOL_VALUE(score_type, c10::BFloat16); \
+      break; \
+    case torch::kFloat32: \
+      DISPATCH_MAPPED_POOL_VALUE(score_type, float); \
+      break; \
+    default: \
+      TORCH_CHECK(false, "unsupported mapped grouped pool mask data type"); \
+  }
+  switch (scores.scalar_type()) {
+    case torch::kFloat16:
+      DISPATCH_MAPPED_POOL_MASK(c10::Half);
+      break;
+    case torch::kBFloat16:
+      DISPATCH_MAPPED_POOL_MASK(c10::BFloat16);
+      break;
+    case torch::kFloat32:
+      DISPATCH_MAPPED_POOL_MASK(float);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported mapped grouped pool score data type");
+  }
+#undef DISPATCH_MAPPED_POOL_MASK
+#undef DISPATCH_MAPPED_POOL_VALUE
+#undef LAUNCH_MAPPED_POOL
+  CheckHipLaunch("fusion mapped grouped masked-softmax pool");
 }
 
 }  // namespace djl::pytorch::fusion

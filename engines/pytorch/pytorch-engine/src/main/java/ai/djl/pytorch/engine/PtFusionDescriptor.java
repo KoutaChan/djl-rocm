@@ -62,7 +62,7 @@ final class PtFusionDescriptor {
     static final long SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 = 6;
     // Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 = 8;
-    // Opcodes 9 through 12 are reserved for independently validated candidates.
+    static final long MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 = 12;
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2 = 13;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
@@ -159,6 +159,12 @@ final class PtFusionDescriptor {
                                         singleQueryReadoutGroup(value)));
             } else if (value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState) {
                 // The first state encodes the shared multi-result command.
+            } else if (isFirstMappedPoolResult(value)) {
+                commandWords =
+                        Math.addExact(
+                                commandWords, mappedPoolGroupCommandWords(mappedPoolGroup(value)));
+            } else if (value instanceof FusionRecipe.MappedGroupedMaskedSoftmaxPoolResult) {
+                // The first result encodes the shared multi-result command.
             } else if (!(value instanceof FusionRecipe.Input)
                     && !(value instanceof FusionRecipe.Constant)) {
                 throw new UnsupportedOperationException(
@@ -229,6 +235,8 @@ final class PtFusionDescriptor {
                 putBinaryBranchBlendCommand(descriptor, (FusionRecipe.BinaryBranchBlend) value);
             } else if (isFirstSingleQueryReadoutState(value)) {
                 putSingleQueryReadoutGroupCommand(descriptor, singleQueryReadoutGroup(value));
+            } else if (isFirstMappedPoolResult(value)) {
+                putMappedPoolGroupCommand(descriptor, mappedPoolGroup(value));
             }
         }
         for (FusionRecipe.Output output : recipe.getOutputs()) {
@@ -258,6 +266,8 @@ final class PtFusionDescriptor {
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 ++count;
             } else if (isFirstSingleQueryReadoutState(value)) {
+                ++count;
+            } else if (isFirstMappedPoolResult(value)) {
                 ++count;
             }
         }
@@ -432,6 +442,18 @@ final class PtFusionDescriptor {
                                     Math.multiplyExact(readoutCount, 6L * hiddenWidth),
                                     normDataType.getNumOfBytes()));
         }
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!isFirstMappedPoolResult(value)) {
+                continue;
+            }
+            FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroup group = mappedPoolGroup(value);
+            for (FusionRecipe.MappedGroupedMaskedSoftmaxPoolOutputSet outputSet :
+                    group.getOutputSets()) {
+                long destinations =
+                        outputSet.getDestinationGroupIndices().getSpec().getInnerShape()[0];
+                bytes = Math.addExact(bytes, Math.multiplyExact(destinations, 4L * Integer.BYTES));
+            }
+        }
         return bytes;
     }
 
@@ -442,7 +464,8 @@ final class PtFusionDescriptor {
                 || value instanceof FusionRecipe.TransformerEncoderStack
                 || value instanceof FusionRecipe.IndexedLocalTransformerEncoder
                 || value instanceof FusionRecipe.BinaryBranchBlend
-                || value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState;
+                || value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState
+                || value instanceof FusionRecipe.MappedGroupedMaskedSoftmaxPoolResult;
     }
 
     private static long singleQueryReadoutWorkspaceBytes(FusionRecipe recipe) {
@@ -487,6 +510,24 @@ final class PtFusionDescriptor {
     private static FusionRecipe.SingleQueryCrossAttentionReadoutGroup singleQueryReadoutGroup(
             FusionRecipe.Value value) {
         return ((FusionRecipe.SingleQueryCrossAttentionReadoutState) value).getGroup();
+    }
+
+    private static boolean isFirstMappedPoolResult(FusionRecipe.Value value) {
+        if (!(value instanceof FusionRecipe.MappedGroupedMaskedSoftmaxPoolResult)) {
+            return false;
+        }
+        FusionRecipe.MappedGroupedMaskedSoftmaxPoolResult result =
+                (FusionRecipe.MappedGroupedMaskedSoftmaxPoolResult) value;
+        return result.getOutputSet().getOutputSetIndex() == 0
+                && result.getKind()
+                        == FusionRecipe.MappedGroupedMaskedSoftmaxPoolResultKind.CONTEXTS;
+    }
+
+    private static FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroup mappedPoolGroup(
+            FusionRecipe.Value value) {
+        return ((FusionRecipe.MappedGroupedMaskedSoftmaxPoolResult) value)
+                .getOutputSet()
+                .getGroup();
     }
 
     private static long transformerWorkspaceBytes(FusionRecipe recipe) {
@@ -1008,6 +1049,37 @@ final class PtFusionDescriptor {
         descriptor.putLong(group.getReadouts().size());
         for (FusionRecipe.SingleQueryCrossAttentionReadout readout : group.getReadouts()) {
             descriptor.putLong(readout.getFeedForwardWidth());
+        }
+    }
+
+    private static int mappedPoolGroupCommandWords(
+            FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroup group) {
+        int outputSetCount = group.getOutputSets().size();
+        int resultCount = Math.multiplyExact(2, outputSetCount);
+        int operandCount = Math.addExact(3, outputSetCount);
+        return Math.addExact(COMMAND_RECORD_HEADER_WORDS, Math.addExact(resultCount, operandCount));
+    }
+
+    private static void putMappedPoolGroupCommand(
+            ByteBuffer descriptor, FusionRecipe.MappedGroupedMaskedSoftmaxPoolGroup group) {
+        int outputSetCount = group.getOutputSets().size();
+        descriptor.putLong(mappedPoolGroupCommandWords(group));
+        descriptor.putLong(MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(Math.multiplyExact(2, outputSetCount));
+        descriptor.putLong(Math.addExact(3, outputSetCount));
+        descriptor.putLong(0);
+        for (FusionRecipe.MappedGroupedMaskedSoftmaxPoolOutputSet outputSet :
+                group.getOutputSets()) {
+            descriptor.putLong(outputSet.getContexts().getIndex());
+            descriptor.putLong(outputSet.getPresence().getIndex());
+        }
+        descriptor.putLong(group.getScores().getIndex());
+        descriptor.putLong(group.getMasks().getIndex());
+        descriptor.putLong(group.getValues().getIndex());
+        for (FusionRecipe.MappedGroupedMaskedSoftmaxPoolOutputSet outputSet :
+                group.getOutputSets()) {
+            descriptor.putLong(outputSet.getDestinationGroupIndices().getIndex());
         }
     }
 

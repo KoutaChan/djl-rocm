@@ -178,6 +178,12 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias, int64_t active_offset, int64_t active_rows,
     int64_t dense_rows, int64_t hidden_width, float epsilon);
 
+void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
+    const torch::Tensor& masks, const torch::Tensor& values,
+    const torch::Tensor& destination_metadata, torch::Tensor& contexts,
+    torch::Tensor& presence, int64_t batch_count, int64_t candidate_count,
+    int64_t group_count, int64_t width, int64_t destination_count);
+
 }  // namespace djl::pytorch::fusion
 
 #endif  // DJL_TORCH_DJL_PYTORCH_FUSION_KERNELS_H
