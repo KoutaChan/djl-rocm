@@ -1221,6 +1221,90 @@ public interface NDArrayEx {
     }
 
     /**
+     * Applies grouped packed attention in canonical engine layout.
+     *
+     * <p>Query uses {@code [batch, queryTokens, heads * keyFeatures]}. Packed memory uses {@code
+     * [batch, groups, keyTokens, heads * (keyFeatures + valueFeatures)]}; all head keys precede all
+     * head values. The nonzero mask uses {@code [batch, groups, keyTokens]}. The default
+     * implementation is a differentiable decomposition and defines the portable fallback semantics.
+     *
+     * @param packedKeyValue grouped packed key/value projection
+     * @param mask nonzero valid-token mask
+     * @param heads number of attention heads
+     * @param scale query-key score scale
+     * @return attended values shaped {@code [batch, groups, queryTokens, heads * valueFeatures]}
+     */
+    default NDArray canonicalGroupedPackedScaledDotProductAttention(
+            NDArray packedKeyValue, NDArray mask, long heads, double scale) {
+        NDArray query = getArray();
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(query, packedKeyValue, mask);
+            Shape queryShape = query.getShape();
+            Shape packedShape = packedKeyValue.getShape();
+            Shape maskShape = mask.getShape();
+            if (queryShape.dimension() != 3
+                    || packedShape.dimension() != 4
+                    || maskShape.dimension() != 3) {
+                throw new IllegalArgumentException(
+                        "canonical grouped packed attention requires rank 3/4/3 inputs");
+            }
+            long batch = queryShape.get(0);
+            long queryTokens = queryShape.get(1);
+            long queryWidth = queryShape.get(2);
+            long groups = packedShape.get(1);
+            long keyTokens = packedShape.get(2);
+            long packedWidth = packedShape.get(3);
+            if (packedShape.get(0) != batch
+                    || !maskShape.equals(new Shape(batch, groups, keyTokens))
+                    || heads <= 0
+                    || queryWidth % heads != 0
+                    || packedWidth <= queryWidth
+                    || (packedWidth - queryWidth) % heads != 0
+                    || !Double.isFinite(scale)) {
+                throw new IllegalArgumentException(
+                        "canonical grouped packed attention shapes are incompatible");
+            }
+            long keyFeatures = queryWidth / heads;
+            long valueWidth = packedWidth - queryWidth;
+            long valueFeatures = valueWidth / heads;
+
+            NDArray queries =
+                    query.reshape(batch, queryTokens, heads, keyFeatures)
+                            .swapAxes(1, 2)
+                            .expandDims(1)
+                            .broadcast(batch, groups, heads, queryTokens, keyFeatures);
+            NDArray keys =
+                    packedKeyValue
+                            .get("...,0:{}", queryWidth)
+                            .reshape(batch, groups, keyTokens, heads, keyFeatures)
+                            .swapAxes(2, 3);
+            NDArray values =
+                    packedKeyValue
+                            .get("...,{}:{}", queryWidth, packedWidth)
+                            .reshape(batch, groups, keyTokens, heads, valueFeatures)
+                            .swapAxes(2, 3);
+            NDArray valid =
+                    mask.neq(0)
+                            .reshape(batch, groups, 1, 1, keyTokens)
+                            .toType(query.getDataType(), false)
+                            .stopGradient();
+            NDArray probabilities =
+                    queries.matMul(keys.swapAxes(3, 4))
+                            .mul(scale)
+                            .add(valid.neg().add(1.0f).mul(-1.0e30f))
+                            .softmax(4);
+            NDArray result =
+                    probabilities
+                            .matMul(values)
+                            .swapAxes(2, 3)
+                            .reshape(batch, groups, queryTokens, valueWidth);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Applies relation-biased scaled-dot-product attention in canonical engine layout.
      *
      * <p>The operation evaluates {@code softmax((Q K^T + gather(Q R, relationIds)) * scale +

@@ -509,6 +509,95 @@ public final class NDArrays {
     }
 
     /**
+     * Applies grouped attention to packed key/value projections without requiring a head-major
+     * input layout.
+     *
+     * <p>The query is shared by every group in the same leading row. Query features are stored as
+     * all head keys in the trailing dimension. The packed memory stores all head keys followed by
+     * all head values. A nonzero mask entry identifies a memory token that participates in the
+     * softmax. Engines may prepare backend-specific matrix layouts while keeping query-key and
+     * probability-value products on their regular batched-matrix-multiply path.
+     *
+     * <p>Leading dimensions are flattened only at the engine boundary. For example, a query shaped
+     * {@code [batch, queryTokens, heads * keyFeatures]} and memory shaped {@code [batch, groups,
+     * keyTokens, heads * (keyFeatures + valueFeatures)]} produce {@code [batch, groups,
+     * queryTokens, heads * valueFeatures]}.
+     *
+     * @param query shared query projection shaped {@code [..., queryTokens, queryWidth]}
+     * @param packedKeyValue grouped packed projection shaped {@code [..., groups, keyTokens,
+     *     packedWidth]}
+     * @param mask nonzero valid-token mask shaped {@code [..., groups, keyTokens]}
+     * @param heads number of attention heads
+     * @param scale query-key score scale
+     * @return grouped attended values in token-major packed-head layout
+     */
+    public static NDArray groupedPackedScaledDotProductAttention(
+            NDArray query, NDArray packedKeyValue, NDArray mask, long heads, double scale) {
+        Shape queryShape = query.getShape();
+        Shape packedShape = packedKeyValue.getShape();
+        Shape maskShape = mask.getShape();
+        int queryRank = queryShape.dimension();
+        if (queryRank < 2
+                || packedShape.dimension() != queryRank + 1
+                || maskShape.dimension() != queryRank) {
+            throw new IllegalArgumentException(
+                    "grouped packed attention requires query [...,Q,F], memory [...,G,K,P], "
+                            + "and mask [...,G,K]");
+        }
+
+        long[] leadingDimensions = leadingDimensions(queryShape, 2);
+        if (!Arrays.equals(leadingDimensions, leadingDimensions(packedShape, 3))
+                || !Arrays.equals(leadingDimensions, leadingDimensions(maskShape, 2))) {
+            throw new IllegalArgumentException(
+                    "query, packed memory, and mask must preserve the same leading dimensions");
+        }
+        long queryTokens = queryShape.get(queryRank - 2);
+        long queryWidth = queryShape.get(queryRank - 1);
+        long groups = packedShape.get(queryRank - 2);
+        long keyTokens = packedShape.get(queryRank - 1);
+        long packedWidth = packedShape.get(queryRank);
+        if (maskShape.get(queryRank - 2) != groups
+                || maskShape.get(queryRank - 1) != keyTokens
+                || heads <= 0
+                || queryTokens <= 0
+                || groups <= 0
+                || keyTokens <= 0
+                || queryWidth <= 0
+                || queryWidth % heads != 0
+                || packedWidth <= queryWidth
+                || (packedWidth - queryWidth) % heads != 0
+                || !Double.isFinite(scale)) {
+            throw new IllegalArgumentException("grouped packed attention shapes are incompatible");
+        }
+        long valueWidth = packedWidth - queryWidth;
+        long batch = elementCount(leadingDimensions);
+
+        if (queryRank == 3) {
+            return query.getNDArrayInternal()
+                    .canonicalGroupedPackedScaledDotProductAttention(
+                            packedKeyValue, mask, heads, scale);
+        }
+
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(query, packedKeyValue, mask);
+            NDArray canonicalResult =
+                    query.reshape(batch, queryTokens, queryWidth)
+                            .getNDArrayInternal()
+                            .canonicalGroupedPackedScaledDotProductAttention(
+                                    packedKeyValue.reshape(batch, groups, keyTokens, packedWidth),
+                                    mask.reshape(batch, groups, keyTokens),
+                                    heads,
+                                    scale);
+            NDArray result =
+                    canonicalResult.reshape(
+                            shapeWithTrailing(leadingDimensions, groups, queryTokens, valueWidth));
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Applies grouped attention with shared tokens and indexed auxiliary tokens.
      *
      * <p>Packed key/value tensors store all head keys followed by all head values in the last

@@ -97,6 +97,44 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void groupedPackedAttentionSharesQueriesAndMasksMemory() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray query = manager.zeros(new Shape(1, 1, 1));
+            NDArray packedKeyValue =
+                    manager.create(
+                            new float[] {0f, 1f, 0f, 3f, 0f, 2f, 0f, 10f}, new Shape(1, 2, 2, 2));
+            NDArray mask = manager.create(new int[] {1, 1, 1, 0}, new Shape(1, 2, 2));
+
+            NDArray result =
+                    NDArrays.groupedPackedScaledDotProductAttention(
+                            query, packedKeyValue, mask, 1, 1.0);
+
+            Assert.assertEquals(result.getShape(), new Shape(1, 2, 1, 1));
+            assertClose(result.toFloatArray(), new float[] {2f, 2f}, 1e-6f);
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionPreservesPortableGradients() {
+        Engine engine = Engine.getInstance();
+        try (NDManager manager = engine.newBaseManager(Device.cpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray query = requiringGradient(manager.randomNormal(new Shape(2, 3, 8)));
+            NDArray packedKeyValue =
+                    requiringGradient(manager.randomNormal(new Shape(2, 4, 5, 16)));
+            NDArray mask = manager.ones(new Shape(2, 4, 5), DataType.INT32);
+
+            collector.backward(
+                    NDArrays.groupedPackedScaledDotProductAttention(
+                                    query, packedKeyValue, mask, 2, 0.5)
+                            .sum());
+
+            assertFiniteNonzeroGradient(query);
+            assertFiniteNonzeroGradient(packedKeyValue);
+        }
+    }
+
+    @Test
     public void residualAddLayerNormUpdatesOwnedBuffer() {
         try (NDManager manager = NDManager.newBaseManager()) {
             NDArray residual = manager.create(new float[] {1f, 3f}, new Shape(1, 2));
@@ -253,6 +291,7 @@ public class StructuredAttentionTest {
             verifyMappedGroupedAttention(manager);
             verifyRelationAttentionLeadingDimensions(manager);
             verifyGroupedAttentionLeadingDimensions(manager);
+            verifyGroupedPackedAttentionLeadingDimensions(manager);
             verifyResidualLayerNorm(manager);
         }
     }
@@ -269,6 +308,7 @@ public class StructuredAttentionTest {
             verifyMappedGroupedAttention(manager);
             verifyRelationAttentionLeadingDimensions(manager);
             verifyGroupedAttentionLeadingDimensions(manager);
+            verifyGroupedPackedAttentionLeadingDimensions(manager);
             verifyResidualLayerNorm(manager);
         }
     }
@@ -542,6 +582,88 @@ public class StructuredAttentionTest {
                 new Shape(batches, groupsPerBatch, queriesPerGroup, heads, valueFeatures));
         assertClose(
                 actual.toFloatArray(), expected.reshape(actual.getShape()).toFloatArray(), 2e-4f);
+    }
+
+    private static void verifyGroupedPackedAttentionLeadingDimensions(NDManager manager) {
+        int batches = 2;
+        int alternatives = 3;
+        int queryTokens = 4;
+        int groups = 2;
+        int keyTokens = 5;
+        int heads = 2;
+        int keyFeatures = 3;
+        int valueFeatures = 4;
+        int queryWidth = heads * keyFeatures;
+        int packedWidth = heads * (keyFeatures + valueFeatures);
+        NDArray query =
+                manager.randomNormal(new Shape(batches, alternatives, queryTokens, queryWidth));
+        NDArray packedKeyValue =
+                manager.randomNormal(
+                        new Shape(batches, alternatives, groups, keyTokens, packedWidth));
+        NDArray mask = manager.ones(new Shape(batches, alternatives, groups, keyTokens));
+        mask.set(new ai.djl.ndarray.index.NDIndex("0,0,0,-1"), 0);
+        double scale = 0.37;
+
+        NDArray expected =
+                groupedPackedAttentionReference(
+                        query.reshape(batches * alternatives, queryTokens, queryWidth),
+                        packedKeyValue.reshape(
+                                batches * alternatives, groups, keyTokens, packedWidth),
+                        mask.reshape(batches * alternatives, groups, keyTokens),
+                        heads,
+                        scale);
+        NDArray actual =
+                NDArrays.groupedPackedScaledDotProductAttention(
+                        query, packedKeyValue, mask, heads, scale);
+
+        Assert.assertEquals(
+                actual.getShape(),
+                new Shape(batches, alternatives, groups, queryTokens, heads * valueFeatures));
+        assertClose(
+                actual.toFloatArray(), expected.reshape(actual.getShape()).toFloatArray(), 2e-4f);
+    }
+
+    private static NDArray groupedPackedAttentionReference(
+            NDArray query, NDArray packedKeyValue, NDArray mask, int heads, double scale) {
+        Shape queryShape = query.getShape();
+        Shape packedShape = packedKeyValue.getShape();
+        long batch = queryShape.get(0);
+        long queryTokens = queryShape.get(1);
+        long queryWidth = queryShape.get(2);
+        long groups = packedShape.get(1);
+        long keyTokens = packedShape.get(2);
+        long keyFeatures = queryWidth / heads;
+        long valueWidth = packedShape.get(3) - queryWidth;
+        long valueFeatures = valueWidth / heads;
+        NDArray queries =
+                query.reshape(batch, queryTokens, heads, keyFeatures)
+                        .swapAxes(1, 2)
+                        .expandDims(1)
+                        .broadcast(batch, groups, heads, queryTokens, keyFeatures);
+        NDArray keys =
+                packedKeyValue
+                        .get("...,0:{}", queryWidth)
+                        .reshape(batch, groups, keyTokens, heads, keyFeatures)
+                        .swapAxes(2, 3);
+        NDArray values =
+                packedKeyValue
+                        .get("...,{}:{}", queryWidth, packedShape.get(3))
+                        .reshape(batch, groups, keyTokens, heads, valueFeatures)
+                        .swapAxes(2, 3);
+        NDArray bias =
+                mask.neq(0)
+                        .toType(query.getDataType(), false)
+                        .reshape(batch, groups, 1, 1, keyTokens)
+                        .neg()
+                        .add(1)
+                        .mul(-1.0e30f);
+        return queries.matMul(keys.swapAxes(3, 4))
+                .mul(scale)
+                .add(bias)
+                .softmax(4)
+                .matMul(values)
+                .swapAxes(2, 3)
+                .reshape(batch, groups, queryTokens, valueWidth);
     }
 
     private static void verifyRelationAttention(NDManager manager) {
