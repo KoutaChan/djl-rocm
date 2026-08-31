@@ -1449,8 +1449,10 @@ public class PtFusionTest {
                 lease.synchronize();
                 Assert.assertEquals(
                         eagerOutput.toFloatArray(), new float[] {0.237548828125f}, 0.0f);
-                Assert.assertEquals(
-                        lease.get(fixture.output).toFloatArray(), eagerOutput.toFloatArray(), 0.0f);
+                try (NDArray actual = lease.get(fixture.output).get("0:1")) {
+                    Assert.assertEquals(
+                            actual.toFloatArray(), eagerOutput.toFloatArray(), 0.0f);
+                }
             }
         }
     }
