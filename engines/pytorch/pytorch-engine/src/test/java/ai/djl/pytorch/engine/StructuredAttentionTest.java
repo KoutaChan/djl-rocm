@@ -932,8 +932,14 @@ public class StructuredAttentionTest {
         } else {
             tolerance = 3e-2f;
         }
-        assertClose(nativeResult.toFloatArray(), expected.toFloatArray(), tolerance);
-        assertClose(indexFallback.toFloatArray(), expected.toFloatArray(), tolerance);
+        assertClose(
+                nativeResult.toType(DataType.FLOAT32, false).toFloatArray(),
+                expected.toType(DataType.FLOAT32, false).toFloatArray(),
+                tolerance);
+        assertClose(
+                indexFallback.toType(DataType.FLOAT32, false).toFloatArray(),
+                expected.toType(DataType.FLOAT32, false).toFloatArray(),
+                tolerance);
     }
 
     private static void verifyGroupedAttentionShape(
