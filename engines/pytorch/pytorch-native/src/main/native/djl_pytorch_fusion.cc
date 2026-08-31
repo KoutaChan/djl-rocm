@@ -155,6 +155,7 @@ struct OutputPackSourceSpec {
 
 struct SegmentedOutputPackSourceSpec {
   int32_t value_index;
+  torch::ScalarType data_type;
   int64_t source_prefix_count;
   int64_t source_token_count;
   int64_t token_offset;
@@ -760,10 +761,10 @@ OutputPackCommandSpec BuildSegmentedOutputPackCommand(FusionPlanData& plan,
     const ValueSpec& operand = plan.values[operand_index];
     TORCH_CHECK(operand.kind != ValueKind::kUnbound,
         "fusion command operand is not topologically available");
-    TORCH_CHECK(operand.data_type == result.data_type &&
+    TORCH_CHECK(IsFusionFloatingDataType(operand.data_type) &&
             operand.dimension_index == command.extent_index &&
             operand.inner_shape.size() >= 2,
-        "SEGMENTED_OUTPUT_PACK_V1 operands must share the result dimension and type");
+        "SEGMENTED_OUTPUT_PACK_V1 operands must be batch-major floating-point tensors");
     const int64_t source_token_count =
         operand.inner_shape[operand.inner_shape.size() - 2];
     const int64_t hidden_width = operand.inner_shape.back();
@@ -791,7 +792,7 @@ OutputPackCommandSpec BuildSegmentedOutputPackCommand(FusionPlanData& plan,
     TORCH_CHECK(width <= std::numeric_limits<int64_t>::max() - destination_offset,
         "SEGMENTED_OUTPUT_PACK_V1 width exceeds the supported range");
     command.segmented_sources.push_back(SegmentedOutputPackSourceSpec{
-        operand_index, source_prefix_count, source_token_count, token_offset,
+        operand_index, operand.data_type, source_prefix_count, source_token_count, token_offset,
         token_count, hidden_width, destination_offset});
     destination_offset += width;
   }
@@ -2721,7 +2722,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       const torch::Tensor& tensor = ResolveValue(
           session, buffer_index, input_handles, source.value_index);
       segmented_sources[source_index] = SegmentedOutputPackSource{
-          tensor.data_ptr(), source.source_prefix_count,
+          tensor.data_ptr(), source.data_type, source.source_prefix_count,
           source.source_token_count, source.token_offset, source.token_count,
           source.hidden_width, source.destination_offset};
       RecordCurrentStream(tensor);

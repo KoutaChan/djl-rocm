@@ -49,6 +49,7 @@ struct OutputPackArguments {
 
 struct SegmentedOutputPackArguments {
   const void* sources[kMaximumOutputPackSources];
+  int32_t data_types[kMaximumOutputPackSources];
   int64_t source_prefix_counts[kMaximumOutputPackSources];
   int64_t source_token_counts[kMaximumOutputPackSources];
   int64_t token_offsets[kMaximumOutputPackSources];
@@ -160,13 +161,12 @@ __global__ void output_pack_kernel(OutputPackArguments arguments) {
   }
 }
 
-template <typename scalar_t>
-__global__ void segmented_output_pack_kernel(
-    SegmentedOutputPackArguments arguments) {
-  const int32_t segment_index = static_cast<int32_t>(blockIdx.y);
+template <typename output_t, typename source_t>
+__device__ void pack_segmented_source(
+    const SegmentedOutputPackArguments& arguments, int32_t segment_index) {
   const auto* source =
-      static_cast<const scalar_t*>(arguments.sources[segment_index]);
-  auto* output = static_cast<scalar_t*>(arguments.output);
+      static_cast<const source_t*>(arguments.sources[segment_index]);
+  auto* output = static_cast<output_t*>(arguments.output);
   const int64_t prefix_count = arguments.source_prefix_counts[segment_index];
   const int64_t source_token_count =
       arguments.source_token_counts[segment_index];
@@ -189,7 +189,27 @@ __global__ void segmented_output_pack_kernel(
             hidden_width +
         feature;
     output[row * arguments.output_width +
-        arguments.destination_offsets[segment_index] + column] = source[source_element];
+        arguments.destination_offsets[segment_index] + column] =
+        static_cast<output_t>(source[source_element]);
+  }
+}
+
+template <typename output_t>
+__global__ void segmented_output_pack_kernel(
+    SegmentedOutputPackArguments arguments) {
+  const int32_t segment_index = static_cast<int32_t>(blockIdx.y);
+  switch (static_cast<torch::ScalarType>(arguments.data_types[segment_index])) {
+    case torch::kFloat16:
+      pack_segmented_source<output_t, c10::Half>(arguments, segment_index);
+      break;
+    case torch::kBFloat16:
+      pack_segmented_source<output_t, c10::BFloat16>(arguments, segment_index);
+      break;
+    case torch::kFloat32:
+      pack_segmented_source<output_t, float>(arguments, segment_index);
+      break;
+    default:
+      break;
   }
 }
 
@@ -1558,6 +1578,7 @@ void LaunchSegmentedOutputPack(const SegmentedOutputPackSource* sources,
   for (int32_t source_index = 0; source_index < source_count; ++source_index) {
     const auto& source = sources[source_index];
     arguments.sources[source_index] = source.data;
+    arguments.data_types[source_index] = static_cast<int32_t>(source.data_type);
     arguments.source_prefix_counts[source_index] = source.source_prefix_count;
     arguments.source_token_counts[source_index] = source.source_token_count;
     arguments.token_offsets[source_index] = source.token_offset;

@@ -39,6 +39,7 @@ void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
 
 struct SegmentedOutputPackSource {
   const void* data;
+  torch::ScalarType data_type;
   int64_t source_prefix_count;
   int64_t source_token_count;
   int64_t token_offset;

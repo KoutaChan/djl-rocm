@@ -628,11 +628,12 @@ public final class FusionRecipe {
     /**
      * A value that packs batch-major tensor segments into one contiguous tensor.
      *
-     * <p>All sources share the same named leading dimension, data type, and trailing hidden width.
-     * A source may contain fixed group axes before its token axis. Each selected token range is
-     * appended for every group in row-major order. The result preserves the source data type. This
-     * stage is intended for assembling a persistent inference memory from already computed
-     * segments without materializing one intermediate tensor per concatenation step.
+     * <p>All sources share the same named leading dimension and trailing hidden width. A source may
+     * contain fixed group axes before its token axis and may use any supported floating-point data
+     * type. Each selected token range is appended for every group in row-major order. The result
+     * uses the configured output data type, or the first source type by default. This stage is
+     * intended for assembling a persistent inference memory from already computed segments without
+     * materializing one intermediate tensor per concatenation step.
      */
     public static final class SegmentedOutputPack extends Value {
 
@@ -2240,9 +2241,10 @@ public final class FusionRecipe {
          * Adds a segmented output-pack value.
          *
          * <p>Each source must have one named leading dimension followed by at least a token and a
-         * hidden-width dimension. Sources must share the same leading dimension, floating-point
-         * data type, and hidden width. Fixed group axes before the token axis are flattened in
-         * row-major order. The result is contiguous and preserves the source data type.
+         * hidden-width dimension. Sources must share the same leading dimension and hidden width,
+         * and each source must use a supported floating-point data type. Fixed group axes before
+         * the token axis are flattened in row-major order. The result is contiguous and uses the
+         * first source data type unless configured otherwise.
          *
          * @param name the value name
          * @param sources the batch-major tensor segments to pack in order
@@ -2381,6 +2383,7 @@ public final class FusionRecipe {
         private final List<Value> sources = new ArrayList<>();
         private final List<Long> tokenOffsets = new ArrayList<>();
         private final List<Long> tokenCounts = new ArrayList<>();
+        private DataType outputDataType;
         private boolean built;
 
         private SegmentedOutputPackBuilder(Builder recipeBuilder, String name) {
@@ -2442,6 +2445,25 @@ public final class FusionRecipe {
         }
 
         /**
+         * Sets the packed output data type.
+         *
+         * <p>Source values are converted while they are copied into the persistent output. If this
+         * option is not set, the first source data type is used.
+         *
+         * @param dataType FLOAT16, BFLOAT16, or FLOAT32
+         * @return this builder
+         */
+        public SegmentedOutputPackBuilder optOutputDataType(DataType dataType) {
+            checkMutable();
+            if (!Builder.isFloatingDataType(Objects.requireNonNull(dataType, "dataType"))) {
+                throw new IllegalArgumentException(
+                        "A segmented output-pack result must use a floating-point data type.");
+            }
+            outputDataType = dataType;
+            return this;
+        }
+
+        /**
          * Validates and inserts the segmented output-pack value.
          *
          * @return the packed value
@@ -2462,11 +2484,10 @@ public final class FusionRecipe {
                 TensorSpec spec = sources.get(index).spec;
                 long[] innerShape = spec.innerShape;
                 if (spec.leadingDimension != firstSpec.leadingDimension
-                        || spec.dataType != firstSpec.dataType
                         || innerShape[innerShape.length - 1] != hiddenWidth) {
                     throw new IllegalArgumentException(
-                            "Segmented output-pack sources must share the leading dimension, data"
-                                    + " type, and hidden width.");
+                            "Segmented output-pack sources must share the leading dimension and"
+                                    + " hidden width.");
                 }
                 long prefixCount = 1;
                 for (int axis = 0; axis < innerShape.length - 2; axis++) {
@@ -2482,7 +2503,7 @@ public final class FusionRecipe {
             String checkedName = recipeBuilder.addValueName(name);
             TensorSpec outputSpec =
                     TensorSpec.of(
-                            firstSpec.dataType,
+                            outputDataType == null ? firstSpec.dataType : outputDataType,
                             firstSpec.leadingDimension,
                             outputTokens,
                             hiddenWidth);
