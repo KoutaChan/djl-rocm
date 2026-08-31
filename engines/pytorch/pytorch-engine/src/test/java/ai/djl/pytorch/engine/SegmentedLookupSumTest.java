@@ -74,7 +74,10 @@ public class SegmentedLookupSumTest {
         NDArray actual = NDArrays.segmentedLookupSum(lookupTable, stridedStoredIndices);
 
         Assert.assertEquals(actual.getShape(), new Shape(2, 2));
-        float maxAbs = assertClose(actual.toFloatArray(), new float[] {13, 130, 9, 90});
+        float maxAbs =
+                assertClose(
+                        actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                        new float[] {13, 130, 9, 90});
         if (reportParity) {
             System.out.printf(
                     "SEGMENTED_LOOKUP_SUM_PARITY dtype=%s indexDtype=%s maxAbs=%s%n",
