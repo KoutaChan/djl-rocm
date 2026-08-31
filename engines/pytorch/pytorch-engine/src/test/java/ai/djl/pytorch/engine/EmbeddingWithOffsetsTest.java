@@ -45,6 +45,8 @@ public class EmbeddingWithOffsetsTest {
                     for (DataType tableType : tableTypes) {
                         verifyGpuParity(manager, rawType, offsetType, tableType);
                         verifyGpuFeaturePackParity(manager, rawType, offsetType, tableType);
+                        verifyGpuStridedFeaturePackParity(
+                                manager, rawType, offsetType, tableType);
                     }
                 }
             }
@@ -134,6 +136,14 @@ public class EmbeddingWithOffsetsTest {
         }
     }
 
+    @Test
+    public void testEmbeddingFeaturePackRankThreeStridedLeadingSlices() {
+        try (NDManager manager = Engine.getInstance().newBaseManager()) {
+            verifyStridedFeaturePackParity(
+                    manager, DataType.INT16, DataType.INT32, DataType.FLOAT32);
+        }
+    }
+
     @Test(expectedExceptions = IllegalArgumentException.class)
     public void testRejectsNonBroadcastOffsets() {
         try (NDManager manager = Engine.getInstance().newBaseManager()) {
@@ -207,6 +217,56 @@ public class EmbeddingWithOffsetsTest {
                 "EMBEDDING_FEATURE_PACK_PARITY rawDtype=%s offsetDtype=%s valueDtype=%s"
                     + " maxAbs=%s%n",
                 rawType, offsetType, tableType, maxAbs);
+    }
+
+    private static void verifyGpuStridedFeaturePackParity(
+            NDManager manager, DataType rawType, DataType offsetType, DataType tableType) {
+        float maxAbs =
+                verifyStridedFeaturePackParity(manager, rawType, offsetType, tableType);
+        System.out.printf(
+                "EMBEDDING_FEATURE_PACK_STRIDED_PARITY rawDtype=%s offsetDtype=%s"
+                    + " valueDtype=%s maxAbs=%s%n",
+                rawType, offsetType, tableType, maxAbs);
+    }
+
+    private static float verifyStridedFeaturePackParity(
+            NDManager manager, DataType rawType, DataType offsetType, DataType tableType) {
+        NDArray rawBacking =
+                manager.create(
+                                new int[] {
+                                    91, 0, 1, 0, 1, 92,
+                                    93, 1, 0, 1, 0, 94
+                                },
+                                new Shape(2, 6))
+                        .toType(rawType, false);
+        NDArray offsetBacking =
+                manager.create(new int[] {81, 0, 2, 4, 6, 82}, new Shape(1, 6))
+                        .toType(offsetType, false);
+        NDArray featureBacking =
+                manager.create(
+                                new float[] {
+                                    91, -1, -2, -3, -4, -5, -6, 92,
+                                    93, -7, -8, -9, -10, -11, -12, 94
+                                },
+                                new Shape(2, 8))
+                        .toType(tableType, false);
+        NDArray rawIds = rawBacking.get(":,1:5").reshape(2, 2, 2);
+        NDArray offsets = offsetBacking.get(":,1:5").reshape(1, 2, 2);
+        NDArray features = featureBacking.get(":,1:7").reshape(2, 2, 3);
+        NDArray table = manager.arange(32).reshape(16, 2).toType(tableType, false);
+
+        NDArray actual = NDArrays.embeddingFeaturePack(rawIds, offsets, table, features);
+        NDArray expected =
+                Embedding.embedding(rawIds.add(offsets), table, SparseFormat.DENSE)
+                        .singletonOrThrow()
+                        .reshape(2, 2, 4)
+                        .concat(features, 2);
+
+        Assert.assertEquals(actual.getShape(), new Shape(2, 2, 7));
+        Assert.assertEquals(actual.getDataType(), tableType);
+        return assertClose(
+                actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                expected.toType(DataType.FLOAT32, false).toFloatArray());
     }
 
     private static float assertClose(float[] actual, float[] expected) {

@@ -188,28 +188,37 @@ template <typename raw_t, typename offset_t, typename scalar_t>
 __global__ void embedding_feature_pack_kernel(const raw_t* raw_ids,
     const offset_t* offsets, const scalar_t* table, const scalar_t* features,
     scalar_t* output, int64_t output_elements, int64_t raw_columns,
-    int64_t offset_rows, int64_t offset_columns, int64_t table_rows,
-    int64_t embedding_width, int64_t feature_width, int64_t output_width) {
+    int64_t rows_per_outer, int64_t raw_outer_stride, int64_t raw_inner_stride,
+    int64_t offset_outer_stride, int64_t offset_inner_stride,
+    int64_t offset_column_stride,
+    int64_t feature_outer_stride, int64_t feature_inner_stride,
+    int64_t table_rows, int64_t embedding_width, int64_t feature_width,
+    int64_t output_width) {
   for (int64_t output_index =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        output_index < output_elements;
        output_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
     const int64_t row = output_index / output_width;
     const int64_t column = output_index % output_width;
+    const int64_t outer_row = row / rows_per_outer;
+    const int64_t inner_row = row % rows_per_outer;
+    const int64_t raw_base =
+        outer_row * raw_outer_stride + inner_row * raw_inner_stride;
+    const int64_t offset_base =
+        outer_row * offset_outer_stride + inner_row * offset_inner_stride;
+    const int64_t feature_base =
+        outer_row * feature_outer_stride + inner_row * feature_inner_stride;
     const int64_t embedded_width = raw_columns * embedding_width;
     if (column >= embedded_width) {
-      output[output_index] = features[row * feature_width + column - embedded_width];
+      output[output_index] = features[feature_base + column - embedded_width];
       continue;
     }
     const int64_t raw_column = column / embedding_width;
     const int64_t embedding_column = column % embedding_width;
-    const int64_t raw_index = row * raw_columns + raw_column;
-    const int64_t offset_row = offset_rows == 1 ? 0 : row;
-    const int64_t offset_column = offset_columns == 1 ? 0 : raw_column;
-    const int64_t offset_index = offset_row * offset_columns + offset_column;
     const int64_t table_row =
-        static_cast<int64_t>(raw_ids[raw_index]) +
-        static_cast<int64_t>(offsets[offset_index]);
+        static_cast<int64_t>(raw_ids[raw_base + raw_column]) +
+        static_cast<int64_t>(
+            offsets[offset_base + raw_column * offset_column_stride]);
     assert(table_row >= 0 && table_row < table_rows);
     output[output_index] = table_row >= 0 && table_row < table_rows
         ? table[table_row * embedding_width + embedding_column]
@@ -2420,11 +2429,38 @@ bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
 bool supports_embedding_feature_pack(const torch::Tensor& raw_ids,
     const torch::Tensor& offsets, const torch::Tensor& table,
     const torch::Tensor& features) {
-  return supports_embedding_with_offsets(raw_ids, offsets, table) &&
-      features.is_cuda() && features.is_contiguous() &&
-      features.device() == raw_ids.device() && features.dim() == 2 &&
-      features.size(0) == raw_ids.size(0) && features.size(1) > 0 &&
-      features.scalar_type() == table.scalar_type();
+  if (!raw_ids.is_cuda() || !offsets.is_cuda() || !table.is_cuda() ||
+      !features.is_cuda() || raw_ids.device() != offsets.device() ||
+      raw_ids.device() != table.device() || raw_ids.device() != features.device() ||
+      (raw_ids.dim() != 2 && raw_ids.dim() != 3) ||
+      features.dim() != raw_ids.dim() || table.dim() != 2 ||
+      raw_ids.numel() <= 0 || raw_ids.size(-1) <= 0 || features.size(-1) <= 0 ||
+      table.size(0) <= 0 || table.size(1) <= 0 ||
+      raw_ids.stride(-1) != 1 ||
+      (offsets.dim() > 0 && offsets.stride(-1) != 1) ||
+      features.stride(-1) != 1 || !table.is_contiguous() ||
+      !is_embedding_index_type(raw_ids) || !is_embedding_index_type(offsets) ||
+      !is_fused_floating(table) || features.scalar_type() != table.scalar_type() ||
+      (raw_ids.scalar_type() == torch::kInt16 &&
+          offsets.scalar_type() == torch::kInt16)) {
+    return false;
+  }
+  for (int64_t axis = 0; axis + 1 < raw_ids.dim(); ++axis) {
+    if (features.size(axis) != raw_ids.size(axis)) {
+      return false;
+    }
+  }
+  if (offsets.dim() > raw_ids.dim()) {
+    return false;
+  }
+  for (int64_t axis = 1; axis <= offsets.dim(); ++axis) {
+    const int64_t offset_size = offsets.size(offsets.dim() - axis);
+    const int64_t raw_size = raw_ids.size(raw_ids.dim() - axis);
+    if (offset_size != 1 && offset_size != raw_size) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool supports_grouped_masked_softmax_pool(
@@ -2576,9 +2612,12 @@ torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
     const torch::Tensor& features) {
   TORCH_CHECK(supports_embedding_feature_pack(raw_ids, offsets, table, features),
       "embedding feature pack received an unsupported ROCm tensor layout");
+  auto expanded_offsets = offsets.expand_as(raw_ids);
   const int64_t output_width =
-      raw_ids.size(1) * table.size(1) + features.size(1);
-  auto output = torch::empty({raw_ids.size(0), output_width}, table.options());
+      raw_ids.size(-1) * table.size(1) + features.size(-1);
+  auto output_shape = raw_ids.sizes().vec();
+  output_shape.back() = output_width;
+  auto output = torch::empty(output_shape, table.options());
   const int64_t output_elements = output.numel();
   if (output_elements == 0) {
     return output;
@@ -2593,6 +2632,11 @@ torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   const hipStream_t stream =
       c10::hip::getCurrentHIPStream(table.get_device()).stream();
+  const int64_t rows_per_outer = raw_ids.dim() == 3 ? raw_ids.size(1) : 1;
+  const int64_t raw_inner_stride = raw_ids.dim() == 3 ? raw_ids.stride(1) : 0;
+  const int64_t offset_inner_stride =
+      expanded_offsets.dim() == 3 ? expanded_offsets.stride(1) : 0;
+  const int64_t feature_inner_stride = features.dim() == 3 ? features.stride(1) : 0;
   AT_DISPATCH_INTEGRAL_TYPES(
       raw_ids.scalar_type(), "embedding_feature_pack_raw_ids", [&] {
         using raw_t = scalar_t;
@@ -2607,11 +2651,14 @@ torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
                         HIP_KERNEL_NAME(
                             embedding_feature_pack_kernel<raw_t, offset_t, value_t>),
                         dim3(blocks), dim3(threads_per_block), 0, stream,
-                        raw_ids.data_ptr<raw_t>(), offsets.data_ptr<offset_t>(),
+                        raw_ids.data_ptr<raw_t>(), expanded_offsets.data_ptr<offset_t>(),
                         table.data_ptr<value_t>(), features.data_ptr<value_t>(),
-                        output.data_ptr<value_t>(), output_elements, raw_ids.size(1),
-                        offsets.size(0), offsets.size(1), table.size(0), table.size(1),
-                        features.size(1), output_width);
+                        output.data_ptr<value_t>(), output_elements, raw_ids.size(-1),
+                        rows_per_outer, raw_ids.stride(0), raw_inner_stride,
+                        expanded_offsets.stride(0), offset_inner_stride,
+                        expanded_offsets.stride(-1),
+                        features.stride(0), feature_inner_stride,
+                        table.size(0), table.size(1), features.size(-1), output_width);
                   });
             });
       });
