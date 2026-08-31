@@ -12,7 +12,7 @@
  */
 #include "djl_pytorch_fusion_kernels.h"
 
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContextLight.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
