@@ -15,12 +15,15 @@
 #include <torch/torch.h>
 
 #include <cmath>
+#include <cstdint>
 #include <initializer_list>
+#include <vector>
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
+#include "djl_pytorch_routing_masks.h"
 #include "djl_pytorch_structured_attention.h"
 #include "djl_pytorch_utils.h"
 
@@ -260,6 +263,47 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchM
   const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
   const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
   const auto* result = new torch::Tensor(djl::pytorch::masked_log_sum_exp(logits, mask, jaxis));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCategoricalMasks(
+    JNIEnv* env, jobject jthis, jlong jcategories, jlong jmask, jintArray jfield_indices,
+    jlongArray jcategory_sets) {
+  API_BEGIN()
+  const auto field_count = env->GetArrayLength(jfield_indices);
+  TORCH_CHECK(field_count > 0 && field_count == env->GetArrayLength(jcategory_sets),
+      "categorical rules must have matching non-empty arrays");
+  std::vector<int64_t> field_indices(field_count);
+  std::vector<uint64_t> category_sets(field_count);
+  jint* fields = env->GetIntArrayElements(jfield_indices, JNI_FALSE);
+  jlong* sets = env->GetLongArrayElements(jcategory_sets, JNI_FALSE);
+  for (jsize index = 0; index < field_count; ++index) {
+    field_indices[index] = static_cast<int64_t>(fields[index]);
+    category_sets[index] = static_cast<uint64_t>(sets[index]);
+  }
+  env->ReleaseIntArrayElements(jfield_indices, fields, JNI_ABORT);
+  env->ReleaseLongArrayElements(jcategory_sets, sets, JNI_ABORT);
+  const auto& categories = *reinterpret_cast<torch::Tensor*>(jcategories);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto* result =
+      new torch::Tensor(djl::pytorch::categorical_masks(categories, mask, field_indices, category_sets));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBinaryChoiceMasks(
+    JNIEnv* env, jobject jthis, jlong jroutes, jlong jfirst_mask, jlong jsecond_mask,
+    jint jrepresentative_field, jint jfirst_route_field, jint jsecond_route_field,
+    jlong jpadding_value) {
+  API_BEGIN()
+  const auto& routes = *reinterpret_cast<torch::Tensor*>(jroutes);
+  const auto& first_mask = *reinterpret_cast<torch::Tensor*>(jfirst_mask);
+  const auto& second_mask = *reinterpret_cast<torch::Tensor*>(jsecond_mask);
+  const auto* result = new torch::Tensor(djl::pytorch::binary_choice_masks(routes, first_mask,
+      second_mask, static_cast<int64_t>(jrepresentative_field),
+      static_cast<int64_t>(jfirst_route_field), static_cast<int64_t>(jsecond_route_field),
+      static_cast<int64_t>(jpadding_value)));
   return reinterpret_cast<uintptr_t>(result);
   API_END_RETURN()
 }

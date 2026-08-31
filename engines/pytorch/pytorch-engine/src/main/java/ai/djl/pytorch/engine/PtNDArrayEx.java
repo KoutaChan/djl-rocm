@@ -68,6 +68,45 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray categoricalMasks(NDArray mask, int[] fieldIndices, long[] categorySets) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.categoricalMasks(mask, fieldIndices, categorySets);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.categoricalMasks(array, manager.from(mask), fieldIndices, categorySets);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray binaryChoiceMasks(
+            NDArray firstMask,
+            NDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.binaryChoiceMasks(
+                    firstMask,
+                    secondMask,
+                    representativeField,
+                    firstRouteField,
+                    secondRouteField,
+                    paddingValue);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.binaryChoiceMasks(
+                array,
+                manager.from(firstMask),
+                manager.from(secondMask),
+                representativeField,
+                firstRouteField,
+                secondRouteField,
+                paddingValue);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray segmentedLookupSum(NDArray storedIndices) {
         if (!array.getDevice().isGpu()) {
             return NDArrayEx.super.segmentedLookupSum(storedIndices);

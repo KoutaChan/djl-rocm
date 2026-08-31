@@ -60,6 +60,19 @@ torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
 torch::Tensor scatter_rows_backward(
     const torch::Tensor& gradient_output, const torch::Tensor& row_indices);
 
+bool supports_categorical_masks(
+    const torch::Tensor& categories, const torch::Tensor& mask, size_t rule_count);
+
+torch::Tensor categorical_masks(const torch::Tensor& categories, const torch::Tensor& mask,
+    const std::vector<int64_t>& field_indices, const std::vector<uint64_t>& category_sets);
+
+bool supports_binary_choice_masks(const torch::Tensor& routes, const torch::Tensor& first_mask,
+    const torch::Tensor& second_mask);
+
+torch::Tensor binary_choice_masks(const torch::Tensor& routes, const torch::Tensor& first_mask,
+    const torch::Tensor& second_mask, int64_t representative_field, int64_t first_route_field,
+    int64_t second_route_field, int64_t padding_value);
+
 torch::Tensor segmented_lookup_sum_forward(
     const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
 

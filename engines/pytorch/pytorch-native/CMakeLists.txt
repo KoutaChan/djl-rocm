@@ -51,6 +51,8 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_structured_attention.cc"
     "src/main/native/djl_pytorch_masked_categorical.h"
     "src/main/native/djl_pytorch_masked_categorical.cc"
+    "src/main/native/djl_pytorch_routing_masks.h"
+    "src/main/native/djl_pytorch_routing_masks.cc"
     "src/main/native/djl_pytorch_row_ops.h"
     "src/main/native/djl_pytorch_row_ops.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"

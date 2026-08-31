@@ -846,6 +846,36 @@ public final class JniUtils {
                         rows.getHandle(), rowIndices.getHandle(), rowCount));
     }
 
+    /** Builds masked categorical membership indicators. */
+    public static PtNDArray categoricalMasks(
+            PtNDArray categories, PtNDArray mask, int[] fieldIndices, long[] categorySets) {
+        return new PtNDArray(
+                categories.getManager(),
+                PyTorchLibrary.LIB.torchCategoricalMasks(
+                        categories.getHandle(), mask.getHandle(), fieldIndices, categorySets));
+    }
+
+    /** Builds the four masks associated with a routed binary choice. */
+    public static PtNDArray binaryChoiceMasks(
+            PtNDArray routes,
+            PtNDArray firstMask,
+            PtNDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        return new PtNDArray(
+                routes.getManager(),
+                PyTorchLibrary.LIB.torchBinaryChoiceMasks(
+                        routes.getHandle(),
+                        firstMask.getHandle(),
+                        secondMask.getHandle(),
+                        representativeField,
+                        firstRouteField,
+                        secondRouteField,
+                        paddingValue));
+    }
+
     /** Sums one lookup row from each contiguous table segment. */
     public static PtNDArray segmentedLookupSum(PtNDArray lookupTable, PtNDArray storedIndices) {
         return new PtNDArray(

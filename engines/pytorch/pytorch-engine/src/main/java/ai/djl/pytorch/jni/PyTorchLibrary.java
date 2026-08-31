@@ -296,6 +296,18 @@ final class PyTorchLibrary {
 
     native long torchMaskedLogSumExp(long logits, long mask, long axis);
 
+    native long torchCategoricalMasks(
+            long categories, long mask, int[] fieldIndices, long[] categorySets);
+
+    native long torchBinaryChoiceMasks(
+            long routes,
+            long firstMask,
+            long secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue);
+
     native long torchScaledDotProductAttention(
             long query,
             long key,

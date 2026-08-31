@@ -24,6 +24,13 @@ constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
+constexpr int kMaximumCategoricalMaskRules = 32;
+
+struct CategoricalMaskRules {
+  int32_t count;
+  int32_t fields[kMaximumCategoricalMaskRules];
+  uint64_t category_sets[kMaximumCategoricalMaskRules];
+};
 
 void check_hip_kernel_launch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
@@ -38,6 +45,51 @@ bool is_fused_floating(const torch::Tensor& tensor) {
 bool is_embedding_index_type(const torch::Tensor& tensor) {
   return tensor.scalar_type() == torch::kInt16 || tensor.scalar_type() == torch::kInt32 ||
          tensor.scalar_type() == torch::kInt64;
+}
+
+template <typename index_t, typename scalar_t>
+__global__ void categorical_masks_kernel(const index_t* categories, const scalar_t* mask,
+    scalar_t* output, int64_t row_count, int64_t field_count, CategoricalMaskRules rules) {
+  const int64_t element_count = row_count * rules.count;
+  for (int64_t output_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       output_index < element_count;
+       output_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t row = output_index / rules.count;
+    const int rule = static_cast<int>(output_index - row * rules.count);
+    const int64_t category =
+        static_cast<int64_t>(categories[row * field_count + rules.fields[rule]]);
+    const bool selected = category >= 0 && category < 64 &&
+        ((rules.category_sets[rule] >> category) & uint64_t{1}) != 0;
+    output[output_index] = selected ? mask[row] : static_cast<scalar_t>(0.0f);
+  }
+}
+
+template <typename index_t, typename scalar_t>
+__global__ void binary_choice_masks_kernel(const index_t* routes, const scalar_t* first_mask,
+    const scalar_t* second_mask, scalar_t* output, int64_t row_count, int64_t field_count,
+    int64_t representative_field, int64_t first_route_field, int64_t second_route_field,
+    int64_t padding_value) {
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       row < row_count;
+       row += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const float combined =
+        static_cast<float>(first_mask[row]) + static_cast<float>(second_mask[row]);
+    const int64_t route_offset = row * field_count;
+    const int64_t output_offset = row * 4;
+    output[output_offset] = static_cast<scalar_t>(combined);
+    output[output_offset + 1] =
+        static_cast<int64_t>(routes[route_offset + first_route_field]) != padding_value
+            ? static_cast<scalar_t>(combined)
+            : static_cast<scalar_t>(0.0f);
+    output[output_offset + 2] =
+        static_cast<int64_t>(routes[route_offset + second_route_field]) != padding_value
+            ? static_cast<scalar_t>(combined)
+            : static_cast<scalar_t>(0.0f);
+    output[output_offset + 3] =
+        static_cast<int64_t>(routes[route_offset + representative_field]) != padding_value
+            ? static_cast<scalar_t>(combined)
+            : static_cast<scalar_t>(0.0f);
+  }
 }
 
 bool supports_owned_residual_layer_norm_types(
@@ -2132,6 +2184,23 @@ bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_i
          row_indices.scalar_type() == torch::kInt64 && row_indices.device() == rows.device();
 }
 
+bool supports_categorical_masks(
+    const torch::Tensor& categories, const torch::Tensor& mask, size_t rule_count) {
+  return categories.is_cuda() && categories.is_contiguous() && mask.is_cuda() && mask.is_contiguous() &&
+         c10::isIntegralType(categories.scalar_type(), false) && is_fused_floating(mask) &&
+         categories.device() == mask.device() && rule_count > 0 &&
+         rule_count <= kMaximumCategoricalMaskRules;
+}
+
+bool supports_binary_choice_masks(const torch::Tensor& routes, const torch::Tensor& first_mask,
+    const torch::Tensor& second_mask) {
+  return routes.is_cuda() && routes.is_contiguous() && first_mask.is_cuda() && first_mask.is_contiguous() &&
+         second_mask.is_cuda() && second_mask.is_contiguous() &&
+         c10::isIntegralType(routes.scalar_type(), false) && is_fused_floating(first_mask) &&
+         second_mask.scalar_type() == first_mask.scalar_type() && routes.device() == first_mask.device() &&
+         second_mask.device() == first_mask.device();
+}
+
 bool supports_segmented_lookup_sum(
     const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
   return lookup_table.is_cuda() && lookup_table.is_contiguous() &&
@@ -2533,6 +2602,78 @@ torch::Tensor scatter_rows_backward(
       });
   check_hip_kernel_launch("scatter_rows_backward");
   return gradient_rows;
+}
+
+torch::Tensor categorical_masks(const torch::Tensor& categories, const torch::Tensor& mask,
+    const std::vector<int64_t>& field_indices, const std::vector<uint64_t>& category_sets) {
+  TORCH_CHECK(supports_categorical_masks(categories, mask, field_indices.size()),
+      "categorical masks received an unsupported ROCm tensor layout");
+  CategoricalMaskRules rules{};
+  rules.count = static_cast<int32_t>(field_indices.size());
+  for (size_t index = 0; index < field_indices.size(); ++index) {
+    rules.fields[index] = static_cast<int32_t>(field_indices[index]);
+    rules.category_sets[index] = category_sets[index];
+  }
+  auto output_shape = categories.sizes().vec();
+  output_shape.back() = rules.count;
+  auto output = torch::empty(output_shape, mask.options().requires_grad(false));
+  if (output.numel() == 0) {
+    return output;
+  }
+  c10::DeviceGuard device_guard(categories.device());
+  const auto& properties = device_properties(categories.get_device());
+  const int threads_per_block = std::min(256, properties.maxThreadsPerBlock);
+  const int64_t required_blocks =
+      (output.numel() + threads_per_block - 1) / threads_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(categories.get_device()).stream();
+  AT_DISPATCH_INTEGRAL_TYPES(categories.scalar_type(), "categorical_masks_index", [&] {
+    using index_t = scalar_t;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf, torch::kBFloat16, mask.scalar_type(), "categorical_masks", [&] {
+          hipLaunchKernelGGL(HIP_KERNEL_NAME(categorical_masks_kernel<index_t, scalar_t>),
+              dim3(blocks), dim3(threads_per_block), 0, stream, categories.data_ptr<index_t>(),
+              mask.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(), mask.numel(),
+              categories.size(-1), rules);
+        });
+  });
+  check_hip_kernel_launch("categorical_masks");
+  return output;
+}
+
+torch::Tensor binary_choice_masks(const torch::Tensor& routes, const torch::Tensor& first_mask,
+    const torch::Tensor& second_mask, int64_t representative_field, int64_t first_route_field,
+    int64_t second_route_field, int64_t padding_value) {
+  TORCH_CHECK(supports_binary_choice_masks(routes, first_mask, second_mask),
+      "binary choice masks received an unsupported ROCm tensor layout");
+  auto output_shape = routes.sizes().vec();
+  output_shape.back() = 4;
+  auto output = torch::empty(output_shape, first_mask.options().requires_grad(false));
+  if (output.numel() == 0) {
+    return output;
+  }
+  c10::DeviceGuard device_guard(routes.device());
+  const auto& properties = device_properties(routes.get_device());
+  const int threads_per_block = std::min(256, properties.maxThreadsPerBlock);
+  const int64_t required_blocks =
+      (first_mask.numel() + threads_per_block - 1) / threads_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(routes.get_device()).stream();
+  AT_DISPATCH_INTEGRAL_TYPES(routes.scalar_type(), "binary_choice_masks_index", [&] {
+    using index_t = scalar_t;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kHalf, torch::kBFloat16, first_mask.scalar_type(), "binary_choice_masks", [&] {
+          hipLaunchKernelGGL(HIP_KERNEL_NAME(binary_choice_masks_kernel<index_t, scalar_t>),
+              dim3(blocks), dim3(threads_per_block), 0, stream, routes.data_ptr<index_t>(),
+              first_mask.data_ptr<scalar_t>(), second_mask.data_ptr<scalar_t>(),
+              output.data_ptr<scalar_t>(), first_mask.numel(), routes.size(-1),
+              representative_field, first_route_field, second_route_field, padding_value);
+        });
+  });
+  check_hip_kernel_launch("binary_choice_masks");
+  return output;
 }
 
 torch::Tensor segmented_lookup_sum_forward(
