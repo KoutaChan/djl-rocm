@@ -81,6 +81,77 @@ public interface NDArrayEx {
                 .reshape(new Shape(outputShape));
     }
 
+    /** Builds masked categorical membership indicators using portable NDArray operations. */
+    default NDArray categoricalMasks(NDArray mask, int[] fieldIndices, long[] categorySets) {
+        NDArray categories = getArray();
+        NDManager outputManager = categories.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(categories, mask);
+            NDList rules = new NDList(fieldIndices.length);
+            NDArray expandedMask = mask.expandDims(-1);
+            for (int rule = 0; rule < fieldIndices.length; ++rule) {
+                NDArray field = categories.get("...,{}", fieldIndices[rule]);
+                long remaining = categorySets[rule];
+                NDArray selected = null;
+                while (remaining != 0L) {
+                    int category = Long.numberOfTrailingZeros(remaining);
+                    NDArray match = field.eq(category);
+                    selected = selected == null ? match : selected.logicalOr(match);
+                    remaining &= remaining - 1L;
+                }
+                if (selected == null) {
+                    selected = field.eq(field).logicalNot();
+                }
+                rules.add(
+                        selected.toType(mask.getDataType(), false)
+                                .expandDims(-1)
+                                .mul(expandedMask));
+            }
+            NDArray result = NDArrays.concat(rules, -1).stopGradient();
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /** Builds binary-choice routing masks using portable NDArray operations. */
+    default NDArray binaryChoiceMasks(
+            NDArray firstMask,
+            NDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        NDArray routes = getArray();
+        NDManager outputManager = routes.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(routes, firstMask, secondMask);
+            NDArray combined = firstMask.add(secondMask);
+            NDArray firstPresent =
+                    routes.get("...,{}", firstRouteField)
+                            .neq(paddingValue)
+                            .toType(combined.getDataType(), false)
+                            .mul(combined);
+            NDArray secondPresent =
+                    routes.get("...,{}", secondRouteField)
+                            .neq(paddingValue)
+                            .toType(combined.getDataType(), false)
+                            .mul(combined);
+            NDArray representative =
+                    routes.get("...,{}", representativeField)
+                            .neq(paddingValue)
+                            .toType(combined.getDataType(), false)
+                            .mul(combined);
+            NDArray result =
+                    NDArrays.stack(
+                                    new NDList(
+                                            combined, firstPresent, secondPresent, representative),
+                                    -1)
+                            .stopGradient();
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
     /** Sums one lookup row from each contiguous table segment. */
     default NDArray segmentedLookupSum(NDArray storedIndices) {
         NDArray lookupTable = getArray();

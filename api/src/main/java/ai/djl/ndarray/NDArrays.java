@@ -102,6 +102,112 @@ public final class NDArrays {
     }
 
     /**
+     * Builds masked categorical membership indicators.
+     *
+     * <p>{@code categories} stores categorical fields on its last axis. Each output channel is
+     * described by the field at the same position in {@code fieldIndices} and the bit set at the
+     * same position in {@code categorySets}. Bit {@code n} selects encoded category {@code n}.
+     * Matching positions receive the corresponding value from {@code mask}; every other position
+     * receives zero. The returned tensor appends the rule count to the leading shape of {@code
+     * categories} and uses the data type of {@code mask}.
+     *
+     * <p>This operation is intended for non-differentiable routing metadata. Engines may evaluate
+     * all rules with a single kernel.
+     *
+     * @param categories integral categories shaped {@code [..., fields]}
+     * @param mask floating-point mask shaped like the leading category dimensions
+     * @param fieldIndices source field for every output rule
+     * @param categorySets category membership bit set for every output rule
+     * @return indicators shaped {@code [..., rules]}
+     */
+    public static NDArray categoricalMasks(
+            NDArray categories, NDArray mask, int[] fieldIndices, long[] categorySets) {
+        Shape categoryShape = categories.getShape();
+        int dimensions = categoryShape.dimension();
+        if (dimensions == 0 || !mask.getShape().equals(categoryShape.slice(0, dimensions - 1))) {
+            throw new IllegalArgumentException(
+                    "mask shape must match the leading categorical dimensions");
+        }
+        if (!categories.getDataType().isInteger() || !mask.getDataType().isFloating()) {
+            throw new IllegalArgumentException(
+                    "categories must be integral and mask must be floating point");
+        }
+        if (fieldIndices.length == 0 || fieldIndices.length != categorySets.length) {
+            throw new IllegalArgumentException(
+                    "field indices and category sets must have the same non-zero length");
+        }
+        long fields = categoryShape.get(dimensions - 1);
+        for (int fieldIndex : fieldIndices) {
+            if (fieldIndex < 0 || fieldIndex >= fields) {
+                throw new IllegalArgumentException("categorical field index is out of range");
+            }
+        }
+        return categories.getNDArrayInternal().categoricalMasks(mask, fieldIndices, categorySets);
+    }
+
+    /**
+     * Builds routing masks for two mutually exclusive choices.
+     *
+     * <p>The returned trailing channels are, in order, the union of {@code firstMask} and {@code
+     * secondMask}, that union gated by the presence of the first route, the union gated by the
+     * presence of the second route, and the union gated by the representative marker. A route is
+     * present when its encoded value differs from {@code paddingValue}.
+     *
+     * <p>This operation is intended for non-differentiable routing metadata. Engines may compute
+     * all four output channels with a single kernel.
+     *
+     * @param routes integral routing metadata shaped {@code [..., fields]}
+     * @param firstMask mask for the first choice shaped like the leading route dimensions
+     * @param secondMask mask for the second choice shaped like the leading route dimensions
+     * @param representativeField field containing the representative marker
+     * @param firstRouteField field containing the first route
+     * @param secondRouteField field containing the second route
+     * @param paddingValue encoded value denoting an absent route
+     * @return routing masks shaped {@code [..., 4]}
+     */
+    public static NDArray binaryChoiceMasks(
+            NDArray routes,
+            NDArray firstMask,
+            NDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        Shape routeShape = routes.getShape();
+        int dimensions = routeShape.dimension();
+        Shape leadingShape = dimensions == 0 ? routeShape : routeShape.slice(0, dimensions - 1);
+        if (dimensions == 0
+                || !firstMask.getShape().equals(leadingShape)
+                || !secondMask.getShape().equals(leadingShape)) {
+            throw new IllegalArgumentException(
+                    "choice masks must match the leading routing dimensions");
+        }
+        if (!routes.getDataType().isInteger()
+                || !firstMask.getDataType().isFloating()
+                || firstMask.getDataType() != secondMask.getDataType()) {
+            throw new IllegalArgumentException(
+                    "routes must be integral and choice masks must share a floating data type");
+        }
+        long fields = routeShape.get(dimensions - 1);
+        if (representativeField < 0
+                || representativeField >= fields
+                || firstRouteField < 0
+                || firstRouteField >= fields
+                || secondRouteField < 0
+                || secondRouteField >= fields) {
+            throw new IllegalArgumentException("routing field index is out of range");
+        }
+        return routes.getNDArrayInternal()
+                .binaryChoiceMasks(
+                        firstMask,
+                        secondMask,
+                        representativeField,
+                        firstRouteField,
+                        secondRouteField,
+                        paddingValue);
+    }
+
+    /**
      * Sums one lookup row from each contiguous table segment.
      *
      * <p>The lookup table is shaped {@code [segments * entriesPerSegment, ...]}. Stored indices are
