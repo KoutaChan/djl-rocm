@@ -1409,6 +1409,53 @@ public class PtFusionTest {
     }
 
     @Test
+    public void rocmIndexedAffineRoundsSiluBeforeOutputProjection() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        IndexedAffineFixture fixture = new IndexedAffineFixture(DataType.FLOAT16);
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray indices = manager.create(new int[] {0}, new Shape(1));
+                NDArray state = manager.zeros(new Shape(1, 2), DataType.FLOAT32);
+                NDArray branch = manager.zeros(new Shape(1, 2), DataType.FLOAT16);
+                NDArray hiddenWeight = manager.zeros(new Shape(2, 4), DataType.FLOAT16);
+                NDArray hiddenBias =
+                        typed(
+                                manager,
+                                DataType.FLOAT16,
+                                new float[] {-4.44140625f, -3.25f},
+                                new Shape(2));
+                NDArray outputWeight =
+                        typed(
+                                manager,
+                                DataType.FLOAT16,
+                                new float[] {1.580078125f, -2.630859375f},
+                                new Shape(1, 2));
+                NDArray outputBias = manager.zeros(new Shape(1), DataType.FLOAT16);
+                NDArray eagerActivation = Activation.swish(hiddenBias.reshape(1, 2), 1.0f);
+                NDArray eagerOutput = eagerActivation.matMul(outputWeight.transpose()).add(outputBias);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(
+                                fixture.bindings(
+                                        hiddenWeight, hiddenBias, outputWeight, outputBias));
+                FusionSession session =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                FusionInvocation invocation = session.acquire()) {
+            fixture.setInputs(invocation, indices, state, branch, 1, 1, 1);
+            try (FusionOutputLease lease = invocation.submit()) {
+                lease.synchronize();
+                Assert.assertEquals(
+                        eagerOutput.toFloatArray(), new float[] {0.237548828125f}, 0.0f);
+                Assert.assertEquals(
+                        lease.get(fixture.output).toFloatArray(), eagerOutput.toFloatArray(), 0.0f);
+            }
+        }
+    }
+
+    @Test
     public void rocmIndexedAffineSupportsWideUnbiasedInt64InvocationReuse() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {

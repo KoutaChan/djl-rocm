@@ -456,6 +456,7 @@ __global__ void indexed_affine_finalize_kernel(
       }
       if (arguments.activation == static_cast<int32_t>(AffineActivation::kSilu)) {
         value = value / (1.0f + expf(-value));
+        value = static_cast<float>(static_cast<scalar_t>(value));
       }
       sum += value * static_cast<float>(
           output_weight[output_column * arguments.hidden_width + hidden_column]);
