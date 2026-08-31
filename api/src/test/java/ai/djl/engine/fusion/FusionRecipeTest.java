@@ -140,6 +140,30 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void segmentedOutputPackConvertsMixedSourcesIntoConfiguredType() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("mixed-segmented-output-pack");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 16);
+        FusionRecipe.Input half =
+                builder.addInput(
+                        "half", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 256));
+        FusionRecipe.Input single =
+                builder.addInput(
+                        "single", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 3, 256));
+
+        FusionRecipe.SegmentedOutputPack packed =
+                builder.segmentedOutputPack("memory")
+                        .addSource(half)
+                        .addSource(single)
+                        .optOutputDataType(DataType.FLOAT32)
+                        .build();
+        builder.addOutput("memory", packed);
+        builder.build();
+
+        Assert.assertEquals(packed.getSpec().getDataType(), DataType.FLOAT32);
+        Assert.assertEquals(packed.getSpec().getInnerShape(), new long[] {5, 256});
+    }
+
+    @Test
     public void segmentedOutputPackRejectsIncompatibleSources() {
         FusionRecipe.Builder builder = FusionRecipe.builder("invalid-segmented-output-pack");
         FusionRecipe.Dimension batch = builder.addDimension("batch", 8);
@@ -151,9 +175,9 @@ public class FusionRecipeTest {
                 builder.addInput(
                         "wrongRows",
                         FusionRecipe.TensorSpec.of(DataType.FLOAT16, otherBatch, 2, 4));
-        FusionRecipe.Input wrongType =
+        FusionRecipe.Input integral =
                 builder.addInput(
-                        "wrongType", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 2, 4));
+                        "integral", FusionRecipe.TensorSpec.of(DataType.INT32, batch, 2, 4));
         FusionRecipe.Input wrongWidth =
                 builder.addInput(
                         "wrongWidth", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 5));
@@ -166,7 +190,7 @@ public class FusionRecipeTest {
                 () -> builder.segmentedOutputPack("wrongRowsPack", valid, wrongRows));
         Assert.assertThrows(
                 IllegalArgumentException.class,
-                () -> builder.segmentedOutputPack("wrongTypePack", valid, wrongType));
+                () -> builder.segmentedOutputPack("integralPack", valid, integral));
         Assert.assertThrows(
                 IllegalArgumentException.class,
                 () -> builder.segmentedOutputPack("wrongWidthPack", valid, wrongWidth));
@@ -178,6 +202,12 @@ public class FusionRecipeTest {
                 () ->
                         builder.segmentedOutputPack(
                                 "emptyPack", new FusionRecipe.Value[0]));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        builder.segmentedOutputPack("invalidOutputType")
+                                .addSource(valid)
+                                .optOutputDataType(DataType.INT32));
     }
 
     @Test

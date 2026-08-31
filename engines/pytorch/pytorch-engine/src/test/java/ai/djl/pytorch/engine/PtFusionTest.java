@@ -1080,6 +1080,65 @@ public class PtFusionTest {
     }
 
     @Test
+    public void rocmSegmentedOutputPackConvertsMixedSourcesInOneLaunch() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        FusionRecipe.Builder builder = FusionRecipe.builder("mixed-segmented-output-pack-test");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 4);
+        FusionRecipe.Input strategicInput =
+                builder.addInput(
+                        "strategic",
+                        FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 6, 3));
+        FusionRecipe.Input roundTileInput =
+                builder.addInput(
+                        "roundTiles",
+                        FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 5, 3));
+        FusionRecipe.SegmentedOutputPack pack =
+                builder.segmentedOutputPack("memory")
+                        .addSourceSlice(strategicInput, 0, 1)
+                        .addSourceSlice(strategicInput, 2, 4)
+                        .addSourceSlice(roundTileInput, 1, 4)
+                        .optOutputDataType(DataType.FLOAT32)
+                        .build();
+        FusionRecipe.Output output = builder.addOutput("memory", pack);
+        FusionRecipe recipe = builder.build();
+
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray strategic =
+                        patternedArray(
+                                manager, DataType.FLOAT16, new Shape(4, 6, 3), 11, 5, 0.125f);
+                NDArray roundTiles =
+                        patternedArray(
+                                manager, DataType.FLOAT32, new Shape(4, 5, 3), 17, 8, 0.125f);
+                NDArray expected =
+                        NDArrays.concat(
+                                new NDList(
+                                        strategic.get(":,0:1,:").toType(DataType.FLOAT32, false),
+                                        strategic.get(":,2:6,:").toType(DataType.FLOAT32, false),
+                                        roundTiles.get(":,1:5,:")),
+                                1);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(recipe);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(recipe).build());
+                FusionSession session =
+                        executable.newSession(manager, FusionSessionConfig.builder().build())) {
+            try (FusionInvocation invocation = session.acquire()) {
+                invocation.setInput(strategicInput, strategic);
+                invocation.setInput(roundTileInput, roundTiles);
+                invocation.setDimension(batch, 4);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    lease.synchronize();
+                    Assert.assertEquals(
+                            lease.get(output).toByteBuffer(), expected.toByteBuffer());
+                }
+            }
+        }
+    }
+
+    @Test
     public void rocmAffineSumMatchesBroadcastReferenceAcrossDataTypes() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
