@@ -72,6 +72,7 @@ constexpr int64_t kIndexedLocalTransformerEncoderV1 = 8;
 constexpr int64_t kIndexedRelationTransformerEncoderStackV1 = 10;
 constexpr int64_t kMappedGroupedMaskedSoftmaxPoolGroupV1 = 12;
 constexpr int64_t kIndexedLocalTransformerEncoderSegmentedV2 = 13;
+constexpr int64_t kSegmentedOutputPackV1 = 15;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
 
@@ -159,6 +160,7 @@ struct OutputPackCommandSpec {
   int64_t output_width;
   std::vector<int32_t> operand_value_indices;
   std::vector<OutputPackSourceSpec> sources;
+  bool preserve_data_type = false;
 };
 
 struct AffineTermSpec {
@@ -693,6 +695,77 @@ OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
   }
   TORCH_CHECK(destination_offset == command.output_width,
       "OUTPUT_PACK_V1 operand widths do not match the result width");
+
+  result.kind = ValueKind::kComputed;
+  result.producer_index = command_index;
+  result.storage_index = command.result_storage_index;
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+  return command;
+}
+
+OutputPackCommandSpec BuildSegmentedOutputPackCommand(FusionPlanData& plan,
+    int32_t command_index, const std::vector<int32_t>& results,
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0,
+      "SEGMENTED_OUTPUT_PACK_V1 does not support command flags");
+  TORCH_CHECK(results.size() == 1,
+      "SEGMENTED_OUTPUT_PACK_V1 requires exactly one result");
+  TORCH_CHECK(!operands.empty() && operands.size() <= kMaximumOutputPackSources,
+      "SEGMENTED_OUTPUT_PACK_V1 operand count exceeds the native limit");
+  TORCH_CHECK(attributes.empty(),
+      "SEGMENTED_OUTPUT_PACK_V1 does not support attributes");
+
+  const int32_t result_index = results[0];
+  ValueSpec& result = plan.values[result_index];
+  TORCH_CHECK(result.kind == ValueKind::kUnbound,
+      "fusion command result already has a producer or binding");
+  TORCH_CHECK(IsFusionFloatingDataType(result.data_type) &&
+          result.dimension_index >= 0 && result.inner_shape.size() >= 2,
+      "SEGMENTED_OUTPUT_PACK_V1 result must be a batch-major floating-point tensor");
+
+  OutputPackCommandSpec command;
+  command.result_value_index = result_index;
+  command.result_storage_index = NextStorageIndex(plan);
+  command.extent_index = result.dimension_index;
+  command.maximum_rows = plan.dimensions[result.dimension_index].maximum_extent;
+  command.output_width = 1;
+  for (int64_t extent : result.inner_shape) {
+    TORCH_CHECK(extent <= std::numeric_limits<int64_t>::max() / command.output_width,
+        "SEGMENTED_OUTPUT_PACK_V1 result width exceeds the supported range");
+    command.output_width *= extent;
+  }
+  command.operand_value_indices = operands;
+  command.sources.reserve(operands.size());
+  command.preserve_data_type = true;
+
+  int64_t destination_offset = 0;
+  for (int32_t operand_index : operands) {
+    const ValueSpec& operand = plan.values[operand_index];
+    TORCH_CHECK(operand.kind != ValueKind::kUnbound,
+        "fusion command operand is not topologically available");
+    TORCH_CHECK(operand.data_type == result.data_type &&
+            operand.dimension_index == command.extent_index &&
+            operand.inner_shape.size() == result.inner_shape.size(),
+        "SEGMENTED_OUTPUT_PACK_V1 operands must share the result dimension, type, and rank");
+    for (std::size_t axis = 1; axis < result.inner_shape.size(); ++axis) {
+      TORCH_CHECK(operand.inner_shape[axis] == result.inner_shape[axis],
+          "SEGMENTED_OUTPUT_PACK_V1 operands must share the trailing result shape");
+    }
+    int64_t width = 1;
+    for (int64_t extent : operand.inner_shape) {
+      TORCH_CHECK(extent <= std::numeric_limits<int64_t>::max() / width,
+          "SEGMENTED_OUTPUT_PACK_V1 operand width exceeds the supported range");
+      width *= extent;
+    }
+    TORCH_CHECK(width <= std::numeric_limits<int64_t>::max() - destination_offset,
+        "SEGMENTED_OUTPUT_PACK_V1 width exceeds the supported range");
+    command.sources.push_back(OutputPackSourceSpec{
+        operand_index, operand.data_type, width, destination_offset});
+    destination_offset += width;
+  }
+  TORCH_CHECK(destination_offset == command.output_width,
+      "SEGMENTED_OUTPUT_PACK_V1 operand widths do not match the result width");
 
   result.kind = ValueKind::kComputed;
   result.producer_index = command_index;
@@ -2194,6 +2267,10 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         plan->commands.emplace_back(BuildOutputPackCommand(
             *plan, command_index, results, operands, flags, attributes));
         break;
+      case kSegmentedOutputPackV1:
+        plan->commands.emplace_back(BuildSegmentedOutputPackCommand(
+            *plan, command_index, results, operands, flags, attributes));
+        break;
       case kAffineSumV1:
         plan->commands.emplace_back(BuildAffineSumCommand(
             *plan, command_index, results, operands, flags, attributes));
@@ -2597,8 +2674,14 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   if (row_count != 0) {
     work_submitted = true;
   }
-  LaunchOutputPack(launch_sources.data(), static_cast<int32_t>(command.sources.size()),
-      result, row_count, command.output_width);
+  if (command.preserve_data_type) {
+    LaunchSegmentedOutputPack(
+        launch_sources.data(), static_cast<int32_t>(command.sources.size()),
+        result, row_count, command.output_width);
+  } else {
+    LaunchOutputPack(launch_sources.data(), static_cast<int32_t>(command.sources.size()),
+        result, row_count, command.output_width);
+  }
 }
 
 void ExecuteCommand(FusionSession& session, int32_t buffer_index,

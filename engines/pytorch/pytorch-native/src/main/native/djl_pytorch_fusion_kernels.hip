@@ -47,6 +47,15 @@ struct OutputPackArguments {
   int64_t output_width;
 };
 
+struct SegmentedOutputPackArguments {
+  const void* sources[kMaximumOutputPackSources];
+  int64_t widths[kMaximumOutputPackSources];
+  int64_t destination_offsets[kMaximumOutputPackSources];
+  void* output;
+  int64_t row_count;
+  int64_t output_width;
+};
+
 struct BinaryBranchBlendArguments {
   const void* baseline_context;
   const void* selected_context;
@@ -144,6 +153,25 @@ __global__ void output_pack_kernel(OutputPackArguments arguments) {
       break;
     default:
       break;
+  }
+}
+
+template <typename scalar_t>
+__global__ void segmented_output_pack_kernel(
+    SegmentedOutputPackArguments arguments) {
+  const int32_t source_index = static_cast<int32_t>(blockIdx.y);
+  const auto* source =
+      static_cast<const scalar_t*>(arguments.sources[source_index]);
+  auto* output = static_cast<scalar_t*>(arguments.output);
+  const int64_t width = arguments.widths[source_index];
+  const int64_t element_count = arguments.row_count * width;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < element_count;
+       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t row = index / width;
+    const int64_t column = index - row * width;
+    output[row * arguments.output_width +
+        arguments.destination_offsets[source_index] + column] = source[index];
   }
 }
 
@@ -1487,6 +1515,62 @@ void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
   hipLaunchKernelGGL(output_pack_kernel, dim3(block_count, source_count),
       dim3(kThreadsPerBlock), 0, stream.stream(), arguments);
   CheckHipLaunch("fusion output pack");
+}
+
+template <typename scalar_t>
+void LaunchSegmentedOutputPackTyped(
+    const SegmentedOutputPackArguments& arguments, int32_t source_count,
+    uint32_t block_count, hipStream_t stream) {
+  hipLaunchKernelGGL((segmented_output_pack_kernel<scalar_t>),
+      dim3(block_count, source_count), dim3(kThreadsPerBlock), 0, stream,
+      arguments);
+}
+
+void LaunchSegmentedOutputPack(const OutputPackSource* sources,
+    int32_t source_count, torch::Tensor& output, int64_t row_count,
+    int64_t output_width) {
+  if (row_count == 0) {
+    return;
+  }
+  SegmentedOutputPackArguments arguments{};
+  arguments.output = output.data_ptr();
+  arguments.row_count = row_count;
+  arguments.output_width = output_width;
+  int64_t maximum_width = 0;
+  for (int32_t source_index = 0; source_index < source_count; ++source_index) {
+    const auto& source = sources[source_index];
+    TORCH_CHECK(source.data_type == output.scalar_type(),
+        "segmented output-pack source data type does not match the output");
+    arguments.sources[source_index] = source.data;
+    arguments.widths[source_index] = source.width;
+    arguments.destination_offsets[source_index] = source.destination_offset;
+    maximum_width = std::max(maximum_width, source.width);
+  }
+
+  const int64_t maximum_elements = CheckedMultiply(
+      row_count, maximum_width, "fusion segmented output-pack launch element count");
+  const int64_t required_blocks = RequiredBlockCount(maximum_elements);
+  const uint32_t block_count =
+      static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
+  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  switch (output.scalar_type()) {
+    case torch::kFloat16:
+      LaunchSegmentedOutputPackTyped<c10::Half>(
+          arguments, source_count, block_count, stream.stream());
+      break;
+    case torch::kBFloat16:
+      LaunchSegmentedOutputPackTyped<c10::BFloat16>(
+          arguments, source_count, block_count, stream.stream());
+      break;
+    case torch::kFloat32:
+      LaunchSegmentedOutputPackTyped<float>(
+          arguments, source_count, block_count, stream.stream());
+      break;
+    default:
+      TORCH_CHECK(false,
+          "segmented output pack supports FLOAT16, BFLOAT16, and FLOAT32");
+  }
+  CheckHipLaunch("fusion segmented output pack");
 }
 
 template <typename baseline_t, typename selected_t>

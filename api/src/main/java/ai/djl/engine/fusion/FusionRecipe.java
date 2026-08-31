@@ -35,7 +35,9 @@ import java.util.Set;
  * an activation. {@link IndexedAffine} gathers selected rows from several values, evaluates a
  * bounded two-layer projection, and scatters the selected results into a dense value. {@link
  * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
- * them into a contiguous {@link DataType#FLOAT32} value. {@link BinaryBranchBlend} selects or
+ * them into a contiguous {@link DataType#FLOAT32} value. {@link SegmentedOutputPack} concatenates
+ * same-type, batch-major tensor segments along their first inner axis without changing their data
+ * type. {@link BinaryBranchBlend} selects or
  * blends two branch contexts from their presence values and a binary logit. {@link
  * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
  * blocks over a short dense sequence, optionally using {@link IndexedRelationAttention}. {@link
@@ -608,6 +610,34 @@ public final class FusionRecipe {
         private final List<Value> sources;
 
         private OutputPack(
+                Object owner, int index, String name, TensorSpec spec, List<Value> sources) {
+            super(owner, index, name, spec);
+            this.sources = immutableCopy(sources);
+        }
+
+        /**
+         * Returns the source values in packing order.
+         *
+         * @return the source values
+         */
+        public List<Value> getSources() {
+            return sources;
+        }
+    }
+
+    /**
+     * A value that packs batch-major tensor segments into one contiguous tensor.
+     *
+     * <p>All sources share the same named leading dimension, data type, rank, and trailing inner
+     * shape. Their first inner axes are appended in source order. The result preserves the source
+     * data type. This stage is intended for assembling a persistent inference memory from already
+     * computed segments without materializing one intermediate tensor per concatenation step.
+     */
+    public static final class SegmentedOutputPack extends Value {
+
+        private final List<Value> sources;
+
+        private SegmentedOutputPack(
                 Object owner, int index, String name, TensorSpec spec, List<Value> sources) {
             super(owner, index, name, spec);
             this.sources = immutableCopy(sources);
@@ -2173,6 +2203,75 @@ public final class FusionRecipe {
             TensorSpec outputSpec = TensorSpec.of(DataType.FLOAT32, leadingDimension, width);
             OutputPack value =
                     new OutputPack(owner, values.size(), checkedName, outputSpec, checkedSources);
+            values.add(value);
+            return value;
+        }
+
+        /**
+         * Adds a segmented output-pack value.
+         *
+         * <p>Each source must have one named leading dimension followed by at least two fixed inner
+         * dimensions. Sources must share the same leading dimension, floating-point data type,
+         * rank, and trailing inner shape. The first inner axes are concatenated in source order.
+         * The result is contiguous and preserves the source data type.
+         *
+         * @param name the value name
+         * @param sources the batch-major tensor segments to pack in order
+         * @return the packed value
+         */
+        public SegmentedOutputPack segmentedOutputPack(String name, Value... sources) {
+            checkMutable();
+            Objects.requireNonNull(sources, "sources");
+            if (sources.length == 0) {
+                throw new IllegalArgumentException(
+                        "Segmented output pack requires at least one source.");
+            }
+
+            List<Value> checkedSources = new ArrayList<>(sources.length);
+            TensorSpec firstSpec = null;
+            long segmentCount = 0;
+            for (Value source : sources) {
+                checkValue(source);
+                TensorSpec spec = source.spec;
+                if (spec.leadingDimension == null || spec.innerShape.length < 2) {
+                    throw new IllegalArgumentException(
+                            "Segmented output pack sources must have one leading and at least two"
+                                    + " inner dimensions.");
+                }
+                if (!isFloatingDataType(spec.dataType)) {
+                    throw new IllegalArgumentException(
+                            "Segmented output pack only supports FLOAT16, BFLOAT16, and FLOAT32"
+                                    + " sources.");
+                }
+                if (firstSpec == null) {
+                    firstSpec = spec;
+                } else if (firstSpec.leadingDimension != spec.leadingDimension
+                        || firstSpec.dataType != spec.dataType
+                        || firstSpec.innerShape.length != spec.innerShape.length) {
+                    throw new IllegalArgumentException(
+                            "Segmented output pack sources must share the leading dimension, data"
+                                    + " type, and rank.");
+                } else {
+                    for (int axis = 1; axis < spec.innerShape.length; axis++) {
+                        if (firstSpec.innerShape[axis] != spec.innerShape[axis]) {
+                            throw new IllegalArgumentException(
+                                    "Segmented output pack sources must share their trailing inner"
+                                            + " shape.");
+                        }
+                    }
+                }
+                segmentCount = Math.addExact(segmentCount, spec.innerShape[0]);
+                checkedSources.add(source);
+            }
+
+            long[] outputInnerShape = firstSpec.innerShape.clone();
+            outputInnerShape[0] = segmentCount;
+            String checkedName = addValueName(name);
+            TensorSpec outputSpec =
+                    TensorSpec.of(firstSpec.dataType, firstSpec.leadingDimension, outputInnerShape);
+            SegmentedOutputPack value =
+                    new SegmentedOutputPack(
+                            owner, values.size(), checkedName, outputSpec, checkedSources);
             values.add(value);
             return value;
         }

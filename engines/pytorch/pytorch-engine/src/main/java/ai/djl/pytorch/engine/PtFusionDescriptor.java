@@ -65,6 +65,7 @@ final class PtFusionDescriptor {
     static final long INDEXED_RELATION_TRANSFORMER_ENCODER_STACK_V1 = 10;
     static final long MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 = 12;
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2 = 13;
+    static final long SEGMENTED_OUTPUT_PACK_V1 = 15;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
@@ -130,6 +131,12 @@ final class PtFusionDescriptor {
                         Math.addExact(
                                 commandWords,
                                 outputPackCommandWords((FusionRecipe.OutputPack) value));
+            } else if (value instanceof FusionRecipe.SegmentedOutputPack) {
+                commandWords =
+                        Math.addExact(
+                                commandWords,
+                                segmentedOutputPackCommandWords(
+                                        (FusionRecipe.SegmentedOutputPack) value));
             } else if (value instanceof FusionRecipe.AffineSum) {
                 commandWords =
                         Math.addExact(
@@ -224,6 +231,9 @@ final class PtFusionDescriptor {
         for (FusionRecipe.Value value : recipe.getValues()) {
             if (value instanceof FusionRecipe.OutputPack) {
                 putOutputPackCommand(descriptor, (FusionRecipe.OutputPack) value);
+            } else if (value instanceof FusionRecipe.SegmentedOutputPack) {
+                putSegmentedOutputPackCommand(
+                        descriptor, (FusionRecipe.SegmentedOutputPack) value);
             } else if (value instanceof FusionRecipe.AffineSum) {
                 putAffineSumCommand(descriptor, (FusionRecipe.AffineSum) value);
             } else if (value instanceof FusionRecipe.IndexedAffine) {
@@ -257,6 +267,8 @@ final class PtFusionDescriptor {
         int count = 0;
         for (FusionRecipe.Value value : recipe.getValues()) {
             if (value instanceof FusionRecipe.OutputPack) {
+                ++count;
+            } else if (value instanceof FusionRecipe.SegmentedOutputPack) {
                 ++count;
             } else if (value instanceof FusionRecipe.AffineSum) {
                 ++count;
@@ -486,6 +498,7 @@ final class PtFusionDescriptor {
 
     private static boolean isComputed(FusionRecipe.Value value) {
         return value instanceof FusionRecipe.OutputPack
+                || value instanceof FusionRecipe.SegmentedOutputPack
                 || value instanceof FusionRecipe.AffineSum
                 || value instanceof FusionRecipe.IndexedAffine
                 || value instanceof FusionRecipe.TransformerEncoderStack
@@ -819,6 +832,25 @@ final class PtFusionDescriptor {
             ByteBuffer descriptor, FusionRecipe.OutputPack outputPack) {
         descriptor.putLong(outputPackCommandWords(outputPack));
         descriptor.putLong(OUTPUT_PACK_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(outputPack.getSources().size());
+        descriptor.putLong(0);
+        descriptor.putLong(outputPack.getIndex());
+        for (FusionRecipe.Value source : outputPack.getSources()) {
+            descriptor.putLong(source.getIndex());
+        }
+    }
+
+    private static int segmentedOutputPackCommandWords(
+            FusionRecipe.SegmentedOutputPack outputPack) {
+        return Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, outputPack.getSources().size());
+    }
+
+    private static void putSegmentedOutputPackCommand(
+            ByteBuffer descriptor, FusionRecipe.SegmentedOutputPack outputPack) {
+        descriptor.putLong(segmentedOutputPackCommandWords(outputPack));
+        descriptor.putLong(SEGMENTED_OUTPUT_PACK_V1);
         descriptor.putLong(0);
         descriptor.putLong(1);
         descriptor.putLong(outputPack.getSources().size());

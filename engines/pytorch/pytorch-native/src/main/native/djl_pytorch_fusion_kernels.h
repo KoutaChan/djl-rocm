@@ -37,6 +37,10 @@ struct OutputPackSource {
 void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
     torch::Tensor& output, int64_t row_count, int64_t output_width);
 
+void LaunchSegmentedOutputPack(const OutputPackSource* sources,
+    int32_t source_count, torch::Tensor& output, int64_t row_count,
+    int64_t output_width);
+
 void LaunchBinaryBranchBlend(const torch::Tensor& baseline_context,
     const torch::Tensor& selected_context,
     const torch::Tensor& selected_logit,
