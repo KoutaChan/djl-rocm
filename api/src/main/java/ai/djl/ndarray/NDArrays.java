@@ -358,6 +358,30 @@ public final class NDArrays {
     }
 
     /**
+     * Pools a selected subset of choices with masked softmax weights.
+     *
+     * <p>The logits and mask are shaped {@code [..., choices]}, and the values are shaped {@code
+     * [..., choices, features]}. {@code choiceIndices} selects the choices that participate in the
+     * softmax, in reduction order. The returned tensor has shape {@code [..., features]}. A row
+     * with no selected legal choice returns zeros.
+     *
+     * <p>Softmax evaluation, accumulation, and output use {@link DataType#FLOAT32}. Engines may
+     * read the host-side indices directly in a fused kernel while retaining a differentiable
+     * fallback with identical semantics. Indices must be non-empty, unique, and in range.
+     *
+     * @param logits unnormalized scores for all choices
+     * @param mask nonzero entries identify legal choices
+     * @param values values for all choices
+     * @param choiceIndices choices included in the masked softmax pool
+     * @return the pooled selected-choice values
+     */
+    public static NDArray indexedMaskedSoftmaxPool(
+            NDArray logits, NDArray mask, NDArray values, int... choiceIndices) {
+        return logits.getNDArrayInternal()
+                .indexedMaskedSoftmaxPool(mask, values, choiceIndices.clone());
+    }
+
+    /**
      * Computes the log normalizer over legal elements.
      *
      * <p>Computation and output use {@link DataType#FLOAT32}; the reduced axis is retained with

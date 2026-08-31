@@ -420,6 +420,94 @@ public interface NDArrayEx {
         return NDArrays.stack(groups, 0);
     }
 
+    /** Pools a selected subset of choices with masked softmax weights. */
+    default NDArray indexedMaskedSoftmaxPool(NDArray mask, NDArray values, int[] choiceIndices) {
+        NDArray logits = getArray();
+        Shape logitShape = logits.getShape();
+        Shape maskShape = mask.getShape();
+        Shape valueShape = values.getShape();
+        int logitRank = logitShape.dimension();
+        if (logitRank == 0) {
+            throw new IllegalArgumentException(
+                    "indexed masked softmax logits must have at least one dimension");
+        }
+        if (!logitShape.equals(maskShape)) {
+            throw new IllegalArgumentException(
+                    "indexed masked softmax mask must match logits: logits="
+                            + logitShape
+                            + ", mask="
+                            + maskShape);
+        }
+        if (valueShape.dimension() != logitRank + 1) {
+            throw new IllegalArgumentException(
+                    "indexed masked softmax values must add a trailing feature dimension: logits="
+                            + logitShape
+                            + ", values="
+                            + valueShape);
+        }
+        for (int dimension = 0; dimension < logitRank; ++dimension) {
+            if (logitShape.get(dimension) != valueShape.get(dimension)) {
+                throw new IllegalArgumentException(
+                        "indexed masked softmax value dimensions must match logits: logits="
+                                + logitShape
+                                + ", values="
+                                + valueShape);
+            }
+        }
+        if (valueShape.get(logitRank) <= 0) {
+            throw new IllegalArgumentException(
+                    "indexed masked softmax requires a non-empty feature dimension");
+        }
+        validateChoiceIndices(choiceIndices, logitShape.get(logitRank - 1));
+
+        NDList selectedLogits = new NDList(choiceIndices.length);
+        NDList selectedMasks = new NDList(choiceIndices.length);
+        NDList selectedValues = new NDList(choiceIndices.length);
+        for (int choiceIndex : choiceIndices) {
+            selectedLogits.add(logits.get("...,{}", choiceIndex).expandDims(-1));
+            selectedMasks.add(mask.get("...,{}", choiceIndex).expandDims(-1));
+            selectedValues.add(values.get("...,{},:", choiceIndex).expandDims(-2));
+        }
+        NDArray selectedLogitArray = NDArrays.concat(selectedLogits, -1);
+        NDArray selectedMaskArray = NDArrays.concat(selectedMasks, -1);
+        NDArray selectedValueArray = NDArrays.concat(selectedValues, -2);
+        NDArray weights = NDArrays.maskedSoftmax(selectedLogitArray, selectedMaskArray, -1);
+        NDArray pooled =
+                selectedValueArray
+                        .toType(DataType.FLOAT32, false)
+                        .mul(weights.expandDims(-1))
+                        .sum(new int[] {logitRank - 1});
+        NDArray present =
+                selectedMaskArray
+                        .neq(0)
+                        .sum(new int[] {logitRank - 1})
+                        .gt(0)
+                        .expandDims(-1)
+                        .broadcast(pooled.getShape());
+        return NDArrays.where(present, pooled, pooled.zerosLike());
+    }
+
+    /** Validates host-side selected-choice metadata shared by portable engine fallbacks. */
+    static void validateChoiceIndices(int[] choiceIndices, long choiceCount) {
+        if (choiceIndices.length == 0) {
+            throw new IllegalArgumentException(
+                    "indexed masked softmax requires at least one choice index");
+        }
+        for (int index = 0; index < choiceIndices.length; ++index) {
+            int choice = choiceIndices[index];
+            if (choice < 0 || choice >= choiceCount) {
+                throw new IllegalArgumentException(
+                        "indexed masked softmax choice index is out of range: " + choice);
+            }
+            for (int previous = 0; previous < index; ++previous) {
+                if (choiceIndices[previous] == choice) {
+                    throw new IllegalArgumentException(
+                            "indexed masked softmax choice indices must be unique: " + choice);
+                }
+            }
+        }
+    }
+
     /** Returns the float32 log normalizer over nonzero mask entries, retaining the reduced axis. */
     default NDArray maskedLogSumExp(NDArray mask, int axis) {
         NDArray logits = getArray().toType(DataType.FLOAT32, false);
