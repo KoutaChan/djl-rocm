@@ -1448,6 +1448,83 @@ public interface NDArrayEx {
     }
 
     /**
+     * Applies grouped indexed attention using explicit group and shared-delta lookup indices.
+     *
+     * <p>The portable implementation materializes the two mapped inputs and delegates to the
+     * ordinary grouped operation. Engine implementations may instead load both source tables
+     * directly. Group and shared-delta indices are zero-based; indexed shared IDs remain one-based
+     * with zero padding.
+     *
+     * @param sharedKeyValues packed shared data shaped {@code [groups,sharedTokens,packedWidth]}
+     * @param sharedGroupIndices zero-based group indices shaped {@code [query]}
+     * @param sharedDeltaTable packed delta rows shaped {@code [deltas,packedWidth]}
+     * @param sharedDeltaIndices zero-based delta indices shaped {@code [query,sharedTokens]}
+     * @param indexedDeltas query-specific auxiliary deltas
+     * @param indexedSharedIds one-based shared-token IDs; zero denotes padding
+     * @param scale attention score scale
+     * @return attended values shaped {@code [query,heads,valueFeatures]}
+     */
+    default NDArray canonicalMappedGroupedIndexedScaledDotProductAttention(
+            NDArray sharedKeyValues,
+            NDArray sharedGroupIndices,
+            NDArray sharedDeltaTable,
+            NDArray sharedDeltaIndices,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            double scale) {
+        NDArray query = getArray();
+        Shape queryShape = query.getShape();
+        Shape sharedShape = sharedKeyValues.getShape();
+        long queryCount = queryShape.get(0);
+        long sharedTokens = sharedShape.get(1);
+        long packedWidth = sharedShape.get(2);
+        if (queryShape.dimension() != 3
+                || sharedShape.dimension() != 3
+                || !sharedGroupIndices.getShape().equals(new Shape(queryCount))
+                || sharedDeltaTable.getShape().dimension() != 2
+                || sharedDeltaTable.getShape().get(1) != packedWidth
+                || !sharedDeltaIndices.getShape().equals(new Shape(queryCount, sharedTokens))) {
+            throw new IllegalArgumentException(
+                    "mapped grouped attention inputs have incompatible canonical shapes");
+        }
+
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(
+                    query,
+                    sharedKeyValues,
+                    sharedGroupIndices,
+                    sharedDeltaTable,
+                    sharedDeltaIndices,
+                    indexedDeltas,
+                    indexedSharedIds);
+            NDArray mappedSharedKeyValues =
+                    NDArrays.gatherRows(
+                            sharedKeyValues,
+                            sharedGroupIndices.toType(DataType.INT64, false).stopGradient());
+            NDArray mappedSharedDeltas =
+                    NDArrays.gatherRows(
+                                    sharedDeltaTable,
+                                    sharedDeltaIndices
+                                            .toType(DataType.INT64, false)
+                                            .reshape(-1)
+                                            .stopGradient())
+                            .reshape(queryCount, sharedTokens, packedWidth);
+            NDArray result =
+                    query.getNDArrayInternal()
+                            .canonicalGroupedIndexedScaledDotProductAttention(
+                                    mappedSharedKeyValues,
+                                    mappedSharedDeltas,
+                                    indexedDeltas,
+                                    indexedSharedIds,
+                                    1,
+                                    scale);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Adds an inference residual in place and applies affine LayerNorm to the updated value.
      *
      * <p>The returned array is normalized while {@code this} retains the unnormalized sum. Engines

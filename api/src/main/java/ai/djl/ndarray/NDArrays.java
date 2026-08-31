@@ -619,6 +619,117 @@ public final class NDArrays {
     }
 
     /**
+     * Applies grouped indexed attention through explicit group and delta-table mappings.
+     *
+     * <p>Each query selects one packed shared key/value table with a zero-based group index. Each
+     * shared token independently selects one packed delta row with a zero-based delta index.
+     * Auxiliary tokens use the same one-based shared-token indices and zero padding as {@link
+     * #groupedIndexedScaledDotProductAttention(NDArray, NDArray, NDArray, NDArray, NDArray, long,
+     * double)}. This form lets engines read immutable base tables directly instead of materializing
+     * query-local shared key/value and delta tensors.
+     *
+     * <p>The query leading dimensions are preserved. Group indices have exactly those leading
+     * dimensions, shared-delta indices append the shared-token dimension, and auxiliary tensors
+     * append their indexed-token dimension. All group and delta indices must be in range. Engines
+     * may use a forward-only fused implementation when gradients are not required; the portable
+     * implementation remains differentiable.
+     *
+     * @param query query tensor shaped {@code [queryDimensions..., heads, keyFeatures]}
+     * @param sharedKeyValues packed shared data shaped {@code [groups, sharedTokens, packedWidth]}
+     * @param sharedGroupIndices zero-based group index shaped {@code [queryDimensions...]}
+     * @param sharedDeltaTable packed delta rows shaped {@code [deltas, packedWidth]}
+     * @param sharedDeltaIndices zero-based delta indices shaped {@code [queryDimensions...,
+     *     sharedTokens]}
+     * @param indexedDeltas auxiliary-token deltas shaped {@code [queryDimensions..., indexedTokens,
+     *     packedWidth]}
+     * @param indexedSharedIds one-based shared-token indices shaped {@code [queryDimensions...,
+     *     indexedTokens]}; zero denotes padding
+     * @param scale score scale
+     * @return attended values shaped {@code [queryDimensions..., heads, valueFeatures]}
+     */
+    public static NDArray mappedGroupedIndexedScaledDotProductAttention(
+            NDArray query,
+            NDArray sharedKeyValues,
+            NDArray sharedGroupIndices,
+            NDArray sharedDeltaTable,
+            NDArray sharedDeltaIndices,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            double scale) {
+        Shape queryShape = query.getShape();
+        Shape sharedShape = sharedKeyValues.getShape();
+        if (queryShape.dimension() < 3
+                || sharedShape.dimension() != 3
+                || sharedDeltaTable.getShape().dimension() != 2) {
+            throw new IllegalArgumentException(
+                    "mapped grouped attention requires query rank >= 3 and rank-three shared data");
+        }
+
+        long[] queryDimensions = leadingDimensions(queryShape, 2);
+        long queryCount = elementCount(queryDimensions);
+        long heads = queryShape.get(queryShape.dimension() - 2);
+        long keyFeatures = queryShape.get(queryShape.dimension() - 1);
+        long sharedTokens = sharedShape.get(1);
+        long packedWidth = sharedShape.get(2);
+        Shape groupIndexShape = sharedGroupIndices.getShape();
+        Shape sharedDeltaIndexShape = sharedDeltaIndices.getShape();
+        Shape indexedDeltaShape = indexedDeltas.getShape();
+        Shape indexedIdShape = indexedSharedIds.getShape();
+        if (!Arrays.equals(queryDimensions, groupIndexShape.getShape())
+                || !sharedDeltaIndexShape.equals(shapeWithTrailing(queryDimensions, sharedTokens))
+                || indexedDeltaShape.dimension() != queryDimensions.length + 2
+                || indexedIdShape.dimension() != queryDimensions.length + 1
+                || !Arrays.equals(queryDimensions, leadingDimensions(indexedDeltaShape, 2))
+                || !Arrays.equals(queryDimensions, leadingDimensions(indexedIdShape, 1))) {
+            throw new IllegalArgumentException(
+                    "mapped grouped attention indices must preserve query leading dimensions");
+        }
+        long indexedTokens = indexedDeltaShape.get(indexedDeltaShape.dimension() - 2);
+        if (sharedShape.get(0) <= 0
+                || sharedTokens <= 0
+                || sharedDeltaTable.getShape().get(0) <= 0
+                || sharedDeltaTable.getShape().get(1) != packedWidth
+                || indexedDeltaShape.get(indexedDeltaShape.dimension() - 1) != packedWidth
+                || indexedIdShape.get(indexedIdShape.dimension() - 1) != indexedTokens) {
+            throw new IllegalArgumentException("mapped grouped attention shapes are incompatible");
+        }
+        long keyWidth = heads * keyFeatures;
+        if (heads <= 0 || packedWidth <= keyWidth || (packedWidth - keyWidth) % heads != 0) {
+            throw new IllegalArgumentException(
+                    "packed shared features must contain per-head keys followed by values");
+        }
+        long valueFeatures = (packedWidth - keyWidth) / heads;
+
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(
+                    query,
+                    sharedKeyValues,
+                    sharedGroupIndices,
+                    sharedDeltaTable,
+                    sharedDeltaIndices,
+                    indexedDeltas,
+                    indexedSharedIds);
+            NDArray canonicalResult =
+                    query.reshape(queryCount, heads, keyFeatures)
+                            .getNDArrayInternal()
+                            .canonicalMappedGroupedIndexedScaledDotProductAttention(
+                                    sharedKeyValues,
+                                    sharedGroupIndices.reshape(queryCount),
+                                    sharedDeltaTable,
+                                    sharedDeltaIndices.reshape(queryCount, sharedTokens),
+                                    indexedDeltas.reshape(queryCount, indexedTokens, packedWidth),
+                                    indexedSharedIds.reshape(queryCount, indexedTokens),
+                                    scale);
+            NDArray result =
+                    canonicalResult.reshape(
+                            shapeWithTrailing(queryDimensions, heads, valueFeatures));
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Adds an inference residual in place and returns its affine LayerNorm.
      *
      * <p>The residual buffer is left as the unnormalized sum. This operation is intended for

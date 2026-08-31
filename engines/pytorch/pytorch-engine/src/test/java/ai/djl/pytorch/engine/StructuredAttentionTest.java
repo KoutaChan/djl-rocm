@@ -66,6 +66,34 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void mappedGroupedAttentionReadsSharedAndDeltaTables() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray query = manager.zeros(new Shape(2, 1, 1));
+            NDArray shared =
+                    manager.create(
+                            new float[] {0f, 1f, 0f, 3f, 0f, 5f, 0f, 7f}, new Shape(2, 2, 2));
+            NDArray groupIndices = manager.create(new int[] {1, 0});
+            NDArray deltaTable = manager.create(new float[] {0f, 0f, 0f, 2f}, new Shape(2, 2));
+            NDArray deltaIndices = manager.create(new int[] {0, 1, 1, 0}, new Shape(2, 2));
+            NDArray indexedDeltas = manager.zeros(new Shape(2, 1, 2));
+            NDArray indexedIds = manager.zeros(new Shape(2, 1), DataType.INT32);
+
+            NDArray result =
+                    NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                            query,
+                            shared,
+                            groupIndices,
+                            deltaTable,
+                            deltaIndices,
+                            indexedDeltas,
+                            indexedIds,
+                            1.0);
+
+            assertClose(result.toFloatArray(), new float[] {7f, 3f}, 1e-6f);
+        }
+    }
+
+    @Test
     public void residualAddLayerNormUpdatesOwnedBuffer() {
         try (NDManager manager = NDManager.newBaseManager()) {
             NDArray residual = manager.create(new float[] {1f, 3f}, new Shape(1, 2));
@@ -219,6 +247,7 @@ public class StructuredAttentionTest {
         try (NDManager manager = engine.newBaseManager(Device.cpu())) {
             verifyRelationAttention(manager);
             verifyGroupedAttention(manager);
+            verifyMappedGroupedAttention(manager);
             verifyRelationAttentionLeadingDimensions(manager);
             verifyGroupedAttentionLeadingDimensions(manager);
             verifyResidualLayerNorm(manager);
@@ -234,6 +263,7 @@ public class StructuredAttentionTest {
         try (NDManager manager = engine.newBaseManager(Device.gpu())) {
             verifyRelationAttention(manager);
             verifyGroupedAttention(manager);
+            verifyMappedGroupedAttention(manager);
             verifyRelationAttentionLeadingDimensions(manager);
             verifyGroupedAttentionLeadingDimensions(manager);
             verifyResidualLayerNorm(manager);
@@ -433,6 +463,7 @@ public class StructuredAttentionTest {
             Engine engine, Device device, DataType dataType) {
         verifyRelationAttentionGradients(engine, device, dataType);
         verifyGroupedAttentionGradients(engine, device, dataType);
+        verifyMappedGroupedAttentionGradients(engine, device, dataType);
     }
 
     private static void verifyPartialGradientRequests(
@@ -638,6 +669,83 @@ public class StructuredAttentionTest {
         }
     }
 
+    private static void verifyMappedGroupedAttentionGradients(
+            Engine engine, Device device, DataType dataType) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            int queries = 5;
+            int heads = 2;
+            int keyFeatures = 3;
+            int sharedTokens = 5;
+            int indexedTokens = 3;
+            int packedWidth = heads * (keyFeatures + 4);
+            NDArray queryValues =
+                    manager.randomNormal(new Shape(queries, heads, keyFeatures), dataType);
+            NDArray sharedValues =
+                    manager.randomNormal(new Shape(3, sharedTokens, packedWidth), dataType);
+            NDArray deltaTableValues = manager.randomNormal(new Shape(7, packedWidth), dataType);
+            NDArray indexedDeltaValues =
+                    manager.randomNormal(new Shape(queries, indexedTokens, packedWidth), dataType);
+            NDArray groupIndices = manager.create(new int[] {2, 0, 2, 1, 0});
+            NDArray deltaIndices =
+                    manager.create(
+                            new int[] {
+                                0, 1, 2, 3, 4,
+                                1, 2, 3, 4, 5,
+                                2, 3, 4, 5, 6,
+                                3, 4, 5, 6, 0,
+                                4, 5, 6, 0, 1
+                            },
+                            new Shape(queries, sharedTokens));
+            NDArray indexedIds =
+                    manager.create(
+                            new int[] {1, 2, 3, 2, 0, 4, 3, 4, 5, 4, 5, 1, 5, 1, 0},
+                            new Shape(queries, indexedTokens));
+
+            NDArray query = requiringGradient(queryValues.duplicate());
+            NDArray shared = requiringGradient(sharedValues.duplicate());
+            NDArray deltaTable = requiringGradient(deltaTableValues.duplicate());
+            NDArray indexedDeltas = requiringGradient(indexedDeltaValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                                query,
+                                shared,
+                                groupIndices,
+                                deltaTable,
+                                deltaIndices,
+                                indexedDeltas,
+                                indexedIds,
+                                0.27);
+                collector.backward(output.mul(output).sum());
+            }
+
+            NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+            NDArray referenceShared = requiringGradient(sharedValues.duplicate());
+            NDArray referenceDeltaTable = requiringGradient(deltaTableValues.duplicate());
+            NDArray referenceIndexedDeltas = requiringGradient(indexedDeltaValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        mappedGroupedAttentionReference(
+                                referenceQuery,
+                                referenceShared,
+                                groupIndices,
+                                referenceDeltaTable,
+                                deltaIndices,
+                                referenceIndexedDeltas,
+                                indexedIds,
+                                0.27);
+                collector.backward(output.mul(output).sum());
+            }
+
+            assertFiniteNonzeroGradient(query, shared, deltaTable, indexedDeltas);
+            float tolerance = gradientTolerance(dataType);
+            assertGradientClose(query, referenceQuery, tolerance);
+            assertGradientClose(shared, referenceShared, tolerance);
+            assertGradientClose(deltaTable, referenceDeltaTable, tolerance);
+            assertGradientClose(indexedDeltas, referenceIndexedDeltas, tolerance);
+        }
+    }
+
     private static float gradientTolerance(DataType dataType) {
         return dataType == DataType.FLOAT32 ? 8e-4f : 8e-2f;
     }
@@ -686,6 +794,56 @@ public class StructuredAttentionTest {
         verifyGroupedAttentionShape(manager, 1, 7, 5, 33, 37, 65, 17, true);
         verifyGroupedAttentionShape(manager, 1, 3, 2, 7, 11, 9, 5, false, DataType.FLOAT64, 2e-5f);
         verifyStridedGroupedAttention(manager);
+    }
+
+    private static void verifyMappedGroupedAttention(NDManager manager) {
+        int queries = 7;
+        int heads = 3;
+        int keyFeatures = 5;
+        int valueFeatures = 9;
+        int sharedTokens = 11;
+        int indexedTokens = 4;
+        int packedWidth = heads * (keyFeatures + valueFeatures);
+        NDArray query = manager.randomNormal(new Shape(queries, heads, keyFeatures));
+        NDArray shared = manager.randomNormal(new Shape(4, sharedTokens, packedWidth));
+        NDArray groupIndices = manager.create(new int[] {3, 0, 3, 1, 2, 0, 2});
+        NDArray deltaTable = manager.randomNormal(new Shape(13, packedWidth));
+        int[] deltaIds = new int[queries * sharedTokens];
+        int[] indexedIds = new int[queries * indexedTokens];
+        for (int index = 0; index < deltaIds.length; ++index) {
+            deltaIds[index] = index % 13;
+        }
+        for (int index = 0; index < indexedIds.length; ++index) {
+            indexedIds[index] = index % (sharedTokens + 1);
+        }
+        NDArray deltaIndices = manager.create(deltaIds, new Shape(queries, sharedTokens));
+        NDArray indexedDeltas =
+                manager.randomNormal(new Shape(queries, indexedTokens, packedWidth));
+        NDArray storedIndexedIds = manager.create(indexedIds, new Shape(queries, indexedTokens));
+        double scale = 0.39;
+
+        NDArray expected =
+                mappedGroupedAttentionReference(
+                        query,
+                        shared,
+                        groupIndices,
+                        deltaTable,
+                        deltaIndices,
+                        indexedDeltas,
+                        storedIndexedIds,
+                        scale);
+        NDArray actual =
+                NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                        query,
+                        shared,
+                        groupIndices,
+                        deltaTable,
+                        deltaIndices,
+                        indexedDeltas,
+                        storedIndexedIds,
+                        scale);
+
+        assertClose(actual.toFloatArray(), expected.toFloatArray(), 2e-4f);
     }
 
     private static void verifyGroupedAttentionShape(
@@ -929,6 +1087,36 @@ public class StructuredAttentionTest {
                         .add(sharedDeltaValues)
                         .concat(indexedValues.add(indexedDeltaValues), 2);
         return weights.expandDims(3).mul(values).sum(new int[] {2});
+    }
+
+    private static NDArray mappedGroupedAttentionReference(
+            NDArray query,
+            NDArray sharedKeyValues,
+            NDArray sharedGroupIndices,
+            NDArray sharedDeltaTable,
+            NDArray sharedDeltaIndices,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            double scale) {
+        long queryCount = query.getShape().get(0);
+        long sharedTokens = sharedKeyValues.getShape().get(1);
+        long packedWidth = sharedKeyValues.getShape().get(2);
+        NDArray mappedSharedKeyValues =
+                NDArrays.gatherRows(
+                        sharedKeyValues, sharedGroupIndices.toType(DataType.INT64, false));
+        NDArray mappedSharedDeltas =
+                NDArrays.gatherRows(
+                                sharedDeltaTable,
+                                sharedDeltaIndices.toType(DataType.INT64, false).reshape(-1))
+                        .reshape(queryCount, sharedTokens, packedWidth);
+        return groupedAttentionReference(
+                query,
+                mappedSharedKeyValues,
+                mappedSharedDeltas,
+                indexedDeltas,
+                indexedSharedIds,
+                1,
+                scale);
     }
 
     private static void verifyResidualLayerNorm(NDManager manager) {
