@@ -1378,9 +1378,11 @@ __global__ void residual_add_layer_norm_cached_in_place_kernel(residual_t* resid
   }
 }
 
-template <int cached_values_per_lane, typename input_t, typename parameter_t>
+template <int cached_values_per_lane, typename input_t, typename parameter_t,
+    typename converted_t, bool write_converted>
 __global__ void autocast_layer_norm_kernel(const input_t* input, const parameter_t* weight,
-    const parameter_t* bias, float* output, int64_t row_count, int64_t width, float epsilon) {
+    const parameter_t* bias, float* output, converted_t* converted_output,
+    int64_t row_count, int64_t width, float epsilon) {
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
   const int waves_per_block = blockDim.x / warpSize;
@@ -1432,9 +1434,12 @@ __global__ void autocast_layer_norm_kernel(const input_t* input, const parameter
     if (feature < width) {
       const float normalized =
           (cached_values[cached_index] - mean) * inverse_standard_deviation;
-      output[row_offset + feature] =
-          normalized * static_cast<float>(weight[feature]) +
-          static_cast<float>(bias[feature]);
+      const float affine = normalized * static_cast<float>(weight[feature]) +
+                           static_cast<float>(bias[feature]);
+      output[row_offset + feature] = affine;
+      if constexpr (write_converted) {
+        converted_output[row_offset + feature] = static_cast<converted_t>(affine);
+      }
     }
   }
 }
@@ -1963,6 +1968,71 @@ bool has_supported_masked_embedding_index_layout(
           indices.scalar_type() == torch::kInt64);
 }
 
+AutocastLayerNormAndCastResult launch_autocast_layer_norm(
+    const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias,
+    float epsilon, std::optional<torch::ScalarType> converted_type) {
+  c10::DeviceGuard device_guard(input.device());
+  torch::Tensor normalized = torch::empty(input.sizes(),
+      input.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
+  torch::Tensor converted;
+  if (converted_type.has_value()) {
+    converted = torch::empty(input.sizes(), input.options().dtype(*converted_type)
+        .memory_format(torch::MemoryFormat::Contiguous));
+  }
+  if (input.numel() == 0) {
+    return {std::move(normalized), std::move(converted)};
+  }
+
+  const int64_t width = input.size(-1);
+  const int64_t row_count = input.numel() / width;
+  const auto& properties = device_properties(input.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int waves_per_block = threads_per_block / properties.warpSize;
+  const int cached_values_per_lane =
+      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
+  const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
+  const dim3 block(threads_per_block);
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(input.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, input.scalar_type(), "autocast_layer_norm_input", [&] {
+        using input_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+            weight.scalar_type(), "autocast_layer_norm_parameter", [&] {
+              using parameter_t = scalar_t;
+              dispatch_autocast_layer_norm_cached_values_per_lane(
+                  cached_values_per_lane, [&](auto cached_values) {
+                    constexpr int compiled_cached_values = decltype(cached_values)::value;
+                    if (converted.defined()) {
+                      AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+                          converted.scalar_type(), "autocast_layer_norm_converted", [&] {
+                            using converted_t = scalar_t;
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(autocast_layer_norm_kernel<
+                                                   compiled_cached_values, input_t, parameter_t,
+                                                   converted_t, true>),
+                                grid, block, 0, stream, input.data_ptr<input_t>(),
+                                weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+                                normalized.data_ptr<float>(), converted.data_ptr<converted_t>(),
+                                row_count, width, epsilon);
+                          });
+                    } else {
+                      hipLaunchKernelGGL(HIP_KERNEL_NAME(autocast_layer_norm_kernel<
+                                             compiled_cached_values, input_t, parameter_t,
+                                             float, false>),
+                          grid, block, 0, stream, input.data_ptr<input_t>(),
+                          weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+                          normalized.data_ptr<float>(), static_cast<float*>(nullptr), row_count,
+                          width, epsilon);
+                    }
+                  });
+            });
+      });
+  check_hip_kernel_launch(
+      converted.defined() ? "autocast_layer_norm_and_cast" : "autocast_layer_norm");
+  return {std::move(normalized), std::move(converted)};
+}
+
 }  // namespace
 
 bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
@@ -2172,6 +2242,13 @@ bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
   const int64_t row_count = input.numel() / width;
   const int64_t grid_size = (row_count + waves_per_block - 1) / waves_per_block;
   return grid_size <= static_cast<int64_t>(properties.maxGridSize[0]);
+}
+
+bool supports_autocast_layer_norm_and_cast(const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& bias, at::IntArrayRef normalized_shape,
+    torch::ScalarType converted_type) {
+  return supports_autocast_layer_norm(input, weight, bias, normalized_shape) &&
+      (converted_type == torch::kFloat16 || converted_type == torch::kBFloat16);
 }
 
 bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor& gradient,
@@ -3313,43 +3390,17 @@ torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
   const int64_t width = input.size(-1);
   TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, at::IntArrayRef(&width, 1)),
       "autocast LayerNorm received an unsupported ROCm tensor layout");
-  c10::DeviceGuard device_guard(input.device());
-  torch::Tensor output = torch::empty(input.sizes(),
-      input.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
-  if (input.numel() == 0) {
-    return output;
-  }
+  return launch_autocast_layer_norm(input, weight, bias, epsilon, std::nullopt).normalized;
+}
 
-  const int64_t row_count = input.numel() / width;
-  const auto& properties = device_properties(input.get_device());
-  const int threads_per_block = configured_threads_per_block(properties,
-      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
-      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
-  const int waves_per_block = threads_per_block / properties.warpSize;
-  const int cached_values_per_lane =
-      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
-  const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
-  const dim3 block(threads_per_block);
-  const hipStream_t stream = c10::hip::getCurrentHIPStream(input.get_device()).stream();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      torch::kHalf, torch::kBFloat16, input.scalar_type(), "autocast_layer_norm_input", [&] {
-        using input_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
-            weight.scalar_type(), "autocast_layer_norm_parameter", [&] {
-              using parameter_t = scalar_t;
-              dispatch_autocast_layer_norm_cached_values_per_lane(
-                  cached_values_per_lane, [&](auto cached_values) {
-                    constexpr int compiled_cached_values = decltype(cached_values)::value;
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(autocast_layer_norm_kernel<
-                                           compiled_cached_values, input_t, parameter_t>),
-                        grid, block, 0, stream, input.data_ptr<input_t>(),
-                        weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
-                        output.data_ptr<float>(), row_count, width, epsilon);
-                  });
-            });
-      });
-  check_hip_kernel_launch("autocast_layer_norm");
-  return output;
+AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
+    torch::ScalarType converted_type) {
+  const int64_t width = input.size(-1);
+  TORCH_CHECK(supports_autocast_layer_norm_and_cast(
+                  input, weight, bias, at::IntArrayRef(&width, 1), converted_type),
+      "autocast LayerNorm and cast received an unsupported ROCm tensor layout");
+  return launch_autocast_layer_norm(input, weight, bias, epsilon, converted_type);
 }
 
 }  // namespace djl::pytorch::rocm

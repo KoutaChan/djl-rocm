@@ -719,6 +719,14 @@ final class PyTorchLibrary {
             long biasHandle,
             double eps);
 
+    native long[] torchNNLayerNormAndCast(
+            long inputHandle,
+            long[] normalizedShape,
+            long weightHandle,
+            long biasHandle,
+            double eps,
+            int convertedDataType);
+
     native long torchNNBatchNorm(
             long inputHandle,
             long runningMeanHandle,

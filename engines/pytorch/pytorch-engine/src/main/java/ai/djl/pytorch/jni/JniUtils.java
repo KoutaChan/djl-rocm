@@ -2267,6 +2267,26 @@ public final class JniUtils {
                         eps));
     }
 
+    /** Applies LayerNorm and returns its ordinary output together with a converted copy. */
+    public static NDList layerNormAndCast(
+            PtNDArray ndArray,
+            Shape normalizedShape,
+            PtNDArray gamma,
+            PtNDArray beta,
+            double eps,
+            DataType convertedDataType) {
+        long[] handles =
+                PyTorchLibrary.LIB.torchNNLayerNormAndCast(
+                        ndArray.getHandle(),
+                        normalizedShape.getShape(),
+                        gamma.getHandle(),
+                        beta.getHandle(),
+                        eps,
+                        convertedDataType.ordinal());
+        PtNDManager manager = ndArray.getManager();
+        return new NDList(new PtNDArray(manager, handles[0]), new PtNDArray(manager, handles[1]));
+    }
+
     public static PtNDArray normalize(PtNDArray ndArray, double p, long dim, double eps) {
         return new PtNDArray(
                 ndArray.getManager(),

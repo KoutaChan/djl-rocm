@@ -163,6 +163,18 @@ bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
 torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, float epsilon);
 
+struct AutocastLayerNormAndCastResult {
+  torch::Tensor normalized;
+  torch::Tensor converted;
+};
+
+bool supports_autocast_layer_norm_and_cast(const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& bias, at::IntArrayRef normalized_shape, torch::ScalarType converted_type);
+
+AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
+    torch::ScalarType converted_type);
+
 }  // namespace djl::pytorch::rocm
 
 #endif  // DJL_PYTORCH_ROCM_KERNELS_H
