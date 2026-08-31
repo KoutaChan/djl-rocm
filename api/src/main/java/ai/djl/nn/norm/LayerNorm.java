@@ -17,6 +17,7 @@ import ai.djl.MalformedModelException;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.internal.NDArrayEx;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.AbstractBlock;
 import ai.djl.nn.Parameter;
@@ -108,6 +109,35 @@ public class LayerNorm extends AbstractBlock {
             NDArray input, Shape normalizedShape, NDArray gamma, NDArray beta, float eps) {
         NDArrayEx ex = input.getNDArrayInternal();
         return ex.layerNorm(input, normalizedShape, gamma, beta, eps);
+    }
+
+    /**
+     * Applies Layer Normalization and returns both its ordinary output and a converted copy.
+     *
+     * <p>This operation is useful when one consumer needs the engine's native LayerNorm output type
+     * while another consumer uses a lower-precision representation of the same normalized values.
+     * Engines may produce both outputs in one backend operation. The first output follows the same
+     * data type policy as {@link #layerNorm(NDArray, Shape, NDArray, NDArray, float)}. The second
+     * output has {@code convertedDataType}.
+     *
+     * @param input the input {@code NDArray}
+     * @param normalizedShape dimensions to calculate average and variance from
+     * @param gamma gamma weight {@code NDArray}
+     * @param beta beta weight {@code NDArray}
+     * @param eps a value added to the denominator for numerical stability
+     * @param convertedDataType the data type of the second output
+     * @return an {@code NDList} containing the ordinary LayerNorm output followed by its converted
+     *     copy
+     */
+    public static NDList layerNormAndCast(
+            NDArray input,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps,
+            DataType convertedDataType) {
+        NDArrayEx ex = input.getNDArrayInternal();
+        return ex.layerNormAndCast(input, normalizedShape, gamma, beta, eps, convertedDataType);
     }
 
     /**

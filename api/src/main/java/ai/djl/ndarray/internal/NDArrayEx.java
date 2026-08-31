@@ -751,6 +751,32 @@ public interface NDArrayEx {
 
     NDList layerNorm(NDArray input, Shape normalizedShape, NDArray gamma, NDArray beta, float eps);
 
+    /**
+     * Applies LayerNorm and returns its ordinary output together with a converted copy.
+     *
+     * <p>The default implementation composes the existing LayerNorm and type-conversion operations.
+     * Engines may override this method when both outputs can be produced more efficiently by one
+     * backend operation.
+     *
+     * @param input input tensor
+     * @param normalizedShape dimensions normalized by LayerNorm
+     * @param gamma affine scale
+     * @param beta affine bias
+     * @param eps numerical-stability epsilon
+     * @param convertedDataType data type of the second output
+     * @return ordinary LayerNorm output followed by an independently owned converted output
+     */
+    default NDList layerNormAndCast(
+            NDArray input,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps,
+            DataType convertedDataType) {
+        NDArray normalized = layerNorm(input, normalizedShape, gamma, beta, eps).singletonOrThrow();
+        return new NDList(normalized, normalized.toType(convertedDataType, true));
+    }
+
     NDList batchNorm(
             NDArray input,
             NDArray runningMean,
