@@ -30,6 +30,16 @@ bool is_fused_floating(const torch::Tensor& tensor) {
          tensor.scalar_type() == torch::kBFloat16;
 }
 
+bool supports_owned_residual_layer_norm_types(
+    torch::ScalarType residual_type, torch::ScalarType update_type, torch::ScalarType parameter_type) {
+  const bool supports_existing_parameter_type =
+      parameter_type == torch::kFloat32 || parameter_type == residual_type;
+  const bool supports_inference_parameter_type = residual_type == torch::kFloat32 &&
+      update_type == parameter_type &&
+      (parameter_type == torch::kFloat16 || parameter_type == torch::kBFloat16);
+  return supports_existing_parameter_type || supports_inference_parameter_type;
+}
+
 __device__ float maximum_propagating_nan(float left, float right) {
   return isnan(left) || isnan(right) ? NAN : fmaxf(left, right);
 }
@@ -1594,8 +1604,9 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
          bias.is_contiguous() && residual.dim() >= 1 && residual.size(-1) > 0 &&
          residual.sizes() == update.sizes() && weight.dim() == 1 && weight.size(0) == residual.size(-1) &&
          bias.sizes() == weight.sizes() && is_fused_floating(residual) && is_fused_floating(update) &&
-         weight.scalar_type() == bias.scalar_type() &&
-         (weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == residual.scalar_type()) &&
+         is_fused_floating(weight) && weight.scalar_type() == bias.scalar_type() &&
+         supports_owned_residual_layer_norm_types(
+             residual.scalar_type(), update.scalar_type(), weight.scalar_type()) &&
          update.device() == residual.device() && weight.device() == residual.device() &&
          bias.device() == residual.device();
 }
@@ -2440,9 +2451,11 @@ torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, cons
   const int64_t width = residual.size(-1);
   TORCH_CHECK(weight.dim() == 1 && weight.size(0) == width, "LayerNorm weight shape mismatch");
   TORCH_CHECK(bias.sizes() == weight.sizes(), "LayerNorm bias shape mismatch");
+  TORCH_CHECK(is_fused_floating(weight), "LayerNorm parameter dtype is unsupported");
   TORCH_CHECK(weight.scalar_type() == bias.scalar_type(), "LayerNorm parameter dtype mismatch");
-  TORCH_CHECK(weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == residual.scalar_type(),
-      "LayerNorm parameters must be float32 or match the residual dtype");
+  TORCH_CHECK(supports_owned_residual_layer_norm_types(
+                  residual.scalar_type(), update.scalar_type(), weight.scalar_type()),
+      "residual add LayerNorm dtype combination is unsupported");
   TORCH_CHECK(update.device() == residual.device() && weight.device() == residual.device() &&
                   bias.device() == residual.device(),
       "residual add LayerNorm inputs must be on the same device");
@@ -2486,19 +2499,15 @@ torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, cons
           AT_DISPATCH_FLOATING_TYPES_AND2(
               torch::kHalf, torch::kBFloat16, update.scalar_type(), "residual_add_layer_norm_update", [&] {
                 using update_t = scalar_t;
-                if (weight.scalar_type() == torch::kFloat32) {
+                AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+                    weight.scalar_type(), "residual_add_layer_norm_parameter", [&] {
+                  using parameter_t = scalar_t;
                   hipLaunchKernelGGL(
-                      HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, float>), grid,
-                      block, 0, stream, residual.data_ptr<residual_t>(), update.data_ptr<update_t>(),
-                      weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<residual_t>(), row_count,
-                      width, epsilon);
-                } else {
-                  hipLaunchKernelGGL(
-                      HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, residual_t>),
+                      HIP_KERNEL_NAME(residual_add_layer_norm_in_place_kernel<residual_t, update_t, parameter_t>),
                       grid, block, 0, stream, residual.data_ptr<residual_t>(), update.data_ptr<update_t>(),
-                      weight.data_ptr<residual_t>(), bias.data_ptr<residual_t>(), output.data_ptr<residual_t>(),
+                      weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(), output.data_ptr<residual_t>(),
                       row_count, width, epsilon);
-                }
+                });
               });
         });
   }

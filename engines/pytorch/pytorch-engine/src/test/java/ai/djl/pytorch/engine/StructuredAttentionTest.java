@@ -240,6 +240,56 @@ public class StructuredAttentionTest {
         }
     }
 
+    @Test
+    public void nativeResidualLayerNormSupportsMixedPrecisionParameters() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            verifyResidualLayerNormDataTypes(
+                    manager, DataType.FLOAT32, DataType.FLOAT16, DataType.FLOAT16, 5e-4f);
+            verifyResidualLayerNormDataTypes(
+                    manager, DataType.FLOAT32, DataType.BFLOAT16, DataType.BFLOAT16, 5e-4f);
+            verifyResidualLayerNormDataTypes(
+                    manager, DataType.FLOAT16, DataType.FLOAT16, DataType.FLOAT16, 2e-3f);
+            verifyResidualLayerNormDataTypes(
+                    manager, DataType.BFLOAT16, DataType.BFLOAT16, DataType.BFLOAT16, 2e-2f);
+        }
+    }
+
+    @Test
+    public void ownedResidualLayerNormFallsBackForUnsupportedNativeDtype() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            verifyResidualLayerNormDataTypes(
+                    manager, DataType.FLOAT32, DataType.FLOAT64, DataType.FLOAT32, 5e-4f);
+        }
+    }
+
+    @Test
+    public void ownedResidualLayerNormRejectsUnintendedMixedPrecisionParameters() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray residual = manager.ones(new Shape(2, 17));
+            NDArray update = manager.ones(new Shape(2, 17));
+            NDArray weight = manager.ones(new Shape(17)).toType(DataType.FLOAT16, false);
+            NDArray bias = manager.zeros(new Shape(17)).toType(DataType.FLOAT16, false);
+
+            Assert.expectThrows(
+                    RuntimeException.class,
+                    () ->
+                            NDArrays.addToOwnedResidualAndLayerNorm(
+                                    residual, update, weight, bias, 1.0e-5f));
+        }
+    }
+
     private static void verifyRelationAttentionLeadingDimensions(NDManager manager) {
         int batch = 2;
         int alternatives = 3;
@@ -922,6 +972,93 @@ public class StructuredAttentionTest {
             assertClose(residual.toFloatArray(), summed, 1e-6f);
             assertClose(normalized.toFloatArray(), expected, 3e-4f);
         }
+    }
+
+    private static void verifyResidualLayerNormDataTypes(
+            NDManager manager,
+            DataType residualType,
+            DataType updateType,
+            DataType parameterType,
+            float tolerance) {
+        int rowCount = 3;
+        int width = 257;
+        float[] residualValues = new float[rowCount * width];
+        float[] updateValues = new float[rowCount * width];
+        float[] weightValues = new float[width];
+        float[] biasValues = new float[width];
+        for (int index = 0; index < residualValues.length; index++) {
+            residualValues[index] = (index % 29 - 14) * 0.03125f;
+            updateValues[index] = (index % 13 - 6) * 0.015625f;
+        }
+        for (int feature = 0; feature < width; feature++) {
+            weightValues[feature] = 0.75f + (feature % 7) * 0.03125f;
+            biasValues[feature] = (feature % 5 - 2) * 0.015625f;
+        }
+
+        NDArray residual =
+                manager.create(residualValues, new Shape(rowCount, width))
+                        .toType(residualType, false);
+        NDArray update =
+                manager.create(updateValues, new Shape(rowCount, width)).toType(updateType, false);
+        NDArray weight = manager.create(weightValues).toType(parameterType, false);
+        NDArray bias = manager.create(biasValues).toType(parameterType, false);
+        float[] roundedResidual = residual.toType(DataType.FLOAT32, false).toFloatArray();
+        float[] roundedUpdate = update.toType(DataType.FLOAT32, false).toFloatArray();
+        float[] roundedWeight = weight.toType(DataType.FLOAT32, false).toFloatArray();
+        float[] roundedBias = bias.toType(DataType.FLOAT32, false).toFloatArray();
+        float[] summed = new float[residualValues.length];
+        float[] expected =
+                residualLayerNormReference(
+                        roundedResidual,
+                        roundedUpdate,
+                        roundedWeight,
+                        roundedBias,
+                        rowCount,
+                        width,
+                        1.0e-5f,
+                        summed);
+
+        NDArray normalized =
+                NDArrays.addToOwnedResidualAndLayerNorm(residual, update, weight, bias, 1.0e-5f);
+
+        assertClose(residual.toType(DataType.FLOAT32, false).toFloatArray(), summed, tolerance);
+        assertClose(normalized.toType(DataType.FLOAT32, false).toFloatArray(), expected, tolerance);
+    }
+
+    private static float[] residualLayerNormReference(
+            float[] residual,
+            float[] update,
+            float[] weight,
+            float[] bias,
+            int rowCount,
+            int width,
+            float epsilon,
+            float[] summed) {
+        float[] normalized = new float[residual.length];
+        for (int row = 0; row < rowCount; row++) {
+            int rowOffset = row * width;
+            double mean = 0.0;
+            for (int feature = 0; feature < width; feature++) {
+                int index = rowOffset + feature;
+                summed[index] = residual[index] + update[index];
+                mean += summed[index];
+            }
+            mean /= width;
+            double variance = 0.0;
+            for (int feature = 0; feature < width; feature++) {
+                double centered = summed[rowOffset + feature] - mean;
+                variance += centered * centered;
+            }
+            double inverseDeviation = 1.0 / Math.sqrt(variance / width + epsilon);
+            for (int feature = 0; feature < width; feature++) {
+                int index = rowOffset + feature;
+                normalized[index] =
+                        (float)
+                                ((summed[index] - mean) * inverseDeviation * weight[feature]
+                                        + bias[feature]);
+            }
+        }
+        return normalized;
     }
 
     private static void assertClose(float[] actual, float[] expected, float tolerance) {
