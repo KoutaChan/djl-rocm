@@ -443,6 +443,18 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchS
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSegmentedLookupSum(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jstored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jstored_indices_handle);
+  auto result = djl::pytorch::segmented_lookup_sum(*tensor_ptr, *stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGather(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jstored_indices_handle) {
   API_BEGIN()

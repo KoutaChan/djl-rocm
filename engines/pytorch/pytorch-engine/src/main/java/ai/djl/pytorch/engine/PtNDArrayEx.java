@@ -60,6 +60,16 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray segmentedLookupSum(NDArray storedIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.segmentedLookupSum(storedIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.segmentedLookupSum(array, manager.from(storedIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray paddedBatchGather(NDArray storedIndices) {
         if (!array.getDevice().isGpu()) {
             return NDArrayEx.super.paddedBatchGather(storedIndices);

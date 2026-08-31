@@ -53,6 +53,24 @@ public final class NDArrays {
     }
 
     /**
+     * Sums one lookup row from each contiguous table segment.
+     *
+     * <p>The lookup table is shaped {@code [segments * entriesPerSegment, ...]}. Stored indices are
+     * one-based {@code INT16}, {@code INT32}, or {@code INT64} values shaped {@code [...,
+     * segments]}; values are clamped to the segment range, so zero selects the first row of its
+     * segment. The returned shape removes the trailing segment axis and appends every lookup-table
+     * dimension after its leading row axis. Engines may fuse index normalization, lookup, and
+     * reduction while retaining a differentiable eager fallback.
+     *
+     * @param lookupTable contiguous row segments followed by value dimensions
+     * @param storedIndices one-based row indices for every segment
+     * @return sum of one selected row from every segment
+     */
+    public static NDArray segmentedLookupSum(NDArray lookupTable, NDArray storedIndices) {
+        return lookupTable.getNDArrayInternal().segmentedLookupSum(storedIndices);
+    }
+
+    /**
      * Selects entries from a separate table in every batch while preserving padding.
      *
      * <p>The source must be shaped {@code [batch, entries, ...]}. Stored indices are one-based and

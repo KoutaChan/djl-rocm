@@ -382,6 +382,49 @@ __device__ int64_t padded_batch_gather_index_value(
   return 0;
 }
 
+template <int group_width, typename scalar_t>
+__global__ void segmented_lookup_sum_kernel(const scalar_t* lookup_table,
+    const void* stored_indices, scalar_t* output, PaddedBatchGatherIndexType index_type,
+    PaddedBatchGatherIndexLayout index_layout, int64_t output_rows, int64_t segment_count,
+    int64_t entries_per_segment, int64_t row_width) {
+  const int lane = threadIdx.x % group_width;
+  const int group = threadIdx.x / group_width;
+  const int groups_per_block = blockDim.x / group_width;
+  extern __shared__ int64_t index_offsets[];
+  for (int64_t first_row = static_cast<int64_t>(blockIdx.x) * groups_per_block;
+       first_row < output_rows;
+       first_row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t output_row = first_row + group;
+    if (lane == 0) {
+      index_offsets[group] = output_row < output_rows
+          ? padded_batch_gather_index_offset(output_row * segment_count, index_layout)
+          : 0;
+    }
+    __syncthreads();
+    if (output_row < output_rows) {
+      const int64_t first_index_offset = index_offsets[group];
+      for (int64_t column = lane; column < row_width; column += group_width) {
+        float total = 0.0f;
+        for (int64_t segment = 0; segment < segment_count; ++segment) {
+          const int64_t index_offset =
+              first_index_offset + segment * index_layout.strides[index_layout.rank - 1];
+          int64_t stored_index =
+              padded_batch_gather_index_value(stored_indices, index_offset, index_type);
+          stored_index = stored_index < 1 ? 1 : stored_index;
+          stored_index = stored_index > entries_per_segment
+              ? entries_per_segment
+              : stored_index;
+          const int64_t table_row =
+              segment * entries_per_segment + stored_index - 1;
+          total += static_cast<float>(lookup_table[table_row * row_width + column]);
+        }
+        output[output_row * row_width + column] = static_cast<scalar_t>(total);
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <int group_width, typename scalar_t, typename stored_index_t,
     bool has_inner_indices, bool has_explicit_batch_indices>
 __global__ void padded_batch_gather_kernel(const scalar_t* source,
@@ -1610,6 +1653,56 @@ torch::Tensor dispatch_padded_batch_gather(const torch::Tensor& source,
   }
 }
 
+torch::Tensor launch_segmented_lookup_sum(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
+  const int64_t segment_count = stored_indices.size(-1);
+  const int64_t entries_per_segment = lookup_table.size(0) / segment_count;
+  const int64_t output_rows = stored_indices.numel() / segment_count;
+  const int64_t row_width = lookup_table.numel() / lookup_table.size(0);
+  auto output_shape = stored_indices.sizes().vec();
+  output_shape.pop_back();
+  output_shape.insert(
+      output_shape.end(), lookup_table.sizes().begin() + 1, lookup_table.sizes().end());
+  auto output = torch::empty(output_shape, lookup_table.options());
+  if (output.numel() == 0) {
+    return output;
+  }
+
+  const auto& properties = device_properties(lookup_table.get_device());
+  const int group_width = padded_batch_gather_group_width(row_width, properties.warpSize);
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().padded_batch_gather_threads_per_block,
+      launch_environment::kPaddedBatchGatherThreadsPerBlock, false);
+  TORCH_CHECK(threads_per_block % group_width == 0,
+      launch_environment::kPaddedBatchGatherThreadsPerBlock,
+      " must be divisible by the selected lookup group width ", group_width);
+  const int groups_per_block = threads_per_block / group_width;
+  const int64_t required_blocks = (output_rows + groups_per_block - 1) / groups_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  c10::DeviceGuard device_guard(lookup_table.device());
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(lookup_table.get_device()).stream();
+  const auto index_layout = padded_batch_gather_index_layout(stored_indices);
+  const auto index_type = padded_batch_gather_index_type(stored_indices);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+      lookup_table.scalar_type(), "segmented_lookup_sum", [&] {
+        dispatch_padded_batch_gather_group_width(group_width, [&](auto width) {
+          constexpr int compiled_group_width = decltype(width)::value;
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(segmented_lookup_sum_kernel<compiled_group_width, scalar_t>),
+              dim3(blocks), dim3(threads_per_block),
+              groups_per_block * static_cast<int>(sizeof(int64_t)), stream,
+              lookup_table.data_ptr<scalar_t>(), stored_indices.data_ptr(),
+              output.data_ptr<scalar_t>(), index_type, index_layout, output_rows,
+              segment_count, entries_per_segment, row_width);
+        });
+      });
+  check_hip_kernel_launch("segmented lookup sum");
+  return output;
+}
+
 }  // namespace
 
 bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
@@ -1758,6 +1851,16 @@ bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_i
   return rows.is_cuda() && rows.is_contiguous() && is_fused_floating(rows) &&
          row_indices.is_cuda() && row_indices.is_contiguous() &&
          row_indices.scalar_type() == torch::kInt64 && row_indices.device() == rows.device();
+}
+
+bool supports_segmented_lookup_sum(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
+  return lookup_table.is_cuda() && lookup_table.is_contiguous() &&
+      is_fused_floating(lookup_table) && lookup_table.dim() >= 2 &&
+      lookup_table.size(0) > 0 && stored_indices.dim() >= 1 &&
+      stored_indices.size(-1) > 0 &&
+      lookup_table.size(0) % stored_indices.size(-1) == 0 &&
+      has_supported_padded_gather_index_layout(stored_indices, lookup_table.device());
 }
 
 bool supports_padded_batch_gather(
@@ -2106,6 +2209,13 @@ torch::Tensor scatter_rows_backward(
       });
   check_hip_kernel_launch("scatter_rows_backward");
   return gradient_rows;
+}
+
+torch::Tensor segmented_lookup_sum_forward(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
+  TORCH_CHECK(supports_segmented_lookup_sum(lookup_table, stored_indices),
+      "segmented lookup sum received an unsupported ROCm tensor layout");
+  return launch_segmented_lookup_sum(lookup_table, stored_indices);
 }
 
 torch::Tensor padded_batch_gather_forward(

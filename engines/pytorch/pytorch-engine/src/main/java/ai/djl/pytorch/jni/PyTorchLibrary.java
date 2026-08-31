@@ -407,6 +407,8 @@ final class PyTorchLibrary {
 
     native long torchScatterRows(long handle, long index, long rowCount);
 
+    native long torchSegmentedLookupSum(long handle, long storedIndices);
+
     native long torchPaddedBatchGather(long handle, long storedIndices);
 
     native long torchPaddedBatchGather2d(

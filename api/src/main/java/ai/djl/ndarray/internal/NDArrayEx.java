@@ -73,6 +73,63 @@ public interface NDArrayEx {
                 .reshape(new Shape(outputShape));
     }
 
+    /** Sums one lookup row from each contiguous table segment. */
+    default NDArray segmentedLookupSum(NDArray storedIndices) {
+        NDArray lookupTable = getArray();
+        Shape tableShape = lookupTable.getShape();
+        Shape indexShape = storedIndices.getShape();
+        DataType indexType = storedIndices.getDataType();
+        int indexRank = indexShape.dimension();
+        if (indexType != DataType.INT16
+                && indexType != DataType.INT32
+                && indexType != DataType.INT64) {
+            throw new IllegalArgumentException(
+                    "segmented lookup indices must be INT16, INT32, or INT64: " + indexType);
+        }
+        if (tableShape.dimension() < 2
+                || indexRank < 1
+                || tableShape.get(0) <= 0
+                || indexShape.get(indexRank - 1) <= 0
+                || tableShape.get(0) % indexShape.get(indexRank - 1) != 0) {
+            throw new IllegalArgumentException(
+                    "segmented lookup sum requires table [segments * entries,...] and indices "
+                            + "[...,segments]: "
+                            + tableShape
+                            + " / "
+                            + indexShape);
+        }
+        long segmentCount = indexShape.get(indexRank - 1);
+        long entriesPerSegment = tableShape.get(0) / segmentCount;
+        NDArray segmentOffsets =
+                lookupTable
+                        .getManager()
+                        .arange(segmentCount)
+                        .toType(DataType.INT64, false)
+                        .mul(entriesPerSegment);
+        NDArray rowIndices =
+                storedIndices
+                        .toType(DataType.INT64, false)
+                        .maximum(1)
+                        .minimum(entriesPerSegment)
+                        .sub(1)
+                        .add(segmentOffsets)
+                        .reshape(-1)
+                        .stopGradient();
+
+        long[] gatheredShape = new long[indexRank + tableShape.dimension() - 1];
+        System.arraycopy(indexShape.getShape(), 0, gatheredShape, 0, indexRank);
+        System.arraycopy(
+                tableShape.getShape(), 1, gatheredShape, indexRank, tableShape.dimension() - 1);
+        long[] outputShape = new long[gatheredShape.length - 1];
+        System.arraycopy(gatheredShape, 0, outputShape, 0, indexRank - 1);
+        System.arraycopy(
+                gatheredShape, indexRank, outputShape, indexRank - 1, tableShape.dimension() - 1);
+        return NDArrays.gatherRows(lookupTable, rowIndices)
+                .reshape(new Shape(gatheredShape))
+                .sum(new int[] {indexRank - 1})
+                .reshape(new Shape(outputShape));
+    }
+
     /** Selects one-based per-batch table entries while preserving zero padding. */
     default NDArray paddedBatchGather(NDArray storedIndices) {
         NDArray source = getArray();

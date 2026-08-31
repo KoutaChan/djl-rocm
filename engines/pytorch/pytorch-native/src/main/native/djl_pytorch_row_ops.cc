@@ -29,6 +29,25 @@ torch::Tensor scatter_rows_reference(
   return torch::zeros(output_shape, rows.options()).index_copy(0, row_indices, rows);
 }
 
+torch::Tensor segmented_lookup_sum_reference(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
+  const int64_t segment_count = stored_indices.size(-1);
+  const int64_t entries_per_segment = lookup_table.size(0) / segment_count;
+  auto offsets = torch::arange(segment_count, stored_indices.options().dtype(torch::kInt64))
+                     .mul(entries_per_segment);
+  auto row_indices = stored_indices.to(torch::kInt64)
+                         .clamp(1, entries_per_segment)
+                         .sub(1)
+                         .add(offsets)
+                         .reshape({-1});
+  auto gathered_shape = stored_indices.sizes().vec();
+  gathered_shape.insert(
+      gathered_shape.end(), lookup_table.sizes().begin() + 1, lookup_table.sizes().end());
+  return lookup_table.index_select(0, row_indices)
+      .reshape(gathered_shape)
+      .sum(stored_indices.dim() - 1);
+}
+
 bool is_index_type(const torch::Tensor& indices) {
   return indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
       indices.scalar_type() == torch::kInt64;
@@ -127,6 +146,28 @@ torch::Tensor scatter_rows(
   }
 #endif
   return scatter_rows_reference(rows, indices, row_count);
+}
+
+torch::Tensor segmented_lookup_sum(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
+  TORCH_CHECK(lookup_table.dim() >= 2,
+      "segmented lookup sum requires a table with at least two dimensions");
+  TORCH_CHECK(stored_indices.dim() >= 1 && stored_indices.size(-1) > 0,
+      "segmented lookup sum requires a nonempty trailing segment dimension");
+  TORCH_CHECK(lookup_table.size(0) > 0 &&
+          lookup_table.size(0) % stored_indices.size(-1) == 0,
+      "lookup table rows must divide evenly across the stored-index segments");
+  TORCH_CHECK(is_index_type(stored_indices),
+      "segmented lookup indices must be int16, int32, or int64");
+  TORCH_CHECK(lookup_table.device() == stored_indices.device(),
+      "segmented lookup table and stored indices must share a device");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() &&
+      rocm::supports_segmented_lookup_sum(lookup_table, stored_indices)) {
+    return rocm::segmented_lookup_sum_forward(lookup_table, stored_indices);
+  }
+#endif
+  return segmented_lookup_sum_reference(lookup_table, stored_indices);
 }
 
 torch::Tensor padded_batch_gather(

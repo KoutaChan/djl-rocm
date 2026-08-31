@@ -836,6 +836,14 @@ public final class JniUtils {
                         rows.getHandle(), rowIndices.getHandle(), rowCount));
     }
 
+    /** Sums one lookup row from each contiguous table segment. */
+    public static PtNDArray segmentedLookupSum(PtNDArray lookupTable, PtNDArray storedIndices) {
+        return new PtNDArray(
+                lookupTable.getManager(),
+                PyTorchLibrary.LIB.torchSegmentedLookupSum(
+                        lookupTable.getHandle(), storedIndices.getHandle()));
+    }
+
     /** Selects one-based entries from an independent table in each batch. */
     public static PtNDArray paddedBatchGather(PtNDArray source, PtNDArray storedIndices) {
         return new PtNDArray(

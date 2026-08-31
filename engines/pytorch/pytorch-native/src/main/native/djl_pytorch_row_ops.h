@@ -20,6 +20,9 @@ namespace djl::pytorch {
 torch::Tensor scatter_rows(
     const torch::Tensor& rows, const torch::Tensor& row_indices, int64_t row_count);
 
+torch::Tensor segmented_lookup_sum(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
+
 torch::Tensor padded_batch_gather(
     const torch::Tensor& source, const torch::Tensor& stored_indices);
 
