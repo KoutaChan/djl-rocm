@@ -167,6 +167,18 @@ endif()
 if(USE_ROCM AND NOT BUILD_ANDROID)
     target_compile_definitions(djl_torch PRIVATE DJL_USE_ROCM_KERNELS)
     set_property(TARGET djl_torch PROPERTY HIP_STANDARD 17)
+    find_path(HIPBLASLT_INCLUDE_DIR
+        NAMES hipblaslt/hipblaslt.h
+        HINTS $ENV{ROCM_PATH} /opt/rocm
+        PATH_SUFFIXES include
+        REQUIRED)
+    find_library(HIPBLASLT_LIBRARY
+        NAMES hipblaslt
+        HINTS $ENV{ROCM_PATH} /opt/rocm
+        PATH_SUFFIXES lib lib64
+        REQUIRED)
+    target_include_directories(djl_torch PRIVATE ${HIPBLASLT_INCLUDE_DIR})
+    target_link_libraries(djl_torch ${HIPBLASLT_LIBRARY})
 endif()
 
 # build host

@@ -12,18 +12,154 @@
  */
 #include "djl_pytorch_fusion_kernels.h"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 namespace djl::pytorch::fusion {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+
+void CheckHipBlasLt(hipblasStatus_t status, const char* operation) {
+  TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS, operation,
+      " failed with hipBLASLt status ", static_cast<int>(status));
+}
+
+hipDataType HipBlasLtDataType(torch::ScalarType data_type) {
+  switch (data_type) {
+    case torch::kFloat16:
+      return HIP_R_16F;
+    case torch::kBFloat16:
+      return HIP_R_16BF;
+    case torch::kFloat32:
+      return HIP_R_32F;
+    default:
+      TORCH_CHECK(false, "unsupported hipBLASLt data type");
+  }
+}
+
+struct LinearBiasSiluKey {
+  int32_t device;
+  torch::ScalarType data_type;
+  int64_t rows;
+  int64_t input_width;
+  int64_t output_width;
+
+  bool operator==(const LinearBiasSiluKey& other) const {
+    return device == other.device && data_type == other.data_type &&
+        rows == other.rows && input_width == other.input_width &&
+        output_width == other.output_width;
+  }
+};
+
+struct LinearBiasSiluKeyHash {
+  std::size_t operator()(const LinearBiasSiluKey& key) const {
+    std::size_t value = static_cast<std::size_t>(key.device);
+    value = value * 31 + static_cast<std::size_t>(key.data_type);
+    value = value * 31 + static_cast<std::size_t>(key.rows);
+    value = value * 31 + static_cast<std::size_t>(key.input_width);
+    return value * 31 + static_cast<std::size_t>(key.output_width);
+  }
+};
+
+class LinearBiasSiluExecutable {
+ public:
+  LinearBiasSiluExecutable(const LinearBiasSiluKey& key,
+      const torch::Tensor& bias) {
+    const hipDataType data_type = HipBlasLtDataType(key.data_type);
+    CheckHipBlasLt(hipblasLtMatmulDescCreate(
+        &operation_, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+        "hipblasLtMatmulDescCreate");
+    const hipblasLtEpilogue_t epilogue =
+        HIPBLASLT_EPILOGUE_SWISH_BIAS_EXT;
+    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+        HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)),
+        "hipblasLtMatmulDescSetAttribute(epilogue)");
+    const void* bias_pointer = bias.const_data_ptr();
+    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+        HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
+        sizeof(bias_pointer)),
+        "hipblasLtMatmulDescSetAttribute(bias)");
+    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+        HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &data_type,
+        sizeof(data_type)),
+        "hipblasLtMatmulDescSetAttribute(bias type)");
+
+    // Contiguous row-major [M,K] * [K,N] is the same memory as the
+    // column-major product [N,K] * [K,M] -> [N,M]. This also makes the
+    // hipBLASLt bias dimension N, matching a Linear output channel.
+    CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&weight_, data_type,
+        key.output_width, key.input_width, key.output_width),
+        "hipblasLtMatrixLayoutCreate(weight)");
+    CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&input_, data_type,
+        key.input_width, key.rows, key.input_width),
+        "hipblasLtMatrixLayoutCreate(input)");
+    CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&output_, data_type,
+        key.output_width, key.rows, key.output_width),
+        "hipblasLtMatrixLayoutCreate(output)");
+
+    hipblasLtMatmulPreference_t preference = nullptr;
+    CheckHipBlasLt(hipblasLtMatmulPreferenceCreate(&preference),
+        "hipblasLtMatmulPreferenceCreate");
+    const size_t workspace_size = at::cuda::getCUDABlasLtWorkspaceSize();
+    CheckHipBlasLt(hipblasLtMatmulPreferenceSetAttribute(preference,
+        HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
+        sizeof(workspace_size)),
+        "hipblasLtMatmulPreferenceSetAttribute");
+    hipblasLtMatmulHeuristicResult_t result{};
+    int result_count = 0;
+    const hipblasStatus_t heuristic_status = hipblasLtMatmulAlgoGetHeuristic(
+        at::cuda::getCurrentCUDABlasLtHandle(), operation_, weight_, input_,
+        output_, output_, preference, 1, &result, &result_count);
+    hipblasLtMatmulPreferenceDestroy(preference);
+    CheckHipBlasLt(heuristic_status, "hipblasLtMatmulAlgoGetHeuristic");
+    TORCH_CHECK(result_count == 1 && result.state == HIPBLAS_STATUS_SUCCESS,
+        "hipBLASLt has no Swish-bias GEMM algorithm for the requested shape");
+    algorithm_ = result.algo;
+    workspace_size_ = result.workspaceSize;
+  }
+
+  ~LinearBiasSiluExecutable() {
+    hipblasLtMatrixLayoutDestroy(output_);
+    hipblasLtMatrixLayoutDestroy(input_);
+    hipblasLtMatrixLayoutDestroy(weight_);
+    hipblasLtMatmulDescDestroy(operation_);
+  }
+
+  LinearBiasSiluExecutable(const LinearBiasSiluExecutable&) = delete;
+  LinearBiasSiluExecutable& operator=(const LinearBiasSiluExecutable&) = delete;
+
+  void Run(torch::Tensor& output, const torch::Tensor& input,
+      const torch::Tensor& weight) const {
+    constexpr float alpha = 1.0f;
+    constexpr float beta = 0.0f;
+    void* workspace = at::cuda::getCUDABlasLtWorkspace();
+    CheckHipBlasLt(hipblasLtMatmul(
+        at::cuda::getCurrentCUDABlasLtHandle(), operation_, &alpha,
+        weight.const_data_ptr(), weight_, input.const_data_ptr(), input_,
+        &beta, output.const_data_ptr(), output_, output.data_ptr(), output_,
+        &algorithm_, workspace, workspace_size_,
+        at::hip::getCurrentHIPStream(output.get_device()).stream()),
+        "hipblasLtMatmul(Swish-bias)");
+  }
+
+ private:
+  hipblasLtMatmulDesc_t operation_ = nullptr;
+  hipblasLtMatrixLayout_t weight_ = nullptr;
+  hipblasLtMatrixLayout_t input_ = nullptr;
+  hipblasLtMatrixLayout_t output_ = nullptr;
+  hipblasLtMatmulAlgo_t algorithm_{};
+  size_t workspace_size_ = 0;
+};
 
 int64_t CheckedMultiply(int64_t left, int64_t right, const char* name) {
   TORCH_CHECK(left >= 0 && right >= 0, name, " factors must not be negative");
@@ -1526,6 +1662,61 @@ void CheckHipLaunch(const char* kernel_name) {
 }
 
 }  // namespace
+
+class LinearBiasSiluPlan {
+ public:
+  std::shared_ptr<LinearBiasSiluExecutable> GetOrCreate(
+      const LinearBiasSiluKey& key, const torch::Tensor& bias) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = executables_.find(key);
+    if (found != executables_.end()) {
+      return found->second;
+    }
+    auto executable =
+        std::make_shared<LinearBiasSiluExecutable>(key, bias);
+    executables_.emplace(key, executable);
+    return executable;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<LinearBiasSiluKey,
+      std::shared_ptr<LinearBiasSiluExecutable>, LinearBiasSiluKeyHash>
+      executables_;
+};
+
+std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan() {
+  return std::make_shared<LinearBiasSiluPlan>();
+}
+
+bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>& plan,
+    torch::Tensor& output, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias) {
+  if (output.scalar_type() != torch::kFloat16) {
+    return false;
+  }
+  TORCH_CHECK(plan != nullptr, "linear bias-SiLU plan must not be null");
+  TORCH_CHECK(output.is_cuda() && input.is_cuda() && weight.is_cuda() &&
+          bias.is_cuda(),
+      "linear bias-SiLU tensors must be on a ROCm device");
+  TORCH_CHECK(output.is_contiguous() && input.is_contiguous() &&
+          weight.is_contiguous() && bias.is_contiguous(),
+      "linear bias-SiLU tensors must be contiguous");
+  TORCH_CHECK(output.dim() == 2 && input.dim() == 2 && weight.dim() == 2 &&
+          bias.dim() == 1 && output.size(0) == input.size(0) &&
+          input.size(1) == weight.size(0) &&
+          output.size(1) == weight.size(1) &&
+          bias.size(0) == output.size(1),
+      "linear bias-SiLU tensor shapes are inconsistent");
+  TORCH_CHECK(input.scalar_type() == output.scalar_type() &&
+          weight.scalar_type() == output.scalar_type() &&
+          bias.scalar_type() == output.scalar_type(),
+      "linear bias-SiLU tensor data types are inconsistent");
+  const LinearBiasSiluKey key{output.get_device(), output.scalar_type(),
+      output.size(0), input.size(1), output.size(1)};
+  plan->GetOrCreate(key, bias)->Run(output, input, weight);
+  return true;
+}
 
 template <typename output_t>
 void LaunchOutputPackTyped(const OutputPackArguments& arguments,

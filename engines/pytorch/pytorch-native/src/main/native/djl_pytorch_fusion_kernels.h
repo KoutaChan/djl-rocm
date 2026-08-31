@@ -16,6 +16,7 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <memory>
 
 namespace djl::pytorch::fusion {
 
@@ -26,6 +27,27 @@ inline constexpr int32_t kMaximumAffinePrefixRank = 8;
 inline constexpr int32_t kMaximumIndexedAffineSources = 32;
 inline constexpr int32_t kMaximumIndexedAffineOutputWidth = 32;
 inline constexpr int32_t kMaximumIndexedLocalTransformerSegments = 8;
+
+class LinearBiasSiluPlan;
+
+/**
+ * Creates a reusable ROCm linear epilogue plan.
+ *
+ * <p>The plan caches shape-specific hipBLASLt descriptors and algorithms. It owns only host-side
+ * metadata; inputs, weights, outputs, and the PyTorch BLAS workspace remain externally owned.
+ */
+std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan();
+
+/**
+ * Executes {@code output = silu(input * weight + bias)} with a hipBLASLt epilogue when supported.
+ *
+ * <p>All tensors are two-dimensional row-major matrices except the one-dimensional bias. The
+ * weight is laid out as {@code [inputWidth, outputWidth]}. The method returns {@code false} for a
+ * data type or shape that must use the ordinary PyTorch path.
+ */
+bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>& plan,
+    torch::Tensor& output, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias);
 
 struct OutputPackSource {
   const void* data;
