@@ -58,6 +58,7 @@ final class PtFusionDescriptor {
     static final long AFFINE_SUM_V1 = 2;
     static final long INDEXED_AFFINE_V1 = 3;
     static final long TRANSFORMER_ENCODER_STACK_V1 = 4;
+    static final long BINARY_BRANCH_BLEND_V1 = 5;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
@@ -125,6 +126,8 @@ final class PtFusionDescriptor {
                                 commandWords,
                                 transformerEncoderStackCommandWords(
                                         (FusionRecipe.TransformerEncoderStack) value));
+            } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
+                commandWords = Math.addExact(commandWords, binaryBranchBlendCommandWords());
             } else if (!(value instanceof FusionRecipe.Input)
                     && !(value instanceof FusionRecipe.Constant)) {
                 throw new UnsupportedOperationException(
@@ -188,6 +191,8 @@ final class PtFusionDescriptor {
             } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
                 putTransformerEncoderStackCommand(
                         descriptor, (FusionRecipe.TransformerEncoderStack) value);
+            } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
+                putBinaryBranchBlendCommand(descriptor, (FusionRecipe.BinaryBranchBlend) value);
             }
         }
         for (FusionRecipe.Output output : recipe.getOutputs()) {
@@ -211,6 +216,8 @@ final class PtFusionDescriptor {
             } else if (value instanceof FusionRecipe.IndexedAffine) {
                 ++count;
             } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
+                ++count;
+            } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 ++count;
             }
         }
@@ -312,7 +319,8 @@ final class PtFusionDescriptor {
         return value instanceof FusionRecipe.OutputPack
                 || value instanceof FusionRecipe.AffineSum
                 || value instanceof FusionRecipe.IndexedAffine
-                || value instanceof FusionRecipe.TransformerEncoderStack;
+                || value instanceof FusionRecipe.TransformerEncoderStack
+                || value instanceof FusionRecipe.BinaryBranchBlend;
     }
 
     private static long transformerWorkspaceBytes(FusionRecipe recipe) {
@@ -678,6 +686,26 @@ final class PtFusionDescriptor {
         putScalarAttribute(descriptor, TRANSFORMER_ATTENTION_WIDTH, stack.getAttentionWidth());
         putScalarAttribute(descriptor, TRANSFORMER_FEED_FORWARD_WIDTH, stack.getFeedForwardWidth());
         putFloatAttribute(descriptor, TRANSFORMER_EPSILON, stack.getEpsilon());
+    }
+
+    private static int binaryBranchBlendCommandWords() {
+        return COMMAND_RECORD_HEADER_WORDS + 1 + 5;
+    }
+
+    private static void putBinaryBranchBlendCommand(
+            ByteBuffer descriptor, FusionRecipe.BinaryBranchBlend blend) {
+        descriptor.putLong(binaryBranchBlendCommandWords());
+        descriptor.putLong(BINARY_BRANCH_BLEND_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(5);
+        descriptor.putLong(0);
+        descriptor.putLong(blend.getIndex());
+        descriptor.putLong(blend.getBaselineContext().getIndex());
+        descriptor.putLong(blend.getSelectedContext().getIndex());
+        descriptor.putLong(blend.getSelectedLogit().getIndex());
+        descriptor.putLong(blend.getBaselinePresence().getIndex());
+        descriptor.putLong(blend.getSelectedPresence().getIndex());
     }
 
     private static void putScalarAttribute(ByteBuffer descriptor, long key, long value) {

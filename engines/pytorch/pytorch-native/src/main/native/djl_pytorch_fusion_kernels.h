@@ -36,6 +36,13 @@ struct OutputPackSource {
 void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
     torch::Tensor& output, int64_t row_count, int64_t output_width);
 
+void LaunchBinaryBranchBlend(const torch::Tensor& baseline_context,
+    const torch::Tensor& selected_context,
+    const torch::Tensor& selected_logit,
+    const torch::Tensor& baseline_presence,
+    const torch::Tensor& selected_presence, torch::Tensor& output,
+    int64_t row_count, int64_t width);
+
 struct AffineInputPackSource {
   const void* data;
   torch::ScalarType data_type;

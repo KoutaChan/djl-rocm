@@ -226,6 +226,98 @@ public class PtFusionTest {
     }
 
     @Test
+    public void binaryBranchBlendDescriptorUsesClosedOperandOrder() {
+        BinaryBranchBlendFixture fixture = new BinaryBranchBlendFixture();
+        ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.BINARY_BRANCH_BLEND_V1);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 2) * Long.BYTES), 0L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 3) * Long.BYTES), 1L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 5L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 5) * Long.BYTES), 0L);
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 6) * Long.BYTES), fixture.blend.getIndex());
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 7) * Long.BYTES),
+                fixture.baselineContext.getIndex());
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 8) * Long.BYTES),
+                fixture.selectedContext.getIndex());
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 9) * Long.BYTES),
+                fixture.selectedLogit.getIndex());
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 10) * Long.BYTES),
+                fixture.baselinePresence.getIndex());
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 11) * Long.BYTES),
+                fixture.selectedPresence.getIndex());
+        Assert.assertEquals(PtFusionDescriptor.commandCount(fixture.recipe), 1);
+        Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(fixture.recipe), 48L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(fixture.recipe), 0L);
+    }
+
+    @Test
+    public void rocmBinaryBranchBlendMatchesPresenceSemantics() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        BinaryBranchBlendFixture fixture = new BinaryBranchBlendFixture();
+        Device device = Device.gpu(0);
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray baseline =
+                        typed(
+                                manager,
+                                DataType.FLOAT16,
+                                new float[] {2f, 4f, 6f, 10f, 20f, 30f, 1f, 2f, 3f, 7f, 8f, 9f},
+                                new Shape(4, 3));
+                NDArray selected =
+                        typed(
+                                manager,
+                                DataType.BFLOAT16,
+                                new float[] {6f, 8f, 10f, 40f, 50f, 60f, 4f, 5f, 6f, 1f, 2f, 3f},
+                                new Shape(4, 3));
+                NDArray selectedLogit =
+                        typed(
+                                manager,
+                                DataType.FLOAT16,
+                                new float[] {0f, 20f, -20f, 0f},
+                                new Shape(4, 1));
+                NDArray baselinePresence =
+                        typed(
+                                manager,
+                                DataType.BFLOAT16,
+                                new float[] {1f, 1f, 0f, 0f},
+                                new Shape(4, 1));
+                NDArray selectedPresence =
+                        manager.create(new float[] {1f, 0f, 1f, 0f}, new Shape(4, 1));
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                FusionSession session =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                FusionInvocation invocation = session.acquire()) {
+            invocation.setInput(fixture.baselineContext, baseline);
+            invocation.setInput(fixture.selectedContext, selected);
+            invocation.setInput(fixture.selectedLogit, selectedLogit);
+            invocation.setInput(fixture.baselinePresence, baselinePresence);
+            invocation.setInput(fixture.selectedPresence, selectedPresence);
+            invocation.setDimension(fixture.rows, 4);
+            try (FusionOutputLease lease = invocation.submit()) {
+                lease.synchronize();
+                Assert.assertEquals(
+                        lease.get(fixture.output).toFloatArray(),
+                        new float[] {4f, 6f, 8f, 10f, 20f, 30f, 4f, 5f, 6f, 0f, 0f, 0f},
+                        1e-3f);
+            }
+        }
+    }
+
+    @Test
     public void rocmTransformerEncoderStackMatchesEagerReference() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -1727,6 +1819,53 @@ public class PtFusionTest {
         }
         if (cause != null) {
             throw new AssertionError("Fusion test thread failed.", cause);
+        }
+    }
+
+    private static final class BinaryBranchBlendFixture {
+
+        private final FusionRecipe.Dimension rows;
+        private final FusionRecipe.Input baselineContext;
+        private final FusionRecipe.Input selectedContext;
+        private final FusionRecipe.Input selectedLogit;
+        private final FusionRecipe.Input baselinePresence;
+        private final FusionRecipe.Input selectedPresence;
+        private final FusionRecipe.BinaryBranchBlend blend;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private BinaryBranchBlendFixture() {
+            FusionRecipe.Builder builder = FusionRecipe.builder("binary-branch-blend");
+            rows = builder.addDimension("rows", 4);
+            baselineContext =
+                    builder.addInput(
+                            "baselineContext",
+                            FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 3));
+            selectedContext =
+                    builder.addInput(
+                            "selectedContext",
+                            FusionRecipe.TensorSpec.of(DataType.BFLOAT16, rows, 3));
+            selectedLogit =
+                    builder.addInput(
+                            "selectedLogit", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 1));
+            baselinePresence =
+                    builder.addInput(
+                            "baselinePresence",
+                            FusionRecipe.TensorSpec.of(DataType.BFLOAT16, rows, 1));
+            selectedPresence =
+                    builder.addInput(
+                            "selectedPresence",
+                            FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 1));
+            blend =
+                    builder.binaryBranchBlend(
+                            "blend",
+                            baselineContext,
+                            selectedContext,
+                            selectedLogit,
+                            baselinePresence,
+                            selectedPresence);
+            output = builder.addOutput("output", blend);
+            recipe = builder.build();
         }
     }
 

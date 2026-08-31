@@ -99,6 +99,85 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void binaryBranchBlendBuildsPresenceAwareGraph() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("binary-branch-blend");
+        FusionRecipe.Dimension rows = builder.addDimension("rows", 32);
+        FusionRecipe.Input baseline =
+                builder.addInput(
+                        "baseline", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 256));
+        FusionRecipe.Input selected =
+                builder.addInput(
+                        "selected", FusionRecipe.TensorSpec.of(DataType.BFLOAT16, rows, 256));
+        FusionRecipe.Input selectedLogit =
+                builder.addInput(
+                        "selectedLogit", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 1));
+        FusionRecipe.Input baselinePresence =
+                builder.addInput(
+                        "baselinePresence", FusionRecipe.TensorSpec.of(DataType.BFLOAT16, rows, 1));
+        FusionRecipe.Input selectedPresence =
+                builder.addInput(
+                        "selectedPresence", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 1));
+
+        FusionRecipe.BinaryBranchBlend blend =
+                builder.binaryBranchBlend(
+                        "blend",
+                        baseline,
+                        selected,
+                        selectedLogit,
+                        baselinePresence,
+                        selectedPresence);
+        builder.addOutput("output", blend);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertEquals(blend.getSpec().getDataType(), DataType.FLOAT32);
+        Assert.assertSame(blend.getSpec().getLeadingDimension(), rows);
+        Assert.assertEquals(blend.getSpec().getInnerShape(), new long[] {256});
+        Assert.assertSame(blend.getBaselineContext(), baseline);
+        Assert.assertSame(blend.getSelectedContext(), selected);
+        Assert.assertSame(blend.getSelectedLogit(), selectedLogit);
+        Assert.assertSame(blend.getBaselinePresence(), baselinePresence);
+        Assert.assertSame(blend.getSelectedPresence(), selectedPresence);
+        Assert.assertSame(recipe.getOutputs().get(0).getValue(), blend);
+    }
+
+    @Test
+    public void binaryBranchBlendRejectsIncompatibleInputs() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("invalid-binary-branch");
+        FusionRecipe.Dimension rows = builder.addDimension("rows", 8);
+        FusionRecipe.Dimension otherRows = builder.addDimension("otherRows", 8);
+        FusionRecipe.Input baseline =
+                builder.addInput("baseline", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 3));
+        FusionRecipe.Input selected =
+                builder.addInput("selected", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 3));
+        FusionRecipe.Input scalar =
+                builder.addInput("scalar", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 1));
+        FusionRecipe.Input wrongType =
+                builder.addInput("wrongType", FusionRecipe.TensorSpec.of(DataType.INT16, rows, 1));
+        FusionRecipe.Input wrongWidth =
+                builder.addInput(
+                        "wrongWidth", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 2));
+        FusionRecipe.Input wrongRows =
+                builder.addInput(
+                        "wrongRows", FusionRecipe.TensorSpec.of(DataType.FLOAT32, otherRows, 1));
+
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        builder.binaryBranchBlend(
+                                "wrongTypeBlend", baseline, selected, wrongType, scalar, scalar));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        builder.binaryBranchBlend(
+                                "wrongWidthBlend", baseline, selected, scalar, wrongWidth, scalar));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        builder.binaryBranchBlend(
+                                "wrongRowsBlend", baseline, selected, scalar, scalar, wrongRows));
+    }
+
+    @Test
     public void affineSumBuildsBroadcastGraph() {
         FusionRecipe.Builder builder = FusionRecipe.builder("affine-sum");
         FusionRecipe.Dimension rows = builder.addDimension("rows", 32);

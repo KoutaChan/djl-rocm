@@ -35,10 +35,11 @@ import java.util.Set;
  * an activation. {@link IndexedAffine} gathers selected rows from several values, evaluates a
  * bounded two-layer projection, and scatters the selected results into a dense value. {@link
  * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
- * them into a contiguous {@link DataType#FLOAT32} value. {@link TransformerEncoderStack} executes
- * one or more fixed-width, pre-normalized transformer encoder blocks over a short dense sequence.
- * Additional value types can be added without changing the lifecycle of prepared plans and
- * sessions.
+ * them into a contiguous {@link DataType#FLOAT32} value. {@link BinaryBranchBlend} selects or
+ * blends two branch contexts from their presence values and a binary logit. {@link
+ * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
+ * blocks over a short dense sequence. Additional value types can be added without changing the
+ * lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
 
@@ -617,6 +618,98 @@ public final class FusionRecipe {
         }
     }
 
+    /**
+     * A presence-aware binary blend of two context values.
+     *
+     * <p>For baseline context {@code b}, selected context {@code s}, selected logit {@code l}, and
+     * presence values {@code p_b} and {@code p_s}, this stage computes the FLOAT32 value
+     *
+     * <pre>
+     * q   = sigmoid(l)
+     * j   = p_b * p_s
+     * w_b = p_b - j * q
+     * w_s = p_s - j + j * q
+     * y   = w_b * b + w_s * s
+     * </pre>
+     *
+     * <p>The context values are {@code [batch, width]} tensors and may independently use FLOAT16,
+     * BFLOAT16, or FLOAT32. The logit and presence values are {@code [batch, 1]} tensors that may
+     * independently use those same data types; their last axis is broadcast over the context width.
+     * When only one branch is present, that branch is copied without applying the logit. When
+     * neither branch is present, the result is zero.
+     */
+    public static final class BinaryBranchBlend extends Value {
+
+        private final Value baselineContext;
+        private final Value selectedContext;
+        private final Value selectedLogit;
+        private final Value baselinePresence;
+        private final Value selectedPresence;
+
+        private BinaryBranchBlend(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                Value baselineContext,
+                Value selectedContext,
+                Value selectedLogit,
+                Value baselinePresence,
+                Value selectedPresence) {
+            super(owner, index, name, spec);
+            this.baselineContext = baselineContext;
+            this.selectedContext = selectedContext;
+            this.selectedLogit = selectedLogit;
+            this.baselinePresence = baselinePresence;
+            this.selectedPresence = selectedPresence;
+        }
+
+        /**
+         * Returns the baseline context.
+         *
+         * @return the baseline context
+         */
+        public Value getBaselineContext() {
+            return baselineContext;
+        }
+
+        /**
+         * Returns the selected context.
+         *
+         * @return the selected context
+         */
+        public Value getSelectedContext() {
+            return selectedContext;
+        }
+
+        /**
+         * Returns the logit for selecting the selected context when both branches are present.
+         *
+         * @return the selected-branch logit
+         */
+        public Value getSelectedLogit() {
+            return selectedLogit;
+        }
+
+        /**
+         * Returns the baseline-branch presence value.
+         *
+         * @return the baseline presence value
+         */
+        public Value getBaselinePresence() {
+            return baselinePresence;
+        }
+
+        /**
+         * Returns the selected-branch presence value.
+         *
+         * @return the selected presence value
+         */
+        public Value getSelectedPresence() {
+            return selectedPresence;
+        }
+    }
+
     /** The immutable parameters of one block in a {@link TransformerEncoderStack}. */
     public static final class TransformerEncoderBlock {
 
@@ -1045,6 +1138,72 @@ public final class FusionRecipe {
         }
 
         /**
+         * Adds a presence-aware binary branch blend.
+         *
+         * <p>The contexts must be two-dimensional floating-point values with the same leading
+         * dimension and width. The selected logit and both presence values must be floating-point
+         * {@code [batch, 1]} values using that leading dimension. They may use different data
+         * types. The resulting value is FLOAT32 {@code [batch, width]}.
+         *
+         * @param name the value name
+         * @param baselineContext the baseline {@code [batch, width]} context
+         * @param selectedContext the selected {@code [batch, width]} context
+         * @param selectedLogit the selected-branch {@code [batch, 1]} logit
+         * @param baselinePresence the baseline {@code [batch, 1]} presence value
+         * @param selectedPresence the selected {@code [batch, 1]} presence value
+         * @return the blended FLOAT32 value
+         */
+        public BinaryBranchBlend binaryBranchBlend(
+                String name,
+                Value baselineContext,
+                Value selectedContext,
+                Value selectedLogit,
+                Value baselinePresence,
+                Value selectedPresence) {
+            checkMutable();
+            checkValue(baselineContext);
+            checkValue(selectedContext);
+            checkValue(selectedLogit);
+            checkValue(baselinePresence);
+            checkValue(selectedPresence);
+
+            TensorSpec baselineSpec = baselineContext.spec;
+            TensorSpec selectedSpec = selectedContext.spec;
+            if (!isFloatingDataType(baselineSpec.dataType)
+                    || !isFloatingDataType(selectedSpec.dataType)
+                    || baselineSpec.leadingDimension == null
+                    || baselineSpec.innerShape.length != 1
+                    || selectedSpec.leadingDimension != baselineSpec.leadingDimension
+                    || selectedSpec.innerShape.length != 1
+                    || selectedSpec.innerShape[0] != baselineSpec.innerShape[0]) {
+                throw new IllegalArgumentException(
+                        "Binary branch contexts must be matching two-dimensional floating-point"
+                                + " values.");
+            }
+            checkBinaryScalar(selectedLogit, baselineSpec.leadingDimension, "selected logit");
+            checkBinaryScalar(baselinePresence, baselineSpec.leadingDimension, "baseline presence");
+            checkBinaryScalar(selectedPresence, baselineSpec.leadingDimension, "selected presence");
+
+            String checkedName = addValueName(name);
+            BinaryBranchBlend value =
+                    new BinaryBranchBlend(
+                            owner,
+                            values.size(),
+                            checkedName,
+                            TensorSpec.of(
+                                    DataType.FLOAT32,
+                                    baselineSpec.leadingDimension,
+                                    baselineSpec.innerShape[0]),
+                            baselineContext,
+                            selectedContext,
+                            selectedLogit,
+                            baselinePresence,
+                            selectedPresence);
+            values.add(value);
+            return value;
+        }
+
+        /**
          * Adds an output-pack value.
          *
          * <p>Each source must be a two-dimensional FLOAT16, BFLOAT16, or FLOAT32 value from this
@@ -1072,7 +1231,7 @@ public final class FusionRecipe {
                     throw new IllegalArgumentException(
                             "Output pack sources must have one leading and one inner dimension.");
                 }
-                if (!isPackDataType(spec.dataType)) {
+                if (!isFloatingDataType(spec.dataType)) {
                     throw new IllegalArgumentException(
                             "Output pack only supports FLOAT16, BFLOAT16, and FLOAT32 sources.");
                 }
@@ -1143,6 +1302,21 @@ public final class FusionRecipe {
             }
         }
 
+        private static void checkBinaryScalar(
+                Value value, Dimension leadingDimension, String kind) {
+            TensorSpec spec = value.spec;
+            if (!isFloatingDataType(spec.dataType)
+                    || spec.leadingDimension != leadingDimension
+                    || spec.innerShape.length != 1
+                    || spec.innerShape[0] != 1) {
+                throw new IllegalArgumentException(
+                        "Binary branch "
+                                + kind
+                                + " must be a floating-point [batch, 1] value using the context"
+                                + " dimension.");
+            }
+        }
+
         private String addValueName(String name) {
             String checkedName = requireName(name, "value");
             if (!valueNames.add(checkedName)) {
@@ -1157,7 +1331,7 @@ public final class FusionRecipe {
             }
         }
 
-        private static boolean isPackDataType(DataType dataType) {
+        private static boolean isFloatingDataType(DataType dataType) {
             return dataType == DataType.FLOAT16
                     || dataType == DataType.BFLOAT16
                     || dataType == DataType.FLOAT32;

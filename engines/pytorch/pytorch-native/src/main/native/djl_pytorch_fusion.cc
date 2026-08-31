@@ -62,6 +62,7 @@ constexpr int64_t kOutputPackV1 = 1;
 constexpr int64_t kAffineSumV1 = 2;
 constexpr int64_t kIndexedAffineV1 = 3;
 constexpr int64_t kTransformerEncoderStackV1 = 4;
+constexpr int64_t kBinaryBranchBlendV1 = 5;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
 
@@ -230,8 +231,22 @@ struct TransformerEncoderStackCommandSpec {
   std::vector<TransformerEncoderBlockSpec> blocks;
 };
 
+struct BinaryBranchBlendCommandSpec {
+  int32_t result_value_index;
+  int32_t result_storage_index;
+  int32_t extent_index;
+  int32_t baseline_context_value_index;
+  int32_t selected_context_value_index;
+  int32_t selected_logit_value_index;
+  int32_t baseline_presence_value_index;
+  int32_t selected_presence_value_index;
+  int64_t width;
+  std::vector<int32_t> operand_value_indices;
+};
+
 using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec,
-    IndexedAffineCommandSpec, TransformerEncoderStackCommandSpec>;
+    IndexedAffineCommandSpec, TransformerEncoderStackCommandSpec,
+    BinaryBranchBlendCommandSpec>;
 
 struct FusionPlanData {
   explicit FusionPlanData(c10::Device device) : device(device) {}
@@ -522,6 +537,64 @@ OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
   }
   TORCH_CHECK(destination_offset == command.output_width,
       "OUTPUT_PACK_V1 operand widths do not match the result width");
+
+  result.kind = ValueKind::kComputed;
+  result.producer_index = command_index;
+  result.storage_index = command.result_storage_index;
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+  return command;
+}
+
+BinaryBranchBlendCommandSpec BuildBinaryBranchBlendCommand(FusionPlanData& plan,
+    int32_t command_index, const std::vector<int32_t>& results,
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0,
+      "BINARY_BRANCH_BLEND_V1 does not support command flags");
+  TORCH_CHECK(results.size() == 1,
+      "BINARY_BRANCH_BLEND_V1 requires exactly one result");
+  TORCH_CHECK(operands.size() == 5,
+      "BINARY_BRANCH_BLEND_V1 requires exactly five operands");
+  TORCH_CHECK(attributes.empty(),
+      "BINARY_BRANCH_BLEND_V1 does not support attributes");
+
+  const int32_t result_index = results[0];
+  ValueSpec& result = plan.values[result_index];
+  TORCH_CHECK(result.kind == ValueKind::kUnbound,
+      "fusion command result already has a producer or binding");
+  TORCH_CHECK(result.data_type == torch::kFloat32 &&
+          result.dimension_index >= 0 && result.inner_shape.size() == 1,
+      "BINARY_BRANCH_BLEND_V1 result must be FLOAT32 [batch, width]");
+
+  const ValueSpec& baseline_context = plan.values[operands[0]];
+  const ValueSpec& selected_context = plan.values[operands[1]];
+  TORCH_CHECK(IsFusionFloatingDataType(baseline_context.data_type) &&
+          IsFusionFloatingDataType(selected_context.data_type),
+      "BINARY_BRANCH_BLEND_V1 contexts must use FLOAT16, BFLOAT16, or FLOAT32");
+  TORCH_CHECK(baseline_context.dimension_index == result.dimension_index &&
+          selected_context.dimension_index == result.dimension_index &&
+          baseline_context.inner_shape == result.inner_shape &&
+          selected_context.inner_shape == result.inner_shape,
+      "BINARY_BRANCH_BLEND_V1 contexts must match the result shape");
+  for (std::size_t operand_index = 2; operand_index < operands.size(); ++operand_index) {
+    const ValueSpec& scalar = plan.values[operands[operand_index]];
+    TORCH_CHECK(IsFusionFloatingDataType(scalar.data_type) &&
+            scalar.dimension_index == result.dimension_index &&
+            scalar.inner_shape.size() == 1 && scalar.inner_shape[0] == 1,
+        "BINARY_BRANCH_BLEND_V1 scalar operands must be floating-point [batch, 1]");
+  }
+
+  BinaryBranchBlendCommandSpec command;
+  command.result_value_index = result_index;
+  command.result_storage_index = NextStorageIndex(plan);
+  command.extent_index = result.dimension_index;
+  command.baseline_context_value_index = operands[0];
+  command.selected_context_value_index = operands[1];
+  command.selected_logit_value_index = operands[2];
+  command.baseline_presence_value_index = operands[3];
+  command.selected_presence_value_index = operands[4];
+  command.width = result.inner_shape[0];
+  command.operand_value_indices = operands;
 
   result.kind = ValueKind::kComputed;
   result.producer_index = command_index;
@@ -1385,6 +1458,10 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         plan->commands.emplace_back(BuildTransformerEncoderStackCommand(
             *plan, command_index, results, operands, flags, attributes));
         break;
+      case kBinaryBranchBlendV1:
+        plan->commands.emplace_back(BuildBinaryBranchBlendCommand(
+            *plan, command_index, results, operands, flags, attributes));
+        break;
       default:
         TORCH_CHECK(false, "unsupported fusion command opcode: ", opcode);
     }
@@ -1605,6 +1682,23 @@ void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_inde
       dimensions, true, "transformer encoder result storage");
 }
 
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const BinaryBranchBlendCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  for (int32_t operand_index : command.operand_value_indices) {
+    const torch::Tensor& operand = ResolveValue(
+        session, buffer_index, input_handles, operand_index);
+    const ValueSpec& operand_spec = plan.values[operand_index];
+    ValidateTensorMetadata(operand, plan, operand_spec, dimensions,
+        operand_spec.kind == ValueKind::kComputed, "binary branch operand");
+  }
+  const torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
+      dimensions, true, "binary branch result storage");
+}
+
 void ValidateSubmission(const FusionSession& session, int32_t buffer_index,
     const int64_t* input_handles, const int64_t* dimensions) {
   const auto& plan = *session.executable->plan;
@@ -1650,6 +1744,39 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   }
   LaunchOutputPack(launch_sources.data(), static_cast<int32_t>(command.sources.size()),
       result, row_count, command.output_width);
+}
+
+void ExecuteCommand(FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const BinaryBranchBlendCommandSpec& command, bool& work_submitted) {
+  const int64_t row_count = dimensions[command.extent_index];
+  const torch::Tensor& baseline_context = ResolveValue(
+      session, buffer_index, input_handles,
+      command.baseline_context_value_index);
+  const torch::Tensor& selected_context = ResolveValue(
+      session, buffer_index, input_handles,
+      command.selected_context_value_index);
+  const torch::Tensor& selected_logit = ResolveValue(
+      session, buffer_index, input_handles, command.selected_logit_value_index);
+  const torch::Tensor& baseline_presence = ResolveValue(
+      session, buffer_index, input_handles,
+      command.baseline_presence_value_index);
+  const torch::Tensor& selected_presence = ResolveValue(
+      session, buffer_index, input_handles,
+      command.selected_presence_value_index);
+  torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  RecordCurrentStream(baseline_context);
+  RecordCurrentStream(selected_context);
+  RecordCurrentStream(selected_logit);
+  RecordCurrentStream(baseline_presence);
+  RecordCurrentStream(selected_presence);
+  RecordCurrentStream(result);
+  if (row_count != 0) {
+    work_submitted = true;
+  }
+  LaunchBinaryBranchBlend(baseline_context, selected_context, selected_logit,
+      baseline_presence, selected_presence, result, row_count, command.width);
 }
 
 torch::Tensor ActiveAffineMatrix(const torch::Tensor& tensor, int64_t batch_count,
@@ -2154,10 +2281,15 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
                      std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
             *command, command_index, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<TransformerEncoderStackCommandSpec>(
+                         &fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
       } else {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            std::get<TransformerEncoderStackCommandSpec>(fusion_command),
-            command_index, work_submitted);
+            std::get<BinaryBranchBlendCommandSpec>(fusion_command),
+            work_submitted);
       }
     }
   } catch (...) {

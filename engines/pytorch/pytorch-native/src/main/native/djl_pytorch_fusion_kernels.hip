@@ -47,6 +47,20 @@ struct OutputPackArguments {
   int64_t output_width;
 };
 
+struct BinaryBranchBlendArguments {
+  const void* baseline_context;
+  const void* selected_context;
+  const void* selected_logit;
+  const void* baseline_presence;
+  const void* selected_presence;
+  float* output;
+  int64_t row_count;
+  int64_t width;
+  int32_t selected_logit_data_type;
+  int32_t baseline_presence_data_type;
+  int32_t selected_presence_data_type;
+};
+
 struct AffineInputPackArguments {
   const void* sources[kMaximumAffineTerms];
   int64_t widths[kMaximumAffineTerms];
@@ -130,6 +144,61 @@ __global__ void output_pack_kernel(OutputPackArguments arguments) {
       break;
     default:
       break;
+  }
+}
+
+__device__ float load_fusion_float(
+    const void* data, int64_t index, int32_t data_type) {
+  switch (static_cast<torch::ScalarType>(data_type)) {
+    case torch::kFloat16:
+      return static_cast<float>(static_cast<const c10::Half*>(data)[index]);
+    case torch::kBFloat16:
+      return static_cast<float>(static_cast<const c10::BFloat16*>(data)[index]);
+    case torch::kFloat32:
+      return static_cast<const float*>(data)[index];
+    default:
+      return 0.0f;
+  }
+}
+
+template <typename baseline_t, typename selected_t>
+__global__ void binary_branch_blend_kernel(
+    BinaryBranchBlendArguments arguments) {
+  const auto* baseline_context =
+      static_cast<const baseline_t*>(arguments.baseline_context);
+  const auto* selected_context =
+      static_cast<const selected_t*>(arguments.selected_context);
+  __shared__ float baseline_weight;
+  __shared__ float selected_weight;
+  for (int64_t row = blockIdx.x; row < arguments.row_count;
+       row += gridDim.x) {
+    if (threadIdx.x == 0) {
+      const float selected_logit = load_fusion_float(arguments.selected_logit,
+          row, arguments.selected_logit_data_type);
+      const float selected_probability =
+          1.0f / (1.0f + expf(-selected_logit));
+      const float baseline_presence = load_fusion_float(
+          arguments.baseline_presence, row,
+          arguments.baseline_presence_data_type);
+      const float selected_presence = load_fusion_float(
+          arguments.selected_presence, row,
+          arguments.selected_presence_data_type);
+      const float joint_presence = baseline_presence * selected_presence;
+      baseline_weight =
+          baseline_presence - joint_presence * selected_probability;
+      selected_weight = selected_presence - joint_presence +
+          joint_presence * selected_probability;
+    }
+    __syncthreads();
+    const int64_t row_offset = row * arguments.width;
+    for (int64_t column = threadIdx.x; column < arguments.width;
+         column += blockDim.x) {
+      const int64_t index = row_offset + column;
+      arguments.output[index] =
+          baseline_weight * static_cast<float>(baseline_context[index]) +
+          selected_weight * static_cast<float>(selected_context[index]);
+    }
+    __syncthreads();
   }
 }
 
@@ -578,6 +647,78 @@ void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
   hipLaunchKernelGGL(output_pack_kernel, dim3(block_count, source_count),
       dim3(kThreadsPerBlock), 0, stream.stream(), arguments);
   CheckHipLaunch("fusion output pack");
+}
+
+template <typename baseline_t, typename selected_t>
+void LaunchBinaryBranchBlendTyped(const BinaryBranchBlendArguments& arguments,
+    uint32_t block_count, hipStream_t stream) {
+  hipLaunchKernelGGL((binary_branch_blend_kernel<baseline_t, selected_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, arguments);
+}
+
+void LaunchBinaryBranchBlend(const torch::Tensor& baseline_context,
+    const torch::Tensor& selected_context,
+    const torch::Tensor& selected_logit,
+    const torch::Tensor& baseline_presence,
+    const torch::Tensor& selected_presence, torch::Tensor& output,
+    int64_t row_count, int64_t width) {
+  if (row_count == 0) {
+    return;
+  }
+  BinaryBranchBlendArguments arguments{};
+  arguments.baseline_context = baseline_context.data_ptr();
+  arguments.selected_context = selected_context.data_ptr();
+  arguments.selected_logit = selected_logit.data_ptr();
+  arguments.baseline_presence = baseline_presence.data_ptr();
+  arguments.selected_presence = selected_presence.data_ptr();
+  arguments.output = output.data_ptr<float>();
+  arguments.row_count = row_count;
+  arguments.width = width;
+  arguments.selected_logit_data_type =
+      static_cast<int32_t>(selected_logit.scalar_type());
+  arguments.baseline_presence_data_type =
+      static_cast<int32_t>(baseline_presence.scalar_type());
+  arguments.selected_presence_data_type =
+      static_cast<int32_t>(selected_presence.scalar_type());
+  const uint32_t block_count = static_cast<uint32_t>(
+      std::min<int64_t>(row_count, 65535));
+  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+#define LAUNCH_BINARY_BRANCH_BLEND(baseline_type, selected_type) \
+  LaunchBinaryBranchBlendTyped<baseline_type, selected_type>( \
+      arguments, block_count, stream.stream())
+  switch (baseline_context.scalar_type()) {
+    case torch::kFloat16:
+      if (selected_context.scalar_type() == torch::kFloat16) {
+        LAUNCH_BINARY_BRANCH_BLEND(c10::Half, c10::Half);
+      } else if (selected_context.scalar_type() == torch::kBFloat16) {
+        LAUNCH_BINARY_BRANCH_BLEND(c10::Half, c10::BFloat16);
+      } else {
+        LAUNCH_BINARY_BRANCH_BLEND(c10::Half, float);
+      }
+      break;
+    case torch::kBFloat16:
+      if (selected_context.scalar_type() == torch::kFloat16) {
+        LAUNCH_BINARY_BRANCH_BLEND(c10::BFloat16, c10::Half);
+      } else if (selected_context.scalar_type() == torch::kBFloat16) {
+        LAUNCH_BINARY_BRANCH_BLEND(c10::BFloat16, c10::BFloat16);
+      } else {
+        LAUNCH_BINARY_BRANCH_BLEND(c10::BFloat16, float);
+      }
+      break;
+    case torch::kFloat32:
+      if (selected_context.scalar_type() == torch::kFloat16) {
+        LAUNCH_BINARY_BRANCH_BLEND(float, c10::Half);
+      } else if (selected_context.scalar_type() == torch::kBFloat16) {
+        LAUNCH_BINARY_BRANCH_BLEND(float, c10::BFloat16);
+      } else {
+        LAUNCH_BINARY_BRANCH_BLEND(float, float);
+      }
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported binary branch baseline data type");
+  }
+#undef LAUNCH_BINARY_BRANCH_BLEND
+  CheckHipLaunch("fusion binary branch blend");
 }
 
 void LaunchAffineInputPack(const AffineInputPackSource* sources,
