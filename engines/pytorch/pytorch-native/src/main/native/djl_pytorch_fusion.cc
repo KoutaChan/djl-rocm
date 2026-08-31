@@ -12,8 +12,10 @@
  */
 #include "djl_pytorch_fusion.h"
 
-#include <ATen/ops/mm.h>
+#include <ATen/ops/_efficient_attention_forward.h>
 #include <ATen/ops/bmm.h>
+#include <ATen/ops/mm.h>
+#include <ATen/ops/scaled_dot_product_attention.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/core/InferenceMode.h>
 
@@ -67,6 +69,7 @@ constexpr int64_t kBinaryBranchBlendV1 = 5;
 constexpr int64_t kSingleQueryCrossAttentionReadoutGroupV1 = 6;
 // Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
 constexpr int64_t kIndexedLocalTransformerEncoderV1 = 8;
+constexpr int64_t kIndexedRelationTransformerEncoderStackV1 = 10;
 constexpr int64_t kMappedGroupedMaskedSoftmaxPoolGroupV1 = 12;
 constexpr int64_t kIndexedLocalTransformerEncoderSegmentedV2 = 13;
 constexpr int64_t kDimensionPrefixExtent = 1;
@@ -90,6 +93,8 @@ constexpr int64_t kTransformerAttentionHeads = 2;
 constexpr int64_t kTransformerAttentionWidth = 3;
 constexpr int64_t kTransformerFeedForwardWidth = 4;
 constexpr int64_t kTransformerEpsilon = 5;
+constexpr int64_t kTransformerRelationCount = 6;
+constexpr int64_t kTransformerReuseOutputNormalization = 7;
 constexpr int64_t kReadoutCount = 1;
 constexpr int64_t kReadoutAttentionHeads = 2;
 constexpr int64_t kReadoutAttentionWidth = 3;
@@ -230,6 +235,10 @@ struct TransformerEncoderBlockSpec {
   int32_t attention_output_weight_binding_index;
   int32_t feed_forward_expansion_weight_binding_index;
   int32_t feed_forward_projection_weight_binding_index;
+  int32_t relation_key_value_index = -1;
+  int32_t relation_bias_value_index = -1;
+  int32_t relation_key_binding_index = -1;
+  int32_t relation_bias_binding_index = -1;
 };
 
 struct TransformerEncoderStackCommandSpec {
@@ -240,15 +249,25 @@ struct TransformerEncoderStackCommandSpec {
   int32_t normalized_storage_index;
   int32_t query_key_value_storage_index;
   int32_t expanded_storage_index;
+  int32_t attention_bias_storage_index = -1;
+  int32_t relation_ids_value_index = -1;
   int64_t maximum_batches;
   int64_t token_count;
   int64_t hidden_width;
   int64_t attention_heads;
   int64_t attention_width;
   int64_t feed_forward_width;
+  int64_t relation_count = 0;
+  int64_t padded_token_count = 0;
   float epsilon;
+  bool reuse_output_normalization = false;
   std::vector<int32_t> operand_value_indices;
   std::vector<TransformerEncoderBlockSpec> blocks;
+};
+
+struct IndexedRelationBlockWeights {
+  torch::Tensor relation_keys;
+  torch::Tensor pair_bias;
 };
 
 struct BinaryBranchBlendCommandSpec {
@@ -403,6 +422,9 @@ struct FusionExecutableData {
   std::vector<torch::Tensor> indexed_affine_weights;
   std::vector<std::vector<std::array<torch::Tensor, 4>>>
       transformer_encoder_weights;
+  std::vector<std::vector<IndexedRelationBlockWeights>>
+      indexed_relation_transformer_weights;
+  std::vector<torch::Tensor> indexed_relation_ids;
   std::vector<SingleQueryReadoutGroupWeights> single_query_readout_weights;
   std::vector<std::array<torch::Tensor, 4>> indexed_local_transformer_weights;
   std::vector<torch::Tensor> mapped_grouped_pool_mappings;
@@ -749,6 +771,12 @@ int64_t CheckedAdd(int64_t left, int64_t right, const char* name) {
   TORCH_CHECK(right <= std::numeric_limits<int64_t>::max() - left,
       name, " exceeds the supported range");
   return left + right;
+}
+
+int64_t CheckedRoundUp(int64_t value, int64_t multiple, const char* name) {
+  TORCH_CHECK(value >= 0 && multiple > 0, name, " has invalid terms");
+  const int64_t remainder = value % multiple;
+  return remainder == 0 ? value : CheckedAdd(value, multiple - remainder, name);
 }
 
 int64_t Product(const std::vector<int64_t>& shape, const char* name) {
@@ -1171,20 +1199,25 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
     FusionPlanData& plan, int32_t command_index,
     const std::vector<int32_t>& results,
     const std::vector<int32_t>& operands, int64_t flags,
-    const CommandAttributes& attributes) {
+    const CommandAttributes& attributes, bool indexed_relation) {
+  const char* command_name = indexed_relation
+      ? "INDEXED_RELATION_TRANSFORMER_ENCODER_STACK_V1"
+      : "TRANSFORMER_ENCODER_STACK_V1";
   TORCH_CHECK(flags == 0,
-      "TRANSFORMER_ENCODER_STACK_V1 does not support command flags");
+      command_name, " does not support command flags");
   TORCH_CHECK(results.size() == 1,
-      "TRANSFORMER_ENCODER_STACK_V1 requires exactly one result");
-  TORCH_CHECK(attributes.size() == 5,
-      "TRANSFORMER_ENCODER_STACK_V1 requires exactly five attributes");
+      command_name, " requires exactly one result");
+  TORCH_CHECK(attributes.size() == static_cast<std::size_t>(indexed_relation ? 7 : 5),
+      command_name, " has an invalid attribute count");
   const int64_t block_count = GetRequiredInt64Scalar(attributes,
-      kTransformerBlockCount, "TRANSFORMER_ENCODER_STACK_V1 block count");
+      kTransformerBlockCount, command_name);
   TORCH_CHECK(block_count > 0 && block_count <= 16,
-      "TRANSFORMER_ENCODER_STACK_V1 block count exceeds the native limit");
-  TORCH_CHECK(operands.size() ==
-          static_cast<std::size_t>(1 + 13 * block_count),
-      "TRANSFORMER_ENCODER_STACK_V1 operand count does not match its blocks");
+      command_name, " block count exceeds the native limit");
+  const int64_t expected_operands = indexed_relation
+      ? 2 + 15 * block_count
+      : 1 + 13 * block_count;
+  TORCH_CHECK(operands.size() == static_cast<std::size_t>(expected_operands),
+      command_name, " operand count does not match its blocks");
 
   TransformerEncoderStackCommandSpec command;
   command.result_value_index = results[0];
@@ -1198,6 +1231,16 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
   command.feed_forward_width = GetRequiredInt64Scalar(attributes,
       kTransformerFeedForwardWidth,
       "TRANSFORMER_ENCODER_STACK_V1 feed-forward width");
+  if (indexed_relation) {
+    command.relation_count = GetRequiredInt64Scalar(attributes,
+        kTransformerRelationCount, command_name);
+    const int64_t reuse_output_normalization = GetRequiredInt64Scalar(
+        attributes, kTransformerReuseOutputNormalization, command_name);
+    TORCH_CHECK(reuse_output_normalization == 0 ||
+            reuse_output_normalization == 1,
+        command_name, " normalization-reuse flag must be zero or one");
+    command.reuse_output_normalization = reuse_output_normalization != 0;
+  }
   const double epsilon = GetRequiredFloat64Scalar(attributes,
       kTransformerEpsilon, "TRANSFORMER_ENCODER_STACK_V1 epsilon");
   TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0 &&
@@ -1219,12 +1262,26 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
   command.maximum_batches = plan.dimensions[input.dimension_index].maximum_extent;
   command.token_count = input.inner_shape[0];
   command.hidden_width = input.inner_shape[1];
-  TORCH_CHECK(command.token_count > 0 && command.token_count <= 8 &&
-          command.hidden_width == 256 && command.attention_heads == 4 &&
-          command.attention_width == 128 &&
-          command.feed_forward_width > 0,
-      "TRANSFORMER_ENCODER_STACK_V1 native lowering requires tokens<=8, "
-      "hidden=256, heads=4, and attention width=128");
+  if (indexed_relation) {
+    TORCH_CHECK(command.token_count > 0 && command.token_count <= 512 &&
+            command.hidden_width == 256 && command.attention_heads > 0 &&
+            command.attention_width > 0 &&
+            command.attention_width % command.attention_heads == 0 &&
+            command.feed_forward_width > 0 && command.relation_count > 0 &&
+            command.relation_count <= std::numeric_limits<int16_t>::max(),
+        command_name,
+        " requires tokens<=512, hidden=256, divisible attention width, and "
+        "INT16-addressable relations");
+    command.padded_token_count = CheckedRoundUp(
+        command.token_count, 8, "indexed-relation attention padded tokens");
+  } else {
+    TORCH_CHECK(command.token_count > 0 && command.token_count <= 8 &&
+            command.hidden_width == 256 && command.attention_heads == 4 &&
+            command.attention_width == 128 &&
+            command.feed_forward_width > 0,
+        "TRANSFORMER_ENCODER_STACK_V1 native lowering requires tokens<=8, "
+        "hidden=256, heads=4, and attention width=128");
+  }
   TORCH_CHECK(command.maximum_batches <=
           std::numeric_limits<uint32_t>::max() / command.token_count,
       "TRANSFORMER_ENCODER_STACK_V1 maximum batch exceeds the native grid limit");
@@ -1253,6 +1310,17 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
 
   command.blocks.reserve(static_cast<std::size_t>(block_count));
   std::size_t operand_offset = 1;
+  if (indexed_relation) {
+    command.relation_ids_value_index = operands[operand_offset++];
+    const ValueSpec& relation_ids = plan.values[command.relation_ids_value_index];
+    const std::vector<int64_t> expected_relation_id_shape{
+        command.token_count, command.token_count};
+    TORCH_CHECK(relation_ids.kind == ValueKind::kConstant &&
+            relation_ids.dimension_index < 0 &&
+            relation_ids.data_type == torch::kInt16 &&
+            relation_ids.inner_shape == expected_relation_id_shape,
+        command_name, " relation IDs must be fixed INT16 [tokens, tokens]");
+  }
   for (int64_t block_index = 0; block_index < block_count; ++block_index) {
     TransformerEncoderBlockSpec block;
     for (int32_t constant_index = 0; constant_index < 13; ++constant_index) {
@@ -1301,6 +1369,25 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
         plan.values[block.value_indices[7]].binding_index;
     block.feed_forward_projection_weight_binding_index =
         plan.values[block.value_indices[9]].binding_index;
+    if (indexed_relation) {
+      block.relation_key_value_index = operands[operand_offset++];
+      block.relation_bias_value_index = operands[operand_offset++];
+      require_projection(block.relation_key_value_index,
+          command.relation_count, command.attention_width, "relation keys");
+      require_projection(block.relation_bias_value_index,
+          command.relation_count, command.attention_heads, "relation bias");
+      block.relation_key_binding_index =
+          plan.values[block.relation_key_value_index].binding_index;
+      block.relation_bias_binding_index =
+          plan.values[block.relation_bias_value_index].binding_index;
+    }
+    if (command.reuse_output_normalization && !command.blocks.empty()) {
+      const auto& previous = command.blocks.back();
+      TORCH_CHECK(previous.value_indices[11] == block.value_indices[0] &&
+              previous.value_indices[12] == block.value_indices[1],
+          command_name,
+          " adjacent reused normalization operands must be identical");
+    }
     command.blocks.push_back(block);
   }
 
@@ -1317,9 +1404,20 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
       {command.maximum_batches, command.token_count,
           3 * command.attention_width}});
   command.expanded_storage_index = NextStorageIndex(plan);
+  const int64_t tail_width = indexed_relation
+      ? std::max(command.feed_forward_width,
+            CheckedMultiply(command.attention_heads, command.relation_count,
+                "indexed-relation shared tail width"))
+      : command.feed_forward_width;
   plan.storages.push_back(StorageSpec{result.data_type,
       {command.maximum_batches, command.token_count,
-          command.feed_forward_width}});
+          tail_width}});
+  if (indexed_relation) {
+    command.attention_bias_storage_index = NextStorageIndex(plan);
+    plan.storages.push_back(StorageSpec{result.data_type,
+        {command.maximum_batches, command.attention_heads,
+            command.token_count, command.padded_token_count}});
+  }
   return command;
 }
 
@@ -2106,7 +2204,11 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         break;
       case kTransformerEncoderStackV1:
         plan->commands.emplace_back(BuildTransformerEncoderStackCommand(
-            *plan, command_index, results, operands, flags, attributes));
+            *plan, command_index, results, operands, flags, attributes, false));
+        break;
+      case kIndexedRelationTransformerEncoderStackV1:
+        plan->commands.emplace_back(BuildTransformerEncoderStackCommand(
+            *plan, command_index, results, operands, flags, attributes, true));
         break;
       case kBinaryBranchBlendV1:
         plan->commands.emplace_back(BuildBinaryBranchBlendCommand(
@@ -2743,6 +2845,9 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       [command.query_key_value_storage_index];
   torch::Tensor& expanded = session.storages[buffer_index]
       [command.expanded_storage_index];
+  torch::Tensor* attention_bias = command.attention_bias_storage_index < 0
+      ? nullptr
+      : &session.storages[buffer_index][command.attention_bias_storage_index];
   const auto& executable_blocks =
       session.executable->transformer_encoder_weights[command_index];
   TORCH_CHECK(executable_blocks.size() == command.blocks.size(),
@@ -2753,6 +2858,9 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   RecordCurrentStream(normalized);
   RecordCurrentStream(query_key_value);
   RecordCurrentStream(expanded);
+  if (attention_bias != nullptr) {
+    RecordCurrentStream(*attention_bias);
+  }
   const int64_t active_rows = CheckedMultiply(batch_count,
       command.token_count, "TRANSFORMER_ENCODER_STACK_V1 active rows");
   torch::Tensor normalized_matrix = normalized.narrow(0, 0, batch_count).view(
@@ -2769,8 +2877,25 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
           .view({active_rows * 3 * command.attention_width})
           .narrow(0, 0, active_rows * command.hidden_width)
           .view({active_rows, command.hidden_width});
-  torch::Tensor expanded_matrix = expanded.narrow(0, 0, batch_count).view(
-      {active_rows, command.feed_forward_width});
+  torch::Tensor expanded_matrix = expanded.narrow(0, 0, batch_count)
+      .view({-1})
+      .narrow(0, 0, active_rows * command.feed_forward_width)
+      .view({active_rows, command.feed_forward_width});
+
+  const bool indexed_relation = command.relation_ids_value_index >= 0;
+  const torch::Tensor* relation_ids = indexed_relation
+      ? &session.executable->indexed_relation_ids[command_index]
+      : nullptr;
+  const auto* relation_blocks = indexed_relation
+      ? &session.executable
+             ->indexed_relation_transformer_weights[command_index]
+      : nullptr;
+  if (indexed_relation) {
+    TORCH_CHECK(attention_bias != nullptr && relation_ids->defined() &&
+            relation_blocks->size() == command.blocks.size(),
+        "INDEXED_RELATION_TRANSFORMER_ENCODER_STACK_V1 executable is inconsistent");
+    RecordCurrentStream(*relation_ids);
+  }
 
   for (std::size_t block_index = 0;
        block_index < command.blocks.size(); ++block_index) {
@@ -2808,27 +2933,96 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
     RecordCurrentStream(output_bias);
 
     const torch::Tensor& layer_input = block_index == 0 ? input : state;
-    LaunchTransformerCopyAndLayerNorm(layer_input, state, normalized,
-        attention_input_weight, attention_input_bias, batch_count,
-        command.token_count, command.hidden_width, command.epsilon,
-        block_index == 0);
+    if (!(indexed_relation && command.reuse_output_normalization &&
+            block_index != 0)) {
+      LaunchTransformerCopyAndLayerNorm(layer_input, state, normalized,
+          attention_input_weight, attention_input_bias, batch_count,
+          command.token_count, command.hidden_width, command.epsilon,
+          block_index == 0);
+    }
     at::mm_out(query_key_value_matrix, normalized_matrix, weights[0]);
-    LaunchTransformerAttention(query_key_value, normalized, batch_count,
-        command.token_count, command.attention_heads, command.attention_width,
-        command.hidden_width);
-    at::mm_out(
-        attention_output_matrix, attention_context_matrix, weights[1]);
-    LaunchTransformerResidualLayerNorm(state, attention_output_matrix,
-        attention_output_bias, feed_forward_input_weight,
-        feed_forward_input_bias, normalized, active_rows,
-        command.hidden_width, command.epsilon);
+    if (indexed_relation) {
+      const auto& relation = (*relation_blocks)[block_index];
+      RecordCurrentStream(relation.relation_keys);
+      RecordCurrentStream(relation.pair_bias);
+      const int64_t head_width =
+          command.attention_width / command.attention_heads;
+      torch::Tensor active_query_key_value =
+          query_key_value.narrow(0, 0, batch_count);
+      torch::Tensor queries = active_query_key_value
+          .narrow(2, 0, command.attention_width)
+          .view({batch_count, command.token_count,
+              command.attention_heads, head_width});
+      torch::Tensor keys = active_query_key_value
+          .narrow(2, command.attention_width, command.attention_width)
+          .view({batch_count, command.token_count,
+              command.attention_heads, head_width});
+      torch::Tensor values = active_query_key_value
+          .narrow(2, 2 * command.attention_width, command.attention_width)
+          .view({batch_count, command.token_count,
+              command.attention_heads, head_width});
+      torch::Tensor relation_queries = queries.permute({2, 0, 1, 3})
+          .view({command.attention_heads, active_rows, head_width});
+      torch::Tensor relation_logits = expanded.narrow(0, 0, batch_count)
+          .view({-1})
+          .narrow(0, 0, command.attention_heads * active_rows *
+              command.relation_count)
+          .view({command.attention_heads, active_rows,
+              command.relation_count});
+      at::bmm_out(relation_logits, relation_queries, relation.relation_keys);
+      const float attention_scale =
+          1.0f / std::sqrt(static_cast<float>(head_width));
+      torch::Tensor active_attention_bias =
+          attention_bias->narrow(0, 0, batch_count);
+      LaunchIndexedRelationAttentionBias(relation_logits, *relation_ids,
+          relation.pair_bias, active_attention_bias, batch_count,
+          command.attention_heads, command.token_count,
+          command.relation_count, command.padded_token_count,
+          attention_scale);
+      torch::Tensor prepared_attention_bias = active_attention_bias.narrow(
+          3, 0, command.token_count);
+
+      torch::Tensor attention_context;
+      if (query_key_value.scalar_type() == torch::kFloat32) {
+        attention_context = at::scaled_dot_product_attention(
+            queries.transpose(1, 2), keys.transpose(1, 2),
+            values.transpose(1, 2), prepared_attention_bias, 0.0, false,
+            attention_scale)
+            .transpose(1, 2)
+            .contiguous();
+      } else {
+        auto attention_result = at::_efficient_attention_forward(
+            queries, keys, values, prepared_attention_bias,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            0.0, 0, false, attention_scale, std::nullopt, std::nullopt);
+        attention_context = std::get<0>(attention_result);
+      }
+      attention_context_matrix =
+          attention_context.reshape({active_rows, command.attention_width});
+      at::mm_out(normalized_matrix, attention_context_matrix, weights[1]);
+      LaunchTransformerResidualLayerNorm(state, normalized_matrix,
+          attention_output_bias, feed_forward_input_weight,
+          feed_forward_input_bias, normalized, active_rows,
+          command.hidden_width, command.epsilon, true);
+    } else {
+      LaunchTransformerAttention(query_key_value, normalized, batch_count,
+          command.token_count, command.attention_heads,
+          command.attention_width, command.hidden_width);
+      at::mm_out(
+          attention_output_matrix, attention_context_matrix, weights[1]);
+      LaunchTransformerResidualLayerNorm(state, attention_output_matrix,
+          attention_output_bias, feed_forward_input_weight,
+          feed_forward_input_bias, normalized, active_rows,
+          command.hidden_width, command.epsilon);
+    }
     at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
     LaunchTransformerBiasSilu(
-        expanded, expansion_bias, active_rows, command.feed_forward_width);
+        expanded, expansion_bias, active_rows, command.feed_forward_width,
+        indexed_relation);
     at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
     LaunchTransformerResidualLayerNorm(state, normalized,
         projection_bias, output_weight, output_bias, state, active_rows,
-        command.hidden_width, command.epsilon);
+        command.hidden_width, command.epsilon, indexed_relation);
   }
 }
 
@@ -3136,6 +3330,9 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
   data->affine_products.resize(plan->data->commands.size());
   data->indexed_affine_weights.resize(plan->data->commands.size());
   data->transformer_encoder_weights.resize(plan->data->commands.size());
+  data->indexed_relation_transformer_weights.resize(
+      plan->data->commands.size());
+  data->indexed_relation_ids.resize(plan->data->commands.size());
   data->single_query_readout_weights.resize(plan->data->commands.size());
   data->indexed_local_transformer_weights.resize(plan->data->commands.size());
   data->mapped_grouped_pool_mappings.resize(plan->data->commands.size());
@@ -3177,6 +3374,58 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
             executable_blocks[block_index][weight_index] =
                 weight.transpose(0, 1).contiguous();
             RecordCurrentStream(executable_blocks[block_index][weight_index]);
+          }
+        }
+        if (transformer_command->relation_ids_value_index >= 0) {
+          const torch::Tensor& relation_ids = data->constants[
+              plan->data
+                  ->values[transformer_command->relation_ids_value_index]
+                  .binding_index];
+          RecordCurrentStream(relation_ids);
+          TORCH_CHECK(relation_ids.min().item<int64_t>() >= 0 &&
+                  relation_ids.max().item<int64_t>() <
+                      transformer_command->relation_count,
+              "indexed-relation IDs must be in [0, relationCount)");
+          data->indexed_relation_ids[command_index] =
+              relation_ids.clone().contiguous();
+          RecordCurrentStream(data->indexed_relation_ids[command_index]);
+
+          auto& relation_blocks =
+              data->indexed_relation_transformer_weights[command_index];
+          relation_blocks.resize(transformer_command->blocks.size());
+          const int64_t head_width = transformer_command->attention_width /
+              transformer_command->attention_heads;
+          torch::Tensor flattened_ids =
+              data->indexed_relation_ids[command_index]
+                  .view({transformer_command->token_count *
+                      transformer_command->token_count})
+                  .to(torch::kInt64);
+          for (std::size_t block_index = 0;
+               block_index < transformer_command->blocks.size(); ++block_index) {
+            const auto& block = transformer_command->blocks[block_index];
+            const torch::Tensor& relation_keys =
+                data->constants[block.relation_key_binding_index];
+            const torch::Tensor& relation_bias =
+                data->constants[block.relation_bias_binding_index];
+            TORCH_CHECK(!relation_keys.requires_grad() &&
+                    !relation_bias.requires_grad(),
+                "indexed-relation derived tables require frozen constants");
+            RecordCurrentStream(relation_keys);
+            RecordCurrentStream(relation_bias);
+            auto& packed = relation_blocks[block_index];
+            packed.relation_keys = relation_keys
+                .view({transformer_command->relation_count,
+                    transformer_command->attention_heads, head_width})
+                .permute({1, 2, 0})
+                .contiguous();
+            packed.pair_bias = relation_bias.index_select(0, flattened_ids)
+                .view({transformer_command->token_count,
+                    transformer_command->token_count,
+                    transformer_command->attention_heads})
+                .permute({2, 0, 1})
+                .contiguous();
+            RecordCurrentStream(packed.relation_keys);
+            RecordCurrentStream(packed.pair_bias);
           }
         }
       }

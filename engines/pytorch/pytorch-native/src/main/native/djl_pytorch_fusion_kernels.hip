@@ -484,6 +484,41 @@ constexpr int kTransformerHeadWidth = 32;
 constexpr int kTransformerCachedValuesPerLane =
     kTransformerHiddenWidth / 32;
 
+template <typename scalar_t>
+__global__ void indexed_relation_attention_bias_kernel(
+    const scalar_t* relation_logits, const int16_t* relation_ids,
+    const scalar_t* pair_bias, scalar_t* attention_bias,
+    int64_t batch_count, int64_t attention_heads, int64_t token_count,
+    int64_t relation_count, int64_t padded_token_count, float scale) {
+  const int64_t element_count = batch_count * attention_heads * token_count *
+      padded_token_count;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < element_count;
+       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int64_t coordinate = index;
+    const int64_t key = coordinate % padded_token_count;
+    coordinate /= padded_token_count;
+    const int64_t query = coordinate % token_count;
+    coordinate /= token_count;
+    const int64_t head = coordinate % attention_heads;
+    const int64_t batch = coordinate / attention_heads;
+    if (key >= token_count) {
+      attention_bias[index] = static_cast<scalar_t>(0.0f);
+      continue;
+    }
+    const int64_t relation = static_cast<int64_t>(
+        relation_ids[query * token_count + key]);
+    const int64_t query_row = batch * token_count + query;
+    const int64_t relation_logit_index =
+        (head * batch_count * token_count + query_row) * relation_count + relation;
+    const int64_t pair_bias_index =
+        (head * token_count + query) * token_count + key;
+    attention_bias[index] = static_cast<scalar_t>(
+        static_cast<float>(relation_logits[relation_logit_index]) * scale +
+        static_cast<float>(pair_bias[pair_bias_index]));
+  }
+}
+
 __device__ float TransformerWaveSum(float value) {
   for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
     value += __shfl_down(value, offset);
@@ -644,13 +679,16 @@ __global__ void transformer_attention_kernel(const scalar_t* query_key_value,
 template <typename scalar_t>
 __global__ void transformer_bias_silu_kernel(
     scalar_t* values, const scalar_t* bias, int64_t element_count,
-    int64_t width) {
+    int64_t width, bool round_bias_before_activation) {
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
            threadIdx.x;
        index < element_count;
        index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const float value = static_cast<float>(values[index]) +
+    float value = static_cast<float>(values[index]) +
         static_cast<float>(bias[index % width]);
+    if (round_bias_before_activation) {
+      value = static_cast<float>(static_cast<scalar_t>(value));
+    }
     values[index] = static_cast<scalar_t>(value / (1.0f + expf(-value)));
   }
 }
@@ -659,7 +697,7 @@ template <typename scalar_t, typename norm_t>
 __global__ void transformer_residual_layer_norm_kernel(
     scalar_t* state, const scalar_t* update, const scalar_t* update_bias,
     const norm_t* norm_weight, const norm_t* norm_bias, scalar_t* normalized,
-    int64_t active_rows, float epsilon) {
+    int64_t active_rows, float epsilon, bool round_update_before_residual) {
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
   const int32_t waves_per_block = blockDim.x / warpSize;
@@ -678,16 +716,23 @@ __global__ void transformer_residual_layer_norm_kernel(
       const int32_t feature = lane + index * warpSize;
       if (feature < kTransformerHiddenWidth) {
         const int64_t offset = row_offset + feature;
-        const float value = static_cast<float>(state[offset]) +
-            static_cast<float>(update[offset]) +
+        float update_value = static_cast<float>(update[offset]) +
             static_cast<float>(update_bias[feature]);
+        if (round_update_before_residual) {
+          update_value =
+              static_cast<float>(static_cast<scalar_t>(update_value));
+        }
+        const float value =
+            static_cast<float>(state[offset]) + update_value;
         const scalar_t rounded = static_cast<scalar_t>(value);
         state[offset] = rounded;
         values[index] = static_cast<float>(rounded);
         ++count;
-        const float delta = values[index] - mean;
+        const float statistics_value =
+            round_update_before_residual ? value : values[index];
+        const float delta = statistics_value - mean;
         mean += delta / count;
-        moment += delta * (values[index] - mean);
+        moment += delta * (statistics_value - mean);
       }
     }
     for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
@@ -1868,8 +1913,67 @@ void LaunchTransformerAttention(const torch::Tensor& query_key_value,
   CheckHipLaunch("fusion transformer attention");
 }
 
+template <typename scalar_t>
+void LaunchIndexedRelationAttentionBiasTyped(
+    const torch::Tensor& relation_logits,
+    const torch::Tensor& relation_ids,
+    const torch::Tensor& pair_bias, torch::Tensor& attention_bias,
+    int64_t batch_count, int64_t attention_heads, int64_t token_count,
+    int64_t relation_count, int64_t padded_token_count, float scale,
+    uint32_t block_count, hipStream_t stream) {
+  hipLaunchKernelGGL(
+      (indexed_relation_attention_bias_kernel<scalar_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
+      relation_logits.data_ptr<scalar_t>(), relation_ids.data_ptr<int16_t>(),
+      pair_bias.data_ptr<scalar_t>(), attention_bias.data_ptr<scalar_t>(),
+      batch_count, attention_heads, token_count, relation_count,
+      padded_token_count, scale);
+}
+
+void LaunchIndexedRelationAttentionBias(
+    const torch::Tensor& relation_logits,
+    const torch::Tensor& relation_ids,
+    const torch::Tensor& pair_bias, torch::Tensor& attention_bias,
+    int64_t batch_count, int64_t attention_heads, int64_t token_count,
+    int64_t relation_count, int64_t padded_token_count, float scale) {
+  TORCH_CHECK(relation_ids.scalar_type() == torch::kInt16,
+      "indexed-relation IDs must use INT16");
+  TORCH_CHECK(relation_logits.scalar_type() == pair_bias.scalar_type() &&
+          relation_logits.scalar_type() == attention_bias.scalar_type(),
+      "indexed-relation attention tensors must use one data type");
+  const int64_t element_count = CheckedMultiply(
+      CheckedMultiply(
+          CheckedMultiply(batch_count, attention_heads,
+              "indexed-relation attention bias elements"),
+          token_count, "indexed-relation attention bias elements"),
+      padded_token_count, "indexed-relation attention bias elements");
+  if (element_count == 0) {
+    return;
+  }
+  const uint32_t block_count = static_cast<uint32_t>(
+      std::min<int64_t>(RequiredBlockCount(element_count), 65535));
+  const auto stream = at::hip::getCurrentHIPStream(attention_bias.get_device());
+#define LAUNCH_INDEXED_RELATION_ATTENTION_BIAS(scalar_type) \
+  LaunchIndexedRelationAttentionBiasTyped<scalar_type>(relation_logits, \
+      relation_ids, pair_bias, attention_bias, batch_count, attention_heads, \
+      token_count, relation_count, padded_token_count, scale, block_count, \
+      stream.stream())
+  if (attention_bias.scalar_type() == torch::kFloat16) {
+    LAUNCH_INDEXED_RELATION_ATTENTION_BIAS(c10::Half);
+  } else if (attention_bias.scalar_type() == torch::kBFloat16) {
+    LAUNCH_INDEXED_RELATION_ATTENTION_BIAS(c10::BFloat16);
+  } else if (attention_bias.scalar_type() == torch::kFloat32) {
+    LAUNCH_INDEXED_RELATION_ATTENTION_BIAS(float);
+  } else {
+    TORCH_CHECK(false, "unsupported indexed-relation attention data type");
+  }
+#undef LAUNCH_INDEXED_RELATION_ATTENTION_BIAS
+  CheckHipLaunch("fusion indexed-relation attention bias");
+}
+
 void LaunchTransformerBiasSilu(torch::Tensor& values,
-    const torch::Tensor& bias, int64_t active_rows, int64_t width) {
+    const torch::Tensor& bias, int64_t active_rows, int64_t width,
+    bool round_bias_before_activation) {
   const int64_t element_count = CheckedMultiply(
       active_rows, width, "transformer SiLU element count");
   if (element_count == 0) {
@@ -1882,7 +1986,7 @@ void LaunchTransformerBiasSilu(torch::Tensor& values,
   hipLaunchKernelGGL((transformer_bias_silu_kernel<scalar_type>), \
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream.stream(), \
       values.data_ptr<scalar_type>(), bias.data_ptr<scalar_type>(), \
-      element_count, width)
+      element_count, width, round_bias_before_activation)
   if (values.scalar_type() == torch::kFloat16) {
     LAUNCH_TRANSFORMER_SILU(c10::Half);
   } else if (values.scalar_type() == torch::kBFloat16) {
@@ -1901,7 +2005,7 @@ void LaunchTransformerResidualLayerNormTyped(torch::Tensor& state,
     const torch::Tensor& update, const torch::Tensor& update_bias,
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     torch::Tensor& normalized, int64_t active_rows, float epsilon,
-    hipStream_t stream) {
+    bool round_update_before_residual, hipStream_t stream) {
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count = static_cast<uint32_t>(
       (active_rows + maximum_waves_per_block - 1) /
@@ -1912,14 +2016,14 @@ void LaunchTransformerResidualLayerNormTyped(torch::Tensor& state,
       state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
       update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(),
       norm_bias.data_ptr<norm_t>(), normalized.data_ptr<scalar_t>(),
-      active_rows, epsilon);
+      active_rows, epsilon, round_update_before_residual);
 }
 
 void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
     const torch::Tensor& update, const torch::Tensor& update_bias,
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     torch::Tensor& normalized, int64_t active_rows, int64_t hidden_width,
-    float epsilon) {
+    float epsilon, bool round_update_before_residual) {
   TORCH_CHECK(hidden_width == kTransformerHiddenWidth,
       "transformer encoder lowering requires hidden width 256");
   if (active_rows == 0) {
@@ -1929,7 +2033,7 @@ void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
 #define LAUNCH_TRANSFORMER_RESIDUAL_NORM(scalar_type, norm_type) \
   LaunchTransformerResidualLayerNormTyped<scalar_type, norm_type>( \
       state, update, update_bias, norm_weight, norm_bias, normalized, \
-      active_rows, epsilon, stream.stream())
+      active_rows, epsilon, round_update_before_residual, stream.stream())
   if (state.scalar_type() == torch::kFloat16) {
     if (norm_weight.scalar_type() == torch::kFloat32) {
       LAUNCH_TRANSFORMER_RESIDUAL_NORM(c10::Half, float);

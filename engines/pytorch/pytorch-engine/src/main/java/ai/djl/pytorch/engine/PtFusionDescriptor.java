@@ -62,6 +62,7 @@ final class PtFusionDescriptor {
     static final long SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 = 6;
     // Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 = 8;
+    static final long INDEXED_RELATION_TRANSFORMER_ENCODER_STACK_V1 = 10;
     static final long MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 = 12;
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2 = 13;
     static final long DIMENSION_PREFIX_EXTENT = 1;
@@ -81,6 +82,8 @@ final class PtFusionDescriptor {
     static final long TRANSFORMER_ATTENTION_WIDTH = 3;
     static final long TRANSFORMER_FEED_FORWARD_WIDTH = 4;
     static final long TRANSFORMER_EPSILON = 5;
+    static final long TRANSFORMER_RELATION_COUNT = 6;
+    static final long TRANSFORMER_REUSE_OUTPUT_NORMALIZATION = 7;
     static final long READOUT_COUNT = 1;
     static final long READOUT_ATTENTION_HEADS = 2;
     static final long READOUT_ATTENTION_WIDTH = 3;
@@ -363,8 +366,32 @@ final class PtFusionDescriptor {
                         Math.addExact(
                                 blockElements,
                                 storageElements(block.getFeedForwardProjectionWeight()));
+                if (block.getIndexedRelationAttention() != null) {
+                    blockElements =
+                            Math.addExact(
+                                    blockElements,
+                                    storageElements(
+                                            block.getIndexedRelationAttention().getRelationKeys()));
+                    long tokenCount = stack.getSpec().getInnerShape()[0];
+                    blockElements =
+                            Math.addExact(
+                                    blockElements,
+                                    Math.multiplyExact(
+                                            stack.getAttentionHeads(),
+                                            Math.multiplyExact(tokenCount, tokenCount)));
+                }
             }
             bytes = Math.addExact(bytes, Math.multiplyExact(blockElements, elementBytes));
+            if (stack.hasIndexedRelationAttention()) {
+                bytes =
+                        Math.addExact(
+                                bytes,
+                                storageBytes(
+                                        stack.getBlocks()
+                                                .get(0)
+                                                .getIndexedRelationAttention()
+                                                .getRelationIds()));
+            }
         }
         for (FusionRecipe.Value value : recipe.getValues()) {
             if (!(value instanceof FusionRecipe.IndexedLocalTransformerEncoder)) {
@@ -549,8 +576,26 @@ final class PtFusionDescriptor {
                             elements,
                             Math.multiplyExact(
                                     rows, Math.multiplyExact(3L, stack.getAttentionWidth())));
-            elements =
-                    Math.addExact(elements, Math.multiplyExact(rows, stack.getFeedForwardWidth()));
+            long tailWidth = stack.getFeedForwardWidth();
+            if (stack.hasIndexedRelationAttention()) {
+                long relationCount = relationCount(stack);
+                tailWidth =
+                        Math.max(
+                                tailWidth,
+                                Math.multiplyExact(stack.getAttentionHeads(), relationCount));
+            }
+            elements = Math.addExact(elements, Math.multiplyExact(rows, tailWidth));
+            if (stack.hasIndexedRelationAttention()) {
+                long paddedTokens = roundUp(stack.getSpec().getInnerShape()[0], 8L);
+                elements =
+                        Math.addExact(
+                                elements,
+                                Math.multiplyExact(
+                                        batch,
+                                        Math.multiplyExact(
+                                                stack.getAttentionHeads(),
+                                                Math.multiplyExact(tokens, paddedTokens))));
+            }
             bytes =
                     Math.addExact(
                             bytes,
@@ -879,23 +924,43 @@ final class PtFusionDescriptor {
 
     private static int transformerEncoderStackCommandWords(
             FusionRecipe.TransformerEncoderStack stack) {
-        int operandCount = Math.addExact(1, Math.multiplyExact(13, stack.getBlocks().size()));
+        boolean indexedRelation = stack.hasIndexedRelationAttention();
+        int operandCount =
+                indexedRelation
+                        ? Math.addExact(2, Math.multiplyExact(15, stack.getBlocks().size()))
+                        : Math.addExact(1, Math.multiplyExact(13, stack.getBlocks().size()));
+        int attributeCount = indexedRelation ? 7 : 5;
         return Math.addExact(
                 Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, operandCount),
-                Math.multiplyExact(5, SCALAR_ATTRIBUTE_WORDS));
+                Math.multiplyExact(attributeCount, SCALAR_ATTRIBUTE_WORDS));
     }
 
     private static void putTransformerEncoderStackCommand(
             ByteBuffer descriptor, FusionRecipe.TransformerEncoderStack stack) {
-        int operandCount = Math.addExact(1, Math.multiplyExact(13, stack.getBlocks().size()));
+        boolean indexedRelation = stack.hasIndexedRelationAttention();
+        int operandCount =
+                indexedRelation
+                        ? Math.addExact(2, Math.multiplyExact(15, stack.getBlocks().size()))
+                        : Math.addExact(1, Math.multiplyExact(13, stack.getBlocks().size()));
         descriptor.putLong(transformerEncoderStackCommandWords(stack));
-        descriptor.putLong(TRANSFORMER_ENCODER_STACK_V1);
+        descriptor.putLong(
+                indexedRelation
+                        ? INDEXED_RELATION_TRANSFORMER_ENCODER_STACK_V1
+                        : TRANSFORMER_ENCODER_STACK_V1);
         descriptor.putLong(0);
         descriptor.putLong(1);
         descriptor.putLong(operandCount);
-        descriptor.putLong(5);
+        descriptor.putLong(indexedRelation ? 7 : 5);
         descriptor.putLong(stack.getIndex());
         descriptor.putLong(stack.getInput().getIndex());
+        if (indexedRelation) {
+            descriptor.putLong(
+                    stack.getBlocks()
+                            .get(0)
+                            .getIndexedRelationAttention()
+                            .getRelationIds()
+                            .getIndex());
+        }
         for (FusionRecipe.TransformerEncoderBlock block : stack.getBlocks()) {
             descriptor.putLong(block.getAttentionInputWeight().getIndex());
             descriptor.putLong(block.getAttentionInputBias().getIndex());
@@ -910,12 +975,39 @@ final class PtFusionDescriptor {
             descriptor.putLong(block.getFeedForwardProjectionBias().getIndex());
             descriptor.putLong(block.getOutputWeight().getIndex());
             descriptor.putLong(block.getOutputBias().getIndex());
+            if (indexedRelation) {
+                descriptor.putLong(
+                        block.getIndexedRelationAttention().getRelationKeys().getIndex());
+                descriptor.putLong(
+                        block.getIndexedRelationAttention().getRelationBias().getIndex());
+            }
         }
         putScalarAttribute(descriptor, TRANSFORMER_BLOCK_COUNT, stack.getBlocks().size());
         putScalarAttribute(descriptor, TRANSFORMER_ATTENTION_HEADS, stack.getAttentionHeads());
         putScalarAttribute(descriptor, TRANSFORMER_ATTENTION_WIDTH, stack.getAttentionWidth());
         putScalarAttribute(descriptor, TRANSFORMER_FEED_FORWARD_WIDTH, stack.getFeedForwardWidth());
         putFloatAttribute(descriptor, TRANSFORMER_EPSILON, stack.getEpsilon());
+        if (indexedRelation) {
+            putScalarAttribute(descriptor, TRANSFORMER_RELATION_COUNT, relationCount(stack));
+            putScalarAttribute(
+                    descriptor,
+                    TRANSFORMER_REUSE_OUTPUT_NORMALIZATION,
+                    stack.isOutputNormalizationReused() ? 1 : 0);
+        }
+    }
+
+    private static long relationCount(FusionRecipe.TransformerEncoderStack stack) {
+        return stack.getBlocks()
+                .get(0)
+                .getIndexedRelationAttention()
+                .getRelationKeys()
+                .getSpec()
+                .getInnerShape()[0];
+    }
+
+    private static long roundUp(long value, long multiple) {
+        return Math.multiplyExact(
+                Math.floorDiv(Math.addExact(value, multiple - 1), multiple), multiple);
     }
 
     private static int indexedLocalTransformerCommandWords(

@@ -101,14 +101,22 @@ void LaunchTransformerAttention(const torch::Tensor& query_key_value,
     torch::Tensor& context, int64_t batch_count, int64_t token_count,
     int64_t attention_heads, int64_t attention_width, int64_t hidden_width);
 
+void LaunchIndexedRelationAttentionBias(
+    const torch::Tensor& relation_logits,
+    const torch::Tensor& relation_ids,
+    const torch::Tensor& pair_bias, torch::Tensor& attention_bias,
+    int64_t batch_count, int64_t attention_heads, int64_t token_count,
+    int64_t relation_count, int64_t padded_token_count, float scale);
+
 void LaunchTransformerBiasSilu(torch::Tensor& values,
-    const torch::Tensor& bias, int64_t active_rows, int64_t width);
+    const torch::Tensor& bias, int64_t active_rows, int64_t width,
+    bool round_bias_before_activation = false);
 
 void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
     const torch::Tensor& update, const torch::Tensor& update_bias,
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     torch::Tensor& normalized, int64_t active_rows, int64_t hidden_width,
-    float epsilon);
+    float epsilon, bool round_update_before_residual = false);
 
 void LaunchSingleQueryReadoutSeedInput(const torch::Tensor& memory,
     const torch::Tensor& query_source, const torch::Tensor& valid_mask,

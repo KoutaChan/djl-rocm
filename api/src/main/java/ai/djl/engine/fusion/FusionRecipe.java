@@ -38,13 +38,13 @@ import java.util.Set;
  * them into a contiguous {@link DataType#FLOAT32} value. {@link BinaryBranchBlend} selects or
  * blends two branch contexts from their presence values and a binary logit. {@link
  * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
- * blocks over a short dense sequence. {@link SingleQueryCrossAttentionReadoutGroup} evaluates
- * several purpose-specific single-query readouts over one shared masked memory without
- * materializing projected keys and values. {@link IndexedLocalTransformerEncoder} evaluates one
- * transformer block over compact rows selected from fixed-size local groups. {@link
- * MappedGroupedMaskedSoftmaxPoolGroup} pools one candidate memory into several independently
- * mapped, contiguous output sets. Additional value types can be added without changing the
- * lifecycle of prepared plans and sessions.
+ * blocks over a short dense sequence, optionally using {@link IndexedRelationAttention}. {@link
+ * SingleQueryCrossAttentionReadoutGroup} evaluates several purpose-specific single-query readouts
+ * over one shared masked memory without materializing projected keys and values. {@link
+ * IndexedLocalTransformerEncoder} evaluates one transformer block over compact rows selected from
+ * fixed-size local groups. {@link MappedGroupedMaskedSoftmaxPoolGroup} pools one candidate memory
+ * into several independently mapped, contiguous output sets. Additional value types can be added
+ * without changing the lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
 
@@ -1533,6 +1533,7 @@ public final class FusionRecipe {
         private final Constant feedForwardProjectionBias;
         private final Constant outputWeight;
         private final Constant outputBias;
+        private final IndexedRelationAttention indexedRelationAttention;
 
         private TransformerEncoderBlock(
                 Constant attentionInputWeight,
@@ -1547,7 +1548,8 @@ public final class FusionRecipe {
                 Constant feedForwardProjectionWeight,
                 Constant feedForwardProjectionBias,
                 Constant outputWeight,
-                Constant outputBias) {
+                Constant outputBias,
+                IndexedRelationAttention indexedRelationAttention) {
             this.attentionInputWeight = attentionInputWeight;
             this.attentionInputBias = attentionInputBias;
             this.queryKeyValueWeight = queryKeyValueWeight;
@@ -1561,97 +1563,77 @@ public final class FusionRecipe {
             this.feedForwardProjectionBias = feedForwardProjectionBias;
             this.outputWeight = outputWeight;
             this.outputBias = outputBias;
+            this.indexedRelationAttention = indexedRelationAttention;
         }
 
-        /**
-         * @return the affine scale of the attention-input LayerNorm
-         */
+        /** Returns the affine scale of the attention-input LayerNorm. */
         public Constant getAttentionInputWeight() {
             return attentionInputWeight;
         }
 
-        /**
-         * @return the affine bias of the attention-input LayerNorm
-         */
+        /** Returns the affine bias of the attention-input LayerNorm. */
         public Constant getAttentionInputBias() {
             return attentionInputBias;
         }
 
-        /**
-         * @return the {@code [3 * attentionWidth, hiddenWidth]} QKV weight
-         */
+        /** Returns the {@code [3 * attentionWidth, hiddenWidth]} QKV weight. */
         public Constant getQueryKeyValueWeight() {
             return queryKeyValueWeight;
         }
 
-        /**
-         * @return the {@code [hiddenWidth, attentionWidth]} attention output weight
-         */
+        /** Returns the {@code [hiddenWidth, attentionWidth]} attention output weight. */
         public Constant getAttentionOutputWeight() {
             return attentionOutputWeight;
         }
 
-        /**
-         * @return the attention output bias
-         */
+        /** Returns the attention output bias. */
         public Constant getAttentionOutputBias() {
             return attentionOutputBias;
         }
 
-        /**
-         * @return the affine scale of the feed-forward-input LayerNorm
-         */
+        /** Returns the affine scale of the feed-forward-input LayerNorm. */
         public Constant getFeedForwardInputWeight() {
             return feedForwardInputWeight;
         }
 
-        /**
-         * @return the affine bias of the feed-forward-input LayerNorm
-         */
+        /** Returns the affine bias of the feed-forward-input LayerNorm. */
         public Constant getFeedForwardInputBias() {
             return feedForwardInputBias;
         }
 
-        /**
-         * @return the {@code [feedForwardWidth, hiddenWidth]} expansion weight
-         */
+        /** Returns the {@code [feedForwardWidth, hiddenWidth]} expansion weight. */
         public Constant getFeedForwardExpansionWeight() {
             return feedForwardExpansionWeight;
         }
 
-        /**
-         * @return the feed-forward expansion bias
-         */
+        /** Returns the feed-forward expansion bias. */
         public Constant getFeedForwardExpansionBias() {
             return feedForwardExpansionBias;
         }
 
-        /**
-         * @return the {@code [hiddenWidth, feedForwardWidth]} projection weight
-         */
+        /** Returns the {@code [hiddenWidth, feedForwardWidth]} projection weight. */
         public Constant getFeedForwardProjectionWeight() {
             return feedForwardProjectionWeight;
         }
 
-        /**
-         * @return the feed-forward projection bias
-         */
+        /** Returns the feed-forward projection bias. */
         public Constant getFeedForwardProjectionBias() {
             return feedForwardProjectionBias;
         }
 
-        /**
-         * @return the affine scale of the output LayerNorm
-         */
+        /** Returns the affine scale of the output LayerNorm. */
         public Constant getOutputWeight() {
             return outputWeight;
         }
 
-        /**
-         * @return the affine bias of the output LayerNorm
-         */
+        /** Returns the affine bias of the output LayerNorm. */
         public Constant getOutputBias() {
             return outputBias;
+        }
+
+        /** Returns the indexed relation parameters, or {@code null}. */
+        public IndexedRelationAttention getIndexedRelationAttention() {
+            return indexedRelationAttention;
         }
     }
 
@@ -1671,6 +1653,7 @@ public final class FusionRecipe {
         private final int attentionWidth;
         private final int feedForwardWidth;
         private final float epsilon;
+        private final boolean reuseOutputNormalization;
         private final List<TransformerEncoderBlock> blocks;
 
         private TransformerEncoderStack(
@@ -1683,6 +1666,7 @@ public final class FusionRecipe {
                 int attentionWidth,
                 int feedForwardWidth,
                 float epsilon,
+                boolean reuseOutputNormalization,
                 List<TransformerEncoderBlock> blocks) {
             super(owner, index, name, spec);
             this.input = input;
@@ -1690,49 +1674,48 @@ public final class FusionRecipe {
             this.attentionWidth = attentionWidth;
             this.feedForwardWidth = feedForwardWidth;
             this.epsilon = epsilon;
+            this.reuseOutputNormalization = reuseOutputNormalization;
             this.blocks = immutableCopy(blocks);
         }
 
-        /**
-         * @return the stack input
-         */
+        /** Returns the stack input. */
         public Value getInput() {
             return input;
         }
 
-        /**
-         * @return the attention head count
-         */
+        /** Returns the attention head count. */
         public int getAttentionHeads() {
             return attentionHeads;
         }
 
-        /**
-         * @return the concatenated attention feature width
-         */
+        /** Returns the concatenated attention feature width. */
         public int getAttentionWidth() {
             return attentionWidth;
         }
 
-        /**
-         * @return the feed-forward hidden width
-         */
+        /** Returns the feed-forward hidden width. */
         public int getFeedForwardWidth() {
             return feedForwardWidth;
         }
 
-        /**
-         * @return the LayerNorm epsilon
-         */
+        /** Returns the LayerNorm epsilon. */
         public float getEpsilon() {
             return epsilon;
         }
 
-        /**
-         * @return the blocks in execution order
-         */
+        /** Returns whether adjacent normalization is reused. */
+        public boolean isOutputNormalizationReused() {
+            return reuseOutputNormalization;
+        }
+
+        /** Returns the blocks in execution order. */
         public List<TransformerEncoderBlock> getBlocks() {
             return blocks;
+        }
+
+        /** Returns whether indexed relation attention is enabled. */
+        public boolean hasIndexedRelationAttention() {
+            return blocks.get(0).indexedRelationAttention != null;
         }
     }
 
@@ -2066,6 +2049,16 @@ public final class FusionRecipe {
                     attentionHeads,
                     attentionWidth,
                     feedForwardWidth);
+        }
+
+        /** Returns the immutable indexed relation descriptor. */
+        public IndexedRelationAttention indexedRelationAttention(
+                Constant relationIds, Constant relationKeys, Constant relationBias) {
+            checkMutable();
+            checkValue(relationIds);
+            checkValue(relationKeys);
+            checkValue(relationBias);
+            return new IndexedRelationAttention(relationIds, relationKeys, relationBias);
         }
 
         /**
@@ -3227,24 +3220,7 @@ public final class FusionRecipe {
             epsilon = DEFAULT_EPSILON;
         }
 
-        /**
-         * Adds one pre-normalized attention and SiLU feed-forward block.
-         *
-         * @param attentionInputWeight attention-input LayerNorm scale
-         * @param attentionInputBias attention-input LayerNorm bias
-         * @param queryKeyValueWeight combined QKV projection weight
-         * @param attentionOutputWeight attention output projection weight
-         * @param attentionOutputBias attention output projection bias
-         * @param feedForwardInputWeight feed-forward-input LayerNorm scale
-         * @param feedForwardInputBias feed-forward-input LayerNorm bias
-         * @param feedForwardExpansionWeight feed-forward expansion weight
-         * @param feedForwardExpansionBias feed-forward expansion bias
-         * @param feedForwardProjectionWeight feed-forward projection weight
-         * @param feedForwardProjectionBias feed-forward projection bias
-         * @param outputWeight output LayerNorm scale
-         * @param outputBias output LayerNorm bias
-         * @return this builder
-         */
+        /** Adds one pre-normalized attention and SiLU feed-forward block. */
         public TransformerEncoderStackBuilder addBlock(
                 Constant attentionInputWeight,
                 Constant attentionInputBias,
@@ -3259,6 +3235,39 @@ public final class FusionRecipe {
                 Constant feedForwardProjectionBias,
                 Constant outputWeight,
                 Constant outputBias) {
+            return addBlock(
+                    attentionInputWeight,
+                    attentionInputBias,
+                    queryKeyValueWeight,
+                    attentionOutputWeight,
+                    attentionOutputBias,
+                    feedForwardInputWeight,
+                    feedForwardInputBias,
+                    feedForwardExpansionWeight,
+                    feedForwardExpansionBias,
+                    feedForwardProjectionWeight,
+                    feedForwardProjectionBias,
+                    outputWeight,
+                    outputBias,
+                    null);
+        }
+
+        /** Adds one pre-normalized block with indexed relation attention. */
+        public TransformerEncoderStackBuilder addBlock(
+                Constant attentionInputWeight,
+                Constant attentionInputBias,
+                Constant queryKeyValueWeight,
+                Constant attentionOutputWeight,
+                Constant attentionOutputBias,
+                Constant feedForwardInputWeight,
+                Constant feedForwardInputBias,
+                Constant feedForwardExpansionWeight,
+                Constant feedForwardExpansionBias,
+                Constant feedForwardProjectionWeight,
+                Constant feedForwardProjectionBias,
+                Constant outputWeight,
+                Constant outputBias,
+                IndexedRelationAttention indexedRelationAttention) {
             checkMutable();
             Constant[] constants = {
                 attentionInputWeight,
@@ -3278,6 +3287,11 @@ public final class FusionRecipe {
             for (Constant constant : constants) {
                 recipeBuilder.checkValue(constant);
             }
+            if (indexedRelationAttention != null) {
+                recipeBuilder.checkValue(indexedRelationAttention.getRelationIds());
+                recipeBuilder.checkValue(indexedRelationAttention.getRelationKeys());
+                recipeBuilder.checkValue(indexedRelationAttention.getRelationBias());
+            }
             blocks.add(
                     new TransformerEncoderBlock(
                             attentionInputWeight,
@@ -3292,7 +3306,8 @@ public final class FusionRecipe {
                             feedForwardProjectionWeight,
                             feedForwardProjectionBias,
                             outputWeight,
-                            outputBias));
+                            outputBias,
+                            indexedRelationAttention));
             return this;
         }
 
@@ -3340,7 +3355,14 @@ public final class FusionRecipe {
             if (blocks.isEmpty()) {
                 throw new IllegalStateException("A transformer encoder stack requires a block.");
             }
+            IndexedRelationAttention firstRelation = blocks.get(0).indexedRelationAttention;
+            boolean reuseOutputNormalization = firstRelation != null && blocks.size() > 1;
+            TransformerEncoderBlock previous = null;
             for (TransformerEncoderBlock block : blocks) {
+                if ((block.indexedRelationAttention == null) != (firstRelation == null)) {
+                    throw new IllegalArgumentException(
+                            "Every transformer block must use the same attention kind.");
+                }
                 requireNorm(block.attentionInputWeight, hiddenWidth, inputSpec.dataType);
                 requireNorm(block.attentionInputBias, hiddenWidth, inputSpec.dataType);
                 requireSameDataType(block.attentionInputWeight, block.attentionInputBias);
@@ -3373,6 +3395,20 @@ public final class FusionRecipe {
                 requireNorm(block.outputWeight, hiddenWidth, inputSpec.dataType);
                 requireNorm(block.outputBias, hiddenWidth, inputSpec.dataType);
                 requireSameDataType(block.outputWeight, block.outputBias);
+                if (firstRelation != null) {
+                    block.indexedRelationAttention.validate(
+                            firstRelation.getRelationIds(),
+                            inputSpec.innerShape[0],
+                            attentionHeads,
+                            attentionWidth,
+                            inputSpec.dataType);
+                }
+                if (previous != null
+                        && (previous.outputWeight != block.attentionInputWeight
+                                || previous.outputBias != block.attentionInputBias)) {
+                    reuseOutputNormalization = false;
+                }
+                previous = block;
             }
 
             String checkedName = recipeBuilder.addValueName(name);
@@ -3390,6 +3426,7 @@ public final class FusionRecipe {
                             attentionWidth,
                             feedForwardWidth,
                             epsilon,
+                            reuseOutputNormalization,
                             blocks);
             recipeBuilder.values.add(value);
             built = true;

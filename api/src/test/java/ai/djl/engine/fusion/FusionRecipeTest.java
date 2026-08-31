@@ -645,6 +645,86 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void transformerEncoderStackBuildsIndexedRelationGraph() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("relation-transformer");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
+        FusionRecipe.Input input =
+                builder.addInput(
+                        "tokens", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 34, 256));
+        FusionRecipe.Constant relationIds =
+                builder.addConstant(
+                        "relationIds", FusionRecipe.TensorSpec.fixed(DataType.INT16, 34, 34));
+        FusionRecipe.Constant relationKeys = matrix(builder, "relationKeys", 23, 64);
+        FusionRecipe.Constant relationBias = matrix(builder, "relationBias", 23, 4);
+        IndexedRelationAttention relation =
+                builder.indexedRelationAttention(relationIds, relationKeys, relationBias);
+        FusionRecipe.TransformerEncoderStack stack =
+                builder.transformerEncoderStack("stack", input, 4, 64, 128)
+                        .addBlock(
+                                vector(builder, "attnNormWeight", 256, true),
+                                vector(builder, "attnNormBias", 256, true),
+                                matrix(builder, "qkv", 192, 256),
+                                matrix(builder, "attentionOutput", 256, 64),
+                                vector(builder, "attentionOutputBias", 256, false),
+                                vector(builder, "ffNormWeight", 256, true),
+                                vector(builder, "ffNormBias", 256, true),
+                                matrix(builder, "expansion", 128, 256),
+                                vector(builder, "expansionBias", 128, false),
+                                matrix(builder, "projection", 256, 128),
+                                vector(builder, "projectionBias", 256, false),
+                                vector(builder, "outputNormWeight", 256, true),
+                                vector(builder, "outputNormBias", 256, true),
+                                relation)
+                        .build();
+
+        Assert.assertTrue(stack.hasIndexedRelationAttention());
+        Assert.assertSame(
+                stack.getBlocks().get(0).getIndexedRelationAttention().getRelationIds(),
+                relationIds);
+        Assert.assertSame(
+                stack.getBlocks().get(0).getIndexedRelationAttention().getRelationKeys(),
+                relationKeys);
+        Assert.assertSame(
+                stack.getBlocks().get(0).getIndexedRelationAttention().getRelationBias(),
+                relationBias);
+    }
+
+    @Test
+    public void transformerEncoderStackRejectsNonInt16RelationIds() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("invalid-relation-transformer");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 2);
+        FusionRecipe.Input input =
+                builder.addInput(
+                        "tokens", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 34, 256));
+        IndexedRelationAttention relation =
+                builder.indexedRelationAttention(
+                        builder.addConstant(
+                                "relationIds",
+                                FusionRecipe.TensorSpec.fixed(DataType.INT32, 34, 34)),
+                        matrix(builder, "relationKeys", 23, 64),
+                        matrix(builder, "relationBias", 23, 4));
+        FusionRecipe.TransformerEncoderStackBuilder stack =
+                builder.transformerEncoderStack("stack", input, 4, 64, 128)
+                        .addBlock(
+                                vector(builder, "attnNormWeight", 256, true),
+                                vector(builder, "attnNormBias", 256, true),
+                                matrix(builder, "qkv", 192, 256),
+                                matrix(builder, "attentionOutput", 256, 64),
+                                vector(builder, "attentionOutputBias", 256, false),
+                                vector(builder, "ffNormWeight", 256, true),
+                                vector(builder, "ffNormBias", 256, true),
+                                matrix(builder, "expansion", 128, 256),
+                                vector(builder, "expansionBias", 128, false),
+                                matrix(builder, "projection", 256, 128),
+                                vector(builder, "projectionBias", 256, false),
+                                vector(builder, "outputNormWeight", 256, true),
+                                vector(builder, "outputNormBias", 256, true),
+                                relation);
+
+        Assert.assertThrows(IllegalArgumentException.class, stack::build);
+    }
+
+    @Test
     public void singleQueryReadoutGroupBuildsSharedMemoryGraph() {
         FusionRecipe.Builder builder = FusionRecipe.builder("single-query-readouts");
         FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
