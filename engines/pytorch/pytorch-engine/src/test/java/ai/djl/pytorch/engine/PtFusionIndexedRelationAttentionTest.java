@@ -106,7 +106,7 @@ public class PtFusionIndexedRelationAttentionTest {
         if (engine.getGpuCount() == 0) {
             throw new SkipException("This fusion test requires a PyTorch ROCm device.");
         }
-        int[] batchCounts = {1, 31, 256, 384};
+        int[] batchCounts = {1, 384, 31, 256, 1};
         DataType[] dataTypes = {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16};
         for (int deviceIndex = 0; deviceIndex < engine.getGpuCount(); ++deviceIndex) {
             Device device = Device.gpu(deviceIndex);
@@ -119,7 +119,7 @@ public class PtFusionIndexedRelationAttentionTest {
                         FusionSession session =
                                 executable.newSession(
                                         manager,
-                                        FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                        FusionSessionConfig.builder().optBufferCount(2).build())) {
                     for (int iteration = 0; iteration < 2; ++iteration) {
                         try (NDManager workingManager = manager.newSubManager()) {
                             for (int batchCount : batchCounts) {
