@@ -1009,25 +1009,41 @@ public class PtFusionTest {
             FusionRecipe.Input roundInput =
                     builder.addInput(
                             "round", FusionRecipe.TensorSpec.of(dataType, batch, 1, 3));
-            FusionRecipe.Input playerInput =
+            FusionRecipe.Input playerMemoryInput =
                     builder.addInput(
-                            "players", FusionRecipe.TensorSpec.of(dataType, batch, 2, 3));
+                            "playerMemory",
+                            FusionRecipe.TensorSpec.of(dataType, batch, 2, 4, 3));
             FusionRecipe.Input tileInput =
                     builder.addInput(
                             "tiles", FusionRecipe.TensorSpec.of(dataType, batch, 3, 3));
             FusionRecipe.SegmentedOutputPack pack =
-                    builder.segmentedOutputPack("memory", roundInput, playerInput, tileInput);
+                    builder.segmentedOutputPack("memory")
+                            .addSource(roundInput)
+                            .addSourceSlice(playerMemoryInput, 0, 1)
+                            .addSource(tileInput)
+                            .addSourceSlice(playerMemoryInput, 1, 2)
+                            .addSourceSlice(playerMemoryInput, 3, 1)
+                            .build();
             FusionRecipe.Output output = builder.addOutput("memory", pack);
             FusionRecipe recipe = builder.build();
 
             try (NDManager manager = engine.newBaseManager(device);
                     NDArray round =
                             patternedArray(manager, dataType, new Shape(4, 1, 3), 11, 5, 0.125f);
-                    NDArray players =
-                            patternedArray(manager, dataType, new Shape(4, 2, 3), 13, 6, 0.125f);
+                    NDArray playerMemory =
+                            patternedArray(
+                                    manager, dataType, new Shape(4, 2, 4, 3), 13, 6, 0.125f);
                     NDArray tiles =
                             patternedArray(manager, dataType, new Shape(4, 3, 3), 17, 8, 0.125f);
-                    NDArray expected = NDArrays.concat(new NDList(round, players, tiles), 1);
+                    NDArray expected =
+                            NDArrays.concat(
+                                    new NDList(
+                                            round,
+                                            playerMemory.get(":,:,0,:").reshape(4, 2, 3),
+                                            tiles,
+                                            playerMemory.get(":,:,1:3,:").reshape(4, 4, 3),
+                                            playerMemory.get(":,:,3,:").reshape(4, 2, 3)),
+                                    1);
                     FusionPlan plan = engine.newFusionCompiler(device).prepare(recipe);
                     FusionExecutable executable =
                             plan.bind(FusionConstantBindings.builder(recipe).build());
@@ -1038,7 +1054,7 @@ public class PtFusionTest {
                 FusionOutputLease firstLease;
                 try (FusionInvocation invocation = session.acquire()) {
                     invocation.setInput(roundInput, round);
-                    invocation.setInput(playerInput, players);
+                    invocation.setInput(playerMemoryInput, playerMemory);
                     invocation.setInput(tileInput, tiles);
                     invocation.setDimension(batch, 4);
                     firstLease = invocation.submit();
@@ -1046,7 +1062,7 @@ public class PtFusionTest {
                 try (firstLease;
                         FusionInvocation invocation = session.acquire()) {
                     invocation.setInput(roundInput, round);
-                    invocation.setInput(playerInput, players);
+                    invocation.setInput(playerMemoryInput, playerMemory);
                     invocation.setInput(tileInput, tiles);
                     invocation.setDimension(batch, 2);
                     try (FusionOutputLease secondLease = invocation.submit()) {

@@ -109,22 +109,32 @@ public class FusionRecipeTest {
                         "round", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 1, 256));
         FusionRecipe.Input players =
                 builder.addInput(
-                        "players", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 256));
+                        "players",
+                        FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 29, 256));
         FusionRecipe.Input tiles =
                 builder.addInput(
                         "tiles", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 34, 256));
 
         FusionRecipe.SegmentedOutputPack packed =
-                builder.segmentedOutputPack("memory", round, players, tiles);
+                builder.segmentedOutputPack("memory")
+                        .addSource(round)
+                        .addSourceSlice(players, 0, 1)
+                        .addSource(tiles)
+                        .addSourceSlice(players, 1, 24)
+                        .addSourceSlice(players, 25, 4)
+                        .build();
         builder.addOutput("memory", packed);
         FusionRecipe recipe = builder.build();
 
         Assert.assertEquals(packed.getSpec().getDataType(), DataType.FLOAT16);
         Assert.assertSame(packed.getSpec().getLeadingDimension(), batch);
-        Assert.assertEquals(packed.getSpec().getInnerShape(), new long[] {39, 256});
+        Assert.assertEquals(packed.getSpec().getInnerShape(), new long[] {151, 256});
         Assert.assertEquals(
-                packed.getSpec().getMaximumShape().getShape(), new long[] {16, 39, 256});
-        Assert.assertEquals(packed.getSources(), Arrays.asList(round, players, tiles));
+                packed.getSpec().getMaximumShape().getShape(), new long[] {16, 151, 256});
+        Assert.assertEquals(
+                packed.getSources(), Arrays.asList(round, players, tiles, players, players));
+        Assert.assertEquals(packed.getSourceTokenOffsets(), new long[] {0, 0, 0, 1, 25});
+        Assert.assertEquals(packed.getSourceTokenCounts(), new long[] {1, 1, 34, 24, 4});
         Assert.assertSame(recipe.getOutputs().get(0).getValue(), packed);
         Assert.assertThrows(UnsupportedOperationException.class, () -> packed.getSources().clear());
     }
