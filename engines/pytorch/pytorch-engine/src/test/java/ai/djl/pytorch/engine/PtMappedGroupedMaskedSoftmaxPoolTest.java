@@ -141,8 +141,8 @@ public class PtMappedGroupedMaskedSoftmaxPoolTest {
                 finalLease.synchronize();
                 assertOutputShapes(fixture, finalLease, 1, DataType.FLOAT32);
             }
-            Assert.assertTrue(Float.isFinite(first.scores.getFloat(0)));
-            Assert.assertTrue(Float.isFinite(second.values.getFloat(0)));
+            Assert.assertTrue(Float.isFinite(first.scores.getFloat(0, 0)));
+            Assert.assertTrue(Float.isFinite(second.values.getFloat(0, 0, 0)));
         }
     }
 
