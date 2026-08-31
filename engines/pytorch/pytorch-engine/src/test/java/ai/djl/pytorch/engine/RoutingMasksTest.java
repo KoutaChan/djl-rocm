@@ -100,12 +100,18 @@ public class RoutingMasksTest {
                                     new int[] {7, 1, 0, 2, 0, 1, 1, 0, 9, 2, 1, 2, 0, 0, 0, 0},
                                     new Shape(2, 2, 4))
                             .toType(indexType, false);
-            NDArray firstMask =
-                    manager.create(new float[] {1f, 0f, 0.5f, 0f}, new Shape(2, 2))
+            NDArray maskChannels =
+                    manager.create(
+                                    new float[] {
+                                        1f, 0f, -1f,
+                                        0f, 1f, -1f,
+                                        0.5f, 0f, -1f,
+                                        0f, 0f, -1f
+                                    },
+                                    new Shape(2, 2, 3))
                             .toType(maskType, false);
-            NDArray secondMask =
-                    manager.create(new float[] {0f, 1f, 0f, 0f}, new Shape(2, 2))
-                            .toType(maskType, false);
+            NDArray firstMask = maskChannels.get("...,0");
+            NDArray secondMask = maskChannels.get("...,1");
             NDArray result = NDArrays.binaryChoiceMasks(routes, firstMask, secondMask, 0, 2, 3, 0);
 
             Assert.assertEquals(result.getShape(), new Shape(2, 2, 4));

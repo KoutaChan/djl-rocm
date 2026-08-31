@@ -67,13 +67,14 @@ __global__ void categorical_masks_kernel(const index_t* categories, const scalar
 template <typename index_t, typename scalar_t>
 __global__ void binary_choice_masks_kernel(const index_t* routes, const scalar_t* first_mask,
     const scalar_t* second_mask, scalar_t* output, int64_t row_count, int64_t field_count,
-    int64_t representative_field, int64_t first_route_field, int64_t second_route_field,
-    int64_t padding_value) {
+    int64_t first_mask_stride, int64_t second_mask_stride, int64_t representative_field,
+    int64_t first_route_field, int64_t second_route_field, int64_t padding_value) {
   for (int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        row < row_count;
        row += static_cast<int64_t>(blockDim.x) * gridDim.x) {
     const float combined =
-        static_cast<float>(first_mask[row]) + static_cast<float>(second_mask[row]);
+        static_cast<float>(first_mask[row * first_mask_stride]) +
+        static_cast<float>(second_mask[row * second_mask_stride]);
     const int64_t route_offset = row * field_count;
     const int64_t output_offset = row * 4;
     output[output_offset] = static_cast<scalar_t>(combined);
@@ -90,6 +91,24 @@ __global__ void binary_choice_masks_kernel(const index_t* routes, const scalar_t
             ? static_cast<scalar_t>(combined)
             : static_cast<scalar_t>(0.0f);
   }
+}
+
+std::optional<int64_t> uniform_element_stride(const torch::Tensor& tensor) {
+  if (tensor.numel() == 0 || tensor.dim() == 0) {
+    return 1;
+  }
+  const int64_t element_stride = tensor.stride(-1);
+  if (element_stride <= 0) {
+    return std::nullopt;
+  }
+  int64_t expected_stride = element_stride;
+  for (int64_t dimension = tensor.dim() - 1; dimension >= 0; --dimension) {
+    if (tensor.size(dimension) > 1 && tensor.stride(dimension) != expected_stride) {
+      return std::nullopt;
+    }
+    expected_stride *= tensor.size(dimension);
+  }
+  return element_stride;
 }
 
 bool supports_owned_residual_layer_norm_types(
@@ -2194,8 +2213,9 @@ bool supports_categorical_masks(
 
 bool supports_binary_choice_masks(const torch::Tensor& routes, const torch::Tensor& first_mask,
     const torch::Tensor& second_mask) {
-  return routes.is_cuda() && routes.is_contiguous() && first_mask.is_cuda() && first_mask.is_contiguous() &&
-         second_mask.is_cuda() && second_mask.is_contiguous() &&
+  return routes.is_cuda() && routes.is_contiguous() && first_mask.is_cuda() &&
+         uniform_element_stride(first_mask).has_value() && second_mask.is_cuda() &&
+         uniform_element_stride(second_mask).has_value() &&
          c10::isIntegralType(routes.scalar_type(), false) && is_fused_floating(first_mask) &&
          second_mask.scalar_type() == first_mask.scalar_type() && routes.device() == first_mask.device() &&
          second_mask.device() == first_mask.device();
@@ -2661,6 +2681,8 @@ torch::Tensor binary_choice_masks(const torch::Tensor& routes, const torch::Tens
   const int blocks = static_cast<int>(
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   const hipStream_t stream = c10::hip::getCurrentHIPStream(routes.get_device()).stream();
+  const int64_t first_mask_stride = *uniform_element_stride(first_mask);
+  const int64_t second_mask_stride = *uniform_element_stride(second_mask);
   AT_DISPATCH_INTEGRAL_TYPES(routes.scalar_type(), "binary_choice_masks_index", [&] {
     using index_t = scalar_t;
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -2669,7 +2691,8 @@ torch::Tensor binary_choice_masks(const torch::Tensor& routes, const torch::Tens
               dim3(blocks), dim3(threads_per_block), 0, stream, routes.data_ptr<index_t>(),
               first_mask.data_ptr<scalar_t>(), second_mask.data_ptr<scalar_t>(),
               output.data_ptr<scalar_t>(), first_mask.numel(), routes.size(-1),
-              representative_field, first_route_field, second_route_field, padding_value);
+              first_mask_stride, second_mask_stride, representative_field, first_route_field,
+              second_route_field, padding_value);
         });
   });
   check_hip_kernel_launch("binary_choice_masks");
