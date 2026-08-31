@@ -2863,6 +2863,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   }
   const int64_t active_rows = CheckedMultiply(batch_count,
       command.token_count, "TRANSFORMER_ENCODER_STACK_V1 active rows");
+  const bool indexed_relation = command.relation_ids_value_index >= 0;
   torch::Tensor normalized_matrix = normalized.narrow(0, 0, batch_count).view(
       {active_rows, command.hidden_width});
   torch::Tensor query_key_value_matrix =
@@ -2872,17 +2873,18 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       .view({active_rows * command.hidden_width})
       .narrow(0, 0, active_rows * command.attention_width)
       .view({active_rows, command.attention_width});
-  torch::Tensor attention_output_matrix =
-      query_key_value.narrow(0, 0, batch_count)
-          .view({active_rows * 3 * command.attention_width})
-          .narrow(0, 0, active_rows * command.hidden_width)
-          .view({active_rows, command.hidden_width});
+  torch::Tensor attention_output_matrix;
+  if (!indexed_relation) {
+    attention_output_matrix = query_key_value.narrow(0, 0, batch_count)
+        .view({active_rows * 3 * command.attention_width})
+        .narrow(0, 0, active_rows * command.hidden_width)
+        .view({active_rows, command.hidden_width});
+  }
   torch::Tensor expanded_matrix = expanded.narrow(0, 0, batch_count)
       .view({-1})
       .narrow(0, 0, active_rows * command.feed_forward_width)
       .view({active_rows, command.feed_forward_width});
 
-  const bool indexed_relation = command.relation_ids_value_index >= 0;
   const torch::Tensor* relation_ids = indexed_relation
       ? &session.executable->indexed_relation_ids[command_index]
       : nullptr;
