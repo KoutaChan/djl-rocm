@@ -36,8 +36,8 @@ import java.util.Set;
  * bounded two-layer projection, and scatters the selected results into a dense value. {@link
  * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
  * them into one configured floating-point data type. {@link SegmentedOutputPack} concatenates
- * same-type, batch-major tensor segments along their first inner axis without changing their data
- * type. {@link BinaryBranchBlend} selects or
+ * batch-major tensor segments along their first inner axis and converts them into one configured
+ * floating-point data type. {@link BinaryBranchBlend} selects or
  * blends two branch contexts from their presence values and a binary logit. {@link
  * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
  * blocks over a short dense sequence, optionally using {@link IndexedRelationAttention}. {@link
