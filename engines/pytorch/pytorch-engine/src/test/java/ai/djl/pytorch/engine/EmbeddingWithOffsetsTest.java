@@ -12,18 +12,43 @@
  */
 package ai.djl.pytorch.engine;
 
+import ai.djl.Device;
 import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.ndarray.types.SparseFormat;
+import ai.djl.nn.core.Embedding;
 import ai.djl.training.GradientCollector;
 
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
 public class EmbeddingWithOffsetsTest {
+
+    @Test
+    public void testNativeGpuPathAcrossSupportedDtypes() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            DataType[] indexTypes = {DataType.INT16, DataType.INT32, DataType.INT64};
+            DataType[] tableTypes = {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16};
+            for (DataType rawType : indexTypes) {
+                for (DataType offsetType : indexTypes) {
+                    if (rawType == DataType.INT16 && offsetType == DataType.INT16) {
+                        continue;
+                    }
+                    for (DataType tableType : tableTypes) {
+                        verifyGpuParity(manager, rawType, offsetType, tableType);
+                    }
+                }
+            }
+        }
+    }
 
     @Test
     public void testBroadcastOffsetsAndTableDtype() {
@@ -70,5 +95,45 @@ public class EmbeddingWithOffsetsTest {
             NDArray table = manager.zeros(new Shape(4, 2));
             NDArrays.embeddingWithOffsets(rawIds, offsets, table);
         }
+    }
+
+    private static void verifyGpuParity(
+            NDManager manager, DataType rawType, DataType offsetType, DataType tableType) {
+        NDArray rawFields =
+                manager.create(
+                                new int[] {
+                                    0, 91, 1, 92, 0, 93,
+                                    1, 94, 0, 95, 1, 96
+                                },
+                                new Shape(2, 3, 2))
+                        .toType(rawType, false);
+        NDArray offsetFields =
+                manager.create(new int[] {0, 81, 2, 82, 4, 83}, new Shape(1, 3, 2))
+                        .toType(offsetType, false);
+        NDArray rawIds = rawFields.get("...,0");
+        NDArray offsets = offsetFields.get("...,0");
+        NDArray table = manager.arange(24).reshape(12, 2).toType(tableType, false);
+
+        NDArray actual = NDArrays.embeddingWithOffsets(rawIds, offsets, table);
+        NDArray expected =
+                Embedding.embedding(rawIds.add(offsets), table, SparseFormat.DENSE)
+                        .singletonOrThrow();
+
+        Assert.assertEquals(actual.getShape(), new Shape(2, 3, 2));
+        Assert.assertEquals(actual.getDataType(), tableType);
+        float maxAbs = assertClose(actual.toFloatArray(), expected.toFloatArray());
+        System.out.printf(
+                "EMBEDDING_WITH_OFFSETS_PARITY rawDtype=%s offsetDtype=%s tableDtype=%s maxAbs=%s%n",
+                rawType, offsetType, tableType, maxAbs);
+    }
+
+    private static float assertClose(float[] actual, float[] expected) {
+        Assert.assertEquals(actual.length, expected.length);
+        float maxAbs = 0;
+        for (int index = 0; index < actual.length; ++index) {
+            maxAbs = Math.max(maxAbs, Math.abs(actual[index] - expected[index]));
+            Assert.assertEquals(actual[index], expected[index], 1e-3f, "index=" + index);
+        }
+        return maxAbs;
     }
 }
