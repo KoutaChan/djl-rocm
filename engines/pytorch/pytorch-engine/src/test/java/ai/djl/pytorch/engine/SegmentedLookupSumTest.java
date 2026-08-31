@@ -29,22 +29,29 @@ public class SegmentedLookupSumTest {
     @Test
     public void cpuFallbackSelectsAndSumsEverySegment() {
         try (NDManager manager = NDManager.newBaseManager(Device.cpu())) {
-            verifySegmentedLookupSum(manager, DataType.FLOAT32);
+            verifySegmentedLookupSum(manager, DataType.FLOAT32, DataType.INT16, false);
         }
     }
 
     @Test
-    public void nativeGpuPathAcceptsStridedInt16Indices() {
+    public void nativeGpuPathMatchesReferenceAcrossSupportedDtypes() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             return;
         }
         try (NDManager manager = engine.newBaseManager(Device.gpu())) {
-            verifySegmentedLookupSum(manager, DataType.FLOAT16);
+            for (DataType dataType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                for (DataType indexType :
+                        new DataType[] {DataType.INT16, DataType.INT32, DataType.INT64}) {
+                    verifySegmentedLookupSum(manager, dataType, indexType, true);
+                }
+            }
         }
     }
 
-    private static void verifySegmentedLookupSum(NDManager manager, DataType dataType) {
+    private static void verifySegmentedLookupSum(
+            NDManager manager, DataType dataType, DataType indexType, boolean reportParity) {
         NDArray lookupTable =
                 manager.create(
                                 new float[] {
@@ -61,13 +68,18 @@ public class SegmentedLookupSumTest {
                                     3, 94, 1, 95, 2, 96
                                 },
                                 new Shape(2, 3, 2))
-                        .toType(DataType.INT16, false);
+                        .toType(indexType, false);
         NDArray stridedStoredIndices = storedFields.get("...,0");
 
         NDArray actual = NDArrays.segmentedLookupSum(lookupTable, stridedStoredIndices);
 
         Assert.assertEquals(actual.getShape(), new Shape(2, 2));
-        assertClose(actual.toFloatArray(), new float[] {13, 130, 9, 90});
+        float maxAbs = assertClose(actual.toFloatArray(), new float[] {13, 130, 9, 90});
+        if (reportParity) {
+            System.out.printf(
+                    "SEGMENTED_LOOKUP_SUM_PARITY dtype=%s indexDtype=%s maxAbs=%s%n",
+                    dataType, indexType, maxAbs);
+        }
         Assert.expectThrows(
                 IllegalArgumentException.class,
                 () ->
@@ -75,10 +87,13 @@ public class SegmentedLookupSumTest {
                                 lookupTable, stridedStoredIndices.toType(DataType.FLOAT32, false)));
     }
 
-    private static void assertClose(float[] actual, float[] expected) {
+    private static float assertClose(float[] actual, float[] expected) {
         Assert.assertEquals(actual.length, expected.length);
+        float maxAbs = 0;
         for (int index = 0; index < actual.length; ++index) {
+            maxAbs = Math.max(maxAbs, Math.abs(actual[index] - expected[index]));
             Assert.assertEquals(actual[index], expected[index], 1e-3f, "index=" + index);
         }
+        return maxAbs;
     }
 }
