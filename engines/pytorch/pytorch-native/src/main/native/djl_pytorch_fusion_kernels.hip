@@ -621,9 +621,9 @@ __device__ bool single_query_valid(const mask_t* mask, int64_t index) {
   return static_cast<float>(mask[index]) != 0.0f;
 }
 
-template <typename scalar_t, typename mask_t>
-__global__ void single_query_seed_input_kernel(const scalar_t* memory,
-    const scalar_t* query_source, const mask_t* valid_mask,
+template <typename memory_t, typename scalar_t, typename mask_t>
+__global__ void single_query_seed_input_kernel(const memory_t* memory,
+    const memory_t* query_source, const mask_t* valid_mask,
     scalar_t* seed_input, int64_t batch_count, int64_t token_count,
     int64_t query_token_count, int64_t query_index) {
   const int64_t batch = blockIdx.x;
@@ -643,9 +643,9 @@ __global__ void single_query_seed_input_kernel(const scalar_t* memory,
   for (int32_t feature = threadIdx.x; feature < kSingleQueryHiddenWidth;
        feature += blockDim.x) {
     seed_input[batch * (2 * kSingleQueryHiddenWidth) + feature] =
-        query_source[
+        static_cast<scalar_t>(query_source[
             (batch * query_token_count + query_index) * kSingleQueryHiddenWidth +
-            feature];
+            feature]);
     float sum = 0.0f;
     if (valid_count != 0) {
       for (int64_t token = 0; token < token_count; ++token) {
@@ -663,10 +663,10 @@ __global__ void single_query_seed_input_kernel(const scalar_t* memory,
   }
 }
 
-template <typename scalar_t, typename mask_t>
+template <typename memory_t, typename scalar_t, typename mask_t>
 __global__ void single_query_attention_kernel(
     const scalar_t* seed_products, const scalar_t* seed_bias,
-    const scalar_t* memory, const mask_t* valid_mask,
+    const memory_t* memory, const mask_t* valid_mask,
     const scalar_t* query_weight, const scalar_t* query_bias,
     const scalar_t* key_value_weight, scalar_t* state, scalar_t* context,
     int64_t batch_count, int64_t readout_count, int64_t token_count,
@@ -736,7 +736,8 @@ __global__ void single_query_attention_kernel(
       const int64_t memory_offset =
           (batch * token_count + token) * kSingleQueryHiddenWidth;
       for (int32_t feature = 0; feature < kSingleQueryHiddenWidth; ++feature) {
-        score += static_cast<float>(memory[memory_offset + feature]) *
+        score += static_cast<float>(
+                     static_cast<scalar_t>(memory[memory_offset + feature])) *
             direction[feature];
       }
     }
@@ -770,8 +771,10 @@ __global__ void single_query_attention_kernel(
        feature += blockDim.x) {
     float value = 0.0f;
     for (int64_t token = 0; token < token_count; ++token) {
-      value += probabilities[token] * static_cast<float>(memory[
-          (batch * token_count + token) * kSingleQueryHiddenWidth + feature]);
+      value += probabilities[token] * static_cast<float>(
+          static_cast<scalar_t>(memory[
+              (batch * token_count + token) * kSingleQueryHiddenWidth +
+              feature]));
     }
     pooled[feature] = value;
   }
@@ -1489,15 +1492,15 @@ void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
   CheckHipLaunch("fusion transformer residual LayerNorm");
 }
 
-template <typename scalar_t, typename mask_t>
+template <typename memory_t, typename scalar_t, typename mask_t>
 void LaunchSingleQueryReadoutSeedInputTyped(const torch::Tensor& memory,
     const torch::Tensor& query_source, const torch::Tensor& valid_mask,
     torch::Tensor& seed_input, int64_t batch_count, int64_t token_count,
     int64_t query_token_count, int64_t query_index, hipStream_t stream) {
   hipLaunchKernelGGL(
-      (single_query_seed_input_kernel<scalar_t, mask_t>),
+      (single_query_seed_input_kernel<memory_t, scalar_t, mask_t>),
       dim3(batch_count), dim3(kThreadsPerBlock), 0, stream,
-      memory.data_ptr<scalar_t>(), query_source.data_ptr<scalar_t>(),
+      memory.data_ptr<memory_t>(), query_source.data_ptr<memory_t>(),
       valid_mask.data_ptr<mask_t>(), seed_input.data_ptr<scalar_t>(),
       batch_count, token_count, query_token_count, query_index);
 }
@@ -1514,45 +1517,60 @@ void LaunchSingleQueryReadoutSeedInput(const torch::Tensor& memory,
     return;
   }
   const auto stream = at::hip::getCurrentHIPStream(memory.get_device());
-#define LAUNCH_SINGLE_QUERY_SEED(scalar_type, mask_type) \
-  LaunchSingleQueryReadoutSeedInputTyped<scalar_type, mask_type>( \
+#define LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, mask_type) \
+  LaunchSingleQueryReadoutSeedInputTyped<memory_type, compute_t, mask_type>( \
       memory, query_source, valid_mask, seed_input, batch_count, token_count, \
       query_token_count, query_index, stream.stream())
-#define DISPATCH_SINGLE_QUERY_SEED_MASK(value_type) \
+#define DISPATCH_SINGLE_QUERY_SEED_MASK(memory_type, compute_t) \
   switch (valid_mask.scalar_type()) { \
     case torch::kBool: \
-      LAUNCH_SINGLE_QUERY_SEED(value_type, bool); \
+      LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, bool); \
       break; \
     case torch::kUInt8: \
-      LAUNCH_SINGLE_QUERY_SEED(value_type, uint8_t); \
+      LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, uint8_t); \
       break; \
     case torch::kFloat16: \
-      LAUNCH_SINGLE_QUERY_SEED(value_type, c10::Half); \
+      LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, c10::Half); \
       break; \
     case torch::kBFloat16: \
-      LAUNCH_SINGLE_QUERY_SEED(value_type, c10::BFloat16); \
+      LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, c10::BFloat16); \
       break; \
     case torch::kFloat32: \
-      LAUNCH_SINGLE_QUERY_SEED(value_type, float); \
+      LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, float); \
       break; \
     default: \
       TORCH_CHECK(false, "unsupported single-query readout mask data type"); \
   }
-  if (memory.scalar_type() == torch::kFloat16) {
-    DISPATCH_SINGLE_QUERY_SEED_MASK(c10::Half);
-  } else if (memory.scalar_type() == torch::kBFloat16) {
-    DISPATCH_SINGLE_QUERY_SEED_MASK(c10::BFloat16);
-  } else if (memory.scalar_type() == torch::kFloat32) {
-    DISPATCH_SINGLE_QUERY_SEED_MASK(float);
-  } else {
-    TORCH_CHECK(false, "unsupported single-query readout data type");
+#define DISPATCH_SINGLE_QUERY_SEED_MEMORY(compute_type) \
+  switch (memory.scalar_type()) { \
+    case torch::kFloat16: \
+      DISPATCH_SINGLE_QUERY_SEED_MASK(c10::Half, compute_type); \
+      break; \
+    case torch::kBFloat16: \
+      DISPATCH_SINGLE_QUERY_SEED_MASK(c10::BFloat16, compute_type); \
+      break; \
+    case torch::kFloat32: \
+      DISPATCH_SINGLE_QUERY_SEED_MASK(float, compute_type); \
+      break; \
+    default: \
+      TORCH_CHECK(false, "unsupported single-query readout memory data type"); \
   }
+  if (seed_input.scalar_type() == torch::kFloat16) {
+    DISPATCH_SINGLE_QUERY_SEED_MEMORY(c10::Half);
+  } else if (seed_input.scalar_type() == torch::kBFloat16) {
+    DISPATCH_SINGLE_QUERY_SEED_MEMORY(c10::BFloat16);
+  } else if (seed_input.scalar_type() == torch::kFloat32) {
+    DISPATCH_SINGLE_QUERY_SEED_MEMORY(float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout compute data type");
+  }
+#undef DISPATCH_SINGLE_QUERY_SEED_MEMORY
 #undef DISPATCH_SINGLE_QUERY_SEED_MASK
 #undef LAUNCH_SINGLE_QUERY_SEED
   CheckHipLaunch("fusion single-query readout seed input");
 }
 
-template <typename scalar_t, typename mask_t>
+template <typename memory_t, typename scalar_t, typename mask_t>
 void LaunchSingleQueryReadoutAttentionTyped(
     const torch::Tensor& seed_products, const torch::Tensor& seed_bias,
     const torch::Tensor& memory, const torch::Tensor& valid_mask,
@@ -1562,11 +1580,11 @@ void LaunchSingleQueryReadoutAttentionTyped(
     int64_t token_count, int64_t attention_heads, int64_t attention_width,
     hipStream_t stream) {
   hipLaunchKernelGGL(
-      (single_query_attention_kernel<scalar_t, mask_t>),
+      (single_query_attention_kernel<memory_t, scalar_t, mask_t>),
       dim3(batch_count, readout_count * attention_heads),
       dim3(kThreadsPerBlock), 0, stream,
       seed_products.data_ptr<scalar_t>(), seed_bias.data_ptr<scalar_t>(),
-      memory.data_ptr<scalar_t>(), valid_mask.data_ptr<mask_t>(),
+      memory.data_ptr<memory_t>(), valid_mask.data_ptr<mask_t>(),
       query_weight.data_ptr<scalar_t>(), query_bias.data_ptr<scalar_t>(),
       key_value_weight.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
       context.data_ptr<scalar_t>(), batch_count, readout_count, token_count,
@@ -1589,40 +1607,55 @@ void LaunchSingleQueryReadoutAttention(const torch::Tensor& seed_products,
     return;
   }
   const auto stream = at::hip::getCurrentHIPStream(memory.get_device());
-#define LAUNCH_SINGLE_QUERY_ATTENTION(scalar_type, mask_type) \
-  LaunchSingleQueryReadoutAttentionTyped<scalar_type, mask_type>( \
+#define LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, mask_type) \
+  LaunchSingleQueryReadoutAttentionTyped<memory_type, compute_t, mask_type>( \
       seed_products, seed_bias, memory, valid_mask, query_weight, query_bias, \
       key_value_weight, state, context, batch_count, readout_count, token_count, \
       attention_heads, attention_width, stream.stream())
-#define DISPATCH_SINGLE_QUERY_ATTENTION_MASK(value_type) \
+#define DISPATCH_SINGLE_QUERY_ATTENTION_MASK(memory_type, compute_t) \
   switch (valid_mask.scalar_type()) { \
     case torch::kBool: \
-      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, bool); \
+      LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, bool); \
       break; \
     case torch::kUInt8: \
-      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, uint8_t); \
+      LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, uint8_t); \
       break; \
     case torch::kFloat16: \
-      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, c10::Half); \
+      LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, c10::Half); \
       break; \
     case torch::kBFloat16: \
-      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, c10::BFloat16); \
+      LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, c10::BFloat16); \
       break; \
     case torch::kFloat32: \
-      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, float); \
+      LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, float); \
       break; \
     default: \
       TORCH_CHECK(false, "unsupported single-query readout mask data type"); \
   }
-  if (memory.scalar_type() == torch::kFloat16) {
-    DISPATCH_SINGLE_QUERY_ATTENTION_MASK(c10::Half);
-  } else if (memory.scalar_type() == torch::kBFloat16) {
-    DISPATCH_SINGLE_QUERY_ATTENTION_MASK(c10::BFloat16);
-  } else if (memory.scalar_type() == torch::kFloat32) {
-    DISPATCH_SINGLE_QUERY_ATTENTION_MASK(float);
-  } else {
-    TORCH_CHECK(false, "unsupported single-query readout data type");
+#define DISPATCH_SINGLE_QUERY_ATTENTION_MEMORY(compute_type) \
+  switch (memory.scalar_type()) { \
+    case torch::kFloat16: \
+      DISPATCH_SINGLE_QUERY_ATTENTION_MASK(c10::Half, compute_type); \
+      break; \
+    case torch::kBFloat16: \
+      DISPATCH_SINGLE_QUERY_ATTENTION_MASK(c10::BFloat16, compute_type); \
+      break; \
+    case torch::kFloat32: \
+      DISPATCH_SINGLE_QUERY_ATTENTION_MASK(float, compute_type); \
+      break; \
+    default: \
+      TORCH_CHECK(false, "unsupported single-query readout memory data type"); \
   }
+  if (state.scalar_type() == torch::kFloat16) {
+    DISPATCH_SINGLE_QUERY_ATTENTION_MEMORY(c10::Half);
+  } else if (state.scalar_type() == torch::kBFloat16) {
+    DISPATCH_SINGLE_QUERY_ATTENTION_MEMORY(c10::BFloat16);
+  } else if (state.scalar_type() == torch::kFloat32) {
+    DISPATCH_SINGLE_QUERY_ATTENTION_MEMORY(float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout compute data type");
+  }
+#undef DISPATCH_SINGLE_QUERY_ATTENTION_MEMORY
 #undef DISPATCH_SINGLE_QUERY_ATTENTION_MASK
 #undef LAUNCH_SINGLE_QUERY_ATTENTION
   CheckHipLaunch("fusion single-query readout attention");

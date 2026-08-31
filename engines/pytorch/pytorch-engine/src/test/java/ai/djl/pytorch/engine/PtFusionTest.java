@@ -346,20 +346,28 @@ public class PtFusionTest {
         }
         int deviceCount = Math.min(2, engine.getGpuCount());
         int[] batches = {1, 31, 256, 384};
+        DataType[][] dataTypes = {
+            {DataType.FLOAT32, DataType.FLOAT32},
+            {DataType.FLOAT16, DataType.FLOAT16},
+            {DataType.FLOAT16, DataType.FLOAT32},
+            {DataType.BFLOAT16, DataType.BFLOAT16},
+            {DataType.BFLOAT16, DataType.FLOAT32}
+        };
         for (int deviceIndex = 0; deviceIndex < deviceCount; ++deviceIndex) {
             Device device = Device.gpu(deviceIndex);
-            for (DataType dataType :
-                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (DataType[] types : dataTypes) {
+                DataType dataType = types[0];
+                DataType memoryDataType = types[1];
                 PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture fixture =
                         new PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture(
-                                dataType, DataType.FLOAT32, 384, true, 3);
+                                dataType, memoryDataType, DataType.FLOAT32, 384, true, 3);
                 try (NDManager manager = engine.newBaseManager(device);
                         PtSingleQueryReadoutTestSupport.BoundSingleQueryReadouts bound =
                                 fixture.bind(manager);
                         NDArray memory =
                                 patternedArray(
                                         manager,
-                                        dataType,
+                                        memoryDataType,
                                         new Shape(384, 151, 256),
                                         37,
                                         18,
@@ -1790,7 +1798,7 @@ public class PtFusionTest {
             scope.suppressNotUsedWarning();
             NDArray memory = memoryStorage.get("0:" + batchCount);
             NDArray mask = maskStorage.get("0:" + batchCount);
-            NDArray querySeed = memory.get(":," + queryIndex);
+            NDArray querySeed = memory.get(":," + queryIndex).toType(dataType, false);
             NDArray floatMask = mask.neq(0).toType(DataType.FLOAT32, false);
             NDArray mean =
                     memory.toType(DataType.FLOAT32, false)
@@ -1809,9 +1817,11 @@ public class PtFusionTest {
             int headWidth = attentionWidth / attentionHeads;
             int tokenCount = Math.toIntExact(memory.getShape().get(1));
             int hiddenWidth = Math.toIntExact(memory.getShape().get(2));
+            NDArray projectionMemory = memory.toType(dataType, false);
             NDArray queryHeads = query.reshape(batchCount, attentionHeads, 1, headWidth);
             NDArray keyValues =
-                    memory.reshape(batchCount * tokenCount, hiddenWidth)
+                    projectionMemory
+                            .reshape(batchCount * tokenCount, hiddenWidth)
                             .matMul(weights.keyValueWeight.transpose())
                             .reshape(batchCount, tokenCount, 2 * attentionWidth);
             NDArray keys =
@@ -1846,10 +1856,10 @@ public class PtFusionTest {
             NDArray direction = queryHeads.matMul(keyWeights).div((float) Math.sqrt(headWidth));
             NDArray reorderedProbabilities =
                     direction
-                            .matMul(memory.expandDims(1).swapAxes(2, 3))
+                            .matMul(projectionMemory.expandDims(1).swapAxes(2, 3))
                             .add(invalidBias)
                             .softmax(3);
-            NDArray pooled = reorderedProbabilities.matMul(memory.expandDims(1));
+            NDArray pooled = reorderedProbabilities.matMul(projectionMemory.expandDims(1));
             NDArray valueWeights =
                     weights.keyValueWeight
                             .get(attentionWidth + ":" + (2 * attentionWidth))

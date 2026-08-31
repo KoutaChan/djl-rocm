@@ -1333,10 +1333,10 @@ SingleQueryReadoutGroupCommandSpec BuildSingleQueryReadoutGroupCommand(
   command.mask_data_type = valid_mask.data_type;
   for (int32_t result_index : command.result_value_indices) {
     const ValueSpec& current_result = plan.values[result_index];
-    TORCH_CHECK(current_result.data_type == memory.data_type &&
+    TORCH_CHECK(current_result.data_type == result.data_type &&
             current_result.dimension_index == command.extent_index &&
             current_result.inner_shape == expected_result_shape,
-        "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 result metadata does not match memory");
+        "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 result metadata does not match the group");
   }
   TORCH_CHECK(command.hidden_width == 256 && command.token_count > 0 &&
           command.token_count <= 256 && command.attention_heads > 0 &&

@@ -525,12 +525,12 @@ public class FusionRecipeTest {
         FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
         FusionRecipe.Input memory =
                 builder.addInput(
-                        "memory", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 151, 256));
+                        "memory", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 151, 256));
         FusionRecipe.Input querySource =
                 builder.addInput(
-                        "querySource", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 6, 256));
+                        "querySource", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 6, 256));
         FusionRecipe.Input mask =
-                builder.addInput("mask", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 151));
+                builder.addInput("mask", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 151));
         FusionRecipe.SingleQueryCrossAttentionReadoutGroupBuilder groupBuilder =
                 builder.singleQueryCrossAttentionReadoutGroup(
                                 "readouts", memory, querySource, mask, 4)
@@ -548,6 +548,7 @@ public class FusionRecipeTest {
         Assert.assertEquals(
                 group.getReadoutState(1).getSpec().getMaximumShape().getShape(),
                 new long[] {384, 256});
+        Assert.assertEquals(group.getReadoutState(0).getSpec().getDataType(), DataType.FLOAT16);
         Assert.assertSame(group.getMemory(), memory);
         Assert.assertSame(group.getQuerySource(), querySource);
         Assert.assertEquals(group.getQueryIndex(), 3);

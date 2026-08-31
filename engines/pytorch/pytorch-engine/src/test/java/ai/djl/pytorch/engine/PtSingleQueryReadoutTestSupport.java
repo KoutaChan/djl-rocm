@@ -74,25 +74,35 @@ final class PtSingleQueryReadoutTestSupport {
                 int maximumBatch,
                 boolean shareMemoryAsQuery,
                 int queryIndex) {
+            this(dataType, dataType, maskDataType, maximumBatch, shareMemoryAsQuery, queryIndex);
+        }
+
+        SingleQueryReadoutFixture(
+                DataType computeDataType,
+                DataType memoryDataType,
+                DataType maskDataType,
+                int maximumBatch,
+                boolean shareMemoryAsQuery,
+                int queryIndex) {
             FusionRecipe.Builder builder = FusionRecipe.builder("single-query-readout");
             batch = builder.addDimension("batch", maximumBatch);
             memory =
                     builder.addInput(
-                            "memory", FusionRecipe.TensorSpec.of(dataType, batch, 151, 256));
+                            "memory", FusionRecipe.TensorSpec.of(memoryDataType, batch, 151, 256));
             querySource =
                     shareMemoryAsQuery
                             ? memory
                             : builder.addInput(
                                     "querySource",
-                                    FusionRecipe.TensorSpec.of(dataType, batch, 6, 256));
+                                    FusionRecipe.TensorSpec.of(memoryDataType, batch, 6, 256));
             mask = builder.addInput("mask", FusionRecipe.TensorSpec.of(maskDataType, batch, 151));
             FusionRecipe.SingleQueryCrossAttentionReadoutGroupBuilder group =
                     builder.singleQueryCrossAttentionReadoutGroup(
                                     "readouts", memory, querySource, mask, 4)
                             .optQueryIndex(queryIndex);
             readoutConstants = new ArrayList<>(2);
-            readoutConstants.add(addReadout(builder, group, "policy", 384, dataType));
-            readoutConstants.add(addReadout(builder, group, "value", 256, dataType));
+            readoutConstants.add(addReadout(builder, group, "policy", 384, computeDataType));
+            readoutConstants.add(addReadout(builder, group, "value", 256, computeDataType));
             FusionRecipe.SingleQueryCrossAttentionReadoutGroup readouts = group.build();
             policyOutput = builder.addOutput("policy", readouts.getReadoutState(0));
             valueOutput = builder.addOutput("value", readouts.getReadoutState(1));

@@ -944,15 +944,19 @@ public final class FusionRecipe {
      * <p>The stage first computes the masked mean of {@code memory} once. Each readout projects the
      * concatenation of the selected {@code querySource} token and that mean, attends to the same
      * memory, applies a residual LayerNorm, evaluates a SiLU feed-forward network, and applies a
-     * final residual LayerNorm. A nonzero mask element marks a valid memory token. A row with no
-     * valid tokens uses a zero mean and a zero attention context.
+     * final residual LayerNorm. The memory and query source use one floating-point input type. A
+     * nonzero mask element marks a valid memory token. A row with no valid tokens uses a zero mean
+     * and a zero attention context.
      *
      * <p>For each attention head, an implementation may use {@code q (E W_k^T)^T = E (W_k^T q)} and
      * {@code softmax(E (W_k^T q)) E W_v^T = (softmax(E (W_k^T q)) E) W_v^T}. This avoids the
-     * projected key-value tensor while preserving exact real-number semantics. FLOAT16 and BFLOAT16
-     * implementations accumulate projections, reductions, and LayerNorm statistics in FLOAT32 and
-     * may round at the documented projection and residual boundaries; they are not required to be
-     * bitwise identical to a materialized key-value implementation.
+     * projected key-value tensor while preserving exact real-number semantics. The memory and query
+     * source may use a data type different from the projections. They are converted to the
+     * projection data type at the same boundaries as an autocast linear operation; the masked mean
+     * is reduced in FLOAT32 before that conversion. FLOAT16 and BFLOAT16 implementations accumulate
+     * projections, reductions, and LayerNorm statistics in FLOAT32 and may round at the documented
+     * projection and residual boundaries; they are not required to be bitwise identical to a
+     * materialized key-value implementation.
      *
      * <p>Each readout produces a separate contiguous {@code [batch, hiddenWidth]} state. Keeping
      * the states separate allows each state to be passed directly to a later Fusion recipe without
@@ -1863,9 +1867,10 @@ public final class FusionRecipe {
          * Adds one purpose-specific readout.
          *
          * <p>Projection weights use {@code [outputWidth, inputWidth]} layout. The key-value weight
-         * stores all key rows followed by all value rows. Every projection and bias uses the memory
-         * data type. LayerNorm scale and bias pairs may instead use FLOAT32, but all LayerNorm
-         * parameters in the group must share one data type.
+         * stores all key rows followed by all value rows. Every projection and bias uses one shared
+         * compute data type, which may differ from the memory and query-source types. LayerNorm
+         * scale and bias pairs may instead use FLOAT32, but all LayerNorm parameters in the group
+         * must share one data type.
          *
          * @param querySeedWeight query-seed projection weight
          * @param querySeedBias query-seed projection bias
@@ -2042,6 +2047,11 @@ public final class FusionRecipe {
             int attentionWidth = -1;
             int maximumFeedForwardWidth = 0;
             DataType normDataType = null;
+            DataType computeDataType = readouts.get(0).querySeedWeight.getSpec().dataType;
+            if (!Builder.isAffineDataType(computeDataType)) {
+                throw new IllegalArgumentException(
+                        "Readout projections only support FLOAT16, BFLOAT16, and FLOAT32.");
+            }
             List<SingleQueryCrossAttentionReadout> checkedReadouts =
                     new ArrayList<>(readouts.size());
             for (SingleQueryCrossAttentionReadout readout : readouts) {
@@ -2049,13 +2059,13 @@ public final class FusionRecipe {
                         readout.querySeedWeight,
                         hiddenWidth,
                         2L * hiddenWidth,
-                        memorySpec.dataType,
+                        computeDataType,
                         "query-seed weight");
                 requireVector(
-                        readout.querySeedBias, hiddenWidth, memorySpec.dataType, "query-seed bias");
+                        readout.querySeedBias, hiddenWidth, computeDataType, "query-seed bias");
                 TensorSpec queryWeightSpec = readout.queryWeight.getSpec();
                 if (queryWeightSpec.leadingDimension != null
-                        || queryWeightSpec.dataType != memorySpec.dataType
+                        || queryWeightSpec.dataType != computeDataType
                         || queryWeightSpec.innerShape.length != 2
                         || queryWeightSpec.innerShape[1] != hiddenWidth) {
                     throw new IllegalArgumentException(
@@ -2072,27 +2082,26 @@ public final class FusionRecipe {
                     throw new IllegalArgumentException(
                             "Readout attention width must be positive and divisible by its heads.");
                 }
-                requireVector(readout.queryBias, attentionWidth, memorySpec.dataType, "query bias");
+                requireVector(readout.queryBias, attentionWidth, computeDataType, "query bias");
                 requireProjection(
                         readout.keyValueWeight,
                         2L * attentionWidth,
                         hiddenWidth,
-                        memorySpec.dataType,
+                        computeDataType,
                         "key-value weight");
                 requireProjection(
                         readout.contextWeight,
                         hiddenWidth,
                         attentionWidth,
-                        memorySpec.dataType,
+                        computeDataType,
                         "context weight");
-                requireVector(
-                        readout.contextBias, hiddenWidth, memorySpec.dataType, "context bias");
+                requireVector(readout.contextBias, hiddenWidth, computeDataType, "context bias");
                 normDataType =
                         requireNormPair(
                                 readout.queryNormWeight,
                                 readout.queryNormBias,
                                 hiddenWidth,
-                                memorySpec.dataType,
+                                computeDataType,
                                 normDataType,
                                 "post-attention LayerNorm");
                 normDataType =
@@ -2100,13 +2109,13 @@ public final class FusionRecipe {
                                 readout.feedForwardNormWeight,
                                 readout.feedForwardNormBias,
                                 hiddenWidth,
-                                memorySpec.dataType,
+                                computeDataType,
                                 normDataType,
                                 "feed-forward LayerNorm");
 
                 TensorSpec expansionSpec = readout.feedForwardExpansionWeight.getSpec();
                 if (expansionSpec.leadingDimension != null
-                        || expansionSpec.dataType != memorySpec.dataType
+                        || expansionSpec.dataType != computeDataType
                         || expansionSpec.innerShape.length != 2
                         || expansionSpec.innerShape[1] != hiddenWidth) {
                     throw new IllegalArgumentException(
@@ -2116,25 +2125,25 @@ public final class FusionRecipe {
                 requireVector(
                         readout.feedForwardExpansionBias,
                         feedForwardWidth,
-                        memorySpec.dataType,
+                        computeDataType,
                         "feed-forward expansion bias");
                 requireProjection(
                         readout.feedForwardProjectionWeight,
                         hiddenWidth,
                         feedForwardWidth,
-                        memorySpec.dataType,
+                        computeDataType,
                         "feed-forward projection weight");
                 requireVector(
                         readout.feedForwardProjectionBias,
                         hiddenWidth,
-                        memorySpec.dataType,
+                        computeDataType,
                         "feed-forward projection bias");
                 normDataType =
                         requireNormPair(
                                 readout.outputNormWeight,
                                 readout.outputNormBias,
                                 hiddenWidth,
-                                memorySpec.dataType,
+                                computeDataType,
                                 normDataType,
                                 "output LayerNorm");
                 maximumFeedForwardWidth = Math.max(maximumFeedForwardWidth, feedForwardWidth);
@@ -2170,7 +2179,7 @@ public final class FusionRecipe {
                             recipeBuilder.values.size(),
                             stateNames,
                             TensorSpec.of(
-                                    memorySpec.dataType, memorySpec.leadingDimension, hiddenWidth),
+                                    computeDataType, memorySpec.leadingDimension, hiddenWidth),
                             memory,
                             querySource,
                             validMask,
