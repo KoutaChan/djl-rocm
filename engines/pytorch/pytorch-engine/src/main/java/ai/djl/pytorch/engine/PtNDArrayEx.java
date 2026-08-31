@@ -64,6 +64,13 @@ public class PtNDArrayEx implements NDArrayEx {
         if (!array.getDevice().isGpu()) {
             return NDArrayEx.super.segmentedLookupSum(storedIndices);
         }
+        DataType indexType = storedIndices.getDataType();
+        if (indexType != DataType.INT16
+                && indexType != DataType.INT32
+                && indexType != DataType.INT64) {
+            throw new IllegalArgumentException(
+                    "segmented lookup indices must be INT16, INT32, or INT64: " + indexType);
+        }
         PtNDManager manager = array.getManager();
         return JniUtils.segmentedLookupSum(array, manager.from(storedIndices));
     }
