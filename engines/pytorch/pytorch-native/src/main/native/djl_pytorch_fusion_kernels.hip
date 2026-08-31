@@ -141,7 +141,7 @@ __device__ void pack_source(const OutputPackArguments& arguments, int32_t source
     const int64_t column = index - row * width;
     output[row * arguments.output_width +
         arguments.destination_offsets[source_index] + column] =
-        static_cast<output_t>(source[index]);
+        static_cast<output_t>(static_cast<float>(source[index]));
   }
 }
 
@@ -192,7 +192,7 @@ __device__ void pack_segmented_source(
         feature;
     output[row * arguments.output_width +
         arguments.destination_offsets[segment_index] + column] =
-        static_cast<output_t>(source[source_element]);
+        static_cast<output_t>(static_cast<float>(source[source_element]));
   }
 }
 
