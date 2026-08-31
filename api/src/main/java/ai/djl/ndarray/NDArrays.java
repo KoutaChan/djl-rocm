@@ -25,6 +25,51 @@ public final class NDArrays {
     private NDArrays() {}
 
     /**
+     * Adds namespace offsets to integer IDs and looks up their dense embeddings.
+     *
+     * <p>{@code offsets} must be broadcastable to {@code rawIds}. The result has the shape of the
+     * broadcast IDs followed by the embedding width, and its data type is the data type of {@code
+     * table}. Engines may fuse the offset addition and lookup while retaining the same dense
+     * embedding gradient semantics as the portable implementation.
+     *
+     * @param rawIds unoffset integer IDs
+     * @param offsets integer namespace offsets broadcastable to {@code rawIds}
+     * @param table dense embedding table shaped {@code [entries, embeddingSize]}
+     * @return embeddings selected by {@code rawIds + offsets}
+     */
+    public static NDArray embeddingWithOffsets(NDArray rawIds, NDArray offsets, NDArray table) {
+        DataType rawType = rawIds.getDataType();
+        DataType offsetType = offsets.getDataType();
+        if (!isEmbeddingIndexType(rawType) || !isEmbeddingIndexType(offsetType)) {
+            throw new IllegalArgumentException(
+                    "raw IDs and offsets must use int16, int32, or int64");
+        }
+        Shape rawShape = rawIds.getShape();
+        Shape offsetShape = offsets.getShape();
+        if (offsetShape.dimension() > rawShape.dimension()) {
+            throw new IllegalArgumentException("offsets must be broadcastable to raw IDs");
+        }
+        for (int axis = 1; axis <= offsetShape.dimension(); ++axis) {
+            long offsetDimension = offsetShape.get(offsetShape.dimension() - axis);
+            long rawDimension = rawShape.get(rawShape.dimension() - axis);
+            if (offsetDimension != 1 && offsetDimension != rawDimension) {
+                throw new IllegalArgumentException("offsets must be broadcastable to raw IDs");
+            }
+        }
+        if (table.getShape().dimension() != 2 || !table.getDataType().isFloating()) {
+            throw new IllegalArgumentException(
+                    "embedding table must be a rank-two floating-point tensor");
+        }
+        return rawIds.getNDArrayInternal().embeddingWithOffsets(offsets, table);
+    }
+
+    private static boolean isEmbeddingIndexType(DataType dataType) {
+        return dataType == DataType.INT16
+                || dataType == DataType.INT32
+                || dataType == DataType.INT64;
+    }
+
+    /**
      * Selects rows from the leading axis without expanding the row indices across trailing axes.
      *
      * <p>The returned shape is {@code [rowIndices.size(), source.shape[1], ...]}. Repeated indices

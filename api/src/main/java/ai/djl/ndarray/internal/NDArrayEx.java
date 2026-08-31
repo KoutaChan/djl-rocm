@@ -35,6 +35,12 @@ public interface NDArrayEx {
     // NDArrays
     */
 
+    /** Adds integer namespace offsets and performs a dense embedding lookup. */
+    default NDArray embeddingWithOffsets(NDArray offsets, NDArray table) {
+        NDArray indices = getArray().add(offsets);
+        return Embedding.embedding(indices, table, SparseFormat.DENSE).singletonOrThrow();
+    }
+
     /** Selects leading-axis rows while preserving all trailing dimensions. */
     default NDArray gatherRows(NDArray rowIndices) {
         NDArray rows = getArray();
