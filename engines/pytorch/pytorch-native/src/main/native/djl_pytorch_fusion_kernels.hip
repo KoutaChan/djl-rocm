@@ -299,6 +299,250 @@ __global__ void indexed_affine_finalize_kernel(
   }
 }
 
+constexpr int kTransformerHiddenWidth = 256;
+constexpr int kTransformerMaximumTokens = 8;
+constexpr int kTransformerAttentionHeads = 4;
+constexpr int kTransformerAttentionWidth = 128;
+constexpr int kTransformerHeadWidth = 32;
+constexpr int kTransformerCachedValuesPerLane =
+    kTransformerHiddenWidth / 32;
+
+__device__ float TransformerWaveSum(float value) {
+  for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
+    value += __shfl_down(value, offset);
+  }
+  return value;
+}
+
+template <typename scalar_t, typename norm_t>
+__global__ void transformer_copy_layer_norm_kernel(
+    const scalar_t* input, scalar_t* state, scalar_t* normalized,
+    const norm_t* weight, const norm_t* bias, int64_t active_rows,
+    float epsilon, bool copy_input) {
+  const int32_t lane = threadIdx.x % warpSize;
+  const int32_t wave = threadIdx.x / warpSize;
+  const int32_t waves_per_block = blockDim.x / warpSize;
+  for (int64_t row =
+           static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < active_rows;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    float values[kTransformerCachedValuesPerLane];
+    float mean = 0.0f;
+    float moment = 0.0f;
+    int32_t count = 0;
+    const int64_t row_offset = row * kTransformerHiddenWidth;
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
+         ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kTransformerHiddenWidth) {
+        const int64_t offset = row_offset + feature;
+        const float value = static_cast<float>(input[offset]);
+        values[index] = value;
+        if (copy_input) {
+          state[offset] = static_cast<scalar_t>(value);
+        }
+        ++count;
+        const float delta = value - mean;
+        mean += delta / count;
+        moment += delta * (value - mean);
+      }
+    }
+    for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
+      const float other_mean = __shfl_down(mean, offset);
+      const float other_moment = __shfl_down(moment, offset);
+      const int32_t other_count = __shfl_down(count, offset);
+      if (lane + offset < warpSize && other_count > 0) {
+        const int32_t combined_count = count + other_count;
+        const float delta = other_mean - mean;
+        moment += other_moment + delta * delta * count * other_count /
+            combined_count;
+        mean += delta * other_count / combined_count;
+        count = combined_count;
+      }
+    }
+    mean = __shfl(mean, 0);
+    const float inverse_standard_deviation =
+        rsqrtf(__shfl(moment, 0) / kTransformerHiddenWidth + epsilon);
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
+         ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kTransformerHiddenWidth) {
+        normalized[row_offset + feature] = static_cast<scalar_t>(
+            (values[index] - mean) * inverse_standard_deviation *
+                static_cast<float>(weight[feature]) +
+            static_cast<float>(bias[feature]));
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void transformer_attention_kernel(const scalar_t* query_key_value,
+    scalar_t* context, int64_t batch_count, int64_t token_count) {
+  const int64_t batch = blockIdx.x;
+  if (batch >= batch_count) {
+    return;
+  }
+  const int32_t feature = threadIdx.x;
+  const int32_t lane = feature % warpSize;
+  const int32_t wave = feature / warpSize;
+  const int32_t waves_per_block = blockDim.x / warpSize;
+  __shared__ float probabilities
+      [kTransformerAttentionHeads * kTransformerMaximumTokens *
+       kTransformerMaximumTokens];
+
+  const int64_t qkv_batch_offset =
+      batch * token_count * (3 * kTransformerAttentionWidth);
+  constexpr float scale = 0.1767766952966369f;
+  const int32_t attention_row_count =
+      kTransformerAttentionHeads * static_cast<int32_t>(token_count);
+  for (int32_t attention_row = wave; attention_row < attention_row_count;
+       attention_row += waves_per_block) {
+    const int32_t head = attention_row / token_count;
+    const int32_t query = attention_row - head * token_count;
+    float logits[kTransformerMaximumTokens];
+    for (int32_t key = 0; key < token_count; ++key) {
+      float product = 0.0f;
+      if (lane < kTransformerHeadWidth) {
+        const int64_t query_offset =
+            qkv_batch_offset + query * (3 * kTransformerAttentionWidth) +
+            head * kTransformerHeadWidth + lane;
+        const int64_t key_offset =
+            qkv_batch_offset + key * (3 * kTransformerAttentionWidth) +
+            kTransformerAttentionWidth + head * kTransformerHeadWidth + lane;
+        product = static_cast<float>(query_key_value[query_offset]) *
+            static_cast<float>(query_key_value[key_offset]);
+      }
+      product = TransformerWaveSum(product);
+      if (lane == 0) {
+        logits[key] = product * scale;
+      }
+    }
+    if (lane == 0) {
+      float maximum = logits[0];
+      for (int32_t key = 1; key < token_count; ++key) {
+        maximum = fmaxf(maximum, logits[key]);
+      }
+      float denominator = 0.0f;
+      for (int32_t key = 0; key < token_count; ++key) {
+        logits[key] = expf(logits[key] - maximum);
+        denominator += logits[key];
+      }
+      const int32_t probability_offset =
+          (head * kTransformerMaximumTokens + query) *
+          kTransformerMaximumTokens;
+      for (int32_t key = 0; key < token_count; ++key) {
+        probabilities[probability_offset + key] = logits[key] / denominator;
+      }
+    }
+  }
+  __syncthreads();
+
+  const int32_t context_elements =
+      static_cast<int32_t>(token_count) * kTransformerAttentionWidth;
+  for (int32_t index = feature; index < context_elements;
+       index += kThreadsPerBlock) {
+    const int32_t query = index / kTransformerAttentionWidth;
+    const int32_t attention_feature =
+        index - query * kTransformerAttentionWidth;
+    const int32_t head = attention_feature / kTransformerHeadWidth;
+    float value = 0.0f;
+    const int32_t probability_offset =
+        (head * kTransformerMaximumTokens + query) *
+        kTransformerMaximumTokens;
+    for (int32_t key = 0; key < token_count; ++key) {
+      const int64_t value_offset =
+          qkv_batch_offset + key * (3 * kTransformerAttentionWidth) +
+          2 * kTransformerAttentionWidth + attention_feature;
+      value += probabilities[probability_offset + key] *
+          static_cast<float>(query_key_value[value_offset]);
+    }
+    context[(batch * token_count + query) * kTransformerAttentionWidth +
+        attention_feature] = static_cast<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t>
+__global__ void transformer_bias_silu_kernel(
+    scalar_t* values, const scalar_t* bias, int64_t element_count,
+    int64_t width) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+           threadIdx.x;
+       index < element_count;
+       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const float value = static_cast<float>(values[index]) +
+        static_cast<float>(bias[index % width]);
+    values[index] = static_cast<scalar_t>(value / (1.0f + expf(-value)));
+  }
+}
+
+template <typename scalar_t, typename norm_t>
+__global__ void transformer_residual_layer_norm_kernel(
+    scalar_t* state, const scalar_t* update, const scalar_t* update_bias,
+    const norm_t* norm_weight, const norm_t* norm_bias, scalar_t* normalized,
+    int64_t active_rows, float epsilon) {
+  const int32_t lane = threadIdx.x % warpSize;
+  const int32_t wave = threadIdx.x / warpSize;
+  const int32_t waves_per_block = blockDim.x / warpSize;
+  for (int64_t row =
+           static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < active_rows;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    float values[kTransformerCachedValuesPerLane];
+    float mean = 0.0f;
+    float moment = 0.0f;
+    int32_t count = 0;
+    const int64_t row_offset = row * kTransformerHiddenWidth;
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
+         ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kTransformerHiddenWidth) {
+        const int64_t offset = row_offset + feature;
+        const float value = static_cast<float>(state[offset]) +
+            static_cast<float>(update[offset]) +
+            static_cast<float>(update_bias[feature]);
+        const scalar_t rounded = static_cast<scalar_t>(value);
+        state[offset] = rounded;
+        values[index] = static_cast<float>(rounded);
+        ++count;
+        const float delta = values[index] - mean;
+        mean += delta / count;
+        moment += delta * (values[index] - mean);
+      }
+    }
+    for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
+      const float other_mean = __shfl_down(mean, offset);
+      const float other_moment = __shfl_down(moment, offset);
+      const int32_t other_count = __shfl_down(count, offset);
+      if (lane + offset < warpSize && other_count > 0) {
+        const int32_t combined_count = count + other_count;
+        const float delta = other_mean - mean;
+        moment += other_moment + delta * delta * count * other_count /
+            combined_count;
+        mean += delta * other_count / combined_count;
+        count = combined_count;
+      }
+    }
+    mean = __shfl(mean, 0);
+    const float inverse_standard_deviation =
+        rsqrtf(__shfl(moment, 0) / kTransformerHiddenWidth + epsilon);
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
+         ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kTransformerHiddenWidth) {
+        normalized[row_offset + feature] = static_cast<scalar_t>(
+            (values[index] - mean) * inverse_standard_deviation *
+                static_cast<float>(norm_weight[feature]) +
+            static_cast<float>(norm_bias[feature]));
+      }
+    }
+  }
+}
+
 void CheckHipLaunch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
   TORCH_CHECK(error == hipSuccess, kernel_name, " launch failed: ", hipGetErrorString(error));
@@ -590,6 +834,186 @@ void LaunchIndexedAffineFinalize(const void* indices,
   }
 #undef LAUNCH_INDEXED_FINALIZE
   CheckHipLaunch("fusion indexed-affine finalize");
+}
+
+template <typename scalar_t, typename norm_t>
+void LaunchTransformerCopyAndLayerNormTyped(const torch::Tensor& input,
+    torch::Tensor& state, torch::Tensor& normalized,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    int64_t active_rows, float epsilon, bool copy_input,
+    hipStream_t stream) {
+  constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
+  const uint32_t block_count = static_cast<uint32_t>(
+      (active_rows + maximum_waves_per_block - 1) /
+      maximum_waves_per_block);
+  hipLaunchKernelGGL(
+      (transformer_copy_layer_norm_kernel<scalar_t, norm_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
+      input.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
+      normalized.data_ptr<scalar_t>(), weight.data_ptr<norm_t>(),
+      bias.data_ptr<norm_t>(), active_rows, epsilon, copy_input);
+}
+
+void LaunchTransformerCopyAndLayerNorm(const torch::Tensor& input,
+    torch::Tensor& state, torch::Tensor& normalized,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    int64_t batch_count, int64_t token_count, int64_t hidden_width,
+    float epsilon, bool copy_input) {
+  TORCH_CHECK(hidden_width == kTransformerHiddenWidth,
+      "transformer encoder lowering requires hidden width 256");
+  const int64_t active_rows = CheckedMultiply(
+      batch_count, token_count, "transformer LayerNorm row count");
+  if (active_rows == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(state.get_device());
+#define LAUNCH_TRANSFORMER_COPY_LAYER_NORM(scalar_type, norm_type) \
+  LaunchTransformerCopyAndLayerNormTyped<scalar_type, norm_type>( \
+      input, state, normalized, weight, bias, active_rows, epsilon, \
+      copy_input, stream.stream())
+  if (input.scalar_type() == torch::kFloat16) {
+    if (weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_TRANSFORMER_COPY_LAYER_NORM(c10::Half, float);
+    } else {
+      LAUNCH_TRANSFORMER_COPY_LAYER_NORM(c10::Half, c10::Half);
+    }
+  } else if (input.scalar_type() == torch::kBFloat16) {
+    if (weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_TRANSFORMER_COPY_LAYER_NORM(c10::BFloat16, float);
+    } else {
+      LAUNCH_TRANSFORMER_COPY_LAYER_NORM(c10::BFloat16, c10::BFloat16);
+    }
+  } else if (input.scalar_type() == torch::kFloat32) {
+    LAUNCH_TRANSFORMER_COPY_LAYER_NORM(float, float);
+  } else {
+    TORCH_CHECK(false, "unsupported transformer encoder data type");
+  }
+#undef LAUNCH_TRANSFORMER_COPY_LAYER_NORM
+  CheckHipLaunch("fusion transformer copy LayerNorm");
+}
+
+template <typename scalar_t>
+void LaunchTransformerAttentionTyped(const torch::Tensor& query_key_value,
+    torch::Tensor& context, int64_t batch_count, int64_t token_count,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      (transformer_attention_kernel<scalar_t>),
+      dim3(batch_count), dim3(kThreadsPerBlock), 0, stream,
+      query_key_value.data_ptr<scalar_t>(), context.data_ptr<scalar_t>(),
+      batch_count, token_count);
+}
+
+void LaunchTransformerAttention(const torch::Tensor& query_key_value,
+    torch::Tensor& context, int64_t batch_count, int64_t token_count,
+    int64_t attention_heads, int64_t attention_width, int64_t hidden_width) {
+  TORCH_CHECK(token_count > 0 && token_count <= kTransformerMaximumTokens,
+      "transformer encoder lowering supports at most eight tokens");
+  TORCH_CHECK(attention_heads == kTransformerAttentionHeads &&
+          attention_width == kTransformerAttentionWidth &&
+          hidden_width == kTransformerHiddenWidth,
+      "transformer encoder lowering requires heads=4, attention=128, hidden=256");
+  if (batch_count == 0) {
+    return;
+  }
+  const auto stream =
+      at::hip::getCurrentHIPStream(query_key_value.get_device());
+#define LAUNCH_TRANSFORMER_ATTENTION(scalar_type) \
+  LaunchTransformerAttentionTyped<scalar_type>(query_key_value, context, \
+      batch_count, token_count, stream.stream())
+  if (query_key_value.scalar_type() == torch::kFloat16) {
+    LAUNCH_TRANSFORMER_ATTENTION(c10::Half);
+  } else if (query_key_value.scalar_type() == torch::kBFloat16) {
+    LAUNCH_TRANSFORMER_ATTENTION(c10::BFloat16);
+  } else if (query_key_value.scalar_type() == torch::kFloat32) {
+    LAUNCH_TRANSFORMER_ATTENTION(float);
+  } else {
+    TORCH_CHECK(false, "unsupported transformer encoder data type");
+  }
+#undef LAUNCH_TRANSFORMER_ATTENTION
+  CheckHipLaunch("fusion transformer attention");
+}
+
+void LaunchTransformerBiasSilu(torch::Tensor& values,
+    const torch::Tensor& bias, int64_t active_rows, int64_t width) {
+  const int64_t element_count = CheckedMultiply(
+      active_rows, width, "transformer SiLU element count");
+  if (element_count == 0) {
+    return;
+  }
+  const uint32_t block_count = static_cast<uint32_t>(
+      std::min<int64_t>(RequiredBlockCount(element_count), 65535));
+  const auto stream = at::hip::getCurrentHIPStream(values.get_device());
+#define LAUNCH_TRANSFORMER_SILU(scalar_type) \
+  hipLaunchKernelGGL((transformer_bias_silu_kernel<scalar_type>), \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream.stream(), \
+      values.data_ptr<scalar_type>(), bias.data_ptr<scalar_type>(), \
+      element_count, width)
+  if (values.scalar_type() == torch::kFloat16) {
+    LAUNCH_TRANSFORMER_SILU(c10::Half);
+  } else if (values.scalar_type() == torch::kBFloat16) {
+    LAUNCH_TRANSFORMER_SILU(c10::BFloat16);
+  } else if (values.scalar_type() == torch::kFloat32) {
+    LAUNCH_TRANSFORMER_SILU(float);
+  } else {
+    TORCH_CHECK(false, "unsupported transformer encoder data type");
+  }
+#undef LAUNCH_TRANSFORMER_SILU
+  CheckHipLaunch("fusion transformer bias SiLU");
+}
+
+template <typename scalar_t, typename norm_t>
+void LaunchTransformerResidualLayerNormTyped(torch::Tensor& state,
+    const torch::Tensor& update, const torch::Tensor& update_bias,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
+    torch::Tensor& normalized, int64_t active_rows, float epsilon,
+    hipStream_t stream) {
+  constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
+  const uint32_t block_count = static_cast<uint32_t>(
+      (active_rows + maximum_waves_per_block - 1) /
+      maximum_waves_per_block);
+  hipLaunchKernelGGL(
+      (transformer_residual_layer_norm_kernel<scalar_t, norm_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
+      state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
+      update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(),
+      norm_bias.data_ptr<norm_t>(), normalized.data_ptr<scalar_t>(),
+      active_rows, epsilon);
+}
+
+void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
+    const torch::Tensor& update, const torch::Tensor& update_bias,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
+    torch::Tensor& normalized, int64_t active_rows, int64_t hidden_width,
+    float epsilon) {
+  TORCH_CHECK(hidden_width == kTransformerHiddenWidth,
+      "transformer encoder lowering requires hidden width 256");
+  if (active_rows == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(state.get_device());
+#define LAUNCH_TRANSFORMER_RESIDUAL_NORM(scalar_type, norm_type) \
+  LaunchTransformerResidualLayerNormTyped<scalar_type, norm_type>( \
+      state, update, update_bias, norm_weight, norm_bias, normalized, \
+      active_rows, epsilon, stream.stream())
+  if (state.scalar_type() == torch::kFloat16) {
+    if (norm_weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_TRANSFORMER_RESIDUAL_NORM(c10::Half, float);
+    } else {
+      LAUNCH_TRANSFORMER_RESIDUAL_NORM(c10::Half, c10::Half);
+    }
+  } else if (state.scalar_type() == torch::kBFloat16) {
+    if (norm_weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_TRANSFORMER_RESIDUAL_NORM(c10::BFloat16, float);
+    } else {
+      LAUNCH_TRANSFORMER_RESIDUAL_NORM(c10::BFloat16, c10::BFloat16);
+    }
+  } else if (state.scalar_type() == torch::kFloat32) {
+    LAUNCH_TRANSFORMER_RESIDUAL_NORM(float, float);
+  } else {
+    TORCH_CHECK(false, "unsupported transformer encoder data type");
+  }
+#undef LAUNCH_TRANSFORMER_RESIDUAL_NORM
+  CheckHipLaunch("fusion transformer residual LayerNorm");
 }
 
 }  // namespace djl::pytorch::fusion

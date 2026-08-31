@@ -18,6 +18,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -58,6 +61,7 @@ constexpr int64_t kDTypeFloat64 = 10;
 constexpr int64_t kOutputPackV1 = 1;
 constexpr int64_t kAffineSumV1 = 2;
 constexpr int64_t kIndexedAffineV1 = 3;
+constexpr int64_t kTransformerEncoderStackV1 = 4;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
 
@@ -74,6 +78,11 @@ constexpr int64_t kIndexedActivation = 2;
 constexpr int64_t kIndexedHasHiddenBias = 3;
 constexpr int64_t kIndexedHasOutputBias = 4;
 constexpr int64_t kIndexedSourceDivisors = 5;
+constexpr int64_t kTransformerBlockCount = 1;
+constexpr int64_t kTransformerAttentionHeads = 2;
+constexpr int64_t kTransformerAttentionWidth = 3;
+constexpr int64_t kTransformerFeedForwardWidth = 4;
+constexpr int64_t kTransformerEpsilon = 5;
 constexpr int64_t kActivationNone = 0;
 constexpr int64_t kActivationSilu = 1;
 
@@ -194,8 +203,35 @@ struct IndexedAffineCommandSpec {
   std::vector<IndexedAffineSourceSpec> sources;
 };
 
+struct TransformerEncoderBlockSpec {
+  std::array<int32_t, 13> value_indices;
+  int32_t query_key_value_weight_binding_index;
+  int32_t attention_output_weight_binding_index;
+  int32_t feed_forward_expansion_weight_binding_index;
+  int32_t feed_forward_projection_weight_binding_index;
+};
+
+struct TransformerEncoderStackCommandSpec {
+  int32_t result_value_index;
+  int32_t result_storage_index;
+  int32_t input_value_index;
+  int32_t extent_index;
+  int32_t normalized_storage_index;
+  int32_t query_key_value_storage_index;
+  int32_t expanded_storage_index;
+  int64_t maximum_batches;
+  int64_t token_count;
+  int64_t hidden_width;
+  int64_t attention_heads;
+  int64_t attention_width;
+  int64_t feed_forward_width;
+  float epsilon;
+  std::vector<int32_t> operand_value_indices;
+  std::vector<TransformerEncoderBlockSpec> blocks;
+};
+
 using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec,
-    IndexedAffineCommandSpec>;
+    IndexedAffineCommandSpec, TransformerEncoderStackCommandSpec>;
 
 struct FusionPlanData {
   explicit FusionPlanData(c10::Device device) : device(device) {}
@@ -219,6 +255,8 @@ struct FusionExecutableData {
   std::vector<std::vector<torch::Tensor>> affine_weights;
   std::vector<std::vector<torch::Tensor>> affine_products;
   std::vector<torch::Tensor> indexed_affine_weights;
+  std::vector<std::vector<std::array<torch::Tensor, 4>>>
+      transformer_encoder_weights;
   std::unique_ptr<c10::Event> binding_ready;
 };
 
@@ -373,6 +411,19 @@ int64_t GetRequiredInt64Scalar(const CommandAttributes& attributes,
           found->second.payload.size() == 1,
       name, " attribute must be one int64 value");
   return found->second.payload[0];
+}
+
+double GetRequiredFloat64Scalar(const CommandAttributes& attributes,
+    int64_t key, const char* name) {
+  const auto found = attributes.find(key);
+  TORCH_CHECK(found != attributes.end(), "missing ", name, " attribute");
+  TORCH_CHECK(found->second.type == kAttributeFloat64Bits &&
+          found->second.payload.size() == 1,
+      name, " attribute must be one float64 value");
+  double value;
+  const int64_t bits = found->second.payload[0];
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
 }
 
 const std::vector<int64_t>& GetRequiredInt64Vector(
@@ -902,6 +953,162 @@ IndexedAffineCommandSpec BuildIndexedAffineCommand(FusionPlanData& plan,
   return command;
 }
 
+TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
+    FusionPlanData& plan, int32_t command_index,
+    const std::vector<int32_t>& results,
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0,
+      "TRANSFORMER_ENCODER_STACK_V1 does not support command flags");
+  TORCH_CHECK(results.size() == 1,
+      "TRANSFORMER_ENCODER_STACK_V1 requires exactly one result");
+  TORCH_CHECK(attributes.size() == 5,
+      "TRANSFORMER_ENCODER_STACK_V1 requires exactly five attributes");
+  const int64_t block_count = GetRequiredInt64Scalar(attributes,
+      kTransformerBlockCount, "TRANSFORMER_ENCODER_STACK_V1 block count");
+  TORCH_CHECK(block_count > 0 && block_count <= 16,
+      "TRANSFORMER_ENCODER_STACK_V1 block count exceeds the native limit");
+  TORCH_CHECK(operands.size() ==
+          static_cast<std::size_t>(1 + 13 * block_count),
+      "TRANSFORMER_ENCODER_STACK_V1 operand count does not match its blocks");
+
+  TransformerEncoderStackCommandSpec command;
+  command.result_value_index = results[0];
+  command.input_value_index = operands[0];
+  command.attention_heads = GetRequiredInt64Scalar(attributes,
+      kTransformerAttentionHeads,
+      "TRANSFORMER_ENCODER_STACK_V1 attention heads");
+  command.attention_width = GetRequiredInt64Scalar(attributes,
+      kTransformerAttentionWidth,
+      "TRANSFORMER_ENCODER_STACK_V1 attention width");
+  command.feed_forward_width = GetRequiredInt64Scalar(attributes,
+      kTransformerFeedForwardWidth,
+      "TRANSFORMER_ENCODER_STACK_V1 feed-forward width");
+  const double epsilon = GetRequiredFloat64Scalar(attributes,
+      kTransformerEpsilon, "TRANSFORMER_ENCODER_STACK_V1 epsilon");
+  TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0 &&
+          epsilon <= std::numeric_limits<float>::max(),
+      "TRANSFORMER_ENCODER_STACK_V1 epsilon must be finite and positive");
+  command.epsilon = static_cast<float>(epsilon);
+  command.operand_value_indices = operands;
+
+  ValueSpec& result = plan.values[command.result_value_index];
+  const ValueSpec& input = plan.values[command.input_value_index];
+  TORCH_CHECK(result.kind == ValueKind::kUnbound &&
+          input.kind != ValueKind::kUnbound && input.dimension_index >= 0 &&
+          IsFusionFloatingDataType(input.data_type) &&
+          input.inner_shape.size() == 2 && result.data_type == input.data_type &&
+          result.dimension_index == input.dimension_index &&
+          result.inner_shape == input.inner_shape,
+      "TRANSFORMER_ENCODER_STACK_V1 input and result metadata must match");
+  command.extent_index = input.dimension_index;
+  command.maximum_batches = plan.dimensions[input.dimension_index].maximum_extent;
+  command.token_count = input.inner_shape[0];
+  command.hidden_width = input.inner_shape[1];
+  TORCH_CHECK(command.token_count > 0 && command.token_count <= 8 &&
+          command.hidden_width == 256 && command.attention_heads == 4 &&
+          command.attention_width == 128 &&
+          command.feed_forward_width > 0,
+      "TRANSFORMER_ENCODER_STACK_V1 native lowering requires tokens<=8, "
+      "hidden=256, heads=4, and attention width=128");
+  TORCH_CHECK(command.maximum_batches <=
+          std::numeric_limits<uint32_t>::max() / command.token_count,
+      "TRANSFORMER_ENCODER_STACK_V1 maximum batch exceeds the native grid limit");
+
+  const auto require_vector = [&](int32_t value_index, int64_t width,
+                                  bool allow_float32, const char* name) {
+    const ValueSpec& value = plan.values[value_index];
+    TORCH_CHECK(value.kind == ValueKind::kConstant &&
+            value.dimension_index < 0 && value.inner_shape.size() == 1 &&
+            value.inner_shape[0] == width &&
+            (value.data_type == result.data_type ||
+                (allow_float32 && value.data_type == torch::kFloat32)),
+        "TRANSFORMER_ENCODER_STACK_V1 ", name,
+        " metadata does not match the stack");
+  };
+  const auto require_projection = [&](int32_t value_index, int64_t rows,
+                                      int64_t columns, const char* name) {
+    const ValueSpec& value = plan.values[value_index];
+    TORCH_CHECK(value.kind == ValueKind::kConstant &&
+            value.dimension_index < 0 && value.inner_shape.size() == 2 &&
+            value.inner_shape[0] == rows && value.inner_shape[1] == columns &&
+            value.data_type == result.data_type,
+        "TRANSFORMER_ENCODER_STACK_V1 ", name,
+        " metadata does not match the stack");
+  };
+
+  command.blocks.reserve(static_cast<std::size_t>(block_count));
+  std::size_t operand_offset = 1;
+  for (int64_t block_index = 0; block_index < block_count; ++block_index) {
+    TransformerEncoderBlockSpec block;
+    for (int32_t constant_index = 0; constant_index < 13; ++constant_index) {
+      block.value_indices[constant_index] = operands[operand_offset++];
+    }
+    require_vector(block.value_indices[0], command.hidden_width, true,
+        "attention-input norm weight");
+    require_vector(block.value_indices[1], command.hidden_width, true,
+        "attention-input norm bias");
+    TORCH_CHECK(plan.values[block.value_indices[0]].data_type ==
+            plan.values[block.value_indices[1]].data_type,
+        "TRANSFORMER_ENCODER_STACK_V1 attention-input norm types must match");
+    require_projection(block.value_indices[2], 3 * command.attention_width,
+        command.hidden_width, "QKV weight");
+    require_projection(block.value_indices[3], command.hidden_width,
+        command.attention_width, "attention output weight");
+    require_vector(block.value_indices[4], command.hidden_width, false,
+        "attention output bias");
+    require_vector(block.value_indices[5], command.hidden_width, true,
+        "feed-forward-input norm weight");
+    require_vector(block.value_indices[6], command.hidden_width, true,
+        "feed-forward-input norm bias");
+    TORCH_CHECK(plan.values[block.value_indices[5]].data_type ==
+            plan.values[block.value_indices[6]].data_type,
+        "TRANSFORMER_ENCODER_STACK_V1 feed-forward-input norm types must match");
+    require_projection(block.value_indices[7], command.feed_forward_width,
+        command.hidden_width, "feed-forward expansion weight");
+    require_vector(block.value_indices[8], command.feed_forward_width, false,
+        "feed-forward expansion bias");
+    require_projection(block.value_indices[9], command.hidden_width,
+        command.feed_forward_width, "feed-forward projection weight");
+    require_vector(block.value_indices[10], command.hidden_width, false,
+        "feed-forward projection bias");
+    require_vector(block.value_indices[11], command.hidden_width, true,
+        "output norm weight");
+    require_vector(block.value_indices[12], command.hidden_width, true,
+        "output norm bias");
+    TORCH_CHECK(plan.values[block.value_indices[11]].data_type ==
+            plan.values[block.value_indices[12]].data_type,
+        "TRANSFORMER_ENCODER_STACK_V1 output norm types must match");
+    block.query_key_value_weight_binding_index =
+        plan.values[block.value_indices[2]].binding_index;
+    block.attention_output_weight_binding_index =
+        plan.values[block.value_indices[3]].binding_index;
+    block.feed_forward_expansion_weight_binding_index =
+        plan.values[block.value_indices[7]].binding_index;
+    block.feed_forward_projection_weight_binding_index =
+        plan.values[block.value_indices[9]].binding_index;
+    command.blocks.push_back(block);
+  }
+
+  result.kind = ValueKind::kComputed;
+  result.producer_index = command_index;
+  command.result_storage_index = NextStorageIndex(plan);
+  result.storage_index = command.result_storage_index;
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+
+  command.normalized_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+  command.query_key_value_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{result.data_type,
+      {command.maximum_batches, command.token_count,
+          3 * command.attention_width}});
+  command.expanded_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(StorageSpec{result.data_type,
+      {command.maximum_batches, command.token_count,
+          command.feed_forward_width}});
+  return command;
+}
+
 void ValidateOutputReachability(const FusionPlanData& plan) {
   std::vector<bool> reachable_values(plan.values.size(), false);
   std::vector<bool> reachable_commands(plan.commands.size(), false);
@@ -1174,6 +1381,10 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         plan->commands.emplace_back(BuildIndexedAffineCommand(
             *plan, command_index, results, operands, flags, attributes));
         break;
+      case kTransformerEncoderStackV1:
+        plan->commands.emplace_back(BuildTransformerEncoderStackCommand(
+            *plan, command_index, results, operands, flags, attributes));
+        break;
       default:
         TORCH_CHECK(false, "unsupported fusion command opcode: ", opcode);
     }
@@ -1378,6 +1589,20 @@ void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_inde
       [command.result_storage_index];
   ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
       dimensions, true, "indexed-affine result storage");
+}
+
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const TransformerEncoderStackCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  const torch::Tensor& input = ResolveValue(
+      session, buffer_index, input_handles, command.input_value_index);
+  ValidateTensorMetadata(input, plan, plan.values[command.input_value_index],
+      dimensions, false, "transformer encoder input");
+  const torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
+      dimensions, true, "transformer encoder result storage");
 }
 
 void ValidateSubmission(const FusionSession& session, int32_t buffer_index,
@@ -1619,6 +1844,114 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       command.activation);
 }
 
+void ExecuteCommand(FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const TransformerEncoderStackCommandSpec& command,
+    std::size_t command_index, bool& work_submitted) {
+  const int64_t batch_count = dimensions[command.extent_index];
+  if (batch_count == 0) {
+    return;
+  }
+  work_submitted = true;
+  const torch::Tensor& input = ResolveValue(
+      session, buffer_index, input_handles, command.input_value_index);
+  torch::Tensor& state = session.storages[buffer_index]
+      [command.result_storage_index];
+  torch::Tensor& normalized = session.storages[buffer_index]
+      [command.normalized_storage_index];
+  torch::Tensor& query_key_value = session.storages[buffer_index]
+      [command.query_key_value_storage_index];
+  torch::Tensor& expanded = session.storages[buffer_index]
+      [command.expanded_storage_index];
+  const auto& executable_blocks =
+      session.executable->transformer_encoder_weights[command_index];
+  TORCH_CHECK(executable_blocks.size() == command.blocks.size(),
+      "TRANSFORMER_ENCODER_STACK_V1 executable blocks are inconsistent");
+
+  RecordCurrentStream(input);
+  RecordCurrentStream(state);
+  RecordCurrentStream(normalized);
+  RecordCurrentStream(query_key_value);
+  RecordCurrentStream(expanded);
+  const int64_t active_rows = CheckedMultiply(batch_count,
+      command.token_count, "TRANSFORMER_ENCODER_STACK_V1 active rows");
+  torch::Tensor normalized_matrix = normalized.narrow(0, 0, batch_count).view(
+      {active_rows, command.hidden_width});
+  torch::Tensor query_key_value_matrix =
+      query_key_value.narrow(0, 0, batch_count).view(
+          {active_rows, 3 * command.attention_width});
+  torch::Tensor attention_context_matrix = normalized.narrow(0, 0, batch_count)
+      .view({active_rows * command.hidden_width})
+      .narrow(0, 0, active_rows * command.attention_width)
+      .view({active_rows, command.attention_width});
+  torch::Tensor attention_output_matrix =
+      query_key_value.narrow(0, 0, batch_count)
+          .view({active_rows * 3 * command.attention_width})
+          .narrow(0, 0, active_rows * command.hidden_width)
+          .view({active_rows, command.hidden_width});
+  torch::Tensor expanded_matrix = expanded.narrow(0, 0, batch_count).view(
+      {active_rows, command.feed_forward_width});
+
+  for (std::size_t block_index = 0;
+       block_index < command.blocks.size(); ++block_index) {
+    const auto& block = command.blocks[block_index];
+    const auto& weights = executable_blocks[block_index];
+    for (const torch::Tensor& weight : weights) {
+      RecordCurrentStream(weight);
+    }
+    const torch::Tensor& attention_input_weight = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[0]);
+    const torch::Tensor& attention_input_bias = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[1]);
+    const torch::Tensor& attention_output_bias = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[4]);
+    const torch::Tensor& feed_forward_input_weight = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[5]);
+    const torch::Tensor& feed_forward_input_bias = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[6]);
+    const torch::Tensor& expansion_bias = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[8]);
+    const torch::Tensor& projection_bias = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[10]);
+    const torch::Tensor& output_weight = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[11]);
+    const torch::Tensor& output_bias = ResolveValue(session,
+        buffer_index, input_handles, block.value_indices[12]);
+    RecordCurrentStream(attention_input_weight);
+    RecordCurrentStream(attention_input_bias);
+    RecordCurrentStream(attention_output_bias);
+    RecordCurrentStream(feed_forward_input_weight);
+    RecordCurrentStream(feed_forward_input_bias);
+    RecordCurrentStream(expansion_bias);
+    RecordCurrentStream(projection_bias);
+    RecordCurrentStream(output_weight);
+    RecordCurrentStream(output_bias);
+
+    const torch::Tensor& layer_input = block_index == 0 ? input : state;
+    LaunchTransformerCopyAndLayerNorm(layer_input, state, normalized,
+        attention_input_weight, attention_input_bias, batch_count,
+        command.token_count, command.hidden_width, command.epsilon,
+        block_index == 0);
+    at::mm_out(query_key_value_matrix, normalized_matrix, weights[0]);
+    LaunchTransformerAttention(query_key_value, normalized, batch_count,
+        command.token_count, command.attention_heads, command.attention_width,
+        command.hidden_width);
+    at::mm_out(
+        attention_output_matrix, attention_context_matrix, weights[1]);
+    LaunchTransformerResidualLayerNorm(state, attention_output_matrix,
+        attention_output_bias, feed_forward_input_weight,
+        feed_forward_input_bias, normalized, active_rows,
+        command.hidden_width, command.epsilon);
+    at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
+    LaunchTransformerBiasSilu(
+        expanded, expansion_bias, active_rows, command.feed_forward_width);
+    at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
+    LaunchTransformerResidualLayerNorm(state, normalized,
+        projection_bias, output_weight, output_bias, state, active_rows,
+        command.hidden_width, command.epsilon);
+  }
+}
+
 }  // namespace
 
 FusionPlan* PrepareFusionPlan(
@@ -1652,6 +1985,7 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
   data->affine_weights.resize(plan->data->commands.size());
   data->affine_products.resize(plan->data->commands.size());
   data->indexed_affine_weights.resize(plan->data->commands.size());
+  data->transformer_encoder_weights.resize(plan->data->commands.size());
   for (std::size_t command_index = 0;
        command_index < plan->data->commands.size(); ++command_index) {
     const auto* command = std::get_if<AffineSumCommandSpec>(
@@ -1666,6 +2000,32 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
         data->indexed_affine_weights[command_index] =
             weight.transpose(0, 1).contiguous();
         RecordCurrentStream(data->indexed_affine_weights[command_index]);
+      }
+      const auto* transformer_command =
+          std::get_if<TransformerEncoderStackCommandSpec>(
+              &plan->data->commands[command_index]);
+      if (transformer_command != nullptr) {
+        auto& executable_blocks =
+            data->transformer_encoder_weights[command_index];
+        executable_blocks.resize(transformer_command->blocks.size());
+        for (std::size_t block_index = 0;
+             block_index < transformer_command->blocks.size(); ++block_index) {
+          const auto& block = transformer_command->blocks[block_index];
+          const std::array<int32_t, 4> binding_indices{
+              block.query_key_value_weight_binding_index,
+              block.attention_output_weight_binding_index,
+              block.feed_forward_expansion_weight_binding_index,
+              block.feed_forward_projection_weight_binding_index};
+          for (std::size_t weight_index = 0;
+               weight_index < binding_indices.size(); ++weight_index) {
+            const torch::Tensor& weight =
+                data->constants[binding_indices[weight_index]];
+            RecordCurrentStream(weight);
+            executable_blocks[block_index][weight_index] =
+                weight.transpose(0, 1).contiguous();
+            RecordCurrentStream(executable_blocks[block_index][weight_index]);
+          }
+        }
       }
       continue;
     }
@@ -1790,10 +2150,14 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
                      std::get_if<AffineSumCommandSpec>(&fusion_command)) {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
             *command, command_index, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
       } else {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
-            std::get<IndexedAffineCommandSpec>(fusion_command), command_index,
-            work_submitted);
+            std::get<TransformerEncoderStackCommandSpec>(fusion_command),
+            command_index, work_submitted);
       }
     }
   } catch (...) {

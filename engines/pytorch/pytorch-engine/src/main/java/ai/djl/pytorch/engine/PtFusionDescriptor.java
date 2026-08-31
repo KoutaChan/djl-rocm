@@ -57,9 +57,11 @@ final class PtFusionDescriptor {
     static final long OUTPUT_PACK_V1 = 1;
     static final long AFFINE_SUM_V1 = 2;
     static final long INDEXED_AFFINE_V1 = 3;
+    static final long TRANSFORMER_ENCODER_STACK_V1 = 4;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
+    static final long ATTRIBUTE_FLOAT64_BITS = 2;
     static final long AFFINE_TERM_COUNT = 1;
     static final long AFFINE_ACTIVATION = 2;
     static final long AFFINE_HAS_BIAS = 3;
@@ -68,6 +70,11 @@ final class PtFusionDescriptor {
     static final long INDEXED_HAS_HIDDEN_BIAS = 3;
     static final long INDEXED_HAS_OUTPUT_BIAS = 4;
     static final long INDEXED_SOURCE_DIVISORS = 5;
+    static final long TRANSFORMER_BLOCK_COUNT = 1;
+    static final long TRANSFORMER_ATTENTION_HEADS = 2;
+    static final long TRANSFORMER_ATTENTION_WIDTH = 3;
+    static final long TRANSFORMER_FEED_FORWARD_WIDTH = 4;
+    static final long TRANSFORMER_EPSILON = 5;
     static final long ACTIVATION_NONE = 0;
     static final long ACTIVATION_SILU = 1;
 
@@ -112,6 +119,12 @@ final class PtFusionDescriptor {
                         Math.addExact(
                                 commandWords,
                                 indexedAffineCommandWords((FusionRecipe.IndexedAffine) value));
+            } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
+                commandWords =
+                        Math.addExact(
+                                commandWords,
+                                transformerEncoderStackCommandWords(
+                                        (FusionRecipe.TransformerEncoderStack) value));
             } else if (!(value instanceof FusionRecipe.Input)
                     && !(value instanceof FusionRecipe.Constant)) {
                 throw new UnsupportedOperationException(
@@ -172,6 +185,9 @@ final class PtFusionDescriptor {
                 putAffineSumCommand(descriptor, (FusionRecipe.AffineSum) value);
             } else if (value instanceof FusionRecipe.IndexedAffine) {
                 putIndexedAffineCommand(descriptor, (FusionRecipe.IndexedAffine) value);
+            } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
+                putTransformerEncoderStackCommand(
+                        descriptor, (FusionRecipe.TransformerEncoderStack) value);
             }
         }
         for (FusionRecipe.Output output : recipe.getOutputs()) {
@@ -194,6 +210,8 @@ final class PtFusionDescriptor {
                 ++count;
             } else if (value instanceof FusionRecipe.IndexedAffine) {
                 ++count;
+            } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
+                ++count;
             }
         }
         return count;
@@ -208,6 +226,7 @@ final class PtFusionDescriptor {
         }
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -224,6 +243,7 @@ final class PtFusionDescriptor {
         }
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -259,13 +279,70 @@ final class PtFusionDescriptor {
             FusionRecipe.IndexedAffine indexed = (FusionRecipe.IndexedAffine) value;
             bytes = Math.addExact(bytes, storageBytes(indexed.getHiddenWeight()));
         }
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.TransformerEncoderStack)) {
+                continue;
+            }
+            FusionRecipe.TransformerEncoderStack stack =
+                    (FusionRecipe.TransformerEncoderStack) value;
+            int elementBytes = stack.getSpec().getDataType().getNumOfBytes();
+            long blockElements = 0;
+            for (FusionRecipe.TransformerEncoderBlock block : stack.getBlocks()) {
+                blockElements =
+                        Math.addExact(
+                                blockElements, storageElements(block.getQueryKeyValueWeight()));
+                blockElements =
+                        Math.addExact(
+                                blockElements, storageElements(block.getAttentionOutputWeight()));
+                blockElements =
+                        Math.addExact(
+                                blockElements,
+                                storageElements(block.getFeedForwardExpansionWeight()));
+                blockElements =
+                        Math.addExact(
+                                blockElements,
+                                storageElements(block.getFeedForwardProjectionWeight()));
+            }
+            bytes = Math.addExact(bytes, Math.multiplyExact(blockElements, elementBytes));
+        }
         return bytes;
     }
 
     private static boolean isComputed(FusionRecipe.Value value) {
         return value instanceof FusionRecipe.OutputPack
                 || value instanceof FusionRecipe.AffineSum
-                || value instanceof FusionRecipe.IndexedAffine;
+                || value instanceof FusionRecipe.IndexedAffine
+                || value instanceof FusionRecipe.TransformerEncoderStack;
+    }
+
+    private static long transformerWorkspaceBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.TransformerEncoderStack)) {
+                continue;
+            }
+            FusionRecipe.TransformerEncoderStack stack =
+                    (FusionRecipe.TransformerEncoderStack) value;
+            long[] shape = stack.getSpec().getMaximumShape().getShape();
+            long batch = shape[0];
+            long tokens = shape[1];
+            long hidden = shape[2];
+            long rows = Math.multiplyExact(batch, tokens);
+            long elements = Math.multiplyExact(rows, hidden); // normalized
+            elements =
+                    Math.addExact(
+                            elements,
+                            Math.multiplyExact(
+                                    rows, Math.multiplyExact(3L, stack.getAttentionWidth())));
+            elements =
+                    Math.addExact(elements, Math.multiplyExact(rows, stack.getFeedForwardWidth()));
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    elements, stack.getSpec().getDataType().getNumOfBytes()));
+        }
+        return bytes;
     }
 
     private static long indexedAffineWorkspaceBytes(FusionRecipe recipe) {
@@ -395,11 +472,16 @@ final class PtFusionDescriptor {
     }
 
     private static long storageBytes(FusionRecipe.Value value) {
+        long elements = storageElements(value);
+        return Math.multiplyExact(elements, value.getSpec().getDataType().getNumOfBytes());
+    }
+
+    private static long storageElements(FusionRecipe.Value value) {
         long elements = 1;
         for (long extent : value.getSpec().getMaximumShape().getShape()) {
             elements = Math.multiplyExact(elements, extent);
         }
-        return Math.multiplyExact(elements, value.getSpec().getDataType().getNumOfBytes());
+        return elements;
     }
 
     static long dtypeCode(DataType dataType) {
@@ -557,12 +639,61 @@ final class PtFusionDescriptor {
         }
     }
 
+    private static int transformerEncoderStackCommandWords(
+            FusionRecipe.TransformerEncoderStack stack) {
+        int operandCount = Math.addExact(1, Math.multiplyExact(13, stack.getBlocks().size()));
+        return Math.addExact(
+                Math.addExact(COMMAND_RECORD_HEADER_WORDS + 1, operandCount),
+                Math.multiplyExact(5, SCALAR_ATTRIBUTE_WORDS));
+    }
+
+    private static void putTransformerEncoderStackCommand(
+            ByteBuffer descriptor, FusionRecipe.TransformerEncoderStack stack) {
+        int operandCount = Math.addExact(1, Math.multiplyExact(13, stack.getBlocks().size()));
+        descriptor.putLong(transformerEncoderStackCommandWords(stack));
+        descriptor.putLong(TRANSFORMER_ENCODER_STACK_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(operandCount);
+        descriptor.putLong(5);
+        descriptor.putLong(stack.getIndex());
+        descriptor.putLong(stack.getInput().getIndex());
+        for (FusionRecipe.TransformerEncoderBlock block : stack.getBlocks()) {
+            descriptor.putLong(block.getAttentionInputWeight().getIndex());
+            descriptor.putLong(block.getAttentionInputBias().getIndex());
+            descriptor.putLong(block.getQueryKeyValueWeight().getIndex());
+            descriptor.putLong(block.getAttentionOutputWeight().getIndex());
+            descriptor.putLong(block.getAttentionOutputBias().getIndex());
+            descriptor.putLong(block.getFeedForwardInputWeight().getIndex());
+            descriptor.putLong(block.getFeedForwardInputBias().getIndex());
+            descriptor.putLong(block.getFeedForwardExpansionWeight().getIndex());
+            descriptor.putLong(block.getFeedForwardExpansionBias().getIndex());
+            descriptor.putLong(block.getFeedForwardProjectionWeight().getIndex());
+            descriptor.putLong(block.getFeedForwardProjectionBias().getIndex());
+            descriptor.putLong(block.getOutputWeight().getIndex());
+            descriptor.putLong(block.getOutputBias().getIndex());
+        }
+        putScalarAttribute(descriptor, TRANSFORMER_BLOCK_COUNT, stack.getBlocks().size());
+        putScalarAttribute(descriptor, TRANSFORMER_ATTENTION_HEADS, stack.getAttentionHeads());
+        putScalarAttribute(descriptor, TRANSFORMER_ATTENTION_WIDTH, stack.getAttentionWidth());
+        putScalarAttribute(descriptor, TRANSFORMER_FEED_FORWARD_WIDTH, stack.getFeedForwardWidth());
+        putFloatAttribute(descriptor, TRANSFORMER_EPSILON, stack.getEpsilon());
+    }
+
     private static void putScalarAttribute(ByteBuffer descriptor, long key, long value) {
         descriptor.putLong(SCALAR_ATTRIBUTE_WORDS);
         descriptor.putLong(key);
         descriptor.putLong(ATTRIBUTE_INT64);
         descriptor.putLong(1);
         descriptor.putLong(value);
+    }
+
+    private static void putFloatAttribute(ByteBuffer descriptor, long key, double value) {
+        descriptor.putLong(SCALAR_ATTRIBUTE_WORDS);
+        descriptor.putLong(key);
+        descriptor.putLong(ATTRIBUTE_FLOAT64_BITS);
+        descriptor.putLong(1);
+        descriptor.putLong(Double.doubleToRawLongBits(value));
     }
 
     private static long activationCode(FusionRecipe.Activation activation) {

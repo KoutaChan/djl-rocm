@@ -388,4 +388,68 @@ public class FusionRecipeTest {
                                 FusionRecipe.TensorSpec.of(DataType.FLOAT32, firstRows, 1)));
         Assert.assertThrows(IllegalStateException.class, first::build);
     }
+
+    @Test
+    public void transformerEncoderStackBuildsFixedSequenceGraph() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("short-transformer");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
+        FusionRecipe.Input input =
+                builder.addInput(
+                        "tokens", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 6, 256));
+        FusionRecipe.Constant attentionInputWeight = vector(builder, "attnNormWeight", 256, true);
+        FusionRecipe.Constant attentionInputBias = vector(builder, "attnNormBias", 256, true);
+        FusionRecipe.Constant queryKeyValue = matrix(builder, "qkv", 384, 256);
+        FusionRecipe.Constant attentionOutput = matrix(builder, "attentionOutput", 256, 128);
+        FusionRecipe.Constant attentionOutputBias =
+                vector(builder, "attentionOutputBias", 256, false);
+        FusionRecipe.Constant feedForwardInputWeight = vector(builder, "ffNormWeight", 256, true);
+        FusionRecipe.Constant feedForwardInputBias = vector(builder, "ffNormBias", 256, true);
+        FusionRecipe.Constant expansion = matrix(builder, "expansion", 512, 256);
+        FusionRecipe.Constant expansionBias = vector(builder, "expansionBias", 512, false);
+        FusionRecipe.Constant projection = matrix(builder, "projection", 256, 512);
+        FusionRecipe.Constant projectionBias = vector(builder, "projectionBias", 256, false);
+        FusionRecipe.Constant outputWeight = vector(builder, "outputNormWeight", 256, true);
+        FusionRecipe.Constant outputBias = vector(builder, "outputNormBias", 256, true);
+
+        FusionRecipe.TransformerEncoderStack stack =
+                builder.transformerEncoderStack("stack", input, 4, 128, 512)
+                        .addBlock(
+                                attentionInputWeight,
+                                attentionInputBias,
+                                queryKeyValue,
+                                attentionOutput,
+                                attentionOutputBias,
+                                feedForwardInputWeight,
+                                feedForwardInputBias,
+                                expansion,
+                                expansionBias,
+                                projection,
+                                projectionBias,
+                                outputWeight,
+                                outputBias)
+                        .build();
+        builder.addOutput("encoded", stack);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertEquals(stack.getSpec().getMaximumShape().getShape(), new long[] {384, 6, 256});
+        Assert.assertEquals(stack.getBlocks().size(), 1);
+        Assert.assertSame(stack.getBlocks().get(0).getQueryKeyValueWeight(), queryKeyValue);
+        Assert.assertEquals(stack.getAttentionHeads(), 4);
+        Assert.assertEquals(stack.getAttentionWidth(), 128);
+        Assert.assertEquals(stack.getFeedForwardWidth(), 512);
+        Assert.assertEquals(recipe.getOutputs().get(0).getValue(), stack);
+    }
+
+    private static FusionRecipe.Constant vector(
+            FusionRecipe.Builder builder, String name, int width, boolean norm) {
+        return builder.addConstant(
+                name,
+                FusionRecipe.TensorSpec.fixed(norm ? DataType.FLOAT32 : DataType.FLOAT16, width));
+    }
+
+    private static FusionRecipe.Constant matrix(
+            FusionRecipe.Builder builder, String name, int rows, int columns) {
+        return builder.addConstant(
+                name, FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, rows, columns));
+    }
 }

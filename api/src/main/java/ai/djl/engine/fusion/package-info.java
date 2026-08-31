@@ -24,7 +24,13 @@
  * several score values into one persistent FLOAT32 output. {@link
  * ai.djl.engine.fusion.FusionRecipe.IndexedAffine IndexedAffine} gathers selected rows from mixed
  * floating-point sources, evaluates a fixed two-layer projection, and scatters the results into a
- * zero-filled dense output without materializing individual gather or concatenation values.
+ * zero-filled dense output without materializing individual gather or concatenation values. {@link
+ * ai.djl.engine.fusion.FusionRecipe.TransformerEncoderStack TransformerEncoderStack} declares one
+ * or more short, dense pre-normalized attention blocks with an affine output normalization. It
+ * keeps each block's unnormalized attention residual available to the feed-forward branch, while
+ * allowing a backend to combine attention, projection, residual, activation, and normalization
+ * boundaries into a bounded set of native launches. Projection parameters use the stack data type;
+ * normalization parameters may additionally remain FLOAT32 for mixed-precision inference.
  *
  * <p>The lifecycle is {@code recipe -> plan -> executable -> session -> invocation -> output
  * lease}. Preparation validates shapes and builds a bounded command plan. Binding retains caller

@@ -28,6 +28,7 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.NDScope;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.nn.Activation;
 import ai.djl.pytorch.jni.JniUtils;
 
 import org.testng.Assert;
@@ -205,6 +206,162 @@ public class PtFusionTest {
         Assert.assertEquals(descriptor.getLong((divisorsAttribute + 3) * Long.BYTES), 2L);
         Assert.assertEquals(descriptor.getLong((divisorsAttribute + 4) * Long.BYTES), 3L);
         Assert.assertEquals(descriptor.getLong((divisorsAttribute + 5) * Long.BYTES), 1L);
+    }
+
+    @Test
+    public void transformerEncoderDescriptorReportsPhysicalWorkspace() {
+        TransformerFixture fixture = new TransformerFixture();
+        ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.TRANSFORMER_ENCODER_STACK_V1);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 14L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 5) * Long.BYTES), 5L);
+        Assert.assertEquals(PtFusionDescriptor.commandCount(fixture.recipe), 1);
+        Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(fixture.recipe), 786_432L);
+        Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(fixture.recipe), 33_792L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(fixture.recipe), 27_648L);
+    }
+
+    @Test
+    public void rocmTransformerEncoderStackMatchesEagerReference() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        for (DataType dataType : new DataType[] {DataType.FLOAT32, DataType.FLOAT16}) {
+            TransformerFixture fixture = new TransformerFixture(dataType, 2);
+            try (NDManager manager = engine.newBaseManager(device);
+                    NDArray input =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(6 * 256, 29, 14, 0.025f),
+                                    new Shape(1, 6, 256));
+                    NDArray attentionInputWeight =
+                            manager.create(patternedValues(256, 19, 9, 0.01f)).add(1f);
+                    NDArray attentionInputBias =
+                            manager.create(patternedValues(256, 17, 8, 0.002f));
+                    NDArray queryKeyValue =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(384 * 256, 31, 15, 0.002f),
+                                    new Shape(384, 256));
+                    NDArray attentionOutput =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(256 * 128, 37, 18, 0.002f),
+                                    new Shape(256, 128));
+                    NDArray attentionOutputBias =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(256, 13, 6, 0.003f),
+                                    new Shape(256));
+                    NDArray feedForwardInputWeight =
+                            manager.create(patternedValues(256, 23, 11, 0.008f)).add(1f);
+                    NDArray feedForwardInputBias =
+                            manager.create(patternedValues(256, 11, 5, 0.002f));
+                    NDArray expansion =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(512 * 256, 41, 20, 0.0015f),
+                                    new Shape(512, 256));
+                    NDArray expansionBias =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(512, 17, 8, 0.002f),
+                                    new Shape(512));
+                    NDArray projection =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(256 * 512, 43, 21, 0.0015f),
+                                    new Shape(256, 512));
+                    NDArray projectionBias =
+                            typed(
+                                    manager,
+                                    dataType,
+                                    patternedValues(256, 19, 9, 0.002f),
+                                    new Shape(256));
+                    NDArray outputWeight =
+                            manager.create(patternedValues(256, 29, 14, 0.006f)).add(1f);
+                    NDArray outputBias = manager.create(patternedValues(256, 31, 15, 0.002f));
+                    NDArray firstBlock =
+                            transformerEncoderReference(
+                                    input,
+                                    attentionInputWeight,
+                                    attentionInputBias,
+                                    queryKeyValue,
+                                    attentionOutput,
+                                    attentionOutputBias,
+                                    feedForwardInputWeight,
+                                    feedForwardInputBias,
+                                    expansion,
+                                    expansionBias,
+                                    projection,
+                                    projectionBias,
+                                    outputWeight,
+                                    outputBias);
+                    NDArray expected =
+                            transformerEncoderReference(
+                                    firstBlock,
+                                    attentionInputWeight,
+                                    attentionInputBias,
+                                    queryKeyValue,
+                                    attentionOutput,
+                                    attentionOutputBias,
+                                    feedForwardInputWeight,
+                                    feedForwardInputBias,
+                                    expansion,
+                                    expansionBias,
+                                    projection,
+                                    projectionBias,
+                                    outputWeight,
+                                    outputBias);
+                    FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                    FusionExecutable executable =
+                            plan.bind(
+                                    fixture.bindings(
+                                            attentionInputWeight,
+                                            attentionInputBias,
+                                            queryKeyValue,
+                                            attentionOutput,
+                                            attentionOutputBias,
+                                            feedForwardInputWeight,
+                                            feedForwardInputBias,
+                                            expansion,
+                                            expansionBias,
+                                            projection,
+                                            projectionBias,
+                                            outputWeight,
+                                            outputBias));
+                    FusionSession session =
+                            executable.newSession(manager, FusionSessionConfig.defaults());
+                    FusionInvocation invocation = session.acquire()) {
+                invocation.setInput(fixture.input, input);
+                invocation.setDimension(fixture.batch, 1);
+                try (FusionOutputLease lease = invocation.submit();
+                        NDArray actual =
+                                lease.get(fixture.output)
+                                        .get("0:1")
+                                        .toType(DataType.FLOAT32, false);
+                        NDArray expectedFloat = expected.toType(DataType.FLOAT32, false)) {
+                    lease.synchronize();
+                    float tolerance = dataType == DataType.FLOAT32 ? 4e-4f : 4e-2f;
+                    Assert.assertEquals(actual.getShape(), new Shape(1, 6, 256));
+                    Assert.assertEquals(
+                            actual.toFloatArray(), expectedFloat.toFloatArray(), tolerance);
+                }
+            }
+        }
     }
 
     @Test
@@ -1393,6 +1550,83 @@ public class PtFusionTest {
         return manager.create(data, shape).toType(dataType, false);
     }
 
+    private static float[] patternedValues(int count, int period, int center, float scale) {
+        float[] values = new float[count];
+        for (int index = 0; index < count; ++index) {
+            values[index] = (index % period - center) * scale;
+        }
+        return values;
+    }
+
+    private static NDArray transformerEncoderReference(
+            NDArray input,
+            NDArray attentionInputWeight,
+            NDArray attentionInputBias,
+            NDArray queryKeyValueWeight,
+            NDArray attentionOutputWeight,
+            NDArray attentionOutputBias,
+            NDArray feedForwardInputWeight,
+            NDArray feedForwardInputBias,
+            NDArray expansionWeight,
+            NDArray expansionBias,
+            NDArray projectionWeight,
+            NDArray projectionBias,
+            NDArray outputWeight,
+            NDArray outputBias) {
+        NDArray normalized =
+                mixedPrecisionLayerNormReference(input, attentionInputWeight, attentionInputBias);
+        NDArray queryKeyValue =
+                normalized
+                        .reshape(6, 256)
+                        .matMul(queryKeyValueWeight.transpose())
+                        .reshape(1, 6, 384);
+        NDArray queries = queryKeyValue.get("...,0:128").reshape(1, 6, 4, 32).swapAxes(1, 2);
+        NDArray keys = queryKeyValue.get("...,128:256").reshape(1, 6, 4, 32).swapAxes(1, 2);
+        NDArray values = queryKeyValue.get("...,256:384").reshape(1, 6, 4, 32).swapAxes(1, 2);
+        NDArray context =
+                queries.getNDArrayInternal()
+                        .scaledDotProductAttention(keys, values, null, 0.0, false)
+                        .swapAxes(1, 2)
+                        .reshape(6, 128);
+        NDArray residual =
+                input.add(
+                        context.matMul(attentionOutputWeight.transpose())
+                                .add(attentionOutputBias)
+                                .reshape(1, 6, 256));
+        NDArray feedForwardInput =
+                mixedPrecisionLayerNormReference(
+                        residual, feedForwardInputWeight, feedForwardInputBias);
+        NDArray expanded =
+                feedForwardInput
+                        .reshape(6, 256)
+                        .matMul(expansionWeight.transpose())
+                        .add(expansionBias);
+        NDArray projected =
+                expanded.mul(Activation.sigmoid(expanded))
+                        .matMul(projectionWeight.transpose())
+                        .add(projectionBias)
+                        .reshape(1, 6, 256);
+        NDArray output = residual.add(projected);
+        return mixedPrecisionLayerNormReference(output, outputWeight, outputBias);
+    }
+
+    private static NDArray mixedPrecisionLayerNormReference(
+            NDArray input, NDArray weight, NDArray bias) {
+        DataType outputType = input.getDataType();
+        NDArray floatInput = input.toType(DataType.FLOAT32, false);
+        NDArray floatWeight = weight.toType(DataType.FLOAT32, false);
+        NDArray floatBias = bias.toType(DataType.FLOAT32, false);
+        NDArray normalized =
+                floatInput
+                        .getNDArrayInternal()
+                        .layerNorm(floatInput, new Shape(256), floatWeight, floatBias, 1e-5f)
+                        .get(0);
+        if (outputType == DataType.FLOAT32) {
+            return normalized;
+        }
+        return normalized.toType(outputType, false);
+    }
+
     private static void assertAffineReference(float[] actual, float tolerance) {
         float[] candidate = {1f, 2f, 3f, 4f, -1f, 2f, 0.5f, -2f};
         float[] tile = {0.5f, -1f, 2f, 1.5f};
@@ -1982,6 +2216,118 @@ public class PtFusionTest {
             firstOutput = builder.addOutput("first", pack);
             secondOutput = builder.addOutput("second", pack);
             recipe = builder.build();
+        }
+    }
+
+    private static final class TransformerFixture {
+
+        private final FusionRecipe.Dimension batch;
+        private final FusionRecipe.Input input;
+        private final FusionRecipe.Constant attentionInputWeight;
+        private final FusionRecipe.Constant attentionInputBias;
+        private final FusionRecipe.Constant queryKeyValue;
+        private final FusionRecipe.Constant attentionOutput;
+        private final FusionRecipe.Constant attentionOutputBias;
+        private final FusionRecipe.Constant feedForwardInputWeight;
+        private final FusionRecipe.Constant feedForwardInputBias;
+        private final FusionRecipe.Constant expansion;
+        private final FusionRecipe.Constant expansionBias;
+        private final FusionRecipe.Constant projection;
+        private final FusionRecipe.Constant projectionBias;
+        private final FusionRecipe.Constant outputWeight;
+        private final FusionRecipe.Constant outputBias;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private TransformerFixture() {
+            this(DataType.FLOAT16, 1);
+        }
+
+        private TransformerFixture(DataType dataType, int blockCount) {
+            FusionRecipe.Builder builder = FusionRecipe.builder("transformer");
+            batch = builder.addDimension("batch", 2);
+            input = builder.addInput("input", FusionRecipe.TensorSpec.of(dataType, batch, 6, 256));
+            attentionInputWeight = vector(builder, "attentionInputWeight", 256, DataType.FLOAT32);
+            attentionInputBias = vector(builder, "attentionInputBias", 256, DataType.FLOAT32);
+            queryKeyValue = matrix(builder, "qkv", 384, 256, dataType);
+            attentionOutput = matrix(builder, "attentionOutput", 256, 128, dataType);
+            attentionOutputBias = vector(builder, "attentionOutputBias", 256, dataType);
+            feedForwardInputWeight =
+                    vector(builder, "feedForwardInputWeight", 256, DataType.FLOAT32);
+            feedForwardInputBias = vector(builder, "feedForwardInputBias", 256, DataType.FLOAT32);
+            expansion = matrix(builder, "expansion", 512, 256, dataType);
+            expansionBias = vector(builder, "expansionBias", 512, dataType);
+            projection = matrix(builder, "projection", 256, 512, dataType);
+            projectionBias = vector(builder, "projectionBias", 256, dataType);
+            outputWeight = vector(builder, "outputWeight", 256, DataType.FLOAT32);
+            outputBias = vector(builder, "outputBias", 256, DataType.FLOAT32);
+            FusionRecipe.TransformerEncoderStackBuilder stackBuilder =
+                    builder.transformerEncoderStack("stack", input, 4, 128, 512);
+            for (int blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
+                stackBuilder.addBlock(
+                        attentionInputWeight,
+                        attentionInputBias,
+                        queryKeyValue,
+                        attentionOutput,
+                        attentionOutputBias,
+                        feedForwardInputWeight,
+                        feedForwardInputBias,
+                        expansion,
+                        expansionBias,
+                        projection,
+                        projectionBias,
+                        outputWeight,
+                        outputBias);
+            }
+            FusionRecipe.TransformerEncoderStack stack = stackBuilder.build();
+            output = builder.addOutput("output", stack);
+            recipe = builder.build();
+        }
+
+        private FusionConstantBindings bindings(
+                NDArray attentionInputWeightArray,
+                NDArray attentionInputBiasArray,
+                NDArray queryKeyValueArray,
+                NDArray attentionOutputArray,
+                NDArray attentionOutputBiasArray,
+                NDArray feedForwardInputWeightArray,
+                NDArray feedForwardInputBiasArray,
+                NDArray expansionArray,
+                NDArray expansionBiasArray,
+                NDArray projectionArray,
+                NDArray projectionBiasArray,
+                NDArray outputWeightArray,
+                NDArray outputBiasArray) {
+            return FusionConstantBindings.builder(recipe)
+                    .bind(attentionInputWeight, attentionInputWeightArray)
+                    .bind(attentionInputBias, attentionInputBiasArray)
+                    .bind(queryKeyValue, queryKeyValueArray)
+                    .bind(attentionOutput, attentionOutputArray)
+                    .bind(attentionOutputBias, attentionOutputBiasArray)
+                    .bind(feedForwardInputWeight, feedForwardInputWeightArray)
+                    .bind(feedForwardInputBias, feedForwardInputBiasArray)
+                    .bind(expansion, expansionArray)
+                    .bind(expansionBias, expansionBiasArray)
+                    .bind(projection, projectionArray)
+                    .bind(projectionBias, projectionBiasArray)
+                    .bind(outputWeight, outputWeightArray)
+                    .bind(outputBias, outputBiasArray)
+                    .build();
+        }
+
+        private static FusionRecipe.Constant vector(
+                FusionRecipe.Builder builder, String name, int width, DataType dataType) {
+            return builder.addConstant(name, FusionRecipe.TensorSpec.fixed(dataType, width));
+        }
+
+        private static FusionRecipe.Constant matrix(
+                FusionRecipe.Builder builder,
+                String name,
+                int rows,
+                int columns,
+                DataType dataType) {
+            return builder.addConstant(
+                    name, FusionRecipe.TensorSpec.fixed(dataType, rows, columns));
         }
     }
 

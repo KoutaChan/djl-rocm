@@ -83,6 +83,25 @@ void LaunchAffineFinalize(const AffineSumSource* sources, int32_t source_count,
     const int64_t* output_prefix, int32_t output_prefix_rank,
     int64_t output_width, AffineActivation activation);
 
+void LaunchTransformerCopyAndLayerNorm(const torch::Tensor& input,
+    torch::Tensor& state, torch::Tensor& normalized,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    int64_t batch_count, int64_t token_count, int64_t hidden_width,
+    float epsilon, bool copy_input);
+
+void LaunchTransformerAttention(const torch::Tensor& query_key_value,
+    torch::Tensor& context, int64_t batch_count, int64_t token_count,
+    int64_t attention_heads, int64_t attention_width, int64_t hidden_width);
+
+void LaunchTransformerBiasSilu(torch::Tensor& values,
+    const torch::Tensor& bias, int64_t active_rows, int64_t width);
+
+void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
+    const torch::Tensor& update, const torch::Tensor& update_bias,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
+    torch::Tensor& normalized, int64_t active_rows, int64_t hidden_width,
+    float epsilon);
+
 }  // namespace djl::pytorch::fusion
 
 #endif  // DJL_TORCH_DJL_PYTORCH_FUSION_KERNELS_H

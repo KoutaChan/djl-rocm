@@ -35,8 +35,10 @@ import java.util.Set;
  * an activation. {@link IndexedAffine} gathers selected rows from several values, evaluates a
  * bounded two-layer projection, and scatters the selected results into a dense value. {@link
  * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
- * them into a contiguous {@link DataType#FLOAT32} value. Additional value types can be added
- * without changing the lifecycle of prepared plans and sessions.
+ * them into a contiguous {@link DataType#FLOAT32} value. {@link TransformerEncoderStack} executes
+ * one or more fixed-width, pre-normalized transformer encoder blocks over a short dense sequence.
+ * Additional value types can be added without changing the lifecycle of prepared plans and
+ * sessions.
  */
 public final class FusionRecipe {
 
@@ -615,6 +617,225 @@ public final class FusionRecipe {
         }
     }
 
+    /** The immutable parameters of one block in a {@link TransformerEncoderStack}. */
+    public static final class TransformerEncoderBlock {
+
+        private final Constant attentionInputWeight;
+        private final Constant attentionInputBias;
+        private final Constant queryKeyValueWeight;
+        private final Constant attentionOutputWeight;
+        private final Constant attentionOutputBias;
+        private final Constant feedForwardInputWeight;
+        private final Constant feedForwardInputBias;
+        private final Constant feedForwardExpansionWeight;
+        private final Constant feedForwardExpansionBias;
+        private final Constant feedForwardProjectionWeight;
+        private final Constant feedForwardProjectionBias;
+        private final Constant outputWeight;
+        private final Constant outputBias;
+
+        private TransformerEncoderBlock(
+                Constant attentionInputWeight,
+                Constant attentionInputBias,
+                Constant queryKeyValueWeight,
+                Constant attentionOutputWeight,
+                Constant attentionOutputBias,
+                Constant feedForwardInputWeight,
+                Constant feedForwardInputBias,
+                Constant feedForwardExpansionWeight,
+                Constant feedForwardExpansionBias,
+                Constant feedForwardProjectionWeight,
+                Constant feedForwardProjectionBias,
+                Constant outputWeight,
+                Constant outputBias) {
+            this.attentionInputWeight = attentionInputWeight;
+            this.attentionInputBias = attentionInputBias;
+            this.queryKeyValueWeight = queryKeyValueWeight;
+            this.attentionOutputWeight = attentionOutputWeight;
+            this.attentionOutputBias = attentionOutputBias;
+            this.feedForwardInputWeight = feedForwardInputWeight;
+            this.feedForwardInputBias = feedForwardInputBias;
+            this.feedForwardExpansionWeight = feedForwardExpansionWeight;
+            this.feedForwardExpansionBias = feedForwardExpansionBias;
+            this.feedForwardProjectionWeight = feedForwardProjectionWeight;
+            this.feedForwardProjectionBias = feedForwardProjectionBias;
+            this.outputWeight = outputWeight;
+            this.outputBias = outputBias;
+        }
+
+        /**
+         * @return the affine scale of the attention-input LayerNorm
+         */
+        public Constant getAttentionInputWeight() {
+            return attentionInputWeight;
+        }
+
+        /**
+         * @return the affine bias of the attention-input LayerNorm
+         */
+        public Constant getAttentionInputBias() {
+            return attentionInputBias;
+        }
+
+        /**
+         * @return the {@code [3 * attentionWidth, hiddenWidth]} QKV weight
+         */
+        public Constant getQueryKeyValueWeight() {
+            return queryKeyValueWeight;
+        }
+
+        /**
+         * @return the {@code [hiddenWidth, attentionWidth]} attention output weight
+         */
+        public Constant getAttentionOutputWeight() {
+            return attentionOutputWeight;
+        }
+
+        /**
+         * @return the attention output bias
+         */
+        public Constant getAttentionOutputBias() {
+            return attentionOutputBias;
+        }
+
+        /**
+         * @return the affine scale of the feed-forward-input LayerNorm
+         */
+        public Constant getFeedForwardInputWeight() {
+            return feedForwardInputWeight;
+        }
+
+        /**
+         * @return the affine bias of the feed-forward-input LayerNorm
+         */
+        public Constant getFeedForwardInputBias() {
+            return feedForwardInputBias;
+        }
+
+        /**
+         * @return the {@code [feedForwardWidth, hiddenWidth]} expansion weight
+         */
+        public Constant getFeedForwardExpansionWeight() {
+            return feedForwardExpansionWeight;
+        }
+
+        /**
+         * @return the feed-forward expansion bias
+         */
+        public Constant getFeedForwardExpansionBias() {
+            return feedForwardExpansionBias;
+        }
+
+        /**
+         * @return the {@code [hiddenWidth, feedForwardWidth]} projection weight
+         */
+        public Constant getFeedForwardProjectionWeight() {
+            return feedForwardProjectionWeight;
+        }
+
+        /**
+         * @return the feed-forward projection bias
+         */
+        public Constant getFeedForwardProjectionBias() {
+            return feedForwardProjectionBias;
+        }
+
+        /**
+         * @return the affine scale of the output LayerNorm
+         */
+        public Constant getOutputWeight() {
+            return outputWeight;
+        }
+
+        /**
+         * @return the affine bias of the output LayerNorm
+         */
+        public Constant getOutputBias() {
+            return outputBias;
+        }
+    }
+
+    /**
+     * A stack of pre-normalized transformer encoder blocks over one fixed-length dense sequence.
+     *
+     * <p>Each block computes attention from {@code LayerNorm(x)}, adds its projected result to
+     * {@code x}, normalizes that residual for a SiLU feed-forward network, then adds and normalizes
+     * the projected feed-forward result. Projection weights use the input data type. LayerNorm
+     * affine parameters may either use that data type or FLOAT32. The leading batch dimension is
+     * bounded while token count and every feature width are fixed by the recipe.
+     */
+    public static final class TransformerEncoderStack extends Value {
+
+        private final Value input;
+        private final int attentionHeads;
+        private final int attentionWidth;
+        private final int feedForwardWidth;
+        private final float epsilon;
+        private final List<TransformerEncoderBlock> blocks;
+
+        private TransformerEncoderStack(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                Value input,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth,
+                float epsilon,
+                List<TransformerEncoderBlock> blocks) {
+            super(owner, index, name, spec);
+            this.input = input;
+            this.attentionHeads = attentionHeads;
+            this.attentionWidth = attentionWidth;
+            this.feedForwardWidth = feedForwardWidth;
+            this.epsilon = epsilon;
+            this.blocks = immutableCopy(blocks);
+        }
+
+        /**
+         * @return the stack input
+         */
+        public Value getInput() {
+            return input;
+        }
+
+        /**
+         * @return the attention head count
+         */
+        public int getAttentionHeads() {
+            return attentionHeads;
+        }
+
+        /**
+         * @return the concatenated attention feature width
+         */
+        public int getAttentionWidth() {
+            return attentionWidth;
+        }
+
+        /**
+         * @return the feed-forward hidden width
+         */
+        public int getFeedForwardWidth() {
+            return feedForwardWidth;
+        }
+
+        /**
+         * @return the LayerNorm epsilon
+         */
+        public float getEpsilon() {
+            return epsilon;
+        }
+
+        /**
+         * @return the blocks in execution order
+         */
+        public List<TransformerEncoderBlock> getBlocks() {
+            return blocks;
+        }
+    }
+
     /** A named session output backed by slot-owned persistent storage. */
     public static final class Output {
 
@@ -797,6 +1018,33 @@ public final class FusionRecipe {
         }
 
         /**
+         * Starts a fixed-sequence transformer encoder stack.
+         *
+         * @param name the value name
+         * @param input a bounded {@code [batch, tokens, hiddenWidth]} floating-point value
+         * @param attentionHeads the attention head count
+         * @param attentionWidth the concatenated Q, K, and V feature width
+         * @param feedForwardWidth the SiLU feed-forward hidden width
+         * @return a builder for the transformer encoder stack
+         */
+        public TransformerEncoderStackBuilder transformerEncoderStack(
+                String name,
+                Value input,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth) {
+            checkMutable();
+            checkValue(input);
+            return new TransformerEncoderStackBuilder(
+                    this,
+                    requireName(name, "value"),
+                    input,
+                    attentionHeads,
+                    attentionWidth,
+                    feedForwardWidth);
+        }
+
+        /**
          * Adds an output-pack value.
          *
          * <p>Each source must be a two-dimensional FLOAT16, BFLOAT16, or FLOAT32 value from this
@@ -927,6 +1175,255 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException("The " + kind + " name must not be empty.");
             }
             return name;
+        }
+    }
+
+    /** Builds one {@link TransformerEncoderStack} value within a {@link Builder}. */
+    public static final class TransformerEncoderStackBuilder {
+
+        private static final float DEFAULT_EPSILON = 1.0e-5f;
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final Value input;
+        private final int attentionHeads;
+        private final int attentionWidth;
+        private final int feedForwardWidth;
+        private final List<TransformerEncoderBlock> blocks;
+        private float epsilon;
+        private boolean built;
+
+        private TransformerEncoderStackBuilder(
+                Builder recipeBuilder,
+                String name,
+                Value input,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.input = input;
+            this.attentionHeads = attentionHeads;
+            this.attentionWidth = attentionWidth;
+            this.feedForwardWidth = feedForwardWidth;
+            blocks = new ArrayList<>();
+            epsilon = DEFAULT_EPSILON;
+        }
+
+        /**
+         * Adds one pre-normalized attention and SiLU feed-forward block.
+         *
+         * @param attentionInputWeight attention-input LayerNorm scale
+         * @param attentionInputBias attention-input LayerNorm bias
+         * @param queryKeyValueWeight combined QKV projection weight
+         * @param attentionOutputWeight attention output projection weight
+         * @param attentionOutputBias attention output projection bias
+         * @param feedForwardInputWeight feed-forward-input LayerNorm scale
+         * @param feedForwardInputBias feed-forward-input LayerNorm bias
+         * @param feedForwardExpansionWeight feed-forward expansion weight
+         * @param feedForwardExpansionBias feed-forward expansion bias
+         * @param feedForwardProjectionWeight feed-forward projection weight
+         * @param feedForwardProjectionBias feed-forward projection bias
+         * @param outputWeight output LayerNorm scale
+         * @param outputBias output LayerNorm bias
+         * @return this builder
+         */
+        public TransformerEncoderStackBuilder addBlock(
+                Constant attentionInputWeight,
+                Constant attentionInputBias,
+                Constant queryKeyValueWeight,
+                Constant attentionOutputWeight,
+                Constant attentionOutputBias,
+                Constant feedForwardInputWeight,
+                Constant feedForwardInputBias,
+                Constant feedForwardExpansionWeight,
+                Constant feedForwardExpansionBias,
+                Constant feedForwardProjectionWeight,
+                Constant feedForwardProjectionBias,
+                Constant outputWeight,
+                Constant outputBias) {
+            checkMutable();
+            Constant[] constants = {
+                attentionInputWeight,
+                attentionInputBias,
+                queryKeyValueWeight,
+                attentionOutputWeight,
+                attentionOutputBias,
+                feedForwardInputWeight,
+                feedForwardInputBias,
+                feedForwardExpansionWeight,
+                feedForwardExpansionBias,
+                feedForwardProjectionWeight,
+                feedForwardProjectionBias,
+                outputWeight,
+                outputBias
+            };
+            for (Constant constant : constants) {
+                recipeBuilder.checkValue(constant);
+            }
+            blocks.add(
+                    new TransformerEncoderBlock(
+                            attentionInputWeight,
+                            attentionInputBias,
+                            queryKeyValueWeight,
+                            attentionOutputWeight,
+                            attentionOutputBias,
+                            feedForwardInputWeight,
+                            feedForwardInputBias,
+                            feedForwardExpansionWeight,
+                            feedForwardExpansionBias,
+                            feedForwardProjectionWeight,
+                            feedForwardProjectionBias,
+                            outputWeight,
+                            outputBias));
+            return this;
+        }
+
+        /**
+         * Sets the epsilon used by every LayerNorm in this stack.
+         *
+         * @param epsilon the finite positive epsilon
+         * @return this builder
+         */
+        public TransformerEncoderStackBuilder optEpsilon(float epsilon) {
+            checkMutable();
+            if (!(epsilon > 0.0f) || !Float.isFinite(epsilon)) {
+                throw new IllegalArgumentException(
+                        "LayerNorm epsilon must be finite and positive.");
+            }
+            this.epsilon = epsilon;
+            return this;
+        }
+
+        /**
+         * Adds the immutable transformer encoder stack to its recipe.
+         *
+         * @return the transformer encoder stack value
+         */
+        public TransformerEncoderStack build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            TensorSpec inputSpec = input.getSpec();
+            if (inputSpec.leadingDimension == null || inputSpec.innerShape.length != 2) {
+                throw new IllegalArgumentException(
+                        "Transformer input must have shape [bounded batch, tokens, hiddenWidth].");
+            }
+            if (!Builder.isAffineDataType(inputSpec.dataType)) {
+                throw new IllegalArgumentException(
+                        "Transformer input only supports FLOAT16, BFLOAT16, and FLOAT32.");
+            }
+            long hiddenWidth = inputSpec.innerShape[1];
+            if (attentionHeads <= 0
+                    || attentionWidth <= 0
+                    || attentionWidth % attentionHeads != 0
+                    || feedForwardWidth <= 0) {
+                throw new IllegalArgumentException(
+                        "Transformer widths and head count must be positive and divisible.");
+            }
+            if (blocks.isEmpty()) {
+                throw new IllegalStateException("A transformer encoder stack requires a block.");
+            }
+            for (TransformerEncoderBlock block : blocks) {
+                requireNorm(block.attentionInputWeight, hiddenWidth, inputSpec.dataType);
+                requireNorm(block.attentionInputBias, hiddenWidth, inputSpec.dataType);
+                requireSameDataType(block.attentionInputWeight, block.attentionInputBias);
+                requireProjection(
+                        block.queryKeyValueWeight,
+                        3L * attentionWidth,
+                        hiddenWidth,
+                        inputSpec.dataType);
+                requireProjection(
+                        block.attentionOutputWeight,
+                        hiddenWidth,
+                        attentionWidth,
+                        inputSpec.dataType);
+                requireVector(block.attentionOutputBias, hiddenWidth, inputSpec.dataType);
+                requireNorm(block.feedForwardInputWeight, hiddenWidth, inputSpec.dataType);
+                requireNorm(block.feedForwardInputBias, hiddenWidth, inputSpec.dataType);
+                requireSameDataType(block.feedForwardInputWeight, block.feedForwardInputBias);
+                requireProjection(
+                        block.feedForwardExpansionWeight,
+                        feedForwardWidth,
+                        hiddenWidth,
+                        inputSpec.dataType);
+                requireVector(block.feedForwardExpansionBias, feedForwardWidth, inputSpec.dataType);
+                requireProjection(
+                        block.feedForwardProjectionWeight,
+                        hiddenWidth,
+                        feedForwardWidth,
+                        inputSpec.dataType);
+                requireVector(block.feedForwardProjectionBias, hiddenWidth, inputSpec.dataType);
+                requireNorm(block.outputWeight, hiddenWidth, inputSpec.dataType);
+                requireNorm(block.outputBias, hiddenWidth, inputSpec.dataType);
+                requireSameDataType(block.outputWeight, block.outputBias);
+            }
+
+            String checkedName = recipeBuilder.addValueName(name);
+            TransformerEncoderStack value =
+                    new TransformerEncoderStack(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            TensorSpec.of(
+                                    inputSpec.dataType,
+                                    inputSpec.leadingDimension,
+                                    inputSpec.innerShape),
+                            input,
+                            attentionHeads,
+                            attentionWidth,
+                            feedForwardWidth,
+                            epsilon,
+                            blocks);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private static void requireProjection(
+                Constant constant, long rows, long columns, DataType dataType) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.dataType != dataType
+                    || spec.innerShape.length != 2
+                    || spec.innerShape[0] != rows
+                    || spec.innerShape[1] != columns) {
+                throw new IllegalArgumentException(
+                        "Transformer projection shape or type mismatch.");
+            }
+        }
+
+        private static void requireVector(Constant constant, long width, DataType dataType) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.dataType != dataType
+                    || spec.innerShape.length != 1
+                    || spec.innerShape[0] != width) {
+                throw new IllegalArgumentException("Transformer bias shape or type mismatch.");
+            }
+        }
+
+        private static void requireNorm(Constant constant, long width, DataType dataType) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || (spec.dataType != dataType && spec.dataType != DataType.FLOAT32)
+                    || spec.innerShape.length != 1
+                    || spec.innerShape[0] != width) {
+                throw new IllegalArgumentException(
+                        "Transformer LayerNorm parameter shape or type mismatch.");
+            }
+        }
+
+        private static void requireSameDataType(Constant left, Constant right) {
+            if (left.getSpec().dataType != right.getSpec().dataType) {
+                throw new IllegalArgumentException(
+                        "Transformer LayerNorm scale and bias must use one data type.");
+            }
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException("The transformer encoder stack has been built.");
+            }
         }
     }
 
