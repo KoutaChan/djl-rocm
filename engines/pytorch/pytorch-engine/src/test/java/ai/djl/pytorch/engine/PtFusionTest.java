@@ -39,6 +39,8 @@ import org.testng.annotations.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class PtFusionTest {
@@ -245,6 +247,31 @@ public class PtFusionTest {
         Assert.assertEquals(
                 PtFusionDescriptor.persistentStorageBytes(fixture.recipe), 459_276_288L);
         Assert.assertEquals(PtFusionDescriptor.workspaceBytes(fixture.recipe), 216_006_656L);
+    }
+
+    @Test
+    public void segmentedIndexedLocalTransformerUsesV2WithoutExtraStorage() {
+        IndexedLocalTransformerFixture dense =
+                new IndexedLocalTransformerFixture(DataType.FLOAT16, 4096);
+        IndexedLocalTransformerFixture segmented =
+                new IndexedLocalTransformerFixture(DataType.FLOAT16, 4096, true);
+        ByteBuffer descriptor = PtFusionDescriptor.encode(segmented.recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 19L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 5) * Long.BYTES), 4L);
+        Assert.assertEquals(
+                PtFusionDescriptor.executableStorageBytes(segmented.recipe),
+                PtFusionDescriptor.executableStorageBytes(dense.recipe));
+        Assert.assertEquals(
+                PtFusionDescriptor.persistentStorageBytes(segmented.recipe),
+                PtFusionDescriptor.persistentStorageBytes(dense.recipe));
+        Assert.assertEquals(
+                PtFusionDescriptor.workspaceBytes(segmented.recipe),
+                PtFusionDescriptor.workspaceBytes(dense.recipe));
     }
 
     @Test
@@ -477,6 +504,86 @@ public class PtFusionTest {
                                 NDArray indices = maximumIndices.get("0:" + activeRows);
                                 FusionInvocation invocation = session.acquire()) {
                             invocation.setInput(fixture.input, input);
+                            invocation.setInput(fixture.indices, indices);
+                            invocation.setDimension(fixture.batch, batchCount);
+                            invocation.setDimension(fixture.active, activeRows);
+                            try (FusionOutputLease lease = invocation.submit();
+                                    NDArray expected =
+                                            indexedLocalTransformerReference(
+                                                    input, indices, mask, bound)) {
+                                lease.synchronize();
+                                try (NDArray actual =
+                                        lease.get(fixture.output).get("0:" + batchCount)) {
+                                    assertIndexedLocalTransformerClose(
+                                            actual,
+                                            expected,
+                                            outputTolerance(dataType),
+                                            deviceIndex,
+                                            dataType,
+                                            batchCount,
+                                            activeRows);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void rocmSegmentedIndexedLocalTransformerMatchesSparseReferenceAcrossDevicesAndTypes() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        int maximumBatch = 384;
+        int[] batches = {1, 31, 256, 384};
+        IndexedLocalPattern pattern = indexedLocalPattern(maximumBatch);
+        int deviceCount = Math.min(2, engine.getGpuCount());
+        for (int deviceIndex = 0; deviceIndex < deviceCount; ++deviceIndex) {
+            Device device = Device.gpu(deviceIndex);
+            for (DataType dataType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                IndexedLocalTransformerFixture fixture =
+                        new IndexedLocalTransformerFixture(dataType, maximumBatch, true);
+                try (NDManager manager = engine.newBaseManager(device);
+                        BoundIndexedLocalTransformer bound = fixture.bind(manager);
+                        NDArray maximumInput =
+                                patternedArray(
+                                        manager,
+                                        dataType,
+                                        new Shape(maximumBatch, 4, 29, 256),
+                                        61,
+                                        30,
+                                        0.015f);
+                        NDArray maximumPlayer = maximumInput.get(":,:,0:1,:").duplicate();
+                        NDArray maximumRiver = maximumInput.get(":,:,1:25,:").duplicate();
+                        NDArray maximumMeld = maximumInput.get(":,:,25:29,:").duplicate();
+                        NDArray maximumMask =
+                                manager.create(pattern.mask, new Shape(maximumBatch, 4, 29));
+                        NDArray maximumIndices =
+                                manager.create(pattern.indices, new Shape(pattern.indices.length));
+                        FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                        FusionExecutable executable = plan.bind(bound.bindings);
+                        FusionSession session =
+                                executable.newSession(
+                                        manager,
+                                        FusionSessionConfig.builder().optBufferCount(2).build())) {
+                    for (int batchCount : batches) {
+                        int activeRows = pattern.presentCount(batchCount);
+                        try (NDArray input = maximumInput.get("0:" + batchCount);
+                                NDArray player = maximumPlayer.get("0:" + batchCount);
+                                NDArray river = maximumRiver.get("0:" + batchCount);
+                                NDArray meld = maximumMeld.get("0:" + batchCount);
+                                NDArray mask = maximumMask.get("0:" + batchCount);
+                                NDArray indices = maximumIndices.get("0:" + activeRows);
+                                FusionInvocation invocation = session.acquire()) {
+                            NDArray[] inputSegments = {player, river, meld};
+                            for (int segment = 0; segment < inputSegments.length; ++segment) {
+                                invocation.setInput(
+                                        fixture.inputs.get(segment), inputSegments[segment]);
+                            }
                             invocation.setInput(fixture.indices, indices);
                             invocation.setDimension(fixture.batch, batchCount);
                             invocation.setDimension(fixture.active, activeRows);
@@ -2912,6 +3019,7 @@ public class PtFusionTest {
         private final FusionRecipe.Dimension batch;
         private final FusionRecipe.Dimension active;
         private final FusionRecipe.Input input;
+        private final List<FusionRecipe.Input> inputs;
         private final FusionRecipe.Input indices;
         private final FusionRecipe.Constant inputNormWeight;
         private final FusionRecipe.Constant inputNormBias;
@@ -2932,13 +3040,33 @@ public class PtFusionTest {
         private final FusionRecipe recipe;
 
         private IndexedLocalTransformerFixture(DataType dataType, int maximumBatch) {
+            this(dataType, maximumBatch, false);
+        }
+
+        private IndexedLocalTransformerFixture(
+                DataType dataType, int maximumBatch, boolean segmented) {
             long maximumActiveRows = Math.multiplyExact((long) maximumBatch, 4L * 29L);
             FusionRecipe.Builder builder = FusionRecipe.builder("indexed-local-transformer");
             batch = builder.addDimension("batch", maximumBatch);
             active = builder.addDimension("active", maximumActiveRows);
-            input =
-                    builder.addInput(
-                            "input", FusionRecipe.TensorSpec.of(dataType, batch, 4, 29, 256));
+            FusionRecipe.Input river = null;
+            FusionRecipe.Input meld = null;
+            if (segmented) {
+                input =
+                        builder.addInput(
+                                "player", FusionRecipe.TensorSpec.of(dataType, batch, 4, 1, 256));
+                river =
+                        builder.addInput(
+                                "river", FusionRecipe.TensorSpec.of(dataType, batch, 4, 24, 256));
+                meld =
+                        builder.addInput(
+                                "meld", FusionRecipe.TensorSpec.of(dataType, batch, 4, 4, 256));
+            } else {
+                input =
+                        builder.addInput(
+                                "input", FusionRecipe.TensorSpec.of(dataType, batch, 4, 29, 256));
+            }
+            inputs = segmented ? Arrays.asList(input, river, meld) : Arrays.asList(input);
             indices =
                     builder.addInput("indices", FusionRecipe.TensorSpec.of(DataType.INT32, active));
             inputNormWeight = vector(builder, "inputNormWeight", 256, DataType.FLOAT32);
@@ -2957,8 +3085,14 @@ public class PtFusionTest {
             projectionBias = vector(builder, "projectionBias", 256, dataType);
             outputWeight = vector(builder, "outputWeight", 256, DataType.FLOAT32);
             outputBias = vector(builder, "outputBias", 256, DataType.FLOAT32);
+            FusionRecipe.IndexedLocalTransformerEncoderBuilder encoderBuilder =
+                    segmented
+                            ? builder.indexedLocalTransformerEncoder(
+                                    "encoder", inputs, indices, 4, 64, 128)
+                            : builder.indexedLocalTransformerEncoder(
+                                    "encoder", input, indices, 4, 64, 128);
             FusionRecipe.IndexedLocalTransformerEncoder encoder =
-                    builder.indexedLocalTransformerEncoder("encoder", input, indices, 4, 64, 128)
+                    encoderBuilder
                             .setInputNormalization(inputNormWeight, inputNormBias)
                             .setBlock(
                                     attentionInputWeight,

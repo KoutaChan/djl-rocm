@@ -25,6 +25,7 @@ inline constexpr int32_t kMaximumAffineGroups = 32;
 inline constexpr int32_t kMaximumAffinePrefixRank = 8;
 inline constexpr int32_t kMaximumIndexedAffineSources = 32;
 inline constexpr int32_t kMaximumIndexedAffineOutputWidth = 32;
+inline constexpr int32_t kMaximumIndexedLocalTransformerSegments = 8;
 
 struct OutputPackSource {
   const void* data;
@@ -145,6 +146,20 @@ void LaunchIndexedLocalTransformerGatherNormalize(const torch::Tensor& input, co
     const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
     torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t hidden_width,
     float epsilon);
+
+struct IndexedLocalTransformerInputSegment {
+  const void* data;
+  int64_t token_offset;
+  int64_t token_count;
+};
+
+void LaunchIndexedLocalTransformerGatherNormalizeSegments(
+    const IndexedLocalTransformerInputSegment* input_segments, int32_t input_segment_count,
+    torch::ScalarType input_data_type, const torch::Tensor& indices, torch::ScalarType index_data_type,
+    const torch::Tensor& input_norm_weight, const torch::Tensor& input_norm_bias,
+    const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
+    torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t group_count,
+    int64_t token_count, int64_t hidden_width, float epsilon);
 
 void LaunchIndexedLocalTransformerAttention(torch::Tensor& query_key_value, const torch::Tensor& indices,
     torch::ScalarType index_data_type, int64_t active_rows, int64_t dense_rows, int64_t token_count,

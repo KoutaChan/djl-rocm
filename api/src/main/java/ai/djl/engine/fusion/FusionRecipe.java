@@ -1174,7 +1174,7 @@ public final class FusionRecipe {
      */
     public static final class IndexedLocalTransformerEncoder extends Value {
 
-        private final Value input;
+        private final List<Value> inputSegments;
         private final Value indices;
         private final Constant inputNormWeight;
         private final Constant inputNormBias;
@@ -1189,7 +1189,7 @@ public final class FusionRecipe {
                 int index,
                 String name,
                 TensorSpec spec,
-                Value input,
+                List<Value> inputSegments,
                 Value indices,
                 Constant inputNormWeight,
                 Constant inputNormBias,
@@ -1199,7 +1199,7 @@ public final class FusionRecipe {
                 int feedForwardWidth,
                 float epsilon) {
             super(owner, index, name, spec);
-            this.input = input;
+            this.inputSegments = immutableCopy(inputSegments);
             this.indices = indices;
             this.inputNormWeight = inputNormWeight;
             this.inputNormBias = inputNormBias;
@@ -1211,10 +1211,30 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the only dense local-group input.
+         *
          * @return the dense local-group input
+         * @throws IllegalStateException if this encoder uses more than one input segment
          */
         public Value getInput() {
-            return input;
+            if (inputSegments.size() != 1) {
+                throw new IllegalStateException(
+                        "The indexed local transformer input is segmented.");
+            }
+            return inputSegments.get(0);
+        }
+
+        /**
+         * Returns the dense local-group input segments in token order.
+         *
+         * <p>Each segment has shape {@code [batch, groups, segmentTokens, hiddenWidth]}. The
+         * concatenation is logical: engines can gather indexed rows directly from the segments
+         * without materializing one dense input.
+         *
+         * @return the immutable input-segment list
+         */
+        public List<Value> getInputSegments() {
+            return inputSegments;
         }
 
         /**
@@ -1724,7 +1744,51 @@ public final class FusionRecipe {
             return new IndexedLocalTransformerEncoderBuilder(
                     this,
                     requireName(name, "value"),
-                    input,
+                    Collections.singletonList(input),
+                    indices,
+                    attentionHeads,
+                    attentionWidth,
+                    feedForwardWidth);
+        }
+
+        /**
+         * Starts an indexed transformer encoder over logically concatenated local-group segments.
+         *
+         * <p>Every segment must have shape {@code [batch, groups, segmentTokens, hiddenWidth]} with
+         * the same bounded batch dimension, group count, hidden width, and data type. Flattened
+         * indices address the logical concatenation in segment declaration order.
+         *
+         * @param name the value name
+         * @param inputSegments bounded floating-point values in logical token order
+         * @param indices bounded, ascending, flattened INT32 or INT64 token indices
+         * @param attentionHeads the attention head count
+         * @param attentionWidth the concatenated Q, K, and V feature width
+         * @param feedForwardWidth the SiLU feed-forward hidden width
+         * @return a builder for the indexed local transformer encoder
+         */
+        public IndexedLocalTransformerEncoderBuilder indexedLocalTransformerEncoder(
+                String name,
+                List<? extends Value> inputSegments,
+                Value indices,
+                int attentionHeads,
+                int attentionWidth,
+                int feedForwardWidth) {
+            checkMutable();
+            Objects.requireNonNull(inputSegments, "inputSegments");
+            if (inputSegments.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Indexed local transformer input segments must not be empty.");
+            }
+            List<Value> checkedSegments = new ArrayList<>(inputSegments.size());
+            for (Value inputSegment : inputSegments) {
+                checkValue(inputSegment);
+                checkedSegments.add(inputSegment);
+            }
+            checkValue(indices);
+            return new IndexedLocalTransformerEncoderBuilder(
+                    this,
+                    requireName(name, "value"),
+                    checkedSegments,
                     indices,
                     attentionHeads,
                     attentionWidth,
@@ -2408,7 +2472,7 @@ public final class FusionRecipe {
 
         private final Builder recipeBuilder;
         private final String name;
-        private final Value input;
+        private final List<Value> inputSegments;
         private final Value indices;
         private final int attentionHeads;
         private final int attentionWidth;
@@ -2422,14 +2486,14 @@ public final class FusionRecipe {
         private IndexedLocalTransformerEncoderBuilder(
                 Builder recipeBuilder,
                 String name,
-                Value input,
+                List<Value> inputSegments,
                 Value indices,
                 int attentionHeads,
                 int attentionWidth,
                 int feedForwardWidth) {
             this.recipeBuilder = recipeBuilder;
             this.name = name;
-            this.input = input;
+            this.inputSegments = immutableCopy(inputSegments);
             this.indices = indices;
             this.attentionHeads = attentionHeads;
             this.attentionWidth = attentionWidth;
@@ -2547,7 +2611,7 @@ public final class FusionRecipe {
         public IndexedLocalTransformerEncoder build() {
             checkMutable();
             recipeBuilder.checkMutable();
-            TensorSpec inputSpec = input.getSpec();
+            TensorSpec inputSpec = inputSegments.get(0).getSpec();
             TensorSpec indexSpec = indices.getSpec();
             if (inputSpec.leadingDimension == null || inputSpec.innerShape.length != 3) {
                 throw new IllegalArgumentException(
@@ -2565,17 +2629,34 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException(
                         "Indexed local transformer indices must be bounded INT32 or INT64 rows.");
             }
+            long groupCount = inputSpec.innerShape[0];
+            long tokenCount = 0;
             long hiddenWidth = inputSpec.innerShape[2];
+            for (Value inputSegment : inputSegments) {
+                TensorSpec segmentSpec = inputSegment.getSpec();
+                if (segmentSpec.leadingDimension != inputSpec.leadingDimension
+                        || segmentSpec.dataType != inputSpec.dataType
+                        || segmentSpec.innerShape.length != 3
+                        || segmentSpec.innerShape[0] != groupCount
+                        || segmentSpec.innerShape[1] <= 0
+                        || segmentSpec.innerShape[2] != hiddenWidth) {
+                    throw new IllegalArgumentException(
+                            "Indexed local transformer input segments must share batch, groups,"
+                                + " hidden width, and data type and contain positive token"
+                                + " counts.");
+                }
+                tokenCount = Math.addExact(tokenCount, segmentSpec.innerShape[1]);
+            }
             long maximumDenseRows =
                     Math.multiplyExact(
                             inputSpec.leadingDimension.maximumExtent,
-                            Math.multiplyExact(inputSpec.innerShape[0], inputSpec.innerShape[1]));
+                            Math.multiplyExact(groupCount, tokenCount));
             if (indexSpec.leadingDimension.maximumExtent > maximumDenseRows) {
                 throw new IllegalArgumentException(
                         "Indexed local transformer index capacity exceeds the dense input.");
             }
             if (inputSpec.innerShape[0] <= 0
-                    || inputSpec.innerShape[1] <= 0
+                    || tokenCount <= 0
                     || attentionHeads <= 0
                     || attentionWidth <= 0
                     || attentionWidth % attentionHeads != 0
@@ -2660,8 +2741,10 @@ public final class FusionRecipe {
                             TensorSpec.of(
                                     inputSpec.dataType,
                                     inputSpec.leadingDimension,
-                                    inputSpec.innerShape),
-                            input,
+                                    groupCount,
+                                    tokenCount,
+                                    hiddenWidth),
+                            inputSegments,
                             indices,
                             inputNormWeight,
                             inputNormBias,

@@ -953,8 +953,40 @@ constexpr int kIndexedLocalAttentionHeads = 4;
 constexpr int kIndexedLocalAttentionWidth = 64;
 constexpr int kIndexedLocalHeadWidth = 16;
 
-template <typename scalar_t, typename index_t>
-__global__ void indexed_local_gather_normalize_kernel(const scalar_t* input, const index_t* indices,
+template <typename scalar_t>
+struct IndexedLocalDenseInput {
+  const scalar_t* data;
+
+  __device__ const scalar_t* row(int64_t dense_row) const {
+    return data + dense_row * kIndexedLocalHiddenWidth;
+  }
+};
+
+template <typename scalar_t>
+struct IndexedLocalSegmentedInput {
+  const void* data[kMaximumIndexedLocalTransformerSegments];
+  int64_t token_offsets[kMaximumIndexedLocalTransformerSegments];
+  int64_t token_counts[kMaximumIndexedLocalTransformerSegments];
+  int64_t token_count;
+  int32_t segment_count;
+
+  __device__ const scalar_t* row(int64_t dense_row) const {
+    const int64_t token = dense_row % token_count;
+    const int64_t group_row = dense_row / token_count;
+    for (int32_t segment = 0; segment < segment_count; ++segment) {
+      const int64_t local_token = token - token_offsets[segment];
+      if (local_token >= 0 && local_token < token_counts[segment]) {
+        const int64_t segment_row = group_row * token_counts[segment] + local_token;
+        return static_cast<const scalar_t*>(data[segment]) +
+            segment_row * kIndexedLocalHiddenWidth;
+      }
+    }
+    return nullptr;
+  }
+};
+
+template <typename scalar_t, typename index_t, typename input_t>
+__global__ void indexed_local_gather_normalize_kernel(input_t input, const index_t* indices,
     const void* input_norm_weight, const void* input_norm_bias, int32_t input_norm_data_type,
     const void* attention_norm_weight, const void* attention_norm_bias, int32_t attention_norm_data_type,
     scalar_t* output, scalar_t* normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows,
@@ -972,14 +1004,17 @@ __global__ void indexed_local_gather_normalize_kernel(const scalar_t* input, con
     float mean = 0.0f;
     float moment = 0.0f;
     int32_t count = 0;
-    const int64_t input_offset = dense_row * kIndexedLocalHiddenWidth;
+    const scalar_t* input_row = input.row(dense_row);
+    if (input_row == nullptr) {
+      continue;
+    }
     const int64_t output_offset = dense_row * kIndexedLocalHiddenWidth;
     const int64_t normalized_offset = row * kIndexedLocalHiddenWidth;
 #pragma unroll
     for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
       const int32_t feature = lane + item * warpSize;
       if (feature < kIndexedLocalHiddenWidth) {
-        const float value = static_cast<float>(input[input_offset + feature]);
+        const float value = static_cast<float>(input_row[feature]);
         values[item] = value;
         ++count;
         const float delta = value - mean;
@@ -2127,8 +2162,34 @@ void LaunchIndexedLocalGatherNormalizeTyped(const torch::Tensor& input, const to
     const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
     torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, float epsilon,
     uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((indexed_local_gather_normalize_kernel<scalar_t, index_t>), dim3(block_count),
-      dim3(kThreadsPerBlock), 0, stream, input.data_ptr<scalar_t>(), indices.data_ptr<index_t>(),
+  const IndexedLocalDenseInput<scalar_t> dense_input{input.data_ptr<scalar_t>()};
+  hipLaunchKernelGGL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
+                         IndexedLocalDenseInput<scalar_t>>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, dense_input, indices.data_ptr<index_t>(),
+      input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()),
+      attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),
+      static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),
+      normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, epsilon);
+}
+
+template <typename scalar_t, typename index_t>
+void LaunchIndexedLocalGatherNormalizeSegmentsTyped(
+    const IndexedLocalTransformerInputSegment* input_segments, int32_t input_segment_count,
+    const torch::Tensor& indices, const torch::Tensor& input_norm_weight, const torch::Tensor& input_norm_bias,
+    const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
+    torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t token_count,
+    float epsilon, uint32_t block_count, hipStream_t stream) {
+  IndexedLocalSegmentedInput<scalar_t> segmented_input{};
+  segmented_input.segment_count = input_segment_count;
+  segmented_input.token_count = token_count;
+  for (int32_t segment = 0; segment < input_segment_count; ++segment) {
+    segmented_input.data[segment] = input_segments[segment].data;
+    segmented_input.token_offsets[segment] = input_segments[segment].token_offset;
+    segmented_input.token_counts[segment] = input_segments[segment].token_count;
+  }
+  hipLaunchKernelGGL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
+                         IndexedLocalSegmentedInput<scalar_t>>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, segmented_input, indices.data_ptr<index_t>(),
       input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()),
       attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),
       static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),
@@ -2185,6 +2246,64 @@ void LaunchIndexedLocalTransformerGatherNormalize(const torch::Tensor& input, co
   }
 #undef LAUNCH_INDEXED_LOCAL_GATHER
   CheckHipLaunch("fusion indexed local transformer gather LayerNorm");
+}
+
+void LaunchIndexedLocalTransformerGatherNormalizeSegments(
+    const IndexedLocalTransformerInputSegment* input_segments, int32_t input_segment_count,
+    torch::ScalarType input_data_type, const torch::Tensor& indices, torch::ScalarType index_data_type,
+    const torch::Tensor& input_norm_weight, const torch::Tensor& input_norm_bias,
+    const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
+    torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t group_count,
+    int64_t token_count, int64_t hidden_width, float epsilon) {
+  TORCH_CHECK(input_segment_count > 1 && input_segment_count <= kMaximumIndexedLocalTransformerSegments,
+      "segmented indexed local transformer requires two to eight input segments");
+  TORCH_CHECK(group_count > 0 && token_count > 0 && hidden_width == kIndexedLocalHiddenWidth,
+      "segmented indexed local transformer metadata is invalid");
+  int64_t next_token_offset = 0;
+  for (int32_t segment = 0; segment < input_segment_count; ++segment) {
+    TORCH_CHECK(input_segments[segment].data != nullptr &&
+            input_segments[segment].token_offset == next_token_offset &&
+            input_segments[segment].token_count > 0,
+        "segmented indexed local transformer input metadata is invalid");
+    next_token_offset += input_segments[segment].token_count;
+  }
+  TORCH_CHECK(next_token_offset == token_count,
+      "segmented indexed local transformer token count does not match its inputs");
+  if (active_rows == 0) {
+    return;
+  }
+  constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
+  const uint32_t block_count =
+      static_cast<uint32_t>((active_rows + maximum_waves_per_block - 1) / maximum_waves_per_block);
+  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+#define LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(scalar_type, index_type)                               \
+  LaunchIndexedLocalGatherNormalizeSegmentsTyped<scalar_type, index_type>(                           \
+      input_segments, input_segment_count, indices, input_norm_weight, input_norm_bias,              \
+      attention_norm_weight, attention_norm_bias, output, normalized, active_offset, active_rows,   \
+      dense_rows, token_count, epsilon, block_count, stream.stream())
+  if (input_data_type == torch::kFloat16) {
+    if (index_data_type == torch::kInt32) {
+      LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(c10::Half, int32_t);
+    } else {
+      LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(c10::Half, int64_t);
+    }
+  } else if (input_data_type == torch::kBFloat16) {
+    if (index_data_type == torch::kInt32) {
+      LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(c10::BFloat16, int32_t);
+    } else {
+      LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(c10::BFloat16, int64_t);
+    }
+  } else if (input_data_type == torch::kFloat32) {
+    if (index_data_type == torch::kInt32) {
+      LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(float, int32_t);
+    } else {
+      LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(float, int64_t);
+    }
+  } else {
+    TORCH_CHECK(false, "unsupported segmented indexed local transformer data type");
+  }
+#undef LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER
+  CheckHipLaunch("fusion segmented indexed local transformer gather LayerNorm");
 }
 
 template <typename scalar_t, typename index_t>

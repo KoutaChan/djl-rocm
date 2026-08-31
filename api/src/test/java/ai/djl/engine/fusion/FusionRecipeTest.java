@@ -17,6 +17,8 @@ import ai.djl.ndarray.types.DataType;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
+import java.util.Arrays;
+
 public class FusionRecipeTest {
 
     @Test
@@ -577,6 +579,69 @@ public class FusionRecipeTest {
         Assert.assertEquals(
                 encoder.getSpec().getMaximumShape().getShape(), new long[] {384, 4, 29, 256});
         Assert.assertSame(recipe.getOutputs().get(0).getValue(), encoder);
+    }
+
+    @Test
+    public void indexedLocalTransformerBuildsLogicalInputSegments() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("segmented-indexed-local-transformer");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
+        FusionRecipe.Dimension active = builder.addDimension("active", 24_576);
+        FusionRecipe.Input player =
+                builder.addInput(
+                        "player", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 1, 256));
+        FusionRecipe.Input river =
+                builder.addInput(
+                        "river", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 24, 256));
+        FusionRecipe.Input meld =
+                builder.addInput(
+                        "meld", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 4, 256));
+        FusionRecipe.Input indices =
+                builder.addInput("indices", FusionRecipe.TensorSpec.of(DataType.INT32, active));
+        FusionRecipe.Constant inputNormWeight = vector(builder, "inputNormWeight", 256, true);
+        FusionRecipe.Constant inputNormBias = vector(builder, "inputNormBias", 256, true);
+        FusionRecipe.Constant attentionInputWeight = vector(builder, "attnNormWeight", 256, true);
+        FusionRecipe.Constant attentionInputBias = vector(builder, "attnNormBias", 256, true);
+        FusionRecipe.Constant queryKeyValue = matrix(builder, "qkv", 192, 256);
+        FusionRecipe.Constant attentionOutput = matrix(builder, "attentionOutput", 256, 64);
+        FusionRecipe.Constant attentionOutputBias =
+                vector(builder, "attentionOutputBias", 256, false);
+        FusionRecipe.Constant feedForwardInputWeight = vector(builder, "ffNormWeight", 256, true);
+        FusionRecipe.Constant feedForwardInputBias = vector(builder, "ffNormBias", 256, true);
+        FusionRecipe.Constant expansion = matrix(builder, "expansion", 128, 256);
+        FusionRecipe.Constant expansionBias = vector(builder, "expansionBias", 128, false);
+        FusionRecipe.Constant projection = matrix(builder, "projection", 256, 128);
+        FusionRecipe.Constant projectionBias = vector(builder, "projectionBias", 256, false);
+        FusionRecipe.Constant outputWeight = vector(builder, "outputNormWeight", 256, true);
+        FusionRecipe.Constant outputBias = vector(builder, "outputNormBias", 256, true);
+
+        FusionRecipe.IndexedLocalTransformerEncoder encoder =
+                builder.indexedLocalTransformerEncoder(
+                                "encoded", Arrays.asList(player, river, meld), indices, 4, 64, 128)
+                        .setInputNormalization(inputNormWeight, inputNormBias)
+                        .setBlock(
+                                attentionInputWeight,
+                                attentionInputBias,
+                                queryKeyValue,
+                                attentionOutput,
+                                attentionOutputBias,
+                                feedForwardInputWeight,
+                                feedForwardInputBias,
+                                expansion,
+                                expansionBias,
+                                projection,
+                                projectionBias,
+                                outputWeight,
+                                outputBias)
+                        .build();
+        builder.addOutput("output", encoder);
+        builder.build();
+
+        Assert.assertEquals(encoder.getInputSegments(), Arrays.asList(player, river, meld));
+        Assert.assertThrows(IllegalStateException.class, encoder::getInput);
+        Assert.assertEquals(
+                encoder.getSpec().getMaximumShape().getShape(), new long[] {384, 4, 29, 256});
+        Assert.assertThrows(
+                UnsupportedOperationException.class, () -> encoder.getInputSegments().clear());
     }
 
     @Test

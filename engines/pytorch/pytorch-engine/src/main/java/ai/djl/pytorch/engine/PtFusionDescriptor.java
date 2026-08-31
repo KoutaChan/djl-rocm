@@ -62,6 +62,8 @@ final class PtFusionDescriptor {
     static final long SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 = 6;
     // Opcode 7 is reserved for INDEXED_BINARY_SOFTMAX_POOL_V1.
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_V1 = 8;
+    // Opcodes 9 through 12 are reserved for independently validated candidates.
+    static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2 = 13;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
@@ -142,7 +144,11 @@ final class PtFusionDescriptor {
                                 transformerEncoderStackCommandWords(
                                         (FusionRecipe.TransformerEncoderStack) value));
             } else if (value instanceof FusionRecipe.IndexedLocalTransformerEncoder) {
-                commandWords = Math.addExact(commandWords, indexedLocalTransformerCommandWords());
+                commandWords =
+                        Math.addExact(
+                                commandWords,
+                                indexedLocalTransformerCommandWords(
+                                        (FusionRecipe.IndexedLocalTransformerEncoder) value));
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 commandWords = Math.addExact(commandWords, binaryBranchBlendCommandWords());
             } else if (isFirstSingleQueryReadoutState(value)) {
@@ -871,8 +877,9 @@ final class PtFusionDescriptor {
         putFloatAttribute(descriptor, TRANSFORMER_EPSILON, stack.getEpsilon());
     }
 
-    private static int indexedLocalTransformerCommandWords() {
-        int operandCount = 17;
+    private static int indexedLocalTransformerCommandWords(
+            FusionRecipe.IndexedLocalTransformerEncoder encoder) {
+        int operandCount = Math.addExact(16, encoder.getInputSegments().size());
         return Math.addExact(
                 COMMAND_RECORD_HEADER_WORDS + 1 + operandCount,
                 Math.multiplyExact(4, SCALAR_ATTRIBUTE_WORDS));
@@ -881,14 +888,21 @@ final class PtFusionDescriptor {
     private static void putIndexedLocalTransformerCommand(
             ByteBuffer descriptor, FusionRecipe.IndexedLocalTransformerEncoder encoder) {
         FusionRecipe.TransformerEncoderBlock block = encoder.getBlock();
-        descriptor.putLong(indexedLocalTransformerCommandWords());
-        descriptor.putLong(INDEXED_LOCAL_TRANSFORMER_ENCODER_V1);
+        int inputSegmentCount = encoder.getInputSegments().size();
+        int operandCount = Math.addExact(16, inputSegmentCount);
+        descriptor.putLong(indexedLocalTransformerCommandWords(encoder));
+        descriptor.putLong(
+                inputSegmentCount == 1
+                        ? INDEXED_LOCAL_TRANSFORMER_ENCODER_V1
+                        : INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2);
         descriptor.putLong(0);
         descriptor.putLong(1);
-        descriptor.putLong(17);
+        descriptor.putLong(operandCount);
         descriptor.putLong(4);
         descriptor.putLong(encoder.getIndex());
-        descriptor.putLong(encoder.getInput().getIndex());
+        for (FusionRecipe.Value inputSegment : encoder.getInputSegments()) {
+            descriptor.putLong(inputSegment.getIndex());
+        }
         descriptor.putLong(encoder.getIndices().getIndex());
         descriptor.putLong(encoder.getInputNormWeight().getIndex());
         descriptor.putLong(encoder.getInputNormBias().getIndex());
