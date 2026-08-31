@@ -1335,6 +1335,35 @@ public interface NDArrayEx {
     }
 
     /**
+     * Adds a broadcast residual to an owned tensor and applies SiLU and an optional mask in place.
+     *
+     * <p>Engines may fuse the residual addition, activation, and mask into one kernel. This
+     * operation mutates its receiver and is intended for inference graphs with explicit buffer
+     * ownership.
+     *
+     * @param residual residual shaped {@code [batch, 1, features]}
+     * @param mask optional mask shaped {@code [batch, items]}, or {@code null}
+     * @return the updated receiver
+     */
+    default NDArray addBroadcastResidualToOwnedAndSilu(NDArray residual, NDArray mask) {
+        NDArray values = getArray();
+        NDManager outputManager = values.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            if (mask == null) {
+                scope.tempAttachAll(values, residual);
+            } else {
+                scope.tempAttachAll(values, residual, mask);
+            }
+            values.addi(residual);
+            values.muli(Activation.sigmoid(values));
+            if (mask != null) {
+                values.muli(mask.expandDims(2));
+            }
+            return values;
+        }
+    }
+
+    /**
      * Fused scaled-dot-product attention: roughly {@code softmax(Q Kᵀ / sqrt(d_k) + attnMask) V}
      * computed in a single fused kernel.
      *

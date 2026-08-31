@@ -499,6 +499,37 @@ public final class NDArrays {
                         storedIndices, embeddingTable, validMask, paddingIndex, reduction);
     }
 
+    /**
+     * Adds a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * <p>The values must be shaped {@code [batch, items, features]} and the residual {@code [batch,
+     * 1, features]}. If present, the mask must be shaped {@code [batch, items]} and is applied
+     * after SiLU. All arrays must use the same floating-point data type. This operation is intended
+     * for inference graphs where the caller exclusively owns {@code values}; it does not support
+     * automatic differentiation.
+     *
+     * @param values owned values to update
+     * @param residual residual broadcast across the item dimension
+     * @param mask optional item mask, or {@code null}
+     * @return {@code values}, updated in place
+     */
+    public static NDArray addBroadcastResidualToOwnedAndSilu(
+            NDArray values, NDArray residual, NDArray mask) {
+        return values.getNDArrayInternal().addBroadcastResidualToOwnedAndSilu(residual, mask);
+    }
+
+    /**
+     * Adds a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * @param values owned values to update
+     * @param residual residual broadcast across the item dimension
+     * @return {@code values}, updated in place
+     * @see #addBroadcastResidualToOwnedAndSilu(NDArray, NDArray, NDArray)
+     */
+    public static NDArray addBroadcastResidualToOwnedAndSilu(NDArray values, NDArray residual) {
+        return addBroadcastResidualToOwnedAndSilu(values, residual, null);
+    }
+
     private static NDArray canonicalRelationKeys(
             NDArray relationKeys,
             long[] leadingDimensions,

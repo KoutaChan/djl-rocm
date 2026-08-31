@@ -1143,6 +1143,14 @@ public final class JniUtils {
                         reductionValue));
     }
 
+    /** Adds a broadcast residual to caller-owned values and applies SiLU and an optional mask. */
+    public static PtNDArray addBroadcastResidualToOwnedAndSilu(
+            PtNDArray values, PtNDArray residual, PtNDArray mask) {
+        PyTorchLibrary.LIB.torchAddBroadcastResidualToOwnedAndSilu(
+                values.getHandle(), residual.getHandle(), mask == null ? 0L : mask.getHandle());
+        return values;
+    }
+
     public static PtNDArray rmsNorm(
             PtNDArray input, long[] normalizedShape, PtNDArray weight, double eps) {
         long weightHandle = weight == null ? 0L : weight.getHandle();

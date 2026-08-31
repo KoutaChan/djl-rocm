@@ -23,6 +23,7 @@ constexpr int kResidualCachedValuesPerLaneLimit = 16;
 constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
+constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 
 void check_hip_kernel_launch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
@@ -482,6 +483,29 @@ struct MaskedEmbeddingResidualArguments {
 template <typename scalar_t>
 __device__ float round_masked_embedding_value(float value) {
   return static_cast<float>(static_cast<scalar_t>(value));
+}
+
+template <typename scalar_t>
+__global__ void broadcast_residual_to_owned_silu_kernel(scalar_t* values,
+    const scalar_t* residual, const scalar_t* mask, int64_t row_count,
+    int64_t items_per_batch, int64_t width) {
+  for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x) {
+    const int64_t batch = row / items_per_batch;
+    const int64_t row_offset = row * width;
+    const int64_t residual_offset = batch * width;
+    for (int64_t column = threadIdx.x; column < width; column += blockDim.x) {
+      const scalar_t updated = static_cast<scalar_t>(
+          static_cast<float>(values[row_offset + column]) +
+          static_cast<float>(residual[residual_offset + column]));
+      const float value = static_cast<float>(updated);
+      const scalar_t activated =
+          static_cast<scalar_t>(value / (1.0f + expf(-value)));
+      values[row_offset + column] = mask == nullptr
+          ? activated
+          : static_cast<scalar_t>(
+                static_cast<float>(activated) * static_cast<float>(mask[row]));
+    }
+  }
 }
 
 template <typename scalar_t>
@@ -1974,6 +1998,48 @@ torch::Tensor add_masked_embedding_residual_to_owned_tokens(torch::Tensor& token
       });
   check_hip_kernel_launch("masked embedding residual to owned tokens");
   return converted_valid_mask;
+}
+
+bool supports_broadcast_residual_to_owned_silu(const torch::Tensor& values,
+    const torch::Tensor& residual, const torch::Tensor* mask) {
+  if (!values.is_cuda() || !values.is_contiguous() || values.dim() != 3 ||
+      values.size(2) <= 0 || !is_fused_floating(values) ||
+      !residual.is_cuda() || !residual.is_contiguous() || residual.dim() != 3 ||
+      residual.size(0) != values.size(0) || residual.size(1) != 1 ||
+      residual.size(2) != values.size(2) ||
+      residual.scalar_type() != values.scalar_type() ||
+      residual.device() != values.device()) {
+    return false;
+  }
+  return mask == nullptr ||
+      (mask->is_cuda() && mask->is_contiguous() && mask->dim() == 2 &&
+       mask->size(0) == values.size(0) && mask->size(1) == values.size(1) &&
+       mask->scalar_type() == values.scalar_type() && mask->device() == values.device());
+}
+
+void add_broadcast_residual_to_owned_and_silu(
+    torch::Tensor& values, const torch::Tensor& residual, const torch::Tensor* mask) {
+  TORCH_CHECK(supports_broadcast_residual_to_owned_silu(values, residual, mask),
+      "broadcast residual SiLU received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(values.device());
+  const int64_t row_count = values.size(0) * values.size(1);
+  if (row_count == 0) {
+    return;
+  }
+  const uint32_t block_count =
+      static_cast<uint32_t>(std::min<int64_t>(row_count, 65535));
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(values.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, values.scalar_type(),
+      "broadcast_residual_to_owned_silu", [&] {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(broadcast_residual_to_owned_silu_kernel<scalar_t>),
+            dim3(block_count), dim3(kBroadcastResidualSiluThreadsPerBlock), 0, stream,
+            values.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(),
+            mask == nullptr ? nullptr : mask->data_ptr<scalar_t>(), row_count,
+            values.size(1), values.size(2));
+      });
+  check_hip_kernel_launch("broadcast residual to owned SiLU");
 }
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,

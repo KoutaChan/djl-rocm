@@ -328,6 +328,8 @@ final class PyTorchLibrary {
             long paddingIndex,
             int reduction);
 
+    native void torchAddBroadcastResidualToOwnedAndSilu(long values, long residual, long mask);
+
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
 
     native long torchArgMax(long handle);

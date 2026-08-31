@@ -82,6 +82,16 @@ torch::Tensor add_masked_embedding_residual_to_owned_tokens_fallback(torch::Tens
   return converted_valid_mask;
 }
 
+void add_broadcast_residual_to_owned_and_silu_fallback(
+    torch::Tensor& values, const torch::Tensor& residual, const torch::Tensor* mask) {
+  torch::NoGradGuard no_grad;
+  values.add_(residual);
+  values.mul_(torch::sigmoid(values));
+  if (mask != nullptr) {
+    values.mul_(mask->unsqueeze(-1));
+  }
+}
+
 }  // namespace
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPad(
@@ -351,6 +361,50 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddMaskedEmbeddingResidualToOwnedTok
   const auto* result_ptr = new torch::Tensor(std::move(converted_valid_mask));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddBroadcastResidualToOwnedAndSilu(
+    JNIEnv* env, jobject jthis, jlong jvalues, jlong jresidual, jlong jmask) {
+  API_BEGIN()
+  auto* values_ptr = reinterpret_cast<torch::Tensor*>(jvalues);
+  const auto* residual_ptr = reinterpret_cast<torch::Tensor*>(jresidual);
+  const auto* mask_ptr = jmask == djl::utils::jni::NULL_PTR
+      ? nullptr
+      : reinterpret_cast<torch::Tensor*>(jmask);
+  TORCH_CHECK(!requires_autograd({values_ptr, residual_ptr, mask_ptr}),
+      "owned broadcast residual SiLU is an inference operation and does not support automatic differentiation");
+  TORCH_CHECK(values_ptr->dim() == 3 && values_ptr->size(2) > 0,
+      "values must have shape [batch, items, features]");
+  TORCH_CHECK(residual_ptr->dim() == 3 && residual_ptr->size(0) == values_ptr->size(0) &&
+          residual_ptr->size(1) == 1 && residual_ptr->size(2) == values_ptr->size(2),
+      "residual must have shape [batch, 1, features]");
+  TORCH_CHECK(values_ptr->is_floating_point() &&
+          residual_ptr->scalar_type() == values_ptr->scalar_type(),
+      "values and residual must use the same floating-point data type");
+  TORCH_CHECK(residual_ptr->device() == values_ptr->device(),
+      "values and residual must be on the same device");
+  if (mask_ptr != nullptr) {
+    TORCH_CHECK(mask_ptr->dim() == 2 && mask_ptr->size(0) == values_ptr->size(0) &&
+            mask_ptr->size(1) == values_ptr->size(1),
+        "mask must have shape [batch, items]");
+    TORCH_CHECK(mask_ptr->scalar_type() == values_ptr->scalar_type() &&
+            mask_ptr->device() == values_ptr->device(),
+        "mask must use the values data type and device");
+  }
+
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (djl::pytorch::rocm::supports_broadcast_residual_to_owned_silu(
+          *values_ptr, *residual_ptr, mask_ptr)) {
+    djl::pytorch::rocm::add_broadcast_residual_to_owned_and_silu(
+        *values_ptr, *residual_ptr, mask_ptr);
+  } else
+#endif
+  {
+    add_broadcast_residual_to_owned_and_silu_fallback(
+        *values_ptr, *residual_ptr, mask_ptr);
+  }
+  API_END()
 }
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNInterpolate(

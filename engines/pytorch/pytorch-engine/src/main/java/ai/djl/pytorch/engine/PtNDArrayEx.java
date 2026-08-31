@@ -1037,6 +1037,17 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray addBroadcastResidualToOwnedAndSilu(NDArray residual, NDArray mask) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.addBroadcastResidualToOwnedAndSilu(residual, mask);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.addBroadcastResidualToOwnedAndSilu(
+                array, manager.from(residual), mask == null ? null : manager.from(mask));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray scaledDotProductAttention(
             NDArray key, NDArray value, NDArray attnMask, double dropoutP, boolean isCausal) {
         return JniUtils.scaledDotProductAttention(
