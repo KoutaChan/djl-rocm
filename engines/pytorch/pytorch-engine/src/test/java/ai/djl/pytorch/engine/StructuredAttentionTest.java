@@ -271,6 +271,25 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void mappedGroupedAttentionCoversNativeAndIndexFallbackAcrossDtypes() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            for (DataType dataType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                verifyMappedGroupedAttentionIndexFallback(manager, dataType);
+                verifyMappedGroupedAttentionGradients(engine, Device.gpu(), dataType);
+                System.out.printf(
+                        "MAPPED_GROUPED_ATTENTION_PARITY dtype=%s mask=ZERO_PADDED"
+                                + " indices=INT32_NATIVE,INT64_FALLBACK autograd=EAGER%n",
+                        dataType);
+            }
+        }
+    }
+
+    @Test
     public void nativeResidualLayerNormSupportsMixedPrecisionParameters() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -844,6 +863,77 @@ public class StructuredAttentionTest {
                         scale);
 
         assertClose(actual.toFloatArray(), expected.toFloatArray(), 2e-4f);
+    }
+
+    private static void verifyMappedGroupedAttentionIndexFallback(
+            NDManager manager, DataType dataType) {
+        int queries = 7;
+        int heads = 4;
+        int keyFeatures = 8;
+        int valueFeatures = 16;
+        int sharedTokens = 34;
+        int indexedTokens = 6;
+        int packedWidth = heads * (keyFeatures + valueFeatures);
+        NDArray query = manager.randomNormal(new Shape(queries, heads, keyFeatures), dataType);
+        NDArray shared = manager.randomNormal(new Shape(4, sharedTokens, packedWidth), dataType);
+        NDArray deltaTable = manager.randomNormal(new Shape(13, packedWidth), dataType);
+        NDArray indexedDeltas =
+                manager.randomNormal(new Shape(queries, indexedTokens, packedWidth), dataType);
+        int[] groupIds = {3, 0, 3, 1, 2, 0, 2};
+        int[] deltaIds = new int[queries * sharedTokens];
+        int[] indexedIds = new int[queries * indexedTokens];
+        for (int index = 0; index < deltaIds.length; ++index) {
+            deltaIds[index] = (index * 5 + 3) % 13;
+        }
+        for (int index = 0; index < indexedIds.length; ++index) {
+            indexedIds[index] = index % 5 == 0 ? 0 : (index * 7) % sharedTokens + 1;
+        }
+        NDArray groups = manager.create(groupIds);
+        NDArray deltas = manager.create(deltaIds, new Shape(queries, sharedTokens));
+        NDArray storedIndexedIds = manager.create(indexedIds, new Shape(queries, indexedTokens));
+        double scale = 1.0 / Math.sqrt(keyFeatures);
+
+        NDArray expected =
+                mappedGroupedAttentionReference(
+                        query,
+                        shared,
+                        groups,
+                        deltaTable,
+                        deltas,
+                        indexedDeltas,
+                        storedIndexedIds,
+                        scale);
+        NDArray nativeResult =
+                NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                        query,
+                        shared,
+                        groups,
+                        deltaTable,
+                        deltas,
+                        indexedDeltas,
+                        storedIndexedIds,
+                        scale);
+        NDArray indexFallback =
+                NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                        query,
+                        shared,
+                        groups.toType(DataType.INT64, false),
+                        deltaTable,
+                        deltas.toType(DataType.INT64, false),
+                        indexedDeltas,
+                        storedIndexedIds.toType(DataType.INT64, false),
+                        scale);
+
+        float tolerance;
+        if (dataType == DataType.FLOAT32) {
+            tolerance = 3e-4f;
+        } else if (dataType == DataType.FLOAT16) {
+            tolerance = 6e-3f;
+        } else {
+            tolerance = 3e-2f;
+        }
+        assertClose(nativeResult.toFloatArray(), expected.toFloatArray(), tolerance);
+        assertClose(indexFallback.toFloatArray(), expected.toFloatArray(), tolerance);
     }
 
     private static void verifyGroupedAttentionShape(
