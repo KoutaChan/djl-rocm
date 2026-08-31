@@ -284,8 +284,7 @@ public class PtFusionTest {
         FusionRecipe.Input second =
                 builder.addInput(
                         "second", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 3));
-        FusionRecipe.SegmentedOutputPack pack =
-                builder.segmentedOutputPack("pack", first, second);
+        FusionRecipe.SegmentedOutputPack pack = builder.segmentedOutputPack("pack", first, second);
         builder.addOutput("output", pack);
         FusionRecipe recipe = builder.build();
         ByteBuffer descriptor = PtFusionDescriptor.encode(recipe);
@@ -1007,8 +1006,7 @@ public class PtFusionTest {
             FusionRecipe.Builder builder = FusionRecipe.builder("typed-output-pack-test");
             FusionRecipe.Dimension rows = builder.addDimension("rows", 4);
             FusionRecipe.Input halfInput =
-                    builder.addInput(
-                            "half", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 2));
+                    builder.addInput("half", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 2));
             FusionRecipe.Input singleInput =
                     builder.addInput(
                             "single", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 3));
@@ -1031,8 +1029,7 @@ public class PtFusionTest {
                         manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2))
                                 .toType(DataType.FLOAT16, false);
                 NDArray single =
-                        manager.create(
-                                new float[] {5f, 6f, 7f, 8f, 9f, 10f}, new Shape(2, 3));
+                        manager.create(new float[] {5f, 6f, 7f, 8f, 9f, 10f}, new Shape(2, 3));
                 try (FusionInvocation invocation = session.acquire()) {
                     invocation.setInput(halfInput, half);
                     invocation.setInput(singleInput, single);
@@ -1041,10 +1038,13 @@ public class PtFusionTest {
                         lease.synchronize();
                         NDArray actual = lease.get(output);
                         Assert.assertEquals(actual.getDataType(), outputType);
-                        Assert.assertEquals(
-                                actual.get("0:2").toFloatArray(),
-                                new float[] {1f, 2f, 5f, 6f, 7f, 3f, 4f, 8f, 9f, 10f},
-                                outputType == DataType.FLOAT32 ? 0f : 1e-2f);
+                        try (NDArray slice = actual.get("0:2");
+                                NDArray comparable = slice.toType(DataType.FLOAT32, true)) {
+                            Assert.assertEquals(
+                                    comparable.toFloatArray(),
+                                    new float[] {1f, 2f, 5f, 6f, 7f, 3f, 4f, 8f, 9f, 10f},
+                                    outputType == DataType.FLOAT32 ? 0f : 1e-2f);
+                        }
                     }
                 }
             }
@@ -1063,15 +1063,12 @@ public class PtFusionTest {
             FusionRecipe.Builder builder = FusionRecipe.builder("segmented-output-pack-test");
             FusionRecipe.Dimension batch = builder.addDimension("batch", 4);
             FusionRecipe.Input roundInput =
-                    builder.addInput(
-                            "round", FusionRecipe.TensorSpec.of(dataType, batch, 1, 3));
+                    builder.addInput("round", FusionRecipe.TensorSpec.of(dataType, batch, 1, 3));
             FusionRecipe.Input playerMemoryInput =
                     builder.addInput(
-                            "playerMemory",
-                            FusionRecipe.TensorSpec.of(dataType, batch, 2, 4, 3));
+                            "playerMemory", FusionRecipe.TensorSpec.of(dataType, batch, 2, 4, 3));
             FusionRecipe.Input tileInput =
-                    builder.addInput(
-                            "tiles", FusionRecipe.TensorSpec.of(dataType, batch, 3, 3));
+                    builder.addInput("tiles", FusionRecipe.TensorSpec.of(dataType, batch, 3, 3));
             FusionRecipe.SegmentedOutputPack pack =
                     builder.segmentedOutputPack("memory")
                             .addSource(roundInput)
@@ -1146,12 +1143,10 @@ public class PtFusionTest {
         FusionRecipe.Dimension batch = builder.addDimension("batch", 4);
         FusionRecipe.Input strategicInput =
                 builder.addInput(
-                        "strategic",
-                        FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 6, 3));
+                        "strategic", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 6, 3));
         FusionRecipe.Input roundTileInput =
                 builder.addInput(
-                        "roundTiles",
-                        FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 5, 3));
+                        "roundTiles", FusionRecipe.TensorSpec.of(DataType.FLOAT32, batch, 5, 3));
         FusionRecipe.SegmentedOutputPack pack =
                 builder.segmentedOutputPack("memory")
                         .addSourceSlice(strategicInput, 0, 1)
@@ -1187,8 +1182,7 @@ public class PtFusionTest {
                 invocation.setDimension(batch, 4);
                 try (FusionOutputLease lease = invocation.submit()) {
                     lease.synchronize();
-                    Assert.assertEquals(
-                            lease.get(output).toByteBuffer(), expected.toByteBuffer());
+                    Assert.assertEquals(lease.get(output).toByteBuffer(), expected.toByteBuffer());
                 }
             }
         }
@@ -1661,7 +1655,8 @@ public class PtFusionTest {
                                 new Shape(1, 2));
                 NDArray outputBias = manager.zeros(new Shape(1), DataType.FLOAT16);
                 NDArray eagerActivation = Activation.swish(hiddenBias.reshape(1, 2), 1.0f);
-                NDArray eagerOutput = eagerActivation.matMul(outputWeight.transpose()).add(outputBias);
+                NDArray eagerOutput =
+                        eagerActivation.matMul(outputWeight.transpose()).add(outputBias);
                 FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
                 FusionExecutable executable =
                         plan.bind(
@@ -1676,8 +1671,7 @@ public class PtFusionTest {
                 Assert.assertEquals(
                         eagerOutput.toFloatArray(), new float[] {0.237548828125f}, 0.0f);
                 try (NDArray actual = lease.get(fixture.output).get("0:1")) {
-                    Assert.assertEquals(
-                            actual.toFloatArray(), eagerOutput.toFloatArray(), 0.0f);
+                    Assert.assertEquals(actual.toFloatArray(), eagerOutput.toFloatArray(), 0.0f);
                 }
             }
         }

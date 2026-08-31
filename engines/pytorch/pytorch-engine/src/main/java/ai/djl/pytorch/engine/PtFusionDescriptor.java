@@ -233,8 +233,7 @@ final class PtFusionDescriptor {
             if (value instanceof FusionRecipe.OutputPack) {
                 putOutputPackCommand(descriptor, (FusionRecipe.OutputPack) value);
             } else if (value instanceof FusionRecipe.SegmentedOutputPack) {
-                putSegmentedOutputPackCommand(
-                        descriptor, (FusionRecipe.SegmentedOutputPack) value);
+                putSegmentedOutputPackCommand(descriptor, (FusionRecipe.SegmentedOutputPack) value);
             } else if (value instanceof FusionRecipe.AffineSum) {
                 putAffineSumCommand(descriptor, (FusionRecipe.AffineSum) value);
             } else if (value instanceof FusionRecipe.IndexedAffine) {
