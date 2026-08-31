@@ -411,6 +411,8 @@ final class PyTorchLibrary {
 
     native long torchScatter(long handle, long index, long value, int axis);
 
+    native long torchEmbeddingWithOffsets(long rawIds, long offsets, long table);
+
     native long torchGatherRows(long handle, long index);
 
     native long torchScatterRows(long handle, long index, long rowCount);

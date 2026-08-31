@@ -44,6 +44,9 @@ public final class NDArrays {
             throw new IllegalArgumentException(
                     "raw IDs and offsets must use int16, int32, or int64");
         }
+        if (rawType == DataType.INT16 && offsetType == DataType.INT16) {
+            throw new IllegalArgumentException("raw IDs and offsets cannot both use int16");
+        }
         Shape rawShape = rawIds.getShape();
         Shape offsetShape = offsets.getShape();
         if (offsetShape.dimension() > rawShape.dimension()) {

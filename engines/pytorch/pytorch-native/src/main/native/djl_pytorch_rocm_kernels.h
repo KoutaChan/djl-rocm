@@ -17,6 +17,12 @@ void fused_adam_update(torch::Tensor& weight, const torch::Tensor& gradient, tor
 bool supports_masked_categorical(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis);
 
+bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table);
+
+torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table);
+
 bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices);
 
 bool supports_segmented_lookup_sum(

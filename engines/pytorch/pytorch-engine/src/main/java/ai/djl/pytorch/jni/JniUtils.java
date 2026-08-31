@@ -816,6 +816,15 @@ public final class JniUtils {
                         ndArray.getHandle(), index.getHandle(), value.getHandle(), axis));
     }
 
+    /** Adds namespace offsets to integer IDs and performs a dense embedding lookup. */
+    public static PtNDArray embeddingWithOffsets(
+            PtNDArray rawIds, PtNDArray offsets, PtNDArray table) {
+        return new PtNDArray(
+                rawIds.getManager(),
+                PyTorchLibrary.LIB.torchEmbeddingWithOffsets(
+                        rawIds.getHandle(), offsets.getHandle(), table.getHandle()));
+    }
+
     /** Selects leading-axis rows with a one-dimensional index tensor. */
     public static PtNDArray gatherRows(PtNDArray rows, PtNDArray rowIndices) {
         if (rowIndices.getDataType() != DataType.INT64) {

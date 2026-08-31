@@ -422,6 +422,21 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatter(
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEmbeddingWithOffsets(
+    JNIEnv* env, jobject jthis, jlong jraw_ids_handle, jlong joffsets_handle,
+    jlong jtable_handle) {
+  API_BEGIN()
+  const auto* raw_ids_ptr = reinterpret_cast<torch::Tensor*>(jraw_ids_handle);
+  const auto* offsets_ptr = reinterpret_cast<torch::Tensor*>(joffsets_handle);
+  const auto* table_ptr = reinterpret_cast<torch::Tensor*>(jtable_handle);
+  auto result = djl::pytorch::embedding_with_offsets(
+      *raw_ids_ptr, *offsets_ptr, *table_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGatherRows(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle) {
   API_BEGIN()

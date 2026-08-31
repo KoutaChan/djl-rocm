@@ -17,6 +17,9 @@
 
 namespace djl::pytorch {
 
+torch::Tensor embedding_with_offsets(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table);
+
 torch::Tensor scatter_rows(
     const torch::Tensor& rows, const torch::Tensor& row_indices, int64_t row_count);
 

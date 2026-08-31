@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -31,6 +32,11 @@ void check_hip_kernel_launch(const char* kernel_name) {
 bool is_fused_floating(const torch::Tensor& tensor) {
   return tensor.scalar_type() == torch::kFloat32 || tensor.scalar_type() == torch::kFloat16 ||
          tensor.scalar_type() == torch::kBFloat16;
+}
+
+bool is_embedding_index_type(const torch::Tensor& tensor) {
+  return tensor.scalar_type() == torch::kInt16 || tensor.scalar_type() == torch::kInt32 ||
+         tensor.scalar_type() == torch::kInt64;
 }
 
 bool supports_owned_residual_layer_norm_types(
@@ -72,6 +78,31 @@ __global__ void fused_adam_update_kernel(scalar_t* weight, const scalar_t* gradi
     weight[index] = static_cast<scalar_t>(weight_value);
     mean[index] = static_cast<scalar_t>(mean_value);
     variance[index] = static_cast<scalar_t>(variance_value);
+  }
+}
+
+template <typename raw_t, typename offset_t, typename table_t>
+__global__ void embedding_with_offsets_kernel(const raw_t* raw_ids,
+    const offset_t* offsets, const table_t* table, table_t* output,
+    int64_t output_elements, int64_t raw_columns, int64_t offset_rows,
+    int64_t offset_columns, int64_t table_rows, int64_t embedding_width) {
+  for (int64_t output_index =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       output_index < output_elements;
+       output_index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t raw_index = output_index / embedding_width;
+    const int64_t raw_row = raw_index / raw_columns;
+    const int64_t raw_column = raw_index % raw_columns;
+    const int64_t offset_row = offset_rows == 1 ? 0 : raw_row;
+    const int64_t offset_column = offset_columns == 1 ? 0 : raw_column;
+    const int64_t offset_index = offset_row * offset_columns + offset_column;
+    const int64_t table_row =
+        static_cast<int64_t>(raw_ids[raw_index]) +
+        static_cast<int64_t>(offsets[offset_index]);
+    assert(table_row >= 0 && table_row < table_rows);
+    output[output_index] = table_row >= 0 && table_row < table_rows
+        ? table[table_row * embedding_width + output_index % embedding_width]
+        : static_cast<table_t>(0);
   }
 }
 
@@ -1991,6 +2022,23 @@ bool supports_masked_categorical(
          logits.size(-1) > 0 && axis == logits.dim() - 1;
 }
 
+bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table) {
+  if (!raw_ids.is_cuda() || !offsets.is_cuda() || !table.is_cuda() ||
+      !raw_ids.is_contiguous() || !offsets.is_contiguous() || !table.is_contiguous() ||
+      raw_ids.device() != offsets.device() || raw_ids.device() != table.device() ||
+      raw_ids.dim() != 2 || offsets.dim() != 2 || table.dim() != 2 ||
+      raw_ids.size(0) <= 0 || raw_ids.size(1) <= 0 || table.size(0) <= 0 ||
+      table.size(1) <= 0 || !is_embedding_index_type(raw_ids) ||
+      !is_embedding_index_type(offsets) || !is_fused_floating(table) ||
+      (raw_ids.scalar_type() == torch::kInt16 &&
+          offsets.scalar_type() == torch::kInt16)) {
+    return false;
+  }
+  return (offsets.size(0) == 1 || offsets.size(0) == raw_ids.size(0)) &&
+      (offsets.size(1) == 1 || offsets.size(1) == raw_ids.size(1));
+}
+
 bool supports_grouped_masked_softmax_pool(
     const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
   if (!logits.is_cuda() || !logits.is_contiguous() || !mask.is_contiguous() ||
@@ -2047,6 +2095,51 @@ bool supports_padded_batch_gather_by_batch_indices(const torch::Tensor& source,
   return has_contiguous_padded_gather_rows(source, 2) &&
       has_supported_padded_gather_index_layout(batch_indices, source.device()) &&
       has_supported_padded_gather_index_layout(stored_indices, source.device());
+}
+
+torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table) {
+  TORCH_CHECK(supports_embedding_with_offsets(raw_ids, offsets, table),
+      "embedding with offsets received an unsupported ROCm tensor layout");
+  auto output_shape = raw_ids.sizes().vec();
+  output_shape.push_back(table.size(1));
+  auto output = torch::empty(output_shape, table.options());
+  const int64_t output_elements = output.numel();
+  if (output_elements == 0) {
+    return output;
+  }
+
+  c10::DeviceGuard device_guard(table.device());
+  const auto& properties = device_properties(table.get_device());
+  const int threads_per_block = std::min(256, properties.maxThreadsPerBlock);
+  const int64_t required_blocks =
+      (output_elements + threads_per_block - 1) / threads_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(table.get_device()).stream();
+  AT_DISPATCH_INTEGRAL_TYPES(
+      raw_ids.scalar_type(), "embedding_with_offsets_raw_ids", [&] {
+        using raw_t = scalar_t;
+        AT_DISPATCH_INTEGRAL_TYPES(
+            offsets.scalar_type(), "embedding_with_offsets_offsets", [&] {
+              using offset_t = scalar_t;
+              AT_DISPATCH_FLOATING_TYPES_AND2(
+                  torch::kHalf, torch::kBFloat16, table.scalar_type(),
+                  "embedding_with_offsets_table", [&] {
+                    using table_t = scalar_t;
+                    hipLaunchKernelGGL(
+                        HIP_KERNEL_NAME(embedding_with_offsets_kernel<raw_t, offset_t, table_t>),
+                        dim3(blocks), dim3(threads_per_block), 0, stream,
+                        raw_ids.data_ptr<raw_t>(), offsets.data_ptr<offset_t>(),
+                        table.data_ptr<table_t>(), output.data_ptr<table_t>(),
+                        output_elements, raw_ids.size(1), offsets.size(0),
+                        offsets.size(1), table.size(0), table.size(1));
+                  });
+            });
+      });
+  check_hip_kernel_launch("embedding_with_offsets");
+  return output;
 }
 
 void fused_adam_update(torch::Tensor& weight, const torch::Tensor& gradient, torch::Tensor& mean,

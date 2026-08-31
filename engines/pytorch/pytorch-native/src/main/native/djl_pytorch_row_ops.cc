@@ -13,6 +13,8 @@
 
 #include "djl_pytorch_row_ops.h"
 
+#include <ATen/ops/embedding.h>
+#include <ATen/ops/embedding_dense_backward.h>
 #include <torch/csrc/autograd/custom_function.h>
 
 #if defined(DJL_USE_ROCM_KERNELS)
@@ -51,6 +53,25 @@ torch::Tensor segmented_lookup_sum_reference(
 bool is_index_type(const torch::Tensor& indices) {
   return indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
       indices.scalar_type() == torch::kInt64;
+}
+
+bool broadcasts_to(const torch::Tensor& source, const torch::Tensor& destination) {
+  if (source.dim() > destination.dim()) {
+    return false;
+  }
+  for (int64_t axis = 1; axis <= source.dim(); ++axis) {
+    const int64_t source_size = source.size(source.dim() - axis);
+    const int64_t destination_size = destination.size(destination.dim() - axis);
+    if (source_size != 1 && source_size != destination_size) {
+      return false;
+    }
+  }
+  return true;
+}
+
+torch::Tensor embedding_with_offsets_reference(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table) {
+  return at::embedding(table, raw_ids.add(offsets));
 }
 
 std::vector<int64_t> padded_gather_output_shape(
@@ -105,6 +126,29 @@ torch::Tensor implicit_batch_indices(const torch::Tensor& stored_indices, int64_
 
 #if defined(DJL_USE_ROCM_KERNELS)
 
+class EmbeddingWithOffsetsFunction
+    : public torch::autograd::Function<EmbeddingWithOffsetsFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& raw_ids, const torch::Tensor& offsets,
+      const torch::Tensor& table) {
+    context->save_for_backward({raw_ids, offsets});
+    context->saved_data["table_rows"] = table.size(0);
+    return rocm::embedding_with_offsets_forward(raw_ids, offsets, table);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    auto saved = context->get_saved_variables();
+    auto indices = saved.at(0).add(saved.at(1));
+    const int64_t table_rows = context->saved_data["table_rows"].toInt();
+    auto table_gradient = at::embedding_dense_backward(
+        gradient_outputs.at(0), indices, table_rows, -1, false);
+    return {torch::Tensor(), torch::Tensor(), table_gradient};
+  }
+};
+
 class ScatterRowsFunction : public torch::autograd::Function<ScatterRowsFunction> {
  public:
   static torch::Tensor forward(torch::autograd::AutogradContext* context,
@@ -125,6 +169,30 @@ class ScatterRowsFunction : public torch::autograd::Function<ScatterRowsFunction
 #endif
 
 }  // namespace
+
+torch::Tensor embedding_with_offsets(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table) {
+  TORCH_CHECK(is_index_type(raw_ids), "raw IDs must be int16, int32, or int64");
+  TORCH_CHECK(is_index_type(offsets), "offsets must be int16, int32, or int64");
+  TORCH_CHECK(!(raw_ids.scalar_type() == torch::kInt16 &&
+                  offsets.scalar_type() == torch::kInt16),
+      "raw IDs and offsets cannot both be int16");
+  TORCH_CHECK(broadcasts_to(offsets, raw_ids),
+      "offsets must be broadcastable to raw IDs");
+  TORCH_CHECK(table.dim() == 2 && (table.is_floating_point() || table.is_complex()),
+      "embedding table must be a rank-two floating-point tensor");
+  TORCH_CHECK(raw_ids.device() == offsets.device() && raw_ids.device() == table.device(),
+      "raw IDs, offsets, and embedding table must use the same device");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (rocm::supports_embedding_with_offsets(raw_ids, offsets, table)) {
+    if (at::GradMode::is_enabled() && table.requires_grad()) {
+      return EmbeddingWithOffsetsFunction::apply(raw_ids, offsets, table);
+    }
+    return rocm::embedding_with_offsets_forward(raw_ids, offsets, table);
+  }
+#endif
+  return embedding_with_offsets_reference(raw_ids, offsets, table);
+}
 
 torch::Tensor scatter_rows(
     const torch::Tensor& rows, const torch::Tensor& row_indices, int64_t row_count) {
