@@ -38,7 +38,9 @@ import java.util.Set;
  * them into a contiguous {@link DataType#FLOAT32} value. {@link BinaryBranchBlend} selects or
  * blends two branch contexts from their presence values and a binary logit. {@link
  * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
- * blocks over a short dense sequence. Additional value types can be added without changing the
+ * blocks over a short dense sequence. {@link SingleQueryCrossAttentionReadoutGroup} evaluates
+ * several purpose-specific single-query readouts over one shared masked memory without
+ * materializing projected keys and values. Additional value types can be added without changing the
  * lifecycle of prepared plans and sessions.
  */
 public final class FusionRecipe {
@@ -710,6 +712,445 @@ public final class FusionRecipe {
         }
     }
 
+    /**
+     * The immutable parameters of one readout in a {@link SingleQueryCrossAttentionReadoutGroup}.
+     */
+    public static final class SingleQueryCrossAttentionReadout {
+
+        private final Constant querySeedWeight;
+        private final Constant querySeedBias;
+        private final Constant queryWeight;
+        private final Constant queryBias;
+        private final Constant keyValueWeight;
+        private final Constant contextWeight;
+        private final Constant contextBias;
+        private final Constant queryNormWeight;
+        private final Constant queryNormBias;
+        private final Constant feedForwardNormWeight;
+        private final Constant feedForwardNormBias;
+        private final Constant feedForwardExpansionWeight;
+        private final Constant feedForwardExpansionBias;
+        private final Constant feedForwardProjectionWeight;
+        private final Constant feedForwardProjectionBias;
+        private final Constant outputNormWeight;
+        private final Constant outputNormBias;
+        private final int feedForwardWidth;
+
+        private SingleQueryCrossAttentionReadout(
+                Constant querySeedWeight,
+                Constant querySeedBias,
+                Constant queryWeight,
+                Constant queryBias,
+                Constant keyValueWeight,
+                Constant contextWeight,
+                Constant contextBias,
+                Constant queryNormWeight,
+                Constant queryNormBias,
+                Constant feedForwardNormWeight,
+                Constant feedForwardNormBias,
+                Constant feedForwardExpansionWeight,
+                Constant feedForwardExpansionBias,
+                Constant feedForwardProjectionWeight,
+                Constant feedForwardProjectionBias,
+                Constant outputNormWeight,
+                Constant outputNormBias,
+                int feedForwardWidth) {
+            this.querySeedWeight = querySeedWeight;
+            this.querySeedBias = querySeedBias;
+            this.queryWeight = queryWeight;
+            this.queryBias = queryBias;
+            this.keyValueWeight = keyValueWeight;
+            this.contextWeight = contextWeight;
+            this.contextBias = contextBias;
+            this.queryNormWeight = queryNormWeight;
+            this.queryNormBias = queryNormBias;
+            this.feedForwardNormWeight = feedForwardNormWeight;
+            this.feedForwardNormBias = feedForwardNormBias;
+            this.feedForwardExpansionWeight = feedForwardExpansionWeight;
+            this.feedForwardExpansionBias = feedForwardExpansionBias;
+            this.feedForwardProjectionWeight = feedForwardProjectionWeight;
+            this.feedForwardProjectionBias = feedForwardProjectionBias;
+            this.outputNormWeight = outputNormWeight;
+            this.outputNormBias = outputNormBias;
+            this.feedForwardWidth = feedForwardWidth;
+        }
+
+        /**
+         * Returns the {@code [hiddenWidth, 2 * hiddenWidth]} query-seed weight.
+         *
+         * @return the {@code [hiddenWidth, 2 * hiddenWidth]} query-seed weight
+         */
+        public Constant getQuerySeedWeight() {
+            return querySeedWeight;
+        }
+
+        /**
+         * Returns the query-seed bias.
+         *
+         * @return the query-seed bias
+         */
+        public Constant getQuerySeedBias() {
+            return querySeedBias;
+        }
+
+        /**
+         * Returns the {@code [attentionWidth, hiddenWidth]} query weight.
+         *
+         * @return the {@code [attentionWidth, hiddenWidth]} query weight
+         */
+        public Constant getQueryWeight() {
+            return queryWeight;
+        }
+
+        /**
+         * Returns the query bias.
+         *
+         * @return the query bias
+         */
+        public Constant getQueryBias() {
+            return queryBias;
+        }
+
+        /**
+         * Returns the {@code [2 * attentionWidth, hiddenWidth]} key-value weight.
+         *
+         * @return the {@code [2 * attentionWidth, hiddenWidth]} key-value weight
+         */
+        public Constant getKeyValueWeight() {
+            return keyValueWeight;
+        }
+
+        /**
+         * Returns the {@code [hiddenWidth, attentionWidth]} context weight.
+         *
+         * @return the {@code [hiddenWidth, attentionWidth]} context weight
+         */
+        public Constant getContextWeight() {
+            return contextWeight;
+        }
+
+        /**
+         * Returns the context bias.
+         *
+         * @return the context bias
+         */
+        public Constant getContextBias() {
+            return contextBias;
+        }
+
+        /**
+         * Returns the post-attention LayerNorm scale.
+         *
+         * @return the post-attention LayerNorm scale
+         */
+        public Constant getQueryNormWeight() {
+            return queryNormWeight;
+        }
+
+        /**
+         * Returns the post-attention LayerNorm bias.
+         *
+         * @return the post-attention LayerNorm bias
+         */
+        public Constant getQueryNormBias() {
+            return queryNormBias;
+        }
+
+        /**
+         * Returns the feed-forward-input LayerNorm scale.
+         *
+         * @return the feed-forward-input LayerNorm scale
+         */
+        public Constant getFeedForwardNormWeight() {
+            return feedForwardNormWeight;
+        }
+
+        /**
+         * Returns the feed-forward-input LayerNorm bias.
+         *
+         * @return the feed-forward-input LayerNorm bias
+         */
+        public Constant getFeedForwardNormBias() {
+            return feedForwardNormBias;
+        }
+
+        /**
+         * Returns the {@code [feedForwardWidth, hiddenWidth]} expansion weight.
+         *
+         * @return the {@code [feedForwardWidth, hiddenWidth]} expansion weight
+         */
+        public Constant getFeedForwardExpansionWeight() {
+            return feedForwardExpansionWeight;
+        }
+
+        /**
+         * Returns the feed-forward expansion bias.
+         *
+         * @return the feed-forward expansion bias
+         */
+        public Constant getFeedForwardExpansionBias() {
+            return feedForwardExpansionBias;
+        }
+
+        /**
+         * Returns the {@code [hiddenWidth, feedForwardWidth]} projection weight.
+         *
+         * @return the {@code [hiddenWidth, feedForwardWidth]} projection weight
+         */
+        public Constant getFeedForwardProjectionWeight() {
+            return feedForwardProjectionWeight;
+        }
+
+        /**
+         * Returns the feed-forward projection bias.
+         *
+         * @return the feed-forward projection bias
+         */
+        public Constant getFeedForwardProjectionBias() {
+            return feedForwardProjectionBias;
+        }
+
+        /**
+         * Returns the output LayerNorm scale.
+         *
+         * @return the output LayerNorm scale
+         */
+        public Constant getOutputNormWeight() {
+            return outputNormWeight;
+        }
+
+        /**
+         * Returns the output LayerNorm bias.
+         *
+         * @return the output LayerNorm bias
+         */
+        public Constant getOutputNormBias() {
+            return outputNormBias;
+        }
+
+        /**
+         * Returns the feed-forward hidden width.
+         *
+         * @return the feed-forward hidden width
+         */
+        public int getFeedForwardWidth() {
+            return feedForwardWidth;
+        }
+    }
+
+    /**
+     * Several purpose-specific single-query cross-attention readouts over one shared memory.
+     *
+     * <p>The stage first computes the masked mean of {@code memory} once. Each readout projects the
+     * concatenation of the selected {@code querySource} token and that mean, attends to the same
+     * memory, applies a residual LayerNorm, evaluates a SiLU feed-forward network, and applies a
+     * final residual LayerNorm. A nonzero mask element marks a valid memory token. A row with no
+     * valid tokens uses a zero mean and a zero attention context.
+     *
+     * <p>For each attention head, an implementation may use {@code q (E W_k^T)^T = E (W_k^T q)} and
+     * {@code softmax(E (W_k^T q)) E W_v^T = (softmax(E (W_k^T q)) E) W_v^T}. This avoids the
+     * projected key-value tensor while preserving exact real-number semantics. FLOAT16 and BFLOAT16
+     * implementations accumulate projections, reductions, and LayerNorm statistics in FLOAT32 and
+     * may round at the documented projection and residual boundaries; they are not required to be
+     * bitwise identical to a materialized key-value implementation.
+     *
+     * <p>Each readout produces a separate contiguous {@code [batch, hiddenWidth]} state. Keeping
+     * the states separate allows each state to be passed directly to a later Fusion recipe without
+     * materializing a slice. A backend may keep the states in one readout-major backing allocation
+     * and expose contiguous aliases. Readouts may use different feed-forward widths; a backend may
+     * pad them to the largest declared width to execute the group without per-readout dispatches.
+     */
+    public static final class SingleQueryCrossAttentionReadoutGroup {
+
+        private final Value memory;
+        private final Value querySource;
+        private final Value validMask;
+        private final int queryIndex;
+        private final int attentionHeads;
+        private final int attentionWidth;
+        private final int maximumFeedForwardWidth;
+        private final float epsilon;
+        private final List<SingleQueryCrossAttentionReadout> readouts;
+        private final List<SingleQueryCrossAttentionReadoutState> states;
+
+        private SingleQueryCrossAttentionReadoutGroup(
+                Object owner,
+                int firstValueIndex,
+                List<String> stateNames,
+                TensorSpec stateSpec,
+                Value memory,
+                Value querySource,
+                Value validMask,
+                int queryIndex,
+                int attentionHeads,
+                int attentionWidth,
+                int maximumFeedForwardWidth,
+                float epsilon,
+                List<SingleQueryCrossAttentionReadout> readouts) {
+            this.memory = memory;
+            this.querySource = querySource;
+            this.validMask = validMask;
+            this.queryIndex = queryIndex;
+            this.attentionHeads = attentionHeads;
+            this.attentionWidth = attentionWidth;
+            this.maximumFeedForwardWidth = maximumFeedForwardWidth;
+            this.epsilon = epsilon;
+            this.readouts = immutableCopy(readouts);
+            List<SingleQueryCrossAttentionReadoutState> stateValues =
+                    new ArrayList<>(readouts.size());
+            for (int index = 0; index < readouts.size(); ++index) {
+                stateValues.add(
+                        new SingleQueryCrossAttentionReadoutState(
+                                owner,
+                                firstValueIndex + index,
+                                stateNames.get(index),
+                                stateSpec,
+                                this,
+                                index));
+            }
+            states = immutableCopy(stateValues);
+        }
+
+        /**
+         * Returns the shared {@code [batch, tokens, hiddenWidth]} memory.
+         *
+         * @return the shared {@code [batch, tokens, hiddenWidth]} memory
+         */
+        public Value getMemory() {
+            return memory;
+        }
+
+        /**
+         * Returns the shared {@code [batch, hiddenWidth]} or {@code [batch, queryTokens,
+         * hiddenWidth]} query source.
+         *
+         * @return the shared {@code [batch, hiddenWidth]} or {@code [batch, queryTokens,
+         *     hiddenWidth]} query source
+         */
+        public Value getQuerySource() {
+            return querySource;
+        }
+
+        /**
+         * Returns the shared nonzero-is-valid {@code [batch, tokens]} mask.
+         *
+         * @return the shared nonzero-is-valid {@code [batch, tokens]} mask
+         */
+        public Value getValidMask() {
+            return validMask;
+        }
+
+        /**
+         * Returns the selected query token index, or zero for a two-dimensional query source.
+         *
+         * @return the selected query token index, or zero for a two-dimensional query source
+         */
+        public int getQueryIndex() {
+            return queryIndex;
+        }
+
+        /**
+         * Returns the attention head count.
+         *
+         * @return the attention head count
+         */
+        public int getAttentionHeads() {
+            return attentionHeads;
+        }
+
+        /**
+         * Returns the concatenated attention width.
+         *
+         * @return the concatenated attention width
+         */
+        public int getAttentionWidth() {
+            return attentionWidth;
+        }
+
+        /**
+         * Returns the largest feed-forward width in the group.
+         *
+         * @return the largest feed-forward width in the group
+         */
+        public int getMaximumFeedForwardWidth() {
+            return maximumFeedForwardWidth;
+        }
+
+        /**
+         * Returns the LayerNorm epsilon.
+         *
+         * @return the LayerNorm epsilon
+         */
+        public float getEpsilon() {
+            return epsilon;
+        }
+
+        /**
+         * Returns the readouts in output-axis order.
+         *
+         * @return the readouts in output-axis order
+         */
+        public List<SingleQueryCrossAttentionReadout> getReadouts() {
+            return readouts;
+        }
+
+        /**
+         * Returns the contiguous state produced by one readout.
+         *
+         * @param index the readout index
+         * @return the {@code [batch, hiddenWidth]} state
+         */
+        public SingleQueryCrossAttentionReadoutState getReadoutState(int index) {
+            return states.get(index);
+        }
+
+        /**
+         * Returns the contiguous readout states in readout order.
+         *
+         * @return the contiguous readout states in readout order
+         */
+        public List<SingleQueryCrossAttentionReadoutState> getReadoutStates() {
+            return states;
+        }
+    }
+
+    /** One contiguous state produced by a {@link SingleQueryCrossAttentionReadoutGroup}. */
+    public static final class SingleQueryCrossAttentionReadoutState extends Value {
+
+        private final SingleQueryCrossAttentionReadoutGroup group;
+        private final int readoutIndex;
+
+        private SingleQueryCrossAttentionReadoutState(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                SingleQueryCrossAttentionReadoutGroup group,
+                int readoutIndex) {
+            super(owner, index, name, spec);
+            this.group = group;
+            this.readoutIndex = readoutIndex;
+        }
+
+        /**
+         * Returns the group that computes this state.
+         *
+         * @return the group that computes this state
+         */
+        public SingleQueryCrossAttentionReadoutGroup getGroup() {
+            return group;
+        }
+
+        /**
+         * Returns this state's index within the group.
+         *
+         * @return this state's index within the group
+         */
+        public int getReadoutIndex() {
+            return readoutIndex;
+        }
+    }
+
     /** The immutable parameters of one block in a {@link TransformerEncoderStack}. */
     public static final class TransformerEncoderBlock {
 
@@ -1111,6 +1552,32 @@ public final class FusionRecipe {
         }
 
         /**
+         * Starts a group of single-query cross-attention readouts.
+         *
+         * @param name the value name
+         * @param memory a bounded {@code [batch, tokens, hiddenWidth]} floating-point value
+         * @param querySource a bounded {@code [batch, hiddenWidth]} or {@code [batch, queryTokens,
+         *     hiddenWidth]} floating-point value
+         * @param validMask a bounded {@code [batch, tokens]} value whose nonzero elements are valid
+         * @param attentionHeads the attention head count
+         * @return a builder for the readout group
+         */
+        public SingleQueryCrossAttentionReadoutGroupBuilder singleQueryCrossAttentionReadoutGroup(
+                String name, Value memory, Value querySource, Value validMask, int attentionHeads) {
+            checkMutable();
+            checkValue(memory);
+            checkValue(querySource);
+            checkValue(validMask);
+            return new SingleQueryCrossAttentionReadoutGroupBuilder(
+                    this,
+                    requireName(name, "value"),
+                    memory,
+                    querySource,
+                    validMask,
+                    attentionHeads);
+        }
+
+        /**
          * Starts a fixed-sequence transformer encoder stack.
          *
          * @param name the value name
@@ -1343,12 +1810,435 @@ public final class FusionRecipe {
                     || dataType == DataType.FLOAT32;
         }
 
+        private static boolean isMaskDataType(DataType dataType) {
+            return dataType == DataType.BOOLEAN
+                    || dataType == DataType.UINT8
+                    || isAffineDataType(dataType);
+        }
+
         private static String requireName(String name, String kind) {
             Objects.requireNonNull(name, kind + " name");
             if (name.trim().isEmpty()) {
                 throw new IllegalArgumentException("The " + kind + " name must not be empty.");
             }
             return name;
+        }
+    }
+
+    /** Builds one {@link SingleQueryCrossAttentionReadoutGroup} value within a {@link Builder}. */
+    public static final class SingleQueryCrossAttentionReadoutGroupBuilder {
+
+        private static final float DEFAULT_EPSILON = 1.0e-5f;
+        private static final int MAXIMUM_READOUTS = 8;
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final Value memory;
+        private final Value querySource;
+        private final Value validMask;
+        private final int attentionHeads;
+        private final List<SingleQueryCrossAttentionReadout> readouts;
+        private int queryIndex;
+        private float epsilon;
+        private boolean built;
+
+        private SingleQueryCrossAttentionReadoutGroupBuilder(
+                Builder recipeBuilder,
+                String name,
+                Value memory,
+                Value querySource,
+                Value validMask,
+                int attentionHeads) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.memory = memory;
+            this.querySource = querySource;
+            this.validMask = validMask;
+            this.attentionHeads = attentionHeads;
+            readouts = new ArrayList<>();
+            epsilon = DEFAULT_EPSILON;
+        }
+
+        /**
+         * Adds one purpose-specific readout.
+         *
+         * <p>Projection weights use {@code [outputWidth, inputWidth]} layout. The key-value weight
+         * stores all key rows followed by all value rows. Every projection and bias uses the memory
+         * data type. LayerNorm scale and bias pairs may instead use FLOAT32, but all LayerNorm
+         * parameters in the group must share one data type.
+         *
+         * @param querySeedWeight query-seed projection weight
+         * @param querySeedBias query-seed projection bias
+         * @param queryWeight attention query projection weight
+         * @param queryBias attention query projection bias
+         * @param keyValueWeight combined key-value projection weight
+         * @param contextWeight attention-context projection weight
+         * @param contextBias attention-context projection bias
+         * @param queryNormWeight post-attention LayerNorm scale
+         * @param queryNormBias post-attention LayerNorm bias
+         * @param feedForwardNormWeight feed-forward-input LayerNorm scale
+         * @param feedForwardNormBias feed-forward-input LayerNorm bias
+         * @param feedForwardExpansionWeight feed-forward expansion weight
+         * @param feedForwardExpansionBias feed-forward expansion bias
+         * @param feedForwardProjectionWeight feed-forward projection weight
+         * @param feedForwardProjectionBias feed-forward projection bias
+         * @param outputNormWeight output LayerNorm scale
+         * @param outputNormBias output LayerNorm bias
+         * @return this builder
+         */
+        public SingleQueryCrossAttentionReadoutGroupBuilder addReadout(
+                Constant querySeedWeight,
+                Constant querySeedBias,
+                Constant queryWeight,
+                Constant queryBias,
+                Constant keyValueWeight,
+                Constant contextWeight,
+                Constant contextBias,
+                Constant queryNormWeight,
+                Constant queryNormBias,
+                Constant feedForwardNormWeight,
+                Constant feedForwardNormBias,
+                Constant feedForwardExpansionWeight,
+                Constant feedForwardExpansionBias,
+                Constant feedForwardProjectionWeight,
+                Constant feedForwardProjectionBias,
+                Constant outputNormWeight,
+                Constant outputNormBias) {
+            checkMutable();
+            Constant[] constants = {
+                querySeedWeight,
+                querySeedBias,
+                queryWeight,
+                queryBias,
+                keyValueWeight,
+                contextWeight,
+                contextBias,
+                queryNormWeight,
+                queryNormBias,
+                feedForwardNormWeight,
+                feedForwardNormBias,
+                feedForwardExpansionWeight,
+                feedForwardExpansionBias,
+                feedForwardProjectionWeight,
+                feedForwardProjectionBias,
+                outputNormWeight,
+                outputNormBias
+            };
+            for (Constant constant : constants) {
+                recipeBuilder.checkValue(constant);
+            }
+            readouts.add(
+                    new SingleQueryCrossAttentionReadout(
+                            querySeedWeight,
+                            querySeedBias,
+                            queryWeight,
+                            queryBias,
+                            keyValueWeight,
+                            contextWeight,
+                            contextBias,
+                            queryNormWeight,
+                            queryNormBias,
+                            feedForwardNormWeight,
+                            feedForwardNormBias,
+                            feedForwardExpansionWeight,
+                            feedForwardExpansionBias,
+                            feedForwardProjectionWeight,
+                            feedForwardProjectionBias,
+                            outputNormWeight,
+                            outputNormBias,
+                            0));
+            return this;
+        }
+
+        /**
+         * Selects one token from a three-dimensional query source.
+         *
+         * <p>A two-dimensional query source already contains one query per batch and therefore only
+         * accepts index zero. Selection is part of the fused stage and does not materialize a token
+         * view.
+         *
+         * @param queryIndex the zero-based query token index
+         * @return this builder
+         */
+        public SingleQueryCrossAttentionReadoutGroupBuilder optQueryIndex(int queryIndex) {
+            checkMutable();
+            if (queryIndex < 0) {
+                throw new IllegalArgumentException("Readout query index must not be negative.");
+            }
+            this.queryIndex = queryIndex;
+            return this;
+        }
+
+        /**
+         * Sets the epsilon used by every LayerNorm in the group.
+         *
+         * @param epsilon the finite positive epsilon
+         * @return this builder
+         */
+        public SingleQueryCrossAttentionReadoutGroupBuilder optEpsilon(float epsilon) {
+            checkMutable();
+            if (!(epsilon > 0.0f) || !Float.isFinite(epsilon)) {
+                throw new IllegalArgumentException(
+                        "LayerNorm epsilon must be finite and positive.");
+            }
+            this.epsilon = epsilon;
+            return this;
+        }
+
+        /**
+         * Adds the immutable readout group to its recipe.
+         *
+         * @return the single-query readout group value
+         */
+        public SingleQueryCrossAttentionReadoutGroup build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            TensorSpec memorySpec = memory.getSpec();
+            TensorSpec querySourceSpec = querySource.getSpec();
+            TensorSpec maskSpec = validMask.getSpec();
+            if (memorySpec.leadingDimension == null || memorySpec.innerShape.length != 2) {
+                throw new IllegalArgumentException(
+                        "Readout memory must have shape [bounded batch, tokens, hiddenWidth].");
+            }
+            if (!Builder.isAffineDataType(memorySpec.dataType)) {
+                throw new IllegalArgumentException(
+                        "Readout memory only supports FLOAT16, BFLOAT16, and FLOAT32.");
+            }
+            long tokenCount = memorySpec.innerShape[0];
+            long hiddenWidth = memorySpec.innerShape[1];
+            boolean scalarQuery =
+                    querySourceSpec.innerShape.length == 1
+                            && querySourceSpec.innerShape[0] == hiddenWidth;
+            boolean sequenceQuery =
+                    querySourceSpec.innerShape.length == 2
+                            && querySourceSpec.innerShape[0] > 0
+                            && querySourceSpec.innerShape[1] == hiddenWidth;
+            long queryTokenCount =
+                    scalarQuery ? 1 : sequenceQuery ? querySourceSpec.innerShape[0] : 0;
+            if (querySourceSpec.leadingDimension != memorySpec.leadingDimension
+                    || querySourceSpec.dataType != memorySpec.dataType
+                    || queryTokenCount == 0
+                    || queryIndex >= queryTokenCount) {
+                throw new IllegalArgumentException(
+                        "Readout query source must match the memory batch, type, and hidden width,"
+                                + " and contain the selected query index.");
+            }
+            if (maskSpec.leadingDimension != memorySpec.leadingDimension
+                    || maskSpec.innerShape.length != 1
+                    || maskSpec.innerShape[0] != tokenCount
+                    || !Builder.isMaskDataType(maskSpec.dataType)) {
+                throw new IllegalArgumentException(
+                        "Readout mask must match the memory batch and token count and use a"
+                                + " supported mask type.");
+            }
+            if (attentionHeads <= 0) {
+                throw new IllegalArgumentException("Readout attention heads must be positive.");
+            }
+            if (readouts.isEmpty() || readouts.size() > MAXIMUM_READOUTS) {
+                throw new IllegalStateException(
+                        "A readout group requires between one and eight readouts.");
+            }
+
+            int attentionWidth = -1;
+            int maximumFeedForwardWidth = 0;
+            DataType normDataType = null;
+            List<SingleQueryCrossAttentionReadout> checkedReadouts =
+                    new ArrayList<>(readouts.size());
+            for (SingleQueryCrossAttentionReadout readout : readouts) {
+                requireProjection(
+                        readout.querySeedWeight,
+                        hiddenWidth,
+                        2L * hiddenWidth,
+                        memorySpec.dataType,
+                        "query-seed weight");
+                requireVector(
+                        readout.querySeedBias, hiddenWidth, memorySpec.dataType, "query-seed bias");
+                TensorSpec queryWeightSpec = readout.queryWeight.getSpec();
+                if (queryWeightSpec.leadingDimension != null
+                        || queryWeightSpec.dataType != memorySpec.dataType
+                        || queryWeightSpec.innerShape.length != 2
+                        || queryWeightSpec.innerShape[1] != hiddenWidth) {
+                    throw new IllegalArgumentException(
+                            "Readout query weight shape or type mismatch.");
+                }
+                int currentAttentionWidth = Math.toIntExact(queryWeightSpec.innerShape[0]);
+                if (attentionWidth < 0) {
+                    attentionWidth = currentAttentionWidth;
+                } else if (attentionWidth != currentAttentionWidth) {
+                    throw new IllegalArgumentException(
+                            "All readouts in a group must use one attention width.");
+                }
+                if (attentionWidth <= 0 || attentionWidth % attentionHeads != 0) {
+                    throw new IllegalArgumentException(
+                            "Readout attention width must be positive and divisible by its heads.");
+                }
+                requireVector(readout.queryBias, attentionWidth, memorySpec.dataType, "query bias");
+                requireProjection(
+                        readout.keyValueWeight,
+                        2L * attentionWidth,
+                        hiddenWidth,
+                        memorySpec.dataType,
+                        "key-value weight");
+                requireProjection(
+                        readout.contextWeight,
+                        hiddenWidth,
+                        attentionWidth,
+                        memorySpec.dataType,
+                        "context weight");
+                requireVector(
+                        readout.contextBias, hiddenWidth, memorySpec.dataType, "context bias");
+                normDataType =
+                        requireNormPair(
+                                readout.queryNormWeight,
+                                readout.queryNormBias,
+                                hiddenWidth,
+                                memorySpec.dataType,
+                                normDataType,
+                                "post-attention LayerNorm");
+                normDataType =
+                        requireNormPair(
+                                readout.feedForwardNormWeight,
+                                readout.feedForwardNormBias,
+                                hiddenWidth,
+                                memorySpec.dataType,
+                                normDataType,
+                                "feed-forward LayerNorm");
+
+                TensorSpec expansionSpec = readout.feedForwardExpansionWeight.getSpec();
+                if (expansionSpec.leadingDimension != null
+                        || expansionSpec.dataType != memorySpec.dataType
+                        || expansionSpec.innerShape.length != 2
+                        || expansionSpec.innerShape[1] != hiddenWidth) {
+                    throw new IllegalArgumentException(
+                            "Readout feed-forward expansion shape or type mismatch.");
+                }
+                int feedForwardWidth = Math.toIntExact(expansionSpec.innerShape[0]);
+                requireVector(
+                        readout.feedForwardExpansionBias,
+                        feedForwardWidth,
+                        memorySpec.dataType,
+                        "feed-forward expansion bias");
+                requireProjection(
+                        readout.feedForwardProjectionWeight,
+                        hiddenWidth,
+                        feedForwardWidth,
+                        memorySpec.dataType,
+                        "feed-forward projection weight");
+                requireVector(
+                        readout.feedForwardProjectionBias,
+                        hiddenWidth,
+                        memorySpec.dataType,
+                        "feed-forward projection bias");
+                normDataType =
+                        requireNormPair(
+                                readout.outputNormWeight,
+                                readout.outputNormBias,
+                                hiddenWidth,
+                                memorySpec.dataType,
+                                normDataType,
+                                "output LayerNorm");
+                maximumFeedForwardWidth = Math.max(maximumFeedForwardWidth, feedForwardWidth);
+                checkedReadouts.add(
+                        new SingleQueryCrossAttentionReadout(
+                                readout.querySeedWeight,
+                                readout.querySeedBias,
+                                readout.queryWeight,
+                                readout.queryBias,
+                                readout.keyValueWeight,
+                                readout.contextWeight,
+                                readout.contextBias,
+                                readout.queryNormWeight,
+                                readout.queryNormBias,
+                                readout.feedForwardNormWeight,
+                                readout.feedForwardNormBias,
+                                readout.feedForwardExpansionWeight,
+                                readout.feedForwardExpansionBias,
+                                readout.feedForwardProjectionWeight,
+                                readout.feedForwardProjectionBias,
+                                readout.outputNormWeight,
+                                readout.outputNormBias,
+                                feedForwardWidth));
+            }
+
+            List<String> stateNames = new ArrayList<>(readouts.size());
+            for (int index = 0; index < readouts.size(); ++index) {
+                stateNames.add(recipeBuilder.addValueName(name + '[' + index + ']'));
+            }
+            SingleQueryCrossAttentionReadoutGroup value =
+                    new SingleQueryCrossAttentionReadoutGroup(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            stateNames,
+                            TensorSpec.of(
+                                    memorySpec.dataType, memorySpec.leadingDimension, hiddenWidth),
+                            memory,
+                            querySource,
+                            validMask,
+                            queryIndex,
+                            attentionHeads,
+                            attentionWidth,
+                            maximumFeedForwardWidth,
+                            epsilon,
+                            checkedReadouts);
+            recipeBuilder.values.addAll(value.states);
+            built = true;
+            return value;
+        }
+
+        private static void requireProjection(
+                Constant constant, long rows, long columns, DataType dataType, String name) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.dataType != dataType
+                    || spec.innerShape.length != 2
+                    || spec.innerShape[0] != rows
+                    || spec.innerShape[1] != columns) {
+                throw new IllegalArgumentException("Readout " + name + " shape or type mismatch.");
+            }
+        }
+
+        private static void requireVector(
+                Constant constant, long width, DataType dataType, String name) {
+            TensorSpec spec = constant.getSpec();
+            if (spec.leadingDimension != null
+                    || spec.dataType != dataType
+                    || spec.innerShape.length != 1
+                    || spec.innerShape[0] != width) {
+                throw new IllegalArgumentException("Readout " + name + " shape or type mismatch.");
+            }
+        }
+
+        private static DataType requireNormPair(
+                Constant weight,
+                Constant bias,
+                long width,
+                DataType valueDataType,
+                DataType groupNormDataType,
+                String name) {
+            TensorSpec weightSpec = weight.getSpec();
+            TensorSpec biasSpec = bias.getSpec();
+            DataType dataType = weightSpec.dataType;
+            if (weightSpec.leadingDimension != null
+                    || biasSpec.leadingDimension != null
+                    || weightSpec.innerShape.length != 1
+                    || biasSpec.innerShape.length != 1
+                    || weightSpec.innerShape[0] != width
+                    || biasSpec.innerShape[0] != width
+                    || biasSpec.dataType != dataType
+                    || (dataType != valueDataType && dataType != DataType.FLOAT32)) {
+                throw new IllegalArgumentException("Readout " + name + " shape or type mismatch.");
+            }
+            if (groupNormDataType != null && groupNormDataType != dataType) {
+                throw new IllegalArgumentException(
+                        "All LayerNorm parameters in a readout group must use one data type.");
+            }
+            return dataType;
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException("The single-query readout group has been built.");
+            }
         }
     }
 

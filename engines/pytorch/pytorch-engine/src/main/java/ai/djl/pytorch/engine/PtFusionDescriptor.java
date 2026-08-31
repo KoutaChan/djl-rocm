@@ -59,6 +59,7 @@ final class PtFusionDescriptor {
     static final long INDEXED_AFFINE_V1 = 3;
     static final long TRANSFORMER_ENCODER_STACK_V1 = 4;
     static final long BINARY_BRANCH_BLEND_V1 = 5;
+    static final long SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 = 6;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
@@ -76,6 +77,13 @@ final class PtFusionDescriptor {
     static final long TRANSFORMER_ATTENTION_WIDTH = 3;
     static final long TRANSFORMER_FEED_FORWARD_WIDTH = 4;
     static final long TRANSFORMER_EPSILON = 5;
+    static final long READOUT_COUNT = 1;
+    static final long READOUT_ATTENTION_HEADS = 2;
+    static final long READOUT_ATTENTION_WIDTH = 3;
+    static final long READOUT_MAXIMUM_FEED_FORWARD_WIDTH = 4;
+    static final long READOUT_EPSILON = 5;
+    static final long READOUT_FEED_FORWARD_WIDTHS = 6;
+    static final long READOUT_QUERY_INDEX = 7;
     static final long ACTIVATION_NONE = 0;
     static final long ACTIVATION_SILU = 1;
 
@@ -128,6 +136,14 @@ final class PtFusionDescriptor {
                                         (FusionRecipe.TransformerEncoderStack) value));
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 commandWords = Math.addExact(commandWords, binaryBranchBlendCommandWords());
+            } else if (isFirstSingleQueryReadoutState(value)) {
+                commandWords =
+                        Math.addExact(
+                                commandWords,
+                                singleQueryReadoutGroupCommandWords(
+                                        singleQueryReadoutGroup(value)));
+            } else if (value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState) {
+                // The first state encodes the shared multi-result command.
             } else if (!(value instanceof FusionRecipe.Input)
                     && !(value instanceof FusionRecipe.Constant)) {
                 throw new UnsupportedOperationException(
@@ -193,6 +209,8 @@ final class PtFusionDescriptor {
                         descriptor, (FusionRecipe.TransformerEncoderStack) value);
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 putBinaryBranchBlendCommand(descriptor, (FusionRecipe.BinaryBranchBlend) value);
+            } else if (isFirstSingleQueryReadoutState(value)) {
+                putSingleQueryReadoutGroupCommand(descriptor, singleQueryReadoutGroup(value));
             }
         }
         for (FusionRecipe.Output output : recipe.getOutputs()) {
@@ -219,6 +237,8 @@ final class PtFusionDescriptor {
                 ++count;
             } else if (value instanceof FusionRecipe.BinaryBranchBlend) {
                 ++count;
+            } else if (isFirstSingleQueryReadoutState(value)) {
+                ++count;
             }
         }
         return count;
@@ -234,6 +254,7 @@ final class PtFusionDescriptor {
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, singleQueryReadoutWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -251,6 +272,7 @@ final class PtFusionDescriptor {
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, singleQueryReadoutWorkspaceBytes(recipe));
         return bytes;
     }
 
@@ -312,6 +334,62 @@ final class PtFusionDescriptor {
             }
             bytes = Math.addExact(bytes, Math.multiplyExact(blockElements, elementBytes));
         }
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!isFirstSingleQueryReadoutState(value)) {
+                continue;
+            }
+            FusionRecipe.SingleQueryCrossAttentionReadoutGroup group =
+                    singleQueryReadoutGroup(value);
+            int elementBytes = value.getSpec().getDataType().getNumOfBytes();
+            long hiddenWidth = group.getMemory().getSpec().getInnerShape()[1];
+            long readoutCount = group.getReadouts().size();
+            long projectionElements = 0;
+            projectionElements =
+                    Math.addExact(
+                            projectionElements,
+                            Math.multiplyExact(readoutCount, 2L * hiddenWidth * hiddenWidth));
+            projectionElements =
+                    Math.addExact(
+                            projectionElements,
+                            Math.multiplyExact(
+                                    readoutCount, (long) group.getAttentionWidth() * hiddenWidth));
+            projectionElements =
+                    Math.addExact(
+                            projectionElements,
+                            Math.multiplyExact(
+                                    readoutCount, 2L * group.getAttentionWidth() * hiddenWidth));
+            projectionElements =
+                    Math.addExact(
+                            projectionElements,
+                            Math.multiplyExact(
+                                    readoutCount, (long) group.getAttentionWidth() * hiddenWidth));
+            projectionElements =
+                    Math.addExact(
+                            projectionElements,
+                            Math.multiplyExact(
+                                    readoutCount,
+                                    2L * hiddenWidth * group.getMaximumFeedForwardWidth()));
+            long vectorElements =
+                    Math.multiplyExact(
+                            readoutCount,
+                            3L * hiddenWidth
+                                    + group.getAttentionWidth()
+                                    + group.getMaximumFeedForwardWidth());
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    Math.addExact(projectionElements, vectorElements),
+                                    elementBytes));
+            DataType normDataType =
+                    group.getReadouts().get(0).getQueryNormWeight().getSpec().getDataType();
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    Math.multiplyExact(readoutCount, 6L * hiddenWidth),
+                                    normDataType.getNumOfBytes()));
+        }
         return bytes;
     }
 
@@ -320,7 +398,52 @@ final class PtFusionDescriptor {
                 || value instanceof FusionRecipe.AffineSum
                 || value instanceof FusionRecipe.IndexedAffine
                 || value instanceof FusionRecipe.TransformerEncoderStack
-                || value instanceof FusionRecipe.BinaryBranchBlend;
+                || value instanceof FusionRecipe.BinaryBranchBlend
+                || value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState;
+    }
+
+    private static long singleQueryReadoutWorkspaceBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!isFirstSingleQueryReadoutState(value)) {
+                continue;
+            }
+            FusionRecipe.SingleQueryCrossAttentionReadoutGroup group =
+                    singleQueryReadoutGroup(value);
+            long maximumBatch = value.getSpec().getLeadingDimension().getMaximumExtent();
+            long hiddenWidth = group.getMemory().getSpec().getInnerShape()[1];
+            long readoutCount = group.getReadouts().size();
+            long regionElements =
+                    Math.max(
+                            Math.multiplyExact(maximumBatch, 2L * hiddenWidth),
+                            Math.multiplyExact(
+                                    Math.multiplyExact(readoutCount, maximumBatch), hiddenWidth));
+            long stateElements =
+                    Math.multiplyExact(Math.multiplyExact(readoutCount, maximumBatch), hiddenWidth);
+            long tailElements =
+                    Math.multiplyExact(
+                            Math.multiplyExact(readoutCount, maximumBatch),
+                            Math.max(hiddenWidth, group.getMaximumFeedForwardWidth()));
+            long elements =
+                    Math.addExact(regionElements, Math.addExact(stateElements, tailElements));
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    elements, value.getSpec().getDataType().getNumOfBytes()));
+        }
+        return bytes;
+    }
+
+    private static boolean isFirstSingleQueryReadoutState(FusionRecipe.Value value) {
+        return value instanceof FusionRecipe.SingleQueryCrossAttentionReadoutState
+                && ((FusionRecipe.SingleQueryCrossAttentionReadoutState) value).getReadoutIndex()
+                        == 0;
+    }
+
+    private static FusionRecipe.SingleQueryCrossAttentionReadoutGroup singleQueryReadoutGroup(
+            FusionRecipe.Value value) {
+        return ((FusionRecipe.SingleQueryCrossAttentionReadoutState) value).getGroup();
     }
 
     private static long transformerWorkspaceBytes(FusionRecipe recipe) {
@@ -706,6 +829,69 @@ final class PtFusionDescriptor {
         descriptor.putLong(blend.getSelectedLogit().getIndex());
         descriptor.putLong(blend.getBaselinePresence().getIndex());
         descriptor.putLong(blend.getSelectedPresence().getIndex());
+    }
+
+    private static int singleQueryReadoutGroupCommandWords(
+            FusionRecipe.SingleQueryCrossAttentionReadoutGroup group) {
+        int operandCount = Math.addExact(3, Math.multiplyExact(17, group.getReadouts().size()));
+        int feedForwardWidthAttributeWords = Math.addExact(4, group.getReadouts().size());
+        return Math.addExact(
+                Math.addExact(
+                        COMMAND_RECORD_HEADER_WORDS + group.getReadoutStates().size(),
+                        operandCount),
+                Math.addExact(
+                        Math.multiplyExact(6, SCALAR_ATTRIBUTE_WORDS),
+                        feedForwardWidthAttributeWords));
+    }
+
+    private static void putSingleQueryReadoutGroupCommand(
+            ByteBuffer descriptor, FusionRecipe.SingleQueryCrossAttentionReadoutGroup group) {
+        int operandCount = Math.addExact(3, Math.multiplyExact(17, group.getReadouts().size()));
+        descriptor.putLong(singleQueryReadoutGroupCommandWords(group));
+        descriptor.putLong(SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(group.getReadoutStates().size());
+        descriptor.putLong(operandCount);
+        descriptor.putLong(7);
+        for (FusionRecipe.SingleQueryCrossAttentionReadoutState state : group.getReadoutStates()) {
+            descriptor.putLong(state.getIndex());
+        }
+        descriptor.putLong(group.getMemory().getIndex());
+        descriptor.putLong(group.getQuerySource().getIndex());
+        descriptor.putLong(group.getValidMask().getIndex());
+        for (FusionRecipe.SingleQueryCrossAttentionReadout readout : group.getReadouts()) {
+            descriptor.putLong(readout.getQuerySeedWeight().getIndex());
+            descriptor.putLong(readout.getQuerySeedBias().getIndex());
+            descriptor.putLong(readout.getQueryWeight().getIndex());
+            descriptor.putLong(readout.getQueryBias().getIndex());
+            descriptor.putLong(readout.getKeyValueWeight().getIndex());
+            descriptor.putLong(readout.getContextWeight().getIndex());
+            descriptor.putLong(readout.getContextBias().getIndex());
+            descriptor.putLong(readout.getQueryNormWeight().getIndex());
+            descriptor.putLong(readout.getQueryNormBias().getIndex());
+            descriptor.putLong(readout.getFeedForwardNormWeight().getIndex());
+            descriptor.putLong(readout.getFeedForwardNormBias().getIndex());
+            descriptor.putLong(readout.getFeedForwardExpansionWeight().getIndex());
+            descriptor.putLong(readout.getFeedForwardExpansionBias().getIndex());
+            descriptor.putLong(readout.getFeedForwardProjectionWeight().getIndex());
+            descriptor.putLong(readout.getFeedForwardProjectionBias().getIndex());
+            descriptor.putLong(readout.getOutputNormWeight().getIndex());
+            descriptor.putLong(readout.getOutputNormBias().getIndex());
+        }
+        putScalarAttribute(descriptor, READOUT_COUNT, group.getReadouts().size());
+        putScalarAttribute(descriptor, READOUT_ATTENTION_HEADS, group.getAttentionHeads());
+        putScalarAttribute(descriptor, READOUT_ATTENTION_WIDTH, group.getAttentionWidth());
+        putScalarAttribute(
+                descriptor, READOUT_MAXIMUM_FEED_FORWARD_WIDTH, group.getMaximumFeedForwardWidth());
+        putFloatAttribute(descriptor, READOUT_EPSILON, group.getEpsilon());
+        putScalarAttribute(descriptor, READOUT_QUERY_INDEX, group.getQueryIndex());
+        descriptor.putLong(Math.addExact(4, group.getReadouts().size()));
+        descriptor.putLong(READOUT_FEED_FORWARD_WIDTHS);
+        descriptor.putLong(ATTRIBUTE_INT64);
+        descriptor.putLong(group.getReadouts().size());
+        for (FusionRecipe.SingleQueryCrossAttentionReadout readout : group.getReadouts()) {
+            descriptor.putLong(readout.getFeedForwardWidth());
+        }
     }
 
     private static void putScalarAttribute(ByteBuffer descriptor, long key, long value) {

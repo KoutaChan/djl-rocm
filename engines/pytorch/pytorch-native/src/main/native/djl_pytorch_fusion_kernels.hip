@@ -612,6 +612,338 @@ __global__ void transformer_residual_layer_norm_kernel(
   }
 }
 
+constexpr int kSingleQueryHiddenWidth = 256;
+constexpr int kSingleQueryMaximumTokens = 256;
+constexpr int kSingleQueryMaximumHeadWidth = 32;
+
+template <typename mask_t>
+__device__ bool single_query_valid(const mask_t* mask, int64_t index) {
+  return static_cast<float>(mask[index]) != 0.0f;
+}
+
+template <typename scalar_t, typename mask_t>
+__global__ void single_query_seed_input_kernel(const scalar_t* memory,
+    const scalar_t* query_source, const mask_t* valid_mask,
+    scalar_t* seed_input, int64_t batch_count, int64_t token_count,
+    int64_t query_token_count, int64_t query_index) {
+  const int64_t batch = blockIdx.x;
+  if (batch >= batch_count) {
+    return;
+  }
+  __shared__ int32_t valid_count;
+  if (threadIdx.x == 0) {
+    int32_t count = 0;
+    for (int64_t token = 0; token < token_count; ++token) {
+      count += single_query_valid(
+          valid_mask, batch * token_count + token) ? 1 : 0;
+    }
+    valid_count = count;
+  }
+  __syncthreads();
+  for (int32_t feature = threadIdx.x; feature < kSingleQueryHiddenWidth;
+       feature += blockDim.x) {
+    seed_input[batch * (2 * kSingleQueryHiddenWidth) + feature] =
+        query_source[
+            (batch * query_token_count + query_index) * kSingleQueryHiddenWidth +
+            feature];
+    float sum = 0.0f;
+    if (valid_count != 0) {
+      for (int64_t token = 0; token < token_count; ++token) {
+        if (single_query_valid(
+                valid_mask, batch * token_count + token)) {
+          sum += static_cast<float>(memory[
+              (batch * token_count + token) * kSingleQueryHiddenWidth +
+              feature]);
+        }
+      }
+      sum /= valid_count;
+    }
+    seed_input[batch * (2 * kSingleQueryHiddenWidth) +
+        kSingleQueryHiddenWidth + feature] = static_cast<scalar_t>(sum);
+  }
+}
+
+template <typename scalar_t, typename mask_t>
+__global__ void single_query_attention_kernel(
+    const scalar_t* seed_products, const scalar_t* seed_bias,
+    const scalar_t* memory, const mask_t* valid_mask,
+    const scalar_t* query_weight, const scalar_t* query_bias,
+    const scalar_t* key_value_weight, scalar_t* state, scalar_t* context,
+    int64_t batch_count, int64_t readout_count, int64_t token_count,
+    int64_t attention_heads, int64_t attention_width) {
+  const int64_t batch = blockIdx.x;
+  const int64_t readout_head = blockIdx.y;
+  const int64_t readout = readout_head / attention_heads;
+  const int64_t head = readout_head - readout * attention_heads;
+  if (batch >= batch_count || readout >= readout_count) {
+    return;
+  }
+  const int64_t head_width = attention_width / attention_heads;
+  __shared__ float query[kSingleQueryMaximumHeadWidth];
+  __shared__ float direction[kSingleQueryHiddenWidth];
+  __shared__ float probabilities[kSingleQueryMaximumTokens];
+  __shared__ float pooled[kSingleQueryHiddenWidth];
+  const int64_t seed_offset =
+      (batch * readout_count + readout) * kSingleQueryHiddenWidth;
+  const int64_t state_offset =
+      (readout * batch_count + batch) * kSingleQueryHiddenWidth;
+  const int64_t readout_hidden_offset = readout * kSingleQueryHiddenWidth;
+  if (head == 0) {
+    for (int32_t feature = threadIdx.x; feature < kSingleQueryHiddenWidth;
+         feature += blockDim.x) {
+      state[state_offset + feature] = seed_products[seed_offset + feature];
+    }
+  }
+  if (threadIdx.x < head_width) {
+    const int64_t attention_feature = head * head_width + threadIdx.x;
+    float value = static_cast<float>(
+        query_bias[readout * attention_width + attention_feature]);
+    const int64_t weight_offset =
+        (readout * attention_width + attention_feature) *
+        kSingleQueryHiddenWidth;
+    for (int32_t feature = 0; feature < kSingleQueryHiddenWidth; ++feature) {
+      const float seed = static_cast<float>(seed_products[seed_offset + feature]) +
+          static_cast<float>(seed_bias[readout_hidden_offset + feature]);
+      value += seed * static_cast<float>(query_weight[weight_offset + feature]);
+    }
+    query[threadIdx.x] = value;
+  }
+  __syncthreads();
+
+  for (int32_t feature = threadIdx.x; feature < kSingleQueryHiddenWidth;
+       feature += blockDim.x) {
+    float value = 0.0f;
+    for (int64_t head_feature = 0; head_feature < head_width;
+         ++head_feature) {
+      const int64_t attention_feature = head * head_width + head_feature;
+      const int64_t key_weight_offset =
+          (readout * (2 * attention_width) + attention_feature) *
+          kSingleQueryHiddenWidth + feature;
+      value += query[head_feature] *
+          static_cast<float>(key_value_weight[key_weight_offset]);
+    }
+    direction[feature] = value * rsqrtf(static_cast<float>(head_width));
+  }
+  __syncthreads();
+
+  if (threadIdx.x < token_count) {
+    const int64_t token = threadIdx.x;
+    const bool valid = single_query_valid(
+        valid_mask, batch * token_count + token);
+    float score = -INFINITY;
+    if (valid) {
+      score = 0.0f;
+      const int64_t memory_offset =
+          (batch * token_count + token) * kSingleQueryHiddenWidth;
+      for (int32_t feature = 0; feature < kSingleQueryHiddenWidth; ++feature) {
+        score += static_cast<float>(memory[memory_offset + feature]) *
+            direction[feature];
+      }
+    }
+    probabilities[token] = score;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float maximum = -INFINITY;
+    for (int64_t token = 0; token < token_count; ++token) {
+      maximum = fmaxf(maximum, probabilities[token]);
+    }
+    if (isinf(maximum)) {
+      for (int64_t token = 0; token < token_count; ++token) {
+        probabilities[token] = 0.0f;
+      }
+    } else {
+      float denominator = 0.0f;
+      for (int64_t token = 0; token < token_count; ++token) {
+        const float probability = expf(probabilities[token] - maximum);
+        probabilities[token] = probability;
+        denominator += probability;
+      }
+      for (int64_t token = 0; token < token_count; ++token) {
+        probabilities[token] /= denominator;
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int32_t feature = threadIdx.x; feature < kSingleQueryHiddenWidth;
+       feature += blockDim.x) {
+    float value = 0.0f;
+    for (int64_t token = 0; token < token_count; ++token) {
+      value += probabilities[token] * static_cast<float>(memory[
+          (batch * token_count + token) * kSingleQueryHiddenWidth + feature]);
+    }
+    pooled[feature] = value;
+  }
+  __syncthreads();
+  if (threadIdx.x < head_width) {
+    const int64_t attention_feature = head * head_width + threadIdx.x;
+    float value = 0.0f;
+    const int64_t value_weight_offset =
+        (readout * (2 * attention_width) + attention_width +
+            attention_feature) * kSingleQueryHiddenWidth;
+    for (int32_t feature = 0; feature < kSingleQueryHiddenWidth; ++feature) {
+      value += pooled[feature] *
+          static_cast<float>(key_value_weight[value_weight_offset + feature]);
+    }
+    context[(readout * batch_count + batch) * attention_width +
+        attention_feature] = static_cast<scalar_t>(value);
+  }
+}
+
+template <typename scalar_t, typename norm_t>
+__global__ void single_query_residual_layer_norm_kernel(
+    const scalar_t* state, const scalar_t* update, const scalar_t* state_bias,
+    const scalar_t* update_bias, const norm_t* norm_weight,
+    const norm_t* norm_bias, scalar_t* output, int64_t batch_count,
+    int64_t readout_count, int64_t output_batch_stride, float epsilon,
+    bool batch_major_output) {
+  const int32_t lane = threadIdx.x % warpSize;
+  const int32_t wave = threadIdx.x / warpSize;
+  const int32_t waves_per_block = blockDim.x / warpSize;
+  const int64_t active_rows = batch_count * readout_count;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < active_rows;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    const int64_t readout = row / batch_count;
+    const int64_t batch = row - readout * batch_count;
+    float values[kTransformerCachedValuesPerLane];
+    float mean = 0.0f;
+    float moment = 0.0f;
+    int32_t count = 0;
+    const int64_t row_offset = row * kSingleQueryHiddenWidth;
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane; ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kSingleQueryHiddenWidth) {
+        float value = static_cast<float>(state[row_offset + feature]) +
+            static_cast<float>(update[row_offset + feature]) +
+            static_cast<float>(update_bias[
+                readout * kSingleQueryHiddenWidth + feature]);
+        if (state_bias != nullptr) {
+          value += static_cast<float>(state_bias[
+              readout * kSingleQueryHiddenWidth + feature]);
+        }
+        values[index] = static_cast<float>(static_cast<scalar_t>(value));
+        ++count;
+        const float delta = values[index] - mean;
+        mean += delta / count;
+        moment += delta * (values[index] - mean);
+      }
+    }
+    for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
+      const float other_mean = __shfl_down(mean, offset);
+      const float other_moment = __shfl_down(moment, offset);
+      const int32_t other_count = __shfl_down(count, offset);
+      if (lane + offset < warpSize && other_count > 0) {
+        const int32_t combined_count = count + other_count;
+        const float delta = other_mean - mean;
+        moment += other_moment + delta * delta * count * other_count /
+            combined_count;
+        mean += delta * other_count / combined_count;
+        count = combined_count;
+      }
+    }
+    mean = __shfl(mean, 0);
+    const float inverse_standard_deviation = rsqrtf(
+        __shfl(moment, 0) / kSingleQueryHiddenWidth + epsilon);
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane; ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kSingleQueryHiddenWidth) {
+        const float normalized =
+            (values[index] - mean) * inverse_standard_deviation *
+                static_cast<float>(norm_weight[
+                    readout * kSingleQueryHiddenWidth + feature]) +
+            static_cast<float>(norm_bias[
+                readout * kSingleQueryHiddenWidth + feature]);
+        const int64_t output_offset = batch_major_output
+            ? (readout * output_batch_stride + batch) * kSingleQueryHiddenWidth +
+                feature
+            : row_offset + feature;
+        output[output_offset] = static_cast<scalar_t>(normalized);
+      }
+    }
+  }
+}
+
+template <typename scalar_t, typename norm_t>
+__global__ void single_query_layer_norm_kernel(const scalar_t* input,
+    const norm_t* norm_weight, const norm_t* norm_bias, scalar_t* output,
+    int64_t batch_count, int64_t readout_count, float epsilon) {
+  const int32_t lane = threadIdx.x % warpSize;
+  const int32_t wave = threadIdx.x / warpSize;
+  const int32_t waves_per_block = blockDim.x / warpSize;
+  const int64_t active_rows = batch_count * readout_count;
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < active_rows;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    const int64_t readout = row / batch_count;
+    float values[kTransformerCachedValuesPerLane];
+    float mean = 0.0f;
+    float moment = 0.0f;
+    int32_t count = 0;
+    const int64_t row_offset = row * kSingleQueryHiddenWidth;
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane; ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kSingleQueryHiddenWidth) {
+        values[index] = static_cast<float>(input[row_offset + feature]);
+        ++count;
+        const float delta = values[index] - mean;
+        mean += delta / count;
+        moment += delta * (values[index] - mean);
+      }
+    }
+    for (int32_t offset = warpSize / 2; offset > 0; offset /= 2) {
+      const float other_mean = __shfl_down(mean, offset);
+      const float other_moment = __shfl_down(moment, offset);
+      const int32_t other_count = __shfl_down(count, offset);
+      if (lane + offset < warpSize && other_count > 0) {
+        const int32_t combined_count = count + other_count;
+        const float delta = other_mean - mean;
+        moment += other_moment + delta * delta * count * other_count /
+            combined_count;
+        mean += delta * other_count / combined_count;
+        count = combined_count;
+      }
+    }
+    mean = __shfl(mean, 0);
+    const float inverse_standard_deviation = rsqrtf(
+        __shfl(moment, 0) / kSingleQueryHiddenWidth + epsilon);
+#pragma unroll
+    for (int32_t index = 0; index < kTransformerCachedValuesPerLane; ++index) {
+      const int32_t feature = lane + index * warpSize;
+      if (feature < kSingleQueryHiddenWidth) {
+        output[row_offset + feature] = static_cast<scalar_t>(
+            (values[index] - mean) * inverse_standard_deviation *
+                static_cast<float>(norm_weight[
+                    readout * kSingleQueryHiddenWidth + feature]) +
+            static_cast<float>(norm_bias[
+                readout * kSingleQueryHiddenWidth + feature]));
+      }
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void single_query_bias_silu_kernel(scalar_t* values,
+    const scalar_t* bias, int64_t batch_count, int64_t readout_count,
+    int64_t width) {
+  const int64_t element_count = batch_count * readout_count * width;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+           threadIdx.x;
+       index < element_count;
+       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t readout = index / (batch_count * width);
+    const int64_t feature = index % width;
+    const float value = static_cast<float>(values[index]) +
+        static_cast<float>(bias[readout * width + feature]);
+    values[index] = static_cast<scalar_t>(
+        value / (1.0f + expf(-value)));
+  }
+}
+
 void CheckHipLaunch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
   TORCH_CHECK(error == hipSuccess, kernel_name, " launch failed: ", hipGetErrorString(error));
@@ -1155,6 +1487,289 @@ void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
   }
 #undef LAUNCH_TRANSFORMER_RESIDUAL_NORM
   CheckHipLaunch("fusion transformer residual LayerNorm");
+}
+
+template <typename scalar_t, typename mask_t>
+void LaunchSingleQueryReadoutSeedInputTyped(const torch::Tensor& memory,
+    const torch::Tensor& query_source, const torch::Tensor& valid_mask,
+    torch::Tensor& seed_input, int64_t batch_count, int64_t token_count,
+    int64_t query_token_count, int64_t query_index, hipStream_t stream) {
+  hipLaunchKernelGGL(
+      (single_query_seed_input_kernel<scalar_t, mask_t>),
+      dim3(batch_count), dim3(kThreadsPerBlock), 0, stream,
+      memory.data_ptr<scalar_t>(), query_source.data_ptr<scalar_t>(),
+      valid_mask.data_ptr<mask_t>(), seed_input.data_ptr<scalar_t>(),
+      batch_count, token_count, query_token_count, query_index);
+}
+
+void LaunchSingleQueryReadoutSeedInput(const torch::Tensor& memory,
+    const torch::Tensor& query_source, const torch::Tensor& valid_mask,
+    torch::Tensor& seed_input, int64_t batch_count, int64_t token_count,
+    int64_t hidden_width, int64_t query_token_count, int64_t query_index) {
+  TORCH_CHECK(hidden_width == kSingleQueryHiddenWidth && token_count > 0 &&
+          token_count <= kSingleQueryMaximumTokens && query_token_count > 0 &&
+          query_index >= 0 && query_index < query_token_count,
+      "single-query readout seed lowering requires hidden=256 and tokens<=256");
+  if (batch_count == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(memory.get_device());
+#define LAUNCH_SINGLE_QUERY_SEED(scalar_type, mask_type) \
+  LaunchSingleQueryReadoutSeedInputTyped<scalar_type, mask_type>( \
+      memory, query_source, valid_mask, seed_input, batch_count, token_count, \
+      query_token_count, query_index, stream.stream())
+#define DISPATCH_SINGLE_QUERY_SEED_MASK(value_type) \
+  switch (valid_mask.scalar_type()) { \
+    case torch::kBool: \
+      LAUNCH_SINGLE_QUERY_SEED(value_type, bool); \
+      break; \
+    case torch::kUInt8: \
+      LAUNCH_SINGLE_QUERY_SEED(value_type, uint8_t); \
+      break; \
+    case torch::kFloat16: \
+      LAUNCH_SINGLE_QUERY_SEED(value_type, c10::Half); \
+      break; \
+    case torch::kBFloat16: \
+      LAUNCH_SINGLE_QUERY_SEED(value_type, c10::BFloat16); \
+      break; \
+    case torch::kFloat32: \
+      LAUNCH_SINGLE_QUERY_SEED(value_type, float); \
+      break; \
+    default: \
+      TORCH_CHECK(false, "unsupported single-query readout mask data type"); \
+  }
+  if (memory.scalar_type() == torch::kFloat16) {
+    DISPATCH_SINGLE_QUERY_SEED_MASK(c10::Half);
+  } else if (memory.scalar_type() == torch::kBFloat16) {
+    DISPATCH_SINGLE_QUERY_SEED_MASK(c10::BFloat16);
+  } else if (memory.scalar_type() == torch::kFloat32) {
+    DISPATCH_SINGLE_QUERY_SEED_MASK(float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout data type");
+  }
+#undef DISPATCH_SINGLE_QUERY_SEED_MASK
+#undef LAUNCH_SINGLE_QUERY_SEED
+  CheckHipLaunch("fusion single-query readout seed input");
+}
+
+template <typename scalar_t, typename mask_t>
+void LaunchSingleQueryReadoutAttentionTyped(
+    const torch::Tensor& seed_products, const torch::Tensor& seed_bias,
+    const torch::Tensor& memory, const torch::Tensor& valid_mask,
+    const torch::Tensor& query_weight, const torch::Tensor& query_bias,
+    const torch::Tensor& key_value_weight, torch::Tensor& state,
+    torch::Tensor& context, int64_t batch_count, int64_t readout_count,
+    int64_t token_count, int64_t attention_heads, int64_t attention_width,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      (single_query_attention_kernel<scalar_t, mask_t>),
+      dim3(batch_count, readout_count * attention_heads),
+      dim3(kThreadsPerBlock), 0, stream,
+      seed_products.data_ptr<scalar_t>(), seed_bias.data_ptr<scalar_t>(),
+      memory.data_ptr<scalar_t>(), valid_mask.data_ptr<mask_t>(),
+      query_weight.data_ptr<scalar_t>(), query_bias.data_ptr<scalar_t>(),
+      key_value_weight.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
+      context.data_ptr<scalar_t>(), batch_count, readout_count, token_count,
+      attention_heads, attention_width);
+}
+
+void LaunchSingleQueryReadoutAttention(const torch::Tensor& seed_products,
+    const torch::Tensor& seed_bias, const torch::Tensor& memory,
+    const torch::Tensor& valid_mask, const torch::Tensor& query_weight,
+    const torch::Tensor& query_bias, const torch::Tensor& key_value_weight,
+    torch::Tensor& state, torch::Tensor& context, int64_t batch_count,
+    int64_t readout_count, int64_t token_count, int64_t hidden_width,
+    int64_t attention_heads, int64_t attention_width) {
+  TORCH_CHECK(hidden_width == kSingleQueryHiddenWidth && token_count > 0 &&
+          token_count <= kSingleQueryMaximumTokens && attention_heads > 0 &&
+          attention_width > 0 && attention_width % attention_heads == 0 &&
+          attention_width / attention_heads <= kSingleQueryMaximumHeadWidth,
+      "single-query readout attention metadata is unsupported");
+  if (batch_count == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(memory.get_device());
+#define LAUNCH_SINGLE_QUERY_ATTENTION(scalar_type, mask_type) \
+  LaunchSingleQueryReadoutAttentionTyped<scalar_type, mask_type>( \
+      seed_products, seed_bias, memory, valid_mask, query_weight, query_bias, \
+      key_value_weight, state, context, batch_count, readout_count, token_count, \
+      attention_heads, attention_width, stream.stream())
+#define DISPATCH_SINGLE_QUERY_ATTENTION_MASK(value_type) \
+  switch (valid_mask.scalar_type()) { \
+    case torch::kBool: \
+      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, bool); \
+      break; \
+    case torch::kUInt8: \
+      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, uint8_t); \
+      break; \
+    case torch::kFloat16: \
+      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, c10::Half); \
+      break; \
+    case torch::kBFloat16: \
+      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, c10::BFloat16); \
+      break; \
+    case torch::kFloat32: \
+      LAUNCH_SINGLE_QUERY_ATTENTION(value_type, float); \
+      break; \
+    default: \
+      TORCH_CHECK(false, "unsupported single-query readout mask data type"); \
+  }
+  if (memory.scalar_type() == torch::kFloat16) {
+    DISPATCH_SINGLE_QUERY_ATTENTION_MASK(c10::Half);
+  } else if (memory.scalar_type() == torch::kBFloat16) {
+    DISPATCH_SINGLE_QUERY_ATTENTION_MASK(c10::BFloat16);
+  } else if (memory.scalar_type() == torch::kFloat32) {
+    DISPATCH_SINGLE_QUERY_ATTENTION_MASK(float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout data type");
+  }
+#undef DISPATCH_SINGLE_QUERY_ATTENTION_MASK
+#undef LAUNCH_SINGLE_QUERY_ATTENTION
+  CheckHipLaunch("fusion single-query readout attention");
+}
+
+template <typename scalar_t, typename norm_t>
+void LaunchSingleQueryReadoutResidualLayerNormTyped(torch::Tensor& state,
+    const torch::Tensor& update, const torch::Tensor* state_bias,
+    const torch::Tensor& update_bias, const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias, torch::Tensor& output,
+    int64_t batch_count, int64_t readout_count, int64_t output_batch_stride,
+    float epsilon, bool batch_major_output, hipStream_t stream) {
+  const int64_t active_rows = batch_count * readout_count;
+  constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
+  const uint32_t block_count = static_cast<uint32_t>(
+      (active_rows + maximum_waves_per_block - 1) /
+      maximum_waves_per_block);
+  hipLaunchKernelGGL(
+      (single_query_residual_layer_norm_kernel<scalar_t, norm_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
+      state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
+      state_bias == nullptr ? nullptr : state_bias->data_ptr<scalar_t>(),
+      update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(),
+      norm_bias.data_ptr<norm_t>(), output.data_ptr<scalar_t>(), batch_count,
+      readout_count, output_batch_stride, epsilon, batch_major_output);
+}
+
+void LaunchSingleQueryReadoutResidualLayerNorm(torch::Tensor& state,
+    const torch::Tensor& update, const torch::Tensor* state_bias,
+    const torch::Tensor& update_bias, const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias, torch::Tensor& output,
+    int64_t batch_count, int64_t readout_count, int64_t hidden_width,
+    int64_t output_batch_stride, float epsilon, bool batch_major_output) {
+  TORCH_CHECK(hidden_width == kSingleQueryHiddenWidth,
+      "single-query readout residual LayerNorm requires hidden width 256");
+  if (batch_count == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(state.get_device());
+#define LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(scalar_type, norm_type) \
+  LaunchSingleQueryReadoutResidualLayerNormTyped<scalar_type, norm_type>( \
+      state, update, state_bias, update_bias, norm_weight, norm_bias, output, \
+      batch_count, readout_count, output_batch_stride, epsilon, \
+      batch_major_output, stream.stream())
+  if (state.scalar_type() == torch::kFloat16) {
+    if (norm_weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(c10::Half, float);
+    } else {
+      LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(c10::Half, c10::Half);
+    }
+  } else if (state.scalar_type() == torch::kBFloat16) {
+    if (norm_weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(c10::BFloat16, float);
+    } else {
+      LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(c10::BFloat16, c10::BFloat16);
+    }
+  } else if (state.scalar_type() == torch::kFloat32) {
+    LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(float, float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout data type");
+  }
+#undef LAUNCH_SINGLE_QUERY_RESIDUAL_NORM
+  CheckHipLaunch("fusion single-query readout residual LayerNorm");
+}
+
+template <typename scalar_t, typename norm_t>
+void LaunchSingleQueryReadoutLayerNormTyped(const torch::Tensor& input,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
+    torch::Tensor& output, int64_t batch_count, int64_t readout_count,
+    float epsilon, hipStream_t stream) {
+  const int64_t active_rows = batch_count * readout_count;
+  constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
+  const uint32_t block_count = static_cast<uint32_t>(
+      (active_rows + maximum_waves_per_block - 1) /
+      maximum_waves_per_block);
+  hipLaunchKernelGGL(
+      (single_query_layer_norm_kernel<scalar_t, norm_t>),
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
+      input.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(),
+      norm_bias.data_ptr<norm_t>(), output.data_ptr<scalar_t>(), batch_count,
+      readout_count, epsilon);
+}
+
+void LaunchSingleQueryReadoutLayerNorm(const torch::Tensor& input,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
+    torch::Tensor& output, int64_t batch_count, int64_t readout_count,
+    int64_t hidden_width, float epsilon) {
+  TORCH_CHECK(hidden_width == kSingleQueryHiddenWidth,
+      "single-query readout LayerNorm requires hidden width 256");
+  if (batch_count == 0) {
+    return;
+  }
+  const auto stream = at::hip::getCurrentHIPStream(input.get_device());
+#define LAUNCH_SINGLE_QUERY_NORM(scalar_type, norm_type) \
+  LaunchSingleQueryReadoutLayerNormTyped<scalar_type, norm_type>( \
+      input, norm_weight, norm_bias, output, batch_count, readout_count, \
+      epsilon, stream.stream())
+  if (input.scalar_type() == torch::kFloat16) {
+    if (norm_weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_SINGLE_QUERY_NORM(c10::Half, float);
+    } else {
+      LAUNCH_SINGLE_QUERY_NORM(c10::Half, c10::Half);
+    }
+  } else if (input.scalar_type() == torch::kBFloat16) {
+    if (norm_weight.scalar_type() == torch::kFloat32) {
+      LAUNCH_SINGLE_QUERY_NORM(c10::BFloat16, float);
+    } else {
+      LAUNCH_SINGLE_QUERY_NORM(c10::BFloat16, c10::BFloat16);
+    }
+  } else if (input.scalar_type() == torch::kFloat32) {
+    LAUNCH_SINGLE_QUERY_NORM(float, float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout data type");
+  }
+#undef LAUNCH_SINGLE_QUERY_NORM
+  CheckHipLaunch("fusion single-query readout LayerNorm");
+}
+
+void LaunchSingleQueryReadoutBiasSilu(torch::Tensor& values,
+    const torch::Tensor& bias, int64_t batch_count, int64_t readout_count,
+    int64_t width) {
+  const int64_t element_count = CheckedMultiply(
+      CheckedMultiply(batch_count, readout_count,
+          "single-query readout SiLU row count"),
+      width, "single-query readout SiLU element count");
+  if (element_count == 0) {
+    return;
+  }
+  const uint32_t block_count = static_cast<uint32_t>(
+      std::min<int64_t>(RequiredBlockCount(element_count), 65535));
+  const auto stream = at::hip::getCurrentHIPStream(values.get_device());
+#define LAUNCH_SINGLE_QUERY_SILU(scalar_type) \
+  hipLaunchKernelGGL((single_query_bias_silu_kernel<scalar_type>), \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream.stream(), \
+      values.data_ptr<scalar_type>(), bias.data_ptr<scalar_type>(), \
+      batch_count, readout_count, width)
+  if (values.scalar_type() == torch::kFloat16) {
+    LAUNCH_SINGLE_QUERY_SILU(c10::Half);
+  } else if (values.scalar_type() == torch::kBFloat16) {
+    LAUNCH_SINGLE_QUERY_SILU(c10::BFloat16);
+  } else if (values.scalar_type() == torch::kFloat32) {
+    LAUNCH_SINGLE_QUERY_SILU(float);
+  } else {
+    TORCH_CHECK(false, "unsupported single-query readout data type");
+  }
+#undef LAUNCH_SINGLE_QUERY_SILU
+  CheckHipLaunch("fusion single-query readout bias SiLU");
 }
 
 }  // namespace djl::pytorch::fusion

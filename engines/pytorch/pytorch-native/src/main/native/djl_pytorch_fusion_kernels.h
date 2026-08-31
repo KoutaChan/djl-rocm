@@ -109,6 +109,35 @@ void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
     torch::Tensor& normalized, int64_t active_rows, int64_t hidden_width,
     float epsilon);
 
+void LaunchSingleQueryReadoutSeedInput(const torch::Tensor& memory,
+    const torch::Tensor& query_source, const torch::Tensor& valid_mask,
+    torch::Tensor& seed_input, int64_t batch_count, int64_t token_count,
+    int64_t hidden_width, int64_t query_token_count, int64_t query_index);
+
+void LaunchSingleQueryReadoutAttention(const torch::Tensor& seed_products,
+    const torch::Tensor& seed_bias, const torch::Tensor& memory,
+    const torch::Tensor& valid_mask, const torch::Tensor& query_weight,
+    const torch::Tensor& query_bias, const torch::Tensor& key_value_weight,
+    torch::Tensor& state, torch::Tensor& context, int64_t batch_count,
+    int64_t readout_count, int64_t token_count, int64_t hidden_width,
+    int64_t attention_heads, int64_t attention_width);
+
+void LaunchSingleQueryReadoutResidualLayerNorm(torch::Tensor& state,
+    const torch::Tensor& update, const torch::Tensor* state_bias,
+    const torch::Tensor& update_bias, const torch::Tensor& norm_weight,
+    const torch::Tensor& norm_bias, torch::Tensor& output,
+    int64_t batch_count, int64_t readout_count, int64_t hidden_width,
+    int64_t output_batch_stride, float epsilon, bool batch_major_output);
+
+void LaunchSingleQueryReadoutLayerNorm(const torch::Tensor& input,
+    const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
+    torch::Tensor& output, int64_t batch_count, int64_t readout_count,
+    int64_t hidden_width, float epsilon);
+
+void LaunchSingleQueryReadoutBiasSilu(torch::Tensor& values,
+    const torch::Tensor& bias, int64_t batch_count, int64_t readout_count,
+    int64_t width);
+
 }  // namespace djl::pytorch::fusion
 
 #endif  // DJL_TORCH_DJL_PYTORCH_FUSION_KERNELS_H

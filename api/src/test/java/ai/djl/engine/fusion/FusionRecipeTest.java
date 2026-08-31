@@ -519,6 +519,103 @@ public class FusionRecipeTest {
         Assert.assertEquals(recipe.getOutputs().get(0).getValue(), stack);
     }
 
+    @Test
+    public void singleQueryReadoutGroupBuildsSharedMemoryGraph() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("single-query-readouts");
+        FusionRecipe.Dimension batch = builder.addDimension("batch", 384);
+        FusionRecipe.Input memory =
+                builder.addInput(
+                        "memory", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 151, 256));
+        FusionRecipe.Input querySource =
+                builder.addInput(
+                        "querySource", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 6, 256));
+        FusionRecipe.Input mask =
+                builder.addInput("mask", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 151));
+        FusionRecipe.SingleQueryCrossAttentionReadoutGroupBuilder groupBuilder =
+                builder.singleQueryCrossAttentionReadoutGroup(
+                                "readouts", memory, querySource, mask, 4)
+                        .optQueryIndex(3);
+        addReadout(builder, groupBuilder, "policy", 384);
+        addReadout(builder, groupBuilder, "value", 256);
+        FusionRecipe.SingleQueryCrossAttentionReadoutGroup group = groupBuilder.build();
+        builder.addOutput("policy", group.getReadoutState(0));
+        builder.addOutput("value", group.getReadoutState(1));
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertEquals(
+                group.getReadoutState(0).getSpec().getMaximumShape().getShape(),
+                new long[] {384, 256});
+        Assert.assertEquals(
+                group.getReadoutState(1).getSpec().getMaximumShape().getShape(),
+                new long[] {384, 256});
+        Assert.assertSame(group.getMemory(), memory);
+        Assert.assertSame(group.getQuerySource(), querySource);
+        Assert.assertEquals(group.getQueryIndex(), 3);
+        Assert.assertSame(group.getValidMask(), mask);
+        Assert.assertEquals(group.getAttentionHeads(), 4);
+        Assert.assertEquals(group.getAttentionWidth(), 64);
+        Assert.assertEquals(group.getMaximumFeedForwardWidth(), 384);
+        Assert.assertEquals(group.getReadouts().size(), 2);
+        Assert.assertEquals(group.getReadouts().get(0).getFeedForwardWidth(), 384);
+        Assert.assertEquals(group.getReadouts().get(1).getFeedForwardWidth(), 256);
+        Assert.assertSame(recipe.getOutputs().get(0).getValue(), group.getReadoutState(0));
+        Assert.assertSame(recipe.getOutputs().get(1).getValue(), group.getReadoutState(1));
+        Assert.assertThrows(
+                UnsupportedOperationException.class, () -> group.getReadoutStates().clear());
+        Assert.assertThrows(UnsupportedOperationException.class, () -> group.getReadouts().clear());
+    }
+
+    private static void addReadout(
+            FusionRecipe.Builder builder,
+            FusionRecipe.SingleQueryCrossAttentionReadoutGroupBuilder group,
+            String prefix,
+            int feedForwardWidth) {
+        FusionRecipe.Constant seedWeight = matrix(builder, prefix + "SeedWeight", 256, 512);
+        FusionRecipe.Constant seedBias = vector(builder, prefix + "SeedBias", 256, false);
+        FusionRecipe.Constant queryWeight = matrix(builder, prefix + "QueryWeight", 64, 256);
+        FusionRecipe.Constant queryBias = vector(builder, prefix + "QueryBias", 64, false);
+        FusionRecipe.Constant keyValue = matrix(builder, prefix + "KeyValue", 128, 256);
+        FusionRecipe.Constant contextWeight = matrix(builder, prefix + "ContextWeight", 256, 64);
+        FusionRecipe.Constant contextBias = vector(builder, prefix + "ContextBias", 256, false);
+        FusionRecipe.Constant queryNormWeight =
+                vector(builder, prefix + "QueryNormWeight", 256, true);
+        FusionRecipe.Constant queryNormBias = vector(builder, prefix + "QueryNormBias", 256, true);
+        FusionRecipe.Constant feedForwardNormWeight =
+                vector(builder, prefix + "FeedForwardNormWeight", 256, true);
+        FusionRecipe.Constant feedForwardNormBias =
+                vector(builder, prefix + "FeedForwardNormBias", 256, true);
+        FusionRecipe.Constant expansion =
+                matrix(builder, prefix + "Expansion", feedForwardWidth, 256);
+        FusionRecipe.Constant expansionBias =
+                vector(builder, prefix + "ExpansionBias", feedForwardWidth, false);
+        FusionRecipe.Constant projection =
+                matrix(builder, prefix + "Projection", 256, feedForwardWidth);
+        FusionRecipe.Constant projectionBias =
+                vector(builder, prefix + "ProjectionBias", 256, false);
+        FusionRecipe.Constant outputNormWeight =
+                vector(builder, prefix + "OutputNormWeight", 256, true);
+        FusionRecipe.Constant outputNormBias =
+                vector(builder, prefix + "OutputNormBias", 256, true);
+        group.addReadout(
+                seedWeight,
+                seedBias,
+                queryWeight,
+                queryBias,
+                keyValue,
+                contextWeight,
+                contextBias,
+                queryNormWeight,
+                queryNormBias,
+                feedForwardNormWeight,
+                feedForwardNormBias,
+                expansion,
+                expansionBias,
+                projection,
+                projectionBias,
+                outputNormWeight,
+                outputNormBias);
+    }
+
     private static FusionRecipe.Constant vector(
             FusionRecipe.Builder builder, String name, int width, boolean norm) {
         return builder.addConstant(

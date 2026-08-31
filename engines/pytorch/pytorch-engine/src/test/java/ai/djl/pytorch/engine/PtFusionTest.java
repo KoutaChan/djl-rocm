@@ -24,6 +24,8 @@ import ai.djl.engine.fusion.FusionRecipe;
 import ai.djl.engine.fusion.FusionSession;
 import ai.djl.engine.fusion.FusionSessionConfig;
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDArrays;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.NDScope;
 import ai.djl.ndarray.types.DataType;
@@ -313,6 +315,93 @@ public class PtFusionTest {
                         lease.get(fixture.output).toFloatArray(),
                         new float[] {4f, 6f, 8f, 10f, 20f, 30f, 4f, 5f, 6f, 0f, 0f, 0f},
                         1e-3f);
+            }
+        }
+    }
+
+    @Test
+    public void singleQueryReadoutDescriptorReportsGroupedWorkspace() {
+        PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture fixture =
+                new PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture(DataType.FLOAT16);
+        ByteBuffer descriptor = PtFusionDescriptor.encode(fixture.recipe);
+        int commandOffset = Math.toIntExact(descriptor.getLong(14 * Long.BYTES));
+
+        Assert.assertEquals(
+                descriptor.getLong((commandOffset + 1) * Long.BYTES),
+                PtFusionDescriptor.SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 3) * Long.BYTES), 2L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 4) * Long.BYTES), 37L);
+        Assert.assertEquals(descriptor.getLong((commandOffset + 5) * Long.BYTES), 7L);
+        Assert.assertEquals(PtFusionDescriptor.commandCount(fixture.recipe), 1);
+        Assert.assertEquals(PtFusionDescriptor.executableStorageBytes(fixture.recipe), 1_590_016L);
+        Assert.assertEquals(PtFusionDescriptor.persistentStorageBytes(fixture.recipe), 9_216L);
+        Assert.assertEquals(PtFusionDescriptor.workspaceBytes(fixture.recipe), 7_168L);
+    }
+
+    @Test
+    public void rocmSingleQueryReadoutMatchesMaterializedReferenceAcrossDevicesAndTypes() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        int deviceCount = Math.min(2, engine.getGpuCount());
+        int[] batches = {1, 31, 256, 384};
+        for (int deviceIndex = 0; deviceIndex < deviceCount; ++deviceIndex) {
+            Device device = Device.gpu(deviceIndex);
+            for (DataType dataType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture fixture =
+                        new PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture(
+                                dataType, DataType.FLOAT32, 384, true, 3);
+                try (NDManager manager = engine.newBaseManager(device);
+                        PtSingleQueryReadoutTestSupport.BoundSingleQueryReadouts bound =
+                                fixture.bind(manager);
+                        NDArray memory =
+                                patternedArray(
+                                        manager,
+                                        dataType,
+                                        new Shape(384, 151, 256),
+                                        37,
+                                        18,
+                                        0.015f);
+                        NDArray mask = legalReadoutMask(manager, DataType.FLOAT32, 384, 151);
+                        FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                        FusionExecutable executable = plan.bind(bound.bindings);
+                        FusionSession session =
+                                executable.newSession(
+                                        manager,
+                                        FusionSessionConfig.builder().optBufferCount(1).build())) {
+                    for (int batch : batches) {
+                        try (FusionInvocation invocation = session.acquire()) {
+                            invocation.setInput(fixture.memory, memory);
+                            invocation.setInput(fixture.mask, mask);
+                            invocation.setDimension(fixture.batch, batch);
+                            try (FusionOutputLease lease = invocation.submit()) {
+                                lease.synchronize();
+                                assertSingleQueryReadoutReference(
+                                        lease.get(fixture.policyOutput),
+                                        memory,
+                                        mask,
+                                        bound.readouts.get(0),
+                                        fixture.queryIndex,
+                                        batch,
+                                        dataType,
+                                        deviceIndex,
+                                        "policy");
+                                assertSingleQueryReadoutReference(
+                                        lease.get(fixture.valueOutput),
+                                        memory,
+                                        mask,
+                                        bound.readouts.get(1),
+                                        fixture.queryIndex,
+                                        batch,
+                                        dataType,
+                                        deviceIndex,
+                                        "value");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1648,6 +1737,233 @@ public class PtFusionTest {
             values[index] = (index % period - center) * scale;
         }
         return values;
+    }
+
+    private static NDArray patternedArray(
+            NDManager manager,
+            DataType dataType,
+            Shape shape,
+            int period,
+            int center,
+            float scale) {
+        try (NDScope scope = new NDScope()) {
+            scope.suppressNotUsedWarning();
+            NDArray result =
+                    manager.arange((float) shape.size())
+                            .mod(period)
+                            .sub(center)
+                            .mul(scale)
+                            .reshape(shape)
+                            .toType(dataType, false);
+            NDScope.unregister(result);
+            return result;
+        }
+    }
+
+    private static NDArray legalReadoutMask(
+            NDManager manager, DataType dataType, int batchCount, int tokenCount) {
+        try (NDScope scope = new NDScope()) {
+            scope.suppressNotUsedWarning();
+            NDArray tokens = manager.arange(tokenCount).reshape(1, tokenCount);
+            NDArray validCounts =
+                    manager.arange(batchCount).mod(52).add(100).reshape(batchCount, 1);
+            NDArray result =
+                    tokens.broadcast(batchCount, tokenCount)
+                            .lt(validCounts)
+                            .toType(dataType, false);
+            NDScope.unregister(result);
+            return result;
+        }
+    }
+
+    private static void assertSingleQueryReadoutReference(
+            NDArray actualStorage,
+            NDArray memoryStorage,
+            NDArray maskStorage,
+            PtSingleQueryReadoutTestSupport.SingleQueryReadoutArrays weights,
+            int queryIndex,
+            int batchCount,
+            DataType dataType,
+            int deviceIndex,
+            String readoutName) {
+        try (NDScope scope = new NDScope()) {
+            scope.suppressNotUsedWarning();
+            NDArray memory = memoryStorage.get("0:" + batchCount);
+            NDArray mask = maskStorage.get("0:" + batchCount);
+            NDArray querySeed = memory.get(":," + queryIndex);
+            NDArray floatMask = mask.neq(0).toType(DataType.FLOAT32, false);
+            NDArray mean =
+                    memory.toType(DataType.FLOAT32, false)
+                            .mul(floatMask.expandDims(2))
+                            .sum(new int[] {1})
+                            .div(floatMask.sum(new int[] {1}, true).maximum(1f))
+                            .toType(dataType, false);
+            NDArray seedInput = NDArrays.concat(new NDList(querySeed, mean), 1);
+            NDArray seedProduct = seedInput.matMul(weights.seedWeight.transpose());
+            NDArray seedState = seedProduct.add(weights.seedBias);
+            NDArray query =
+                    seedState.matMul(weights.queryWeight.transpose()).add(weights.queryBias);
+
+            int attentionWidth = Math.toIntExact(weights.queryBias.getShape().get(0));
+            int attentionHeads = 4;
+            int headWidth = attentionWidth / attentionHeads;
+            int tokenCount = Math.toIntExact(memory.getShape().get(1));
+            int hiddenWidth = Math.toIntExact(memory.getShape().get(2));
+            NDArray queryHeads = query.reshape(batchCount, attentionHeads, 1, headWidth);
+            NDArray keyValues =
+                    memory.reshape(batchCount * tokenCount, hiddenWidth)
+                            .matMul(weights.keyValueWeight.transpose())
+                            .reshape(batchCount, tokenCount, 2 * attentionWidth);
+            NDArray keys =
+                    keyValues
+                            .get("...,0:" + attentionWidth)
+                            .reshape(batchCount, tokenCount, attentionHeads, headWidth)
+                            .swapAxes(1, 2);
+            NDArray values =
+                    keyValues
+                            .get("...," + attentionWidth + ':' + (2 * attentionWidth))
+                            .reshape(batchCount, tokenCount, attentionHeads, headWidth)
+                            .swapAxes(1, 2);
+            NDArray invalidBias =
+                    mask.eq(0)
+                            .toType(DataType.FLOAT32, false)
+                            .mul(-1.0e9f)
+                            .toType(dataType, false)
+                            .reshape(batchCount, 1, 1, tokenCount);
+            NDArray probabilities =
+                    queryHeads
+                            .matMul(keys.swapAxes(2, 3))
+                            .div((float) Math.sqrt(headWidth))
+                            .add(invalidBias)
+                            .softmax(3);
+            NDArray materializedContext =
+                    probabilities.matMul(values).swapAxes(1, 2).reshape(batchCount, attentionWidth);
+
+            NDArray keyWeights =
+                    weights.keyValueWeight
+                            .get("0:" + attentionWidth)
+                            .reshape(attentionHeads, headWidth, hiddenWidth);
+            NDArray direction = queryHeads.matMul(keyWeights).div((float) Math.sqrt(headWidth));
+            NDArray reorderedProbabilities =
+                    direction
+                            .matMul(memory.expandDims(1).swapAxes(2, 3))
+                            .add(invalidBias)
+                            .softmax(3);
+            NDArray pooled = reorderedProbabilities.matMul(memory.expandDims(1));
+            NDArray valueWeights =
+                    weights.keyValueWeight
+                            .get(attentionWidth + ":" + (2 * attentionWidth))
+                            .reshape(attentionHeads, headWidth, hiddenWidth)
+                            .swapAxes(1, 2);
+            NDArray reorderedContext =
+                    pooled.matMul(valueWeights).swapAxes(1, 2).reshape(batchCount, attentionWidth);
+            assertReadoutClose(
+                    reorderedContext,
+                    materializedContext,
+                    attentionTolerance(dataType),
+                    deviceIndex,
+                    dataType,
+                    batchCount,
+                    readoutName + "-attention");
+
+            NDArray attentionUpdate =
+                    materializedContext
+                            .matMul(weights.contextWeight.transpose())
+                            .add(weights.contextBias);
+            NDArray state =
+                    mixedPrecisionLayerNormReference(
+                            seedState.add(attentionUpdate),
+                            weights.queryNormWeight,
+                            weights.queryNormBias);
+            NDArray feedForwardInput =
+                    mixedPrecisionLayerNormReference(
+                            state, weights.feedForwardNormWeight, weights.feedForwardNormBias);
+            NDArray expanded =
+                    feedForwardInput
+                            .matMul(weights.expansionWeight.transpose())
+                            .add(weights.expansionBias);
+            NDArray projected =
+                    expanded.mul(Activation.sigmoid(expanded))
+                            .matMul(weights.projectionWeight.transpose())
+                            .add(weights.projectionBias);
+            NDArray expected =
+                    mixedPrecisionLayerNormReference(
+                            state.add(projected), weights.outputNormWeight, weights.outputNormBias);
+            NDArray actual = actualStorage.get("0:" + batchCount);
+            Assert.assertEquals(actual.getShape(), new Shape(batchCount, hiddenWidth));
+            assertReadoutClose(
+                    actual,
+                    expected,
+                    outputTolerance(dataType),
+                    deviceIndex,
+                    dataType,
+                    batchCount,
+                    readoutName + "-output");
+        }
+    }
+
+    private static float attentionTolerance(DataType dataType) {
+        if (dataType == DataType.FLOAT32) {
+            return 5.0e-4f;
+        }
+        if (dataType == DataType.FLOAT16) {
+            return 4.0e-2f;
+        }
+        return 1.5e-1f;
+    }
+
+    private static float outputTolerance(DataType dataType) {
+        if (dataType == DataType.FLOAT32) {
+            return 1.0e-3f;
+        }
+        if (dataType == DataType.FLOAT16) {
+            return 6.0e-2f;
+        }
+        return 2.0e-1f;
+    }
+
+    private static void assertReadoutClose(
+            NDArray actual,
+            NDArray expected,
+            float tolerance,
+            int deviceIndex,
+            DataType dataType,
+            int batchCount,
+            String stage) {
+        float[] actualValues = actual.toType(DataType.FLOAT32, false).toFloatArray();
+        float[] expectedValues = expected.toType(DataType.FLOAT32, false).toFloatArray();
+        Assert.assertEquals(actualValues.length, expectedValues.length);
+        float maximum = 0f;
+        double total = 0.0;
+        for (int index = 0; index < actualValues.length; ++index) {
+            Assert.assertTrue(
+                    Float.isFinite(actualValues[index]) && Float.isFinite(expectedValues[index]),
+                    "Non-finite single-query readout value at " + stage + " index " + index);
+            float difference = Math.abs(actualValues[index] - expectedValues[index]);
+            maximum = Math.max(maximum, difference);
+            total += difference;
+        }
+        double mean = total / actualValues.length;
+        System.out.printf(
+                "single-query-parity device=%d dtype=%s batch=%d stage=%s maxAbs=%.9g"
+                        + " meanAbs=%.9g tolerance=%.9g%n",
+                deviceIndex, dataType, batchCount, stage, maximum, mean, tolerance);
+        Assert.assertTrue(
+                maximum <= tolerance,
+                "Single-query readout parity exceeded its fixed tolerance: device="
+                        + deviceIndex
+                        + ", dtype="
+                        + dataType
+                        + ", batch="
+                        + batchCount
+                        + ", stage="
+                        + stage
+                        + ", maxAbs="
+                        + maximum
+                        + ", meanAbs="
+                        + mean
+                        + ", tolerance="
+                        + tolerance);
     }
 
     private static NDArray transformerEncoderReference(
