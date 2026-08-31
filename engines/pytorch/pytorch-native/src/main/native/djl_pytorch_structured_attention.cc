@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 
 #if defined(DJL_USE_ROCM_KERNELS)
 #include "djl_pytorch_rocm_kernels.h"
@@ -84,7 +85,9 @@ torch::Tensor grouped_indexed_attention_reference(const torch::Tensor& query,
   auto keys = torch::cat({shared_keys.add(shared_delta_keys), indexed_keys.add(indexed_delta_keys)}, 2);
   auto scores = query.unsqueeze(2).mul(keys).sum(3).mul(scale);
   auto indexed_present = stored_ids.ne(0).unsqueeze(1).expand({query_count, heads, indexed_tokens});
-  auto indexed_scores = scores.slice(2, shared_tokens).masked_fill(indexed_present.logical_not(), -1.0e9);
+  auto indexed_scores = scores.slice(2, shared_tokens)
+                            .masked_fill(indexed_present.logical_not(),
+                                -std::numeric_limits<float>::infinity());
   scores = torch::cat({scores.slice(2, 0, shared_tokens), indexed_scores}, 2);
   auto weights = scores.softmax(2);
 
