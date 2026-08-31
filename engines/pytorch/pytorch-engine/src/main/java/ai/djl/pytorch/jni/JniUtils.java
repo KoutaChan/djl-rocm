@@ -1142,6 +1142,41 @@ public final class JniUtils {
     }
 
     /**
+     * Applies grouped indexed attention through explicit group and shared-delta lookup mappings.
+     *
+     * @param query queries shaped {@code [query,heads,keyFeatures]}
+     * @param sharedKeyValues packed shared data shaped {@code [groups,sharedTokens,packedWidth]}
+     * @param sharedGroupIndices zero-based group indices
+     * @param sharedDeltaTable packed shared-token delta lookup table
+     * @param sharedDeltaIndices zero-based delta indices
+     * @param indexedDeltas query-specific auxiliary deltas
+     * @param indexedSharedIds one-based shared-token IDs; zero denotes padding
+     * @param scale attention score scale
+     * @return attended values shaped {@code [query,heads,valueFeatures]}
+     */
+    public static PtNDArray mappedGroupedIndexedScaledDotProductAttention(
+            PtNDArray query,
+            PtNDArray sharedKeyValues,
+            PtNDArray sharedGroupIndices,
+            PtNDArray sharedDeltaTable,
+            PtNDArray sharedDeltaIndices,
+            PtNDArray indexedDeltas,
+            PtNDArray indexedSharedIds,
+            float scale) {
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchMappedGroupedIndexedScaledDotProductAttention(
+                        query.getHandle(),
+                        sharedKeyValues.getHandle(),
+                        sharedGroupIndices.getHandle(),
+                        sharedDeltaTable.getHandle(),
+                        sharedDeltaIndices.getHandle(),
+                        indexedDeltas.getHandle(),
+                        indexedSharedIds.getHandle(),
+                        scale));
+    }
+
+    /**
      * Adds an inference residual in place and returns its affine LayerNorm.
      *
      * <p>The residual remains the unnormalized sum so the following residual branch observes the

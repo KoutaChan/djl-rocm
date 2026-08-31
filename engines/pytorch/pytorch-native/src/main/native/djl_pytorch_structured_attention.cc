@@ -104,6 +104,20 @@ torch::Tensor grouped_indexed_attention_reference(const torch::Tensor& query,
   return weights.unsqueeze(3).mul(values).sum(2);
 }
 
+torch::Tensor mapped_grouped_indexed_attention_reference(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, double scale) {
+  const auto query_count = query.size(0);
+  const auto shared_tokens = shared_key_values.size(1);
+  const auto packed_width = shared_key_values.size(2);
+  auto mapped_shared_key_values = shared_key_values.index_select(0, shared_group_indices.to(torch::kLong));
+  auto mapped_shared_deltas = shared_delta_table.index_select(0, shared_delta_indices.to(torch::kLong).reshape(-1))
+                                  .reshape({query_count, shared_tokens, packed_width});
+  return grouped_indexed_attention_reference(query, mapped_shared_key_values, mapped_shared_deltas,
+      indexed_deltas, indexed_shared_ids, 1, scale);
+}
+
 #if defined(DJL_USE_ROCM_KERNELS)
 
 class IndexedRelationBiasFunction : public torch::autograd::Function<IndexedRelationBiasFunction> {
@@ -208,6 +222,25 @@ torch::Tensor grouped_indexed_attention(const torch::Tensor& query, const torch:
 #endif
   return grouped_indexed_attention_reference(
       query, shared_key_values, shared_deltas, indexed_deltas, indexed_shared_ids, queries_per_group, scale);
+}
+
+torch::Tensor mapped_grouped_indexed_attention(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, double scale) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  const bool needs_autograd = requires_autograd(
+      {&query, &shared_key_values, &shared_delta_table, &indexed_deltas});
+  if (!needs_autograd && rocm::supports_mapped_grouped_indexed_attention_forward(query,
+                            shared_key_values, shared_group_indices, shared_delta_table,
+                            shared_delta_indices, indexed_deltas, indexed_shared_ids)) {
+    return rocm::mapped_grouped_indexed_attention_forward(query, shared_key_values,
+        shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
+        indexed_shared_ids, static_cast<float>(scale));
+  }
+#endif
+  return mapped_grouped_indexed_attention_reference(query, shared_key_values, shared_group_indices,
+      shared_delta_table, shared_delta_indices, indexed_deltas, indexed_shared_ids, scale);
 }
 
 }  // namespace djl::pytorch

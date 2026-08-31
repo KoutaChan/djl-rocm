@@ -131,6 +131,16 @@ GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const tor
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, float scale, bool capture_log_sum_exp);
 
+bool supports_mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids);
+
+torch::Tensor mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, float scale);
+
 struct GroupedIndexedAttentionGradients {
   torch::Tensor query;
   torch::Tensor shared_key_values;

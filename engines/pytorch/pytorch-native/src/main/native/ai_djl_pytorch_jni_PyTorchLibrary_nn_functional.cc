@@ -235,6 +235,61 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchG
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMappedGroupedIndexedScaledDotProductAttention(
+    JNIEnv* env, jobject jthis, jlong jquery, jlong jshared_key_values,
+    jlong jshared_group_indices, jlong jshared_delta_table, jlong jshared_delta_indices,
+    jlong jindexed_deltas, jlong jindexed_shared_ids, jfloat jscale) {
+  API_BEGIN()
+  const auto* query_ptr = reinterpret_cast<torch::Tensor*>(jquery);
+  const auto* shared_key_values_ptr = reinterpret_cast<torch::Tensor*>(jshared_key_values);
+  const auto* shared_group_indices_ptr = reinterpret_cast<torch::Tensor*>(jshared_group_indices);
+  const auto* shared_delta_table_ptr = reinterpret_cast<torch::Tensor*>(jshared_delta_table);
+  const auto* shared_delta_indices_ptr = reinterpret_cast<torch::Tensor*>(jshared_delta_indices);
+  const auto* indexed_deltas_ptr = reinterpret_cast<torch::Tensor*>(jindexed_deltas);
+  const auto* indexed_shared_ids_ptr = reinterpret_cast<torch::Tensor*>(jindexed_shared_ids);
+
+  TORCH_CHECK(query_ptr->dim() == 3, "query must have shape [queries, heads, key features]");
+  TORCH_CHECK(shared_key_values_ptr->dim() == 3,
+      "shared key/value storage must have shape [groups, shared tokens, packed features]");
+  TORCH_CHECK(shared_group_indices_ptr->dim() == 1,
+      "shared group indices must have shape [queries]");
+  TORCH_CHECK(shared_delta_table_ptr->dim() == 2,
+      "shared delta table must have shape [deltas, packed features]");
+  TORCH_CHECK(shared_delta_indices_ptr->dim() == 2,
+      "shared delta indices must have shape [queries, shared tokens]");
+  TORCH_CHECK(indexed_deltas_ptr->dim() == 3 && indexed_shared_ids_ptr->dim() == 2,
+      "indexed deltas and IDs must describe query-local auxiliary tokens");
+  const auto query_count = query_ptr->size(0);
+  const auto heads = query_ptr->size(1);
+  const auto key_width = heads * query_ptr->size(2);
+  const auto shared_tokens = shared_key_values_ptr->size(1);
+  const auto packed_width = shared_key_values_ptr->size(2);
+  TORCH_CHECK(heads > 0 && query_ptr->size(2) > 0 && shared_key_values_ptr->size(0) > 0 &&
+          shared_tokens > 0 && shared_delta_table_ptr->size(0) > 0,
+      "mapped grouped attention dimensions must be positive");
+  TORCH_CHECK(packed_width > key_width && (packed_width - key_width) % heads == 0,
+      "packed shared features must contain per-head keys followed by per-head values");
+  TORCH_CHECK(shared_group_indices_ptr->size(0) == query_count &&
+          shared_delta_indices_ptr->size(0) == query_count &&
+          shared_delta_indices_ptr->size(1) == shared_tokens &&
+          shared_delta_table_ptr->size(1) == packed_width,
+      "shared table mappings must describe every query and shared token");
+  TORCH_CHECK(indexed_deltas_ptr->size(0) == query_count &&
+          indexed_deltas_ptr->size(2) == packed_width &&
+          indexed_shared_ids_ptr->size(0) == query_count &&
+          indexed_shared_ids_ptr->size(1) == indexed_deltas_ptr->size(1),
+      "indexed deltas and IDs must describe the same query-token pairs");
+
+  auto result = djl::pytorch::mapped_grouped_indexed_attention(*query_ptr,
+      *shared_key_values_ptr, *shared_group_indices_ptr, *shared_delta_table_ptr,
+      *shared_delta_indices_ptr, *indexed_deltas_ptr, *indexed_shared_ids_ptr,
+      static_cast<double>(jscale));
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedSoftmax(
     JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
   API_BEGIN()

@@ -25,6 +25,11 @@ torch::Tensor grouped_indexed_attention(const torch::Tensor& query, const torch:
     const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, double scale);
 
+torch::Tensor mapped_grouped_indexed_attention(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, double scale);
+
 }  // namespace djl::pytorch
 
 #endif  // DJL_PYTORCH_STRUCTURED_ATTENTION_H

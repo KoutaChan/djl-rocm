@@ -1087,6 +1087,28 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray canonicalMappedGroupedIndexedScaledDotProductAttention(
+            NDArray sharedKeyValues,
+            NDArray sharedGroupIndices,
+            NDArray sharedDeltaTable,
+            NDArray sharedDeltaIndices,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            double scale) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.mappedGroupedIndexedScaledDotProductAttention(
+                array,
+                manager.from(sharedKeyValues),
+                manager.from(sharedGroupIndices),
+                manager.from(sharedDeltaTable),
+                manager.from(sharedDeltaIndices),
+                manager.from(indexedDeltas),
+                manager.from(indexedSharedIds),
+                (float) scale);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray addToOwnedResidualAndLayerNorm(
             NDArray update, NDArray weight, NDArray bias, float eps) {
         PtNDManager manager = array.getManager();

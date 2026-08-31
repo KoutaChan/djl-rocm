@@ -332,6 +332,16 @@ final class PyTorchLibrary {
             long queriesPerGroup,
             float scale);
 
+    native long torchMappedGroupedIndexedScaledDotProductAttention(
+            long query,
+            long sharedKeyValues,
+            long sharedGroupIndices,
+            long sharedDeltaTable,
+            long sharedDeltaIndices,
+            long indexedDeltas,
+            long indexedSharedIds,
+            float scale);
+
     native long torchAddToOwnedResidualAndLayerNorm(
             long residual, long update, long weight, long bias, float epsilon);
 
