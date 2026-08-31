@@ -35,7 +35,7 @@ import java.util.Set;
  * an activation. {@link IndexedAffine} gathers selected rows from several values, evaluates a
  * bounded two-layer projection, and scatters the selected results into a dense value. {@link
  * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
- * them into a contiguous {@link DataType#FLOAT32} value. {@link SegmentedOutputPack} concatenates
+ * them into one configured floating-point data type. {@link SegmentedOutputPack} concatenates
  * same-type, batch-major tensor segments along their first inner axis without changing their data
  * type. {@link BinaryBranchBlend} selects or
  * blends two branch contexts from their presence values and a binary logit. {@link
@@ -600,10 +600,11 @@ public final class FusionRecipe {
     }
 
     /**
-     * A value that packs two-dimensional floating-point sources into a contiguous FLOAT32 tensor.
+     * A value that packs two-dimensional floating-point sources into one contiguous tensor.
      *
      * <p>All sources share the same named leading dimension. Their complete last axes are appended
-     * in source order. Sources may independently use FLOAT16, BFLOAT16, or FLOAT32.
+     * in source order. Sources may independently use FLOAT16, BFLOAT16, or FLOAT32. The result uses
+     * the configured output data type, or FLOAT32 by default.
      */
     public static final class OutputPack extends Value {
 
@@ -2188,53 +2189,35 @@ public final class FusionRecipe {
         }
 
         /**
-         * Adds an output-pack value.
+         * Adds a FLOAT32 output-pack value.
          *
          * <p>Each source must be a two-dimensional FLOAT16, BFLOAT16, or FLOAT32 value from this
          * builder. Sources must share the same named leading dimension. The resulting value is a
-         * contiguous FLOAT32 tensor whose last-axis width is the sum of the source widths.
+         * contiguous FLOAT32 tensor whose last-axis width is the sum of the source widths. Use
+         * {@link #outputPack(String)} when the result should use another floating-point data type.
          *
          * @param name the value name
          * @param sources the values to pack in order
          * @return the packed value
          */
         public OutputPack outputPack(String name, Value... sources) {
-            checkMutable();
             Objects.requireNonNull(sources, "sources");
-            if (sources.length == 0) {
-                throw new IllegalArgumentException("Output pack requires at least one source.");
-            }
-
-            List<Value> checkedSources = new ArrayList<>(sources.length);
-            Dimension leadingDimension = null;
-            long width = 0;
+            OutputPackBuilder outputPack = outputPack(name);
             for (Value source : sources) {
-                checkValue(source);
-                TensorSpec spec = source.spec;
-                if (spec.leadingDimension == null || spec.innerShape.length != 1) {
-                    throw new IllegalArgumentException(
-                            "Output pack sources must have one leading and one inner dimension.");
-                }
-                if (!isFloatingDataType(spec.dataType)) {
-                    throw new IllegalArgumentException(
-                            "Output pack only supports FLOAT16, BFLOAT16, and FLOAT32 sources.");
-                }
-                if (leadingDimension == null) {
-                    leadingDimension = spec.leadingDimension;
-                } else if (leadingDimension != spec.leadingDimension) {
-                    throw new IllegalArgumentException(
-                            "Output pack sources must share the same leading dimension.");
-                }
-                width = Math.addExact(width, spec.innerShape[0]);
-                checkedSources.add(source);
+                outputPack.addSource(source);
             }
+            return outputPack.build();
+        }
 
-            String checkedName = addValueName(name);
-            TensorSpec outputSpec = TensorSpec.of(DataType.FLOAT32, leadingDimension, width);
-            OutputPack value =
-                    new OutputPack(owner, values.size(), checkedName, outputSpec, checkedSources);
-            values.add(value);
-            return value;
+        /**
+         * Starts an output-pack stage with a configurable output data type.
+         *
+         * @param name the value name
+         * @return a builder for the output pack
+         */
+        public OutputPackBuilder outputPack(String name) {
+            checkMutable();
+            return new OutputPackBuilder(this, requireName(name, "value"));
         }
 
         /**
@@ -2372,6 +2355,105 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException("The " + kind + " name must not be empty.");
             }
             return name;
+        }
+    }
+
+    /** Builds one {@link OutputPack} within a {@link Builder}. */
+    public static final class OutputPackBuilder {
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final List<Value> sources = new ArrayList<>();
+        private DataType outputDataType = DataType.FLOAT32;
+        private boolean built;
+
+        private OutputPackBuilder(Builder recipeBuilder, String name) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+        }
+
+        /**
+         * Appends one complete feature axis.
+         *
+         * @param source a {@code [rows, width]} floating-point value
+         * @return this builder
+         */
+        public OutputPackBuilder addSource(Value source) {
+            checkMutable();
+            recipeBuilder.checkValue(source);
+            TensorSpec spec = source.spec;
+            if (spec.leadingDimension == null || spec.innerShape.length != 1) {
+                throw new IllegalArgumentException(
+                        "Output pack sources must have one leading and one inner dimension.");
+            }
+            if (!Builder.isFloatingDataType(spec.dataType)) {
+                throw new IllegalArgumentException(
+                        "Output pack only supports FLOAT16, BFLOAT16, and FLOAT32 sources.");
+            }
+            sources.add(source);
+            return this;
+        }
+
+        /**
+         * Sets the packed output data type.
+         *
+         * <p>Sources are converted while they are copied into the persistent result. The default is
+         * FLOAT32.
+         *
+         * @param dataType FLOAT16, BFLOAT16, or FLOAT32
+         * @return this builder
+         */
+        public OutputPackBuilder optOutputDataType(DataType dataType) {
+            checkMutable();
+            if (!Builder.isFloatingDataType(Objects.requireNonNull(dataType, "dataType"))) {
+                throw new IllegalArgumentException(
+                        "An output-pack result must use a floating-point data type.");
+            }
+            outputDataType = dataType;
+            return this;
+        }
+
+        /**
+         * Validates and inserts the output-pack value.
+         *
+         * @return the packed value
+         */
+        public OutputPack build() {
+            checkMutable();
+            if (sources.isEmpty()) {
+                throw new IllegalArgumentException("Output pack requires at least one source.");
+            }
+            TensorSpec firstSpec = sources.get(0).spec;
+            Dimension leadingDimension = firstSpec.leadingDimension;
+            long width = 0;
+            for (Value source : sources) {
+                TensorSpec spec = source.spec;
+                if (spec.leadingDimension != leadingDimension) {
+                    throw new IllegalArgumentException(
+                            "Output pack sources must share the same leading dimension.");
+                }
+                width = Math.addExact(width, spec.innerShape[0]);
+            }
+
+            String checkedName = recipeBuilder.addValueName(name);
+            TensorSpec outputSpec = TensorSpec.of(outputDataType, leadingDimension, width);
+            OutputPack value =
+                    new OutputPack(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            outputSpec,
+                            sources);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private void checkMutable() {
+            recipeBuilder.checkMutable();
+            if (built) {
+                throw new IllegalStateException("The output pack is already built.");
+            }
         }
     }
 

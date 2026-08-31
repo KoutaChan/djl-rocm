@@ -675,8 +675,8 @@ OutputPackCommandSpec BuildOutputPackCommand(FusionPlanData& plan,
   ValueSpec& result = plan.values[result_index];
   TORCH_CHECK(result.kind == ValueKind::kUnbound,
       "fusion command result already has a producer or binding");
-  TORCH_CHECK(result.data_type == torch::kFloat32,
-      "OUTPUT_PACK_V1 result must use FLOAT32");
+  TORCH_CHECK(IsFusionFloatingDataType(result.data_type),
+      "OUTPUT_PACK_V1 result must use FLOAT16, BFLOAT16, or FLOAT32");
   TORCH_CHECK(result.dimension_index >= 0 && result.inner_shape.size() == 1,
       "OUTPUT_PACK_V1 result must have one leading and one inner dimension");
 

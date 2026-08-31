@@ -42,7 +42,7 @@ struct OutputPackArguments {
   int64_t widths[kMaximumOutputPackSources];
   int64_t destination_offsets[kMaximumOutputPackSources];
   int32_t data_types[kMaximumOutputPackSources];
-  float* output;
+  void* output;
   int64_t row_count;
   int64_t output_width;
 };
@@ -128,9 +128,10 @@ struct IndexedAffineFinalizeArguments {
   int32_t activation;
 };
 
-template <typename scalar_t>
+template <typename output_t, typename scalar_t>
 __device__ void pack_source(const OutputPackArguments& arguments, int32_t source_index) {
   const auto* source = static_cast<const scalar_t*>(arguments.sources[source_index]);
+  auto* output = static_cast<output_t*>(arguments.output);
   const int64_t width = arguments.widths[source_index];
   const int64_t element_count = arguments.row_count * width;
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -138,23 +139,24 @@ __device__ void pack_source(const OutputPackArguments& arguments, int32_t source
        index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t row = index / width;
     const int64_t column = index - row * width;
-    arguments.output[row * arguments.output_width +
+    output[row * arguments.output_width +
         arguments.destination_offsets[source_index] + column] =
-        static_cast<float>(source[index]);
+        static_cast<output_t>(source[index]);
   }
 }
 
+template <typename output_t>
 __global__ void output_pack_kernel(OutputPackArguments arguments) {
   const int32_t source_index = static_cast<int32_t>(blockIdx.y);
   switch (static_cast<torch::ScalarType>(arguments.data_types[source_index])) {
     case torch::kFloat16:
-      pack_source<c10::Half>(arguments, source_index);
+      pack_source<output_t, c10::Half>(arguments, source_index);
       break;
     case torch::kBFloat16:
-      pack_source<c10::BFloat16>(arguments, source_index);
+      pack_source<output_t, c10::BFloat16>(arguments, source_index);
       break;
     case torch::kFloat32:
-      pack_source<float>(arguments, source_index);
+      pack_source<output_t, float>(arguments, source_index);
       break;
     default:
       break;
@@ -1525,13 +1527,21 @@ void CheckHipLaunch(const char* kernel_name) {
 
 }  // namespace
 
+template <typename output_t>
+void LaunchOutputPackTyped(const OutputPackArguments& arguments,
+    int32_t source_count, uint32_t block_count, hipStream_t stream) {
+  hipLaunchKernelGGL((output_pack_kernel<output_t>),
+      dim3(block_count, source_count), dim3(kThreadsPerBlock), 0, stream,
+      arguments);
+}
+
 void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
     torch::Tensor& output, int64_t row_count, int64_t output_width) {
   if (row_count == 0) {
     return;
   }
   OutputPackArguments arguments{};
-  arguments.output = output.data_ptr<float>();
+  arguments.output = output.data_ptr();
   arguments.row_count = row_count;
   arguments.output_width = output_width;
   int64_t maximum_width = 0;
@@ -1550,8 +1560,23 @@ void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
   const auto stream = at::hip::getCurrentHIPStream(output.get_device());
-  hipLaunchKernelGGL(output_pack_kernel, dim3(block_count, source_count),
-      dim3(kThreadsPerBlock), 0, stream.stream(), arguments);
+  switch (output.scalar_type()) {
+    case torch::kFloat16:
+      LaunchOutputPackTyped<c10::Half>(
+          arguments, source_count, block_count, stream.stream());
+      break;
+    case torch::kBFloat16:
+      LaunchOutputPackTyped<c10::BFloat16>(
+          arguments, source_count, block_count, stream.stream());
+      break;
+    case torch::kFloat32:
+      LaunchOutputPackTyped<float>(
+          arguments, source_count, block_count, stream.stream());
+      break;
+    default:
+      TORCH_CHECK(false,
+          "fusion output pack requires FLOAT16, BFLOAT16, or FLOAT32 output");
+  }
   CheckHipLaunch("fusion output pack");
 }
 

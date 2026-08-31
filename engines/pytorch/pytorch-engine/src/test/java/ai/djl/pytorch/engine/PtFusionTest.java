@@ -996,6 +996,62 @@ public class PtFusionTest {
     }
 
     @Test
+    public void rocmOutputPackConvertsIntoConfiguredType() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        for (DataType outputType :
+                new DataType[] {DataType.FLOAT16, DataType.BFLOAT16, DataType.FLOAT32}) {
+            FusionRecipe.Builder builder = FusionRecipe.builder("typed-output-pack-test");
+            FusionRecipe.Dimension rows = builder.addDimension("rows", 4);
+            FusionRecipe.Input halfInput =
+                    builder.addInput(
+                            "half", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 2));
+            FusionRecipe.Input singleInput =
+                    builder.addInput(
+                            "single", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 3));
+            FusionRecipe.OutputPack pack =
+                    builder.outputPack("pack")
+                            .addSource(halfInput)
+                            .addSource(singleInput)
+                            .optOutputDataType(outputType)
+                            .build();
+            FusionRecipe.Output output = builder.addOutput("output", pack);
+            FusionRecipe recipe = builder.build();
+
+            try (NDManager manager = engine.newBaseManager(device);
+                    FusionPlan plan = engine.newFusionCompiler(device).prepare(recipe);
+                    FusionExecutable executable =
+                            plan.bind(FusionConstantBindings.builder(recipe).build());
+                    FusionSession session =
+                            executable.newSession(manager, FusionSessionConfig.defaults())) {
+                NDArray half =
+                        manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2))
+                                .toType(DataType.FLOAT16, false);
+                NDArray single =
+                        manager.create(
+                                new float[] {5f, 6f, 7f, 8f, 9f, 10f}, new Shape(2, 3));
+                try (FusionInvocation invocation = session.acquire()) {
+                    invocation.setInput(halfInput, half);
+                    invocation.setInput(singleInput, single);
+                    invocation.setDimension(rows, 2);
+                    try (FusionOutputLease lease = invocation.submit()) {
+                        lease.synchronize();
+                        NDArray actual = lease.get(output);
+                        Assert.assertEquals(actual.getDataType(), outputType);
+                        Assert.assertEquals(
+                                actual.get("0:2").toFloatArray(),
+                                new float[] {1f, 2f, 5f, 6f, 7f, 3f, 4f, 8f, 9f, 10f},
+                                outputType == DataType.FLOAT32 ? 0f : 1e-2f);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     public void rocmSegmentedOutputPackIsBitExactAcrossTypesAndSlots() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {

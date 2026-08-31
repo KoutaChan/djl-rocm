@@ -101,6 +101,31 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void outputPackUsesConfiguredOutputType() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("typed-output-pack");
+        FusionRecipe.Dimension rows = builder.addDimension("rows", 16);
+        FusionRecipe.Input half =
+                builder.addInput("half", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 3));
+        FusionRecipe.Input single =
+                builder.addInput("single", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 5));
+
+        FusionRecipe.OutputPack packed =
+                builder.outputPack("packed")
+                        .addSource(half)
+                        .addSource(single)
+                        .optOutputDataType(DataType.BFLOAT16)
+                        .build();
+        builder.addOutput("output", packed);
+        builder.build();
+
+        Assert.assertEquals(packed.getSpec().getDataType(), DataType.BFLOAT16);
+        Assert.assertEquals(packed.getSpec().getMaximumShape().getShape(), new long[] {16, 8});
+        Assert.assertThrows(
+                IllegalStateException.class,
+                () -> builder.outputPack("late").addSource(half));
+    }
+
+    @Test
     public void segmentedOutputPackPreservesTypeAndTrailingShape() {
         FusionRecipe.Builder builder = FusionRecipe.builder("segmented-output-pack");
         FusionRecipe.Dimension batch = builder.addDimension("batch", 16);
