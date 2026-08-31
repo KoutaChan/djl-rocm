@@ -121,7 +121,10 @@ public class EmbeddingWithOffsetsTest {
 
         Assert.assertEquals(actual.getShape(), new Shape(2, 3, 2));
         Assert.assertEquals(actual.getDataType(), tableType);
-        float maxAbs = assertClose(actual.toFloatArray(), expected.toFloatArray());
+        float maxAbs =
+                assertClose(
+                        actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                        expected.toType(DataType.FLOAT32, false).toFloatArray());
         System.out.printf(
                 "EMBEDDING_WITH_OFFSETS_PARITY rawDtype=%s offsetDtype=%s tableDtype=%s maxAbs=%s%n",
                 rawType, offsetType, tableType, maxAbs);
