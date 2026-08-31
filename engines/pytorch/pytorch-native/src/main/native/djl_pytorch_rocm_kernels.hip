@@ -25,11 +25,17 @@ constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
+constexpr int kMaximumIndexedPoolChoices = 16;
 
 struct CategoricalMaskRules {
   int32_t count;
   int32_t fields[kMaximumCategoricalMaskRules];
   uint64_t category_sets[kMaximumCategoricalMaskRules];
+};
+
+struct IndexedPoolChoices {
+  int32_t count;
+  int32_t columns[kMaximumIndexedPoolChoices];
 };
 
 void check_hip_kernel_launch(const char* kernel_name) {
@@ -364,6 +370,131 @@ __global__ void grouped_masked_softmax_pool_kernel(const logit_t* logits, const 
       output[output_offset + feature] = pooled;
     }
     __syncthreads();
+  }
+}
+
+template <typename logit_t, typename mask_t, typename value_t>
+__global__ void indexed_masked_softmax_pool_kernel(const logit_t* logits,
+    const mask_t* mask, const value_t* values, float* output, int64_t row_count,
+    int64_t choice_count, int64_t feature_count, IndexedPoolChoices selected) {
+  __shared__ float probabilities[kMaximumIndexedPoolChoices];
+  __shared__ int has_choice;
+  for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x) {
+    if (threadIdx.x == 0) {
+      float maximum = -INFINITY;
+      int selected_count = 0;
+      for (int index = 0; index < selected.count; ++index) {
+        const int64_t offset = row * choice_count + selected.columns[index];
+        const bool legal = static_cast<float>(mask[offset]) != 0.0f;
+        probabilities[index] = legal ? 1.0f : 0.0f;
+        if (legal) {
+          maximum = maximum_propagating_nan(
+              maximum, static_cast<float>(logits[offset]));
+          ++selected_count;
+        }
+      }
+      float denominator = 0.0f;
+      if (selected_count > 0) {
+        for (int index = 0; index < selected.count; ++index) {
+          if (probabilities[index] != 0.0f) {
+            const int64_t offset = row * choice_count + selected.columns[index];
+            probabilities[index] =
+                expf(static_cast<float>(logits[offset]) - maximum);
+            denominator += probabilities[index];
+          }
+        }
+        for (int index = 0; index < selected.count; ++index) {
+          probabilities[index] /= denominator;
+        }
+      } else {
+        for (int index = 0; index < selected.count; ++index) {
+          probabilities[index] = 0.0f;
+        }
+      }
+      has_choice = selected_count > 0;
+    }
+    __syncthreads();
+    const int64_t output_offset = row * feature_count;
+    for (int64_t feature = threadIdx.x; feature < feature_count;
+         feature += blockDim.x) {
+      float pooled = 0.0f;
+      if (has_choice) {
+        for (int index = 0; index < selected.count; ++index) {
+          const int64_t value_offset =
+              (row * choice_count + selected.columns[index]) * feature_count + feature;
+          pooled += probabilities[index] * static_cast<float>(values[value_offset]);
+        }
+      }
+      output[output_offset + feature] = pooled;
+    }
+    __syncthreads();
+  }
+}
+
+template <typename logit_t, typename mask_t, typename value_t>
+void launch_indexed_masked_softmax_pool(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values, torch::Tensor& output,
+    int blocks, int threads, hipStream_t stream, int64_t row_count,
+    int64_t choice_count, int64_t feature_count, IndexedPoolChoices selected) {
+  hipLaunchKernelGGL(
+      (indexed_masked_softmax_pool_kernel<logit_t, mask_t, value_t>),
+      dim3(blocks), dim3(threads), 0, stream, logits.data_ptr<logit_t>(),
+      mask.data_ptr<mask_t>(), values.data_ptr<value_t>(), output.data_ptr<float>(),
+      row_count, choice_count, feature_count, selected);
+}
+
+template <typename logit_t, typename mask_t>
+void dispatch_indexed_pool_value_type(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values, torch::Tensor& output,
+    int blocks, int threads, hipStream_t stream, int64_t row_count,
+    int64_t choice_count, int64_t feature_count, IndexedPoolChoices selected) {
+  switch (values.scalar_type()) {
+    case torch::kFloat32:
+      launch_indexed_masked_softmax_pool<logit_t, mask_t, float>(logits, mask,
+          values, output, blocks, threads, stream, row_count, choice_count,
+          feature_count, selected);
+      break;
+    case torch::kFloat16:
+      launch_indexed_masked_softmax_pool<logit_t, mask_t, c10::Half>(logits, mask,
+          values, output, blocks, threads, stream, row_count, choice_count,
+          feature_count, selected);
+      break;
+    case torch::kBFloat16:
+      launch_indexed_masked_softmax_pool<logit_t, mask_t, c10::BFloat16>(logits,
+          mask, values, output, blocks, threads, stream, row_count, choice_count,
+          feature_count, selected);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported indexed masked softmax pool value data type");
+  }
+}
+
+template <typename logit_t>
+void dispatch_indexed_pool_mask_type(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values, torch::Tensor& output,
+    int blocks, int threads, hipStream_t stream, int64_t row_count,
+    int64_t choice_count, int64_t feature_count, IndexedPoolChoices selected) {
+  switch (mask.scalar_type()) {
+    case torch::kBool:
+      dispatch_indexed_pool_value_type<logit_t, bool>(logits, mask, values, output,
+          blocks, threads, stream, row_count, choice_count, feature_count, selected);
+      break;
+    case torch::kFloat32:
+      dispatch_indexed_pool_value_type<logit_t, float>(logits, mask, values, output,
+          blocks, threads, stream, row_count, choice_count, feature_count, selected);
+      break;
+    case torch::kFloat16:
+      dispatch_indexed_pool_value_type<logit_t, c10::Half>(logits, mask, values,
+          output, blocks, threads, stream, row_count, choice_count, feature_count,
+          selected);
+      break;
+    case torch::kBFloat16:
+      dispatch_indexed_pool_value_type<logit_t, c10::BFloat16>(logits, mask,
+          values, output, blocks, threads, stream, row_count, choice_count,
+          feature_count, selected);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported indexed masked softmax pool mask data type");
   }
 }
 
@@ -2317,6 +2448,29 @@ bool supports_grouped_masked_softmax_pool(
   return logits.size(-1) <= device_properties(logits.get_device()).warpSize;
 }
 
+bool supports_indexed_masked_softmax_pool(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values,
+    at::IntArrayRef choice_indices) {
+  const bool supported_mask = mask.scalar_type() == torch::kBool ||
+      is_fused_floating(mask);
+  if (!logits.is_cuda() || !logits.is_contiguous() || !mask.is_contiguous() ||
+      !values.is_contiguous() || !is_fused_floating(logits) ||
+      !supported_mask || !is_fused_floating(values) ||
+      logits.device() != mask.device() || logits.device() != values.device() ||
+      logits.dim() == 0 || mask.sizes() != logits.sizes() ||
+      values.dim() != logits.dim() + 1 || values.size(-1) <= 0 ||
+      choice_indices.empty() ||
+      choice_indices.size() > static_cast<size_t>(kMaximumIndexedPoolChoices)) {
+    return false;
+  }
+  for (int64_t dimension = 0; dimension < logits.dim(); ++dimension) {
+    if (values.size(dimension) != logits.size(dimension)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices) {
   return rows.is_cuda() && rows.is_contiguous() && is_fused_floating(rows) &&
          row_indices.is_cuda() && row_indices.is_contiguous() &&
@@ -2585,6 +2739,46 @@ torch::Tensor grouped_masked_softmax_pool_forward(
         }
       });
   check_hip_kernel_launch("grouped_masked_softmax_pool");
+  return output;
+}
+
+torch::Tensor indexed_masked_softmax_pool_forward(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values,
+    at::IntArrayRef choice_indices) {
+  TORCH_CHECK(supports_indexed_masked_softmax_pool(
+      logits, mask, values, choice_indices),
+      "indexed masked softmax pool received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(logits.device());
+  const int64_t choice_count = logits.size(-1);
+  const int64_t row_count = logits.numel() / choice_count;
+  const int64_t feature_count = values.size(-1);
+  auto output_shape = logits.sizes().vec();
+  output_shape.pop_back();
+  output_shape.push_back(feature_count);
+  auto output = torch::empty(output_shape, logits.options().dtype(torch::kFloat32));
+  if (row_count == 0) {
+    return output;
+  }
+  IndexedPoolChoices selected{};
+  selected.count = static_cast<int32_t>(choice_indices.size());
+  for (size_t index = 0; index < choice_indices.size(); ++index) {
+    selected.columns[index] = static_cast<int32_t>(choice_indices[index]);
+  }
+  const auto& properties = device_properties(logits.get_device());
+  const int threads = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().masked_categorical_threads_per_block,
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(row_count, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+      logits.scalar_type(), "indexed_masked_softmax_pool_logits", [&] {
+        dispatch_indexed_pool_mask_type<scalar_t>(logits, mask, values, output,
+            blocks, threads, stream, row_count, choice_count, feature_count,
+            selected);
+      });
+  check_hip_kernel_launch("indexed_masked_softmax_pool");
   return output;
 }
 

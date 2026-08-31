@@ -23,6 +23,10 @@ torch::Tensor masked_softmax(const torch::Tensor& logits, const torch::Tensor& m
 torch::Tensor grouped_masked_softmax_pool(
     const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values);
 
+torch::Tensor indexed_masked_softmax_pool(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values,
+    at::IntArrayRef choice_indices);
+
 torch::Tensor masked_log_sum_exp(const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis);
 
 }  // namespace djl::pytorch

@@ -1056,6 +1056,15 @@ public final class JniUtils {
                         logits.getHandle(), mask.getHandle(), values.getHandle()));
     }
 
+    /** Pools selected values with masked softmax weights without materializing the subset. */
+    public static PtNDArray indexedMaskedSoftmaxPool(
+            PtNDArray logits, PtNDArray mask, PtNDArray values, int[] choiceIndices) {
+        return new PtNDArray(
+                logits.getManager(),
+                PyTorchLibrary.LIB.torchIndexedMaskedSoftmaxPool(
+                        logits.getHandle(), mask.getHandle(), values.getHandle(), choiceIndices));
+    }
+
     /** Returns the float32 log normalizer over legal mask entries. */
     public static PtNDArray maskedLogSumExp(PtNDArray logits, PtNDArray mask, long axis) {
         return new PtNDArray(

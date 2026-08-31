@@ -89,6 +89,37 @@ void validate_grouped_pool_shapes(
       "grouped masked softmax tensors must use the same device");
 }
 
+void validate_indexed_pool_shapes(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values,
+    at::IntArrayRef choice_indices) {
+  TORCH_CHECK(logits.dim() > 0,
+      "indexed masked softmax logits must have at least one dimension");
+  TORCH_CHECK(mask.sizes() == logits.sizes(),
+      "indexed masked softmax mask must match logits");
+  TORCH_CHECK(values.dim() == logits.dim() + 1,
+      "indexed masked softmax values must add a trailing feature dimension");
+  for (int64_t dimension = 0; dimension < logits.dim(); ++dimension) {
+    TORCH_CHECK(values.size(dimension) == logits.size(dimension),
+        "indexed masked softmax value dimensions must match logits");
+  }
+  TORCH_CHECK(values.size(-1) > 0,
+      "indexed masked softmax requires a non-empty feature dimension");
+  TORCH_CHECK(mask.device() == logits.device() && values.device() == logits.device(),
+      "indexed masked softmax tensors must use the same device");
+  TORCH_CHECK(!choice_indices.empty(),
+      "indexed masked softmax requires at least one choice index");
+  const int64_t choice_count = logits.size(-1);
+  for (size_t index = 0; index < choice_indices.size(); ++index) {
+    const int64_t choice = choice_indices[index];
+    TORCH_CHECK(choice >= 0 && choice < choice_count,
+        "indexed masked softmax choice index is out of range: ", choice);
+    for (size_t previous = 0; previous < index; ++previous) {
+      TORCH_CHECK(choice_indices[previous] != choice,
+          "indexed masked softmax choice indices must be unique: ", choice);
+    }
+  }
+}
+
 torch::Tensor grouped_masked_softmax_pool_reference(
     const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values) {
   const int64_t choice_axis = logits.dim() - 1;
@@ -102,6 +133,21 @@ torch::Tensor grouped_masked_softmax_pool_reference(
   return torch::where(present, pooled, torch::zeros_like(pooled))
       .movedim(choice_axis, 0)
       .contiguous();
+}
+
+torch::Tensor indexed_masked_softmax_pool_reference(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values,
+    at::IntArrayRef choice_indices) {
+  auto index = torch::tensor(choice_indices.vec(),
+      torch::TensorOptions().dtype(torch::kLong).device(logits.device()));
+  auto selected_logits = logits.index_select(-1, index);
+  auto selected_mask = mask.to(torch::kBool).index_select(-1, index);
+  auto selected_values = values.index_select(-2, index);
+  auto weights = masked_softmax_reference(selected_logits, selected_mask, -1);
+  auto pooled =
+      selected_values.to(torch::kFloat32).mul(weights.unsqueeze(-1)).sum(-2);
+  auto present = selected_mask.any(-1).unsqueeze(-1);
+  return torch::where(present, pooled, torch::zeros_like(pooled));
 }
 
 #if defined(DJL_USE_ROCM_KERNELS)
@@ -180,6 +226,25 @@ torch::Tensor grouped_masked_softmax_pool(
   }
 #endif
   return grouped_masked_softmax_pool_reference(logits, boolean_mask, values);
+}
+
+torch::Tensor indexed_masked_softmax_pool(const torch::Tensor& logits,
+    const torch::Tensor& mask, const torch::Tensor& values,
+    at::IntArrayRef choice_indices) {
+  validate_indexed_pool_shapes(logits, mask, values, choice_indices);
+#if defined(DJL_USE_ROCM_KERNELS)
+  auto contiguous_logits = logits.contiguous();
+  auto contiguous_mask = mask.contiguous();
+  auto contiguous_values = values.contiguous();
+  if ((!at::GradMode::is_enabled() ||
+          (!logits.requires_grad() && !values.requires_grad())) &&
+      rocm::supports_indexed_masked_softmax_pool(
+          contiguous_logits, contiguous_mask, contiguous_values, choice_indices)) {
+    return rocm::indexed_masked_softmax_pool_forward(
+        contiguous_logits, contiguous_mask, contiguous_values, choice_indices);
+  }
+#endif
+  return indexed_masked_softmax_pool_reference(logits, mask, values, choice_indices);
 }
 
 torch::Tensor masked_log_sum_exp(

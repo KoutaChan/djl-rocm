@@ -79,6 +79,82 @@ public class MaskedCategoricalTest {
     }
 
     @Test
+    public void indexedMaskedSoftmaxPoolSelectsWithoutMaterializingAllChoices() {
+        try (NDManager manager = NDManager.newBaseManager(Device.cpu())) {
+            NDArray logits =
+                    manager.create(
+                            new float[] {7f, 0f, 9f, 2f, (float) Math.log(3), 4f, 5f, 6f, 7f, 8f},
+                            new Shape(2, 5));
+            NDArray mask =
+                    manager.create(
+                            new int[] {
+                                1, 1, 0, 0, 1,
+                                1, 0, 1, 0, 0
+                            },
+                            new Shape(2, 5));
+            NDArray values =
+                    manager.create(
+                            new float[] {
+                                100f,
+                                100f,
+                                2f,
+                                4f,
+                                Float.NaN,
+                                Float.POSITIVE_INFINITY,
+                                6f,
+                                8f,
+                                10f,
+                                12f,
+                                1f,
+                                2f,
+                                Float.NaN,
+                                Float.NaN,
+                                3f,
+                                4f,
+                                Float.NaN,
+                                Float.NaN,
+                                Float.NaN,
+                                Float.NaN
+                            },
+                            new Shape(2, 5, 2));
+
+            NDArray pooled = NDArrays.indexedMaskedSoftmaxPool(logits, mask, values, 4, 1, 3);
+
+            Assert.assertEquals(pooled.getShape(), new Shape(2, 2));
+            Assert.assertEquals(pooled.getDataType(), DataType.FLOAT32);
+            assertClose(pooled.toFloatArray(), new float[] {8f, 10f, 0f, 0f}, 1e-6f);
+            Assert.expectThrows(
+                    IllegalArgumentException.class,
+                    () -> NDArrays.indexedMaskedSoftmaxPool(logits, mask, values, 1, 1));
+        }
+    }
+
+    @Test
+    public void indexedMaskedSoftmaxPoolNativeMatchesSelectedEagerReference() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        DataType[][] dataTypes = {
+            {DataType.FLOAT32, DataType.FLOAT32, DataType.FLOAT32},
+            {DataType.FLOAT16, DataType.FLOAT16, DataType.FLOAT16},
+            {DataType.BFLOAT16, DataType.BFLOAT16, DataType.BFLOAT16},
+            {DataType.FLOAT32, DataType.BOOLEAN, DataType.FLOAT16},
+            {DataType.FLOAT32, DataType.BOOLEAN, DataType.BFLOAT16},
+            {DataType.FLOAT16, DataType.FLOAT32, DataType.FLOAT32},
+            {DataType.BFLOAT16, DataType.FLOAT32, DataType.FLOAT32}
+        };
+        for (long batch : new long[] {384, 1408}) {
+            for (int[] choices : new int[][] {{1, 4, 7}, {3, 8}}) {
+                for (DataType[] types : dataTypes) {
+                    verifyIndexedPoolGpuParity(
+                            engine, batch, choices, types[0], types[1], types[2]);
+                }
+            }
+        }
+    }
+
+    @Test
     public void nativeForwardAndBackwardMatchCpuReference() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -152,6 +228,103 @@ public class MaskedCategoricalTest {
             Assert.assertTrue(Float.isNaN(probabilities[1]));
             Assert.assertEquals(probabilities[2], 0f);
             Assert.assertTrue(Float.isNaN(normalizer));
+        }
+    }
+
+    private static void verifyIndexedPoolGpuParity(
+            Engine engine,
+            long batch,
+            int[] choices,
+            DataType logitType,
+            DataType maskType,
+            DataType valueType) {
+        final int choiceCount = 10;
+        final int featureCount = 256;
+        int rows = Math.toIntExact(batch);
+        float[] logitData = new float[rows * choiceCount];
+        float[] maskData = new float[rows * choiceCount];
+        float[] valueData = new float[rows * choiceCount * featureCount];
+        for (int row = 0; row < rows; ++row) {
+            for (int choice = 0; choice < choiceCount; ++choice) {
+                int choiceOffset = row * choiceCount + choice;
+                logitData[choiceOffset] = ((row * 17 + choice * 7) % 23 - 11) * 0.125f;
+                maskData[choiceOffset] = (row + choice * 3) % 5 == 0 ? 0f : 1f;
+                for (int feature = 0; feature < featureCount; ++feature) {
+                    int valueOffset = choiceOffset * featureCount + feature;
+                    valueData[valueOffset] =
+                            ((row * 13 + choice * 19 + feature * 3) % 101 - 50) * 0.03125f;
+                }
+            }
+            if (row % 37 == 0) {
+                for (int choice : choices) {
+                    maskData[row * choiceCount + choice] = 0f;
+                }
+            }
+        }
+
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray logits =
+                    manager.create(logitData, new Shape(batch, choiceCount))
+                            .toType(logitType, false);
+            NDArray mask =
+                    manager.create(maskData, new Shape(batch, choiceCount)).toType(maskType, false);
+            NDArray values =
+                    manager.create(valueData, new Shape(batch, choiceCount, featureCount))
+                            .toType(valueType, false);
+            NDArray actual = NDArrays.indexedMaskedSoftmaxPool(logits, mask, values, choices);
+
+            ai.djl.ndarray.NDList selectedLogits = new ai.djl.ndarray.NDList(choices.length);
+            ai.djl.ndarray.NDList selectedMasks = new ai.djl.ndarray.NDList(choices.length);
+            ai.djl.ndarray.NDList selectedValues = new ai.djl.ndarray.NDList(choices.length);
+            for (int choice : choices) {
+                selectedLogits.add(logits.get("...,{}", choice).expandDims(-1));
+                selectedMasks.add(mask.get("...,{}", choice).expandDims(-1));
+                selectedValues.add(values.get("...,{},:", choice).expandDims(-2));
+            }
+            NDArray selectedLogitArray = NDArrays.concat(selectedLogits, -1);
+            NDArray selectedMaskArray = NDArrays.concat(selectedMasks, -1);
+            NDArray weights = NDArrays.maskedSoftmax(selectedLogitArray, selectedMaskArray, -1);
+            NDArray expected =
+                    NDArrays.concat(selectedValues, -2)
+                            .toType(DataType.FLOAT32, false)
+                            .mul(weights.expandDims(-1))
+                            .sum(new int[] {1});
+            NDArray present =
+                    selectedMaskArray
+                            .neq(0)
+                            .sum(new int[] {1})
+                            .gt(0)
+                            .expandDims(-1)
+                            .broadcast(expected.getShape());
+            expected = NDArrays.where(present, expected, expected.zerosLike());
+
+            float[] actualData = actual.toFloatArray();
+            float[] expectedData = expected.toFloatArray();
+            Assert.assertEquals(actualData.length, expectedData.length);
+            float maxAbs = 0f;
+            for (int index = 0; index < actualData.length; ++index) {
+                Assert.assertTrue(Float.isFinite(actualData[index]), "actual index=" + index);
+                Assert.assertTrue(Float.isFinite(expectedData[index]), "expected index=" + index);
+                maxAbs = Math.max(maxAbs, Math.abs(actualData[index] - expectedData[index]));
+            }
+            float tolerance =
+                    logitType == DataType.BFLOAT16 || valueType == DataType.BFLOAT16
+                            ? 2e-2f
+                            : logitType == DataType.FLOAT16 || valueType == DataType.FLOAT16
+                                    ? 2e-3f
+                                    : 2e-5f;
+            Assert.assertTrue(maxAbs <= tolerance, "maxAbs=" + maxAbs + ", tolerance=" + tolerance);
+            System.out.printf(
+                    java.util.Locale.ROOT,
+                    "INDEXED_MASKED_POOL_PARITY batch=%d choices=%d logits=%s mask=%s values=%s"
+                        + " maxAbs=%.9g tolerance=%.9g%n",
+                    batch,
+                    choices.length,
+                    logitType,
+                    maskType,
+                    valueType,
+                    maxAbs,
+                    tolerance);
         }
     }
 

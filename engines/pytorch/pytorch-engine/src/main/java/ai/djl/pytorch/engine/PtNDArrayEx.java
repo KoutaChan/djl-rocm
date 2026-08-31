@@ -178,6 +178,17 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray indexedMaskedSoftmaxPool(NDArray mask, NDArray values, int[] choiceIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.indexedMaskedSoftmaxPool(mask, values, choiceIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.indexedMaskedSoftmaxPool(
+                array, manager.from(mask), manager.from(values), choiceIndices);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray maskedLogSumExp(NDArray mask, int axis) {
         PtNDManager manager = array.getManager();
         return JniUtils.maskedLogSumExp(array, manager.from(mask), axis);

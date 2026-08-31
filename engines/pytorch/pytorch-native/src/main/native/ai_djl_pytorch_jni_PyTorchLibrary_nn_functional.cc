@@ -257,6 +257,27 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchG
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIndexedMaskedSoftmaxPool(
+    JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jvalues,
+    jintArray jchoice_indices) {
+  API_BEGIN()
+  const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto& values = *reinterpret_cast<torch::Tensor*>(jvalues);
+  const jsize choice_count = env->GetArrayLength(jchoice_indices);
+  std::vector<jint> raw_indices(static_cast<size_t>(choice_count));
+  env->GetIntArrayRegion(jchoice_indices, 0, choice_count, raw_indices.data());
+  std::vector<int64_t> choice_indices;
+  choice_indices.reserve(static_cast<size_t>(choice_count));
+  for (jint choice : raw_indices) {
+    choice_indices.push_back(static_cast<int64_t>(choice));
+  }
+  const auto* result = new torch::Tensor(
+      djl::pytorch::indexed_masked_softmax_pool(logits, mask, values, choice_indices));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedLogSumExp(
     JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
   API_BEGIN()
