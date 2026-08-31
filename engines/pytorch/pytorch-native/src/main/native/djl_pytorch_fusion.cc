@@ -437,6 +437,8 @@ struct FusionExecutableData {
   std::vector<torch::Tensor> indexed_affine_weights;
   std::vector<std::vector<std::array<torch::Tensor, 4>>>
       transformer_encoder_weights;
+  std::vector<std::vector<std::shared_ptr<LinearBiasSiluPlan>>>
+      transformer_expansion_plans;
   std::vector<std::vector<IndexedRelationBlockWeights>>
       indexed_relation_transformer_weights;
   std::vector<torch::Tensor> indexed_relation_ids;
@@ -3153,10 +3155,17 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
           feed_forward_input_bias, normalized, active_rows,
           command.hidden_width, command.epsilon);
     }
-    at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
-    LaunchTransformerBiasSilu(
-        expanded, expansion_bias, active_rows, command.feed_forward_width,
-        indexed_relation);
+    if (!(indexed_relation &&
+            ExecuteLinearBiasSilu(
+                session.executable->transformer_expansion_plans[command_index]
+                    [block_index],
+                expanded_matrix, normalized_matrix, weights[2],
+                expansion_bias))) {
+      at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
+      LaunchTransformerBiasSilu(
+          expanded, expansion_bias, active_rows, command.feed_forward_width,
+          indexed_relation);
+    }
     at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
     torch::Tensor& normalized_output =
         indexed_relation && block_index + 1 < command.blocks.size() ? normalized : state;
@@ -3471,6 +3480,7 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
   data->affine_products.resize(plan->data->commands.size());
   data->indexed_affine_weights.resize(plan->data->commands.size());
   data->transformer_encoder_weights.resize(plan->data->commands.size());
+  data->transformer_expansion_plans.resize(plan->data->commands.size());
   data->indexed_relation_transformer_weights.resize(
       plan->data->commands.size());
   data->indexed_relation_ids.resize(plan->data->commands.size());
@@ -3499,8 +3509,14 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
         auto& executable_blocks =
             data->transformer_encoder_weights[command_index];
         executable_blocks.resize(transformer_command->blocks.size());
+        auto& expansion_plans =
+            data->transformer_expansion_plans[command_index];
+        expansion_plans.resize(transformer_command->blocks.size());
         for (std::size_t block_index = 0;
              block_index < transformer_command->blocks.size(); ++block_index) {
+          if (transformer_command->relation_ids_value_index >= 0) {
+            expansion_plans[block_index] = CreateLinearBiasSiluPlan();
+          }
           const auto& block = transformer_command->blocks[block_index];
           const std::array<int32_t, 4> binding_indices{
               block.query_key_value_weight_binding_index,
