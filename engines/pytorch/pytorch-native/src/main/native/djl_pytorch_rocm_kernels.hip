@@ -1186,6 +1186,17 @@ struct MappedGroupedIndexedAttentionLayout {
 };
 
 template <typename scalar_t>
+__device__ __forceinline__ float round_mapped_attention_value(float value) {
+  // The eager BF16 fallback materializes every elementwise boundary before the
+  // following reduction. Preserve those boundaries while retaining the
+  // existing FP32 accumulation path for FLOAT16 and FLOAT32.
+  if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+    return static_cast<float>(static_cast<scalar_t>(value));
+  }
+  return value;
+}
+
+template <typename scalar_t>
 __global__ void mapped_grouped_indexed_attention_kernel(const scalar_t* query,
     const scalar_t* shared_key_values, const int32_t* shared_group_indices,
     const scalar_t* shared_delta_table, const int32_t* shared_delta_indices,
@@ -1251,9 +1262,11 @@ __global__ void mapped_grouped_indexed_attention_kernel(const scalar_t* query,
               shared_token
                   ? static_cast<float>(shared_delta_table[delta_offset + packed_feature])
                   : static_cast<float>(indexed_deltas[delta_offset + packed_feature]);
-          score += query_values[feature] * (base + delta);
+          const float key = round_mapped_attention_value<scalar_t>(base + delta);
+          score += round_mapped_attention_value<scalar_t>(query_values[feature] * key);
         }
-        score *= scale;
+        score = round_mapped_attention_value<scalar_t>(score);
+        score = round_mapped_attention_value<scalar_t>(score * scale);
       }
       shared_indices[attended_token] = present ? static_cast<int32_t>(shared_index) : -1;
       token_weights[attended_token] = score;
@@ -1307,11 +1320,22 @@ __global__ void mapped_grouped_indexed_attention_kernel(const scalar_t* query,
             shared_token
                 ? static_cast<float>(shared_delta_table[delta_offset + packed_feature])
                 : static_cast<float>(indexed_deltas[delta_offset + packed_feature]);
-        context += token_weights[attended_token] * (base + delta);
+        const float value = round_mapped_attention_value<scalar_t>(base + delta);
+        if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+          const float normalized_weight =
+              round_mapped_attention_value<scalar_t>(token_weights[attended_token] * inverse_sum);
+          context += round_mapped_attention_value<scalar_t>(normalized_weight * value);
+        } else {
+          context += token_weights[attended_token] * value;
+        }
       }
     }
-    output[query_head * layout.value_features + feature] =
-        static_cast<scalar_t>(context * inverse_sum);
+    if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+      output[query_head * layout.value_features + feature] = static_cast<scalar_t>(context);
+    } else {
+      output[query_head * layout.value_features + feature] =
+          static_cast<scalar_t>(context * inverse_sum);
+    }
   }
 }
 

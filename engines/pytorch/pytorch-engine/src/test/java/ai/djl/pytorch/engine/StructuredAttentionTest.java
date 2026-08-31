@@ -28,6 +28,7 @@ import org.testng.annotations.Test;
 public class StructuredAttentionTest {
 
     private static final int[] MAPPED_ATTENTION_SEEDS = {20260901, 20260903, 20260907, 20260909};
+    private static final int MAPPED_ATTENTION_BFLOAT16_ROUNDING_SEED = 20260907;
 
     @Test
     public void relationAttentionUsesPairwiseBias() {
@@ -309,6 +310,23 @@ public class StructuredAttentionTest {
                     printMappedAttentionComparison(dataType, seed, comparison);
                 }
             }
+        }
+    }
+
+    @Test
+    public void mappedGroupedAttentionNativeBfloat16PreservesEagerRoundingBoundaries() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        engine.setRandomSeed(MAPPED_ATTENTION_BFLOAT16_ROUNDING_SEED);
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            AttentionComparison comparison =
+                    verifyMappedGroupedAttentionForward(
+                            manager, DataType.BFLOAT16, MappedAttentionPath.INT32_NATIVE);
+            System.out.printf(
+                    "MAPPED_GROUPED_ATTENTION_BFLOAT16_ROUNDING seed=%d maxAbs=%g%n",
+                    MAPPED_ATTENTION_BFLOAT16_ROUNDING_SEED, comparison.maximumAbsoluteError);
         }
     }
 
