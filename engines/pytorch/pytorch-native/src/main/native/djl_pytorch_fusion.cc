@@ -3022,9 +3022,12 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
         expanded, expansion_bias, active_rows, command.feed_forward_width,
         indexed_relation);
     at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
+    torch::Tensor& normalized_output =
+        indexed_relation && block_index + 1 < command.blocks.size() ? normalized : state;
     LaunchTransformerResidualLayerNorm(state, normalized,
-        projection_bias, output_weight, output_bias, state, active_rows,
-        command.hidden_width, command.epsilon, indexed_relation);
+        projection_bias, output_weight, output_bias, normalized_output,
+        active_rows, command.hidden_width, command.epsilon,
+        indexed_relation);
   }
 }
 
