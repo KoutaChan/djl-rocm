@@ -19,6 +19,7 @@ namespace {
 
 // Bound register-backed specializations; wider rows retain the original two-pass kernel.
 constexpr int kResidualCachedValuesPerLaneLimit = 16;
+constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
 
 void check_hip_kernel_launch(const char* kernel_name) {
   const hipError_t error = hipGetLastError();
@@ -1083,6 +1084,67 @@ __global__ void residual_add_layer_norm_cached_in_place_kernel(residual_t* resid
   }
 }
 
+template <int cached_values_per_lane, typename input_t, typename parameter_t>
+__global__ void autocast_layer_norm_kernel(const input_t* input, const parameter_t* weight,
+    const parameter_t* bias, float* output, int64_t row_count, int64_t width, float epsilon) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+  if (row >= row_count) {
+    return;
+  }
+
+  float cached_values[cached_values_per_lane];
+  float mean = 0.0f;
+  float moment = 0.0f;
+  int count = 0;
+  const int64_t row_offset = row * width;
+#pragma unroll
+  for (int cached_index = 0; cached_index < cached_values_per_lane; cached_index++) {
+    const int64_t feature = lane + static_cast<int64_t>(cached_index) * warpSize;
+    if (feature < width) {
+      const float value = static_cast<float>(input[row_offset + feature]);
+      cached_values[cached_index] = value;
+      count++;
+      const float delta = value - mean;
+      mean += delta / count;
+      moment += delta * (value - mean);
+    }
+  }
+
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    const float other_mean = __shfl_down(mean, offset);
+    const float other_moment = __shfl_down(moment, offset);
+    const int other_count = __shfl_down(count, offset);
+    if (lane + offset < warpSize && other_count > 0) {
+      const int combined_count = count + other_count;
+      const float delta = other_mean - mean;
+      moment += other_moment + delta * delta * static_cast<float>(count) *
+                                   static_cast<float>(other_count) /
+                                   static_cast<float>(combined_count);
+      mean += delta * static_cast<float>(other_count) /
+              static_cast<float>(combined_count);
+      count = combined_count;
+    }
+  }
+  mean = __shfl(mean, 0);
+  const float inverse_standard_deviation =
+      rsqrtf(__shfl(moment, 0) / static_cast<float>(width) + epsilon);
+
+#pragma unroll
+  for (int cached_index = 0; cached_index < cached_values_per_lane; cached_index++) {
+    const int64_t feature = lane + static_cast<int64_t>(cached_index) * warpSize;
+    if (feature < width) {
+      const float normalized =
+          (cached_values[cached_index] - mean) * inverse_standard_deviation;
+      output[row_offset + feature] =
+          normalized * static_cast<float>(weight[feature]) +
+          static_cast<float>(bias[feature]);
+    }
+  }
+}
+
 const hipDeviceProp_t& device_properties(int device) {
   static const std::vector<hipDeviceProp_t> all_properties = [] {
     int device_count;
@@ -1225,6 +1287,20 @@ void dispatch_residual_cached_values_per_lane(int values_per_lane, Callback&& ca
         values_per_lane, callback);
   } else {
     TORCH_CHECK(false, "unsupported residual cache values per lane: ", values_per_lane);
+  }
+}
+
+template <int compiled_values_per_lane = 1, typename Callback>
+void dispatch_autocast_layer_norm_cached_values_per_lane(
+    int values_per_lane, Callback&& callback) {
+  if (values_per_lane == compiled_values_per_lane) {
+    callback(std::integral_constant<int, compiled_values_per_lane>{});
+  } else if constexpr (
+      compiled_values_per_lane < kAutocastLayerNormCachedValuesPerLaneLimit) {
+    dispatch_autocast_layer_norm_cached_values_per_lane<compiled_values_per_lane + 1>(
+        values_per_lane, callback);
+  } else {
+    TORCH_CHECK(false, "unsupported autocast LayerNorm cache values per lane: ", values_per_lane);
   }
 }
 
@@ -1609,6 +1685,34 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
              residual.scalar_type(), update.scalar_type(), weight.scalar_type()) &&
          update.device() == residual.device() && weight.device() == residual.device() &&
          bias.device() == residual.device();
+}
+
+bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& bias, at::IntArrayRef normalized_shape) {
+  if (!input.is_cuda() || !input.is_contiguous() || input.dim() < 1 || input.size(-1) <= 0 ||
+      normalized_shape.size() != 1 || normalized_shape[0] != input.size(-1) ||
+      !weight.defined() || !bias.defined() || !weight.is_contiguous() || !bias.is_contiguous() ||
+      weight.dim() != 1 || weight.size(0) != input.size(-1) || bias.sizes() != weight.sizes() ||
+      (input.scalar_type() != torch::kFloat16 && input.scalar_type() != torch::kBFloat16) ||
+      (weight.scalar_type() != torch::kFloat16 && weight.scalar_type() != torch::kBFloat16) ||
+      bias.scalar_type() != weight.scalar_type() || weight.device() != input.device() ||
+      bias.device() != input.device()) {
+    return false;
+  }
+  const auto& properties = device_properties(input.get_device());
+  const int64_t width = input.size(-1);
+  const int64_t cached_values_per_lane =
+      (width + properties.warpSize - 1) / properties.warpSize;
+  if (cached_values_per_lane > kAutocastLayerNormCachedValuesPerLaneLimit) {
+    return false;
+  }
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int64_t waves_per_block = threads_per_block / properties.warpSize;
+  const int64_t row_count = input.numel() / width;
+  const int64_t grid_size = (row_count + waves_per_block - 1) / waves_per_block;
+  return grid_size <= static_cast<int64_t>(properties.maxGridSize[0]);
 }
 
 bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor& gradient,
@@ -2512,6 +2616,50 @@ torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, cons
         });
   }
   check_hip_kernel_launch("residual_add_layer_norm");
+  return output;
+}
+
+torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& bias, float epsilon) {
+  const int64_t width = input.size(-1);
+  TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, at::IntArrayRef(&width, 1)),
+      "autocast LayerNorm received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(input.device());
+  torch::Tensor output = torch::empty(input.sizes(),
+      input.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
+  if (input.numel() == 0) {
+    return output;
+  }
+
+  const int64_t row_count = input.numel() / width;
+  const auto& properties = device_properties(input.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int waves_per_block = threads_per_block / properties.warpSize;
+  const int cached_values_per_lane =
+      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
+  const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
+  const dim3 block(threads_per_block);
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(input.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, input.scalar_type(), "autocast_layer_norm_input", [&] {
+        using input_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+            weight.scalar_type(), "autocast_layer_norm_parameter", [&] {
+              using parameter_t = scalar_t;
+              dispatch_autocast_layer_norm_cached_values_per_lane(
+                  cached_values_per_lane, [&](auto cached_values) {
+                    constexpr int compiled_cached_values = decltype(cached_values)::value;
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(autocast_layer_norm_kernel<
+                                           compiled_cached_values, input_t, parameter_t>),
+                        grid, block, 0, stream, input.data_ptr<input_t>(),
+                        weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+                        output.data_ptr<float>(), row_count, width, epsilon);
+                  });
+            });
+      });
+  check_hip_kernel_launch("autocast_layer_norm");
   return output;
 }
 

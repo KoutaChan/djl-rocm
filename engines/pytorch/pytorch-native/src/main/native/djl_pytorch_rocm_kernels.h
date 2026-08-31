@@ -108,6 +108,12 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
 torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, const torch::Tensor& update,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon);
 
+bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& bias, at::IntArrayRef normalized_shape);
+
+torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& bias, float epsilon);
+
 }  // namespace djl::pytorch::rocm
 
 #endif  // DJL_PYTORCH_ROCM_KERNELS_H

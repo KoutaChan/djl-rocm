@@ -10,6 +10,7 @@
  * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
  * and limitations under the License.
  */
+#include <ATen/autocast_mode.h>
 #include <djl/utils.h>
 #include <torch/torch.h>
 
@@ -376,8 +377,21 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLayerNorm(
   if (jbias != djl::utils::jni::NULL_PTR) {
     bias = *reinterpret_cast<torch::Tensor*>(jbias);
   }
-  const auto* result_ptr = new torch::Tensor(torch::nn::functional::layer_norm(*tensor_ptr,
-      torch::nn::functional::LayerNormFuncOptions(normalized_shape_vec).weight(weight).bias(bias).eps(jeps)));
+  torch::Tensor result;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() &&
+      at::autocast::is_autocast_enabled(at::DeviceType::CUDA) &&
+      djl::pytorch::rocm::supports_autocast_layer_norm(
+          *tensor_ptr, weight, bias, normalized_shape_vec)) {
+    result = djl::pytorch::rocm::autocast_layer_norm(
+        *tensor_ptr, weight, bias, static_cast<float>(jeps));
+  } else
+#endif
+  {
+    result = torch::nn::functional::layer_norm(*tensor_ptr,
+        torch::nn::functional::LayerNormFuncOptions(normalized_shape_vec).weight(weight).bias(bias).eps(jeps));
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
 #endif
   API_END_RETURN()
