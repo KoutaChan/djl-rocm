@@ -17,6 +17,15 @@ bool supports_masked_categorical(
 
 bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices);
 
+bool supports_padded_batch_gather(
+    const torch::Tensor& source, const torch::Tensor& stored_indices);
+
+bool supports_padded_batch_gather_2d(const torch::Tensor& source,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices);
+
+bool supports_padded_batch_gather_by_batch_indices(const torch::Tensor& source,
+    const torch::Tensor& batch_indices, const torch::Tensor& stored_indices);
+
 torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::Tensor& mask);
 
 torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,
@@ -39,6 +48,15 @@ torch::Tensor scatter_rows_forward(const torch::Tensor& rows,
 
 torch::Tensor scatter_rows_backward(
     const torch::Tensor& gradient_output, const torch::Tensor& row_indices);
+
+torch::Tensor padded_batch_gather_forward(
+    const torch::Tensor& source, const torch::Tensor& stored_indices);
+
+torch::Tensor padded_batch_gather_2d_forward(const torch::Tensor& source,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices);
+
+torch::Tensor padded_batch_gather_by_batch_indices_forward(const torch::Tensor& source,
+    const torch::Tensor& batch_indices, const torch::Tensor& stored_indices);
 
 bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids);

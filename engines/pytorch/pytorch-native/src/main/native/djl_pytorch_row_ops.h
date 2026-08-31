@@ -20,6 +20,15 @@ namespace djl::pytorch {
 torch::Tensor scatter_rows(
     const torch::Tensor& rows, const torch::Tensor& row_indices, int64_t row_count);
 
+torch::Tensor padded_batch_gather(
+    const torch::Tensor& source, const torch::Tensor& stored_indices);
+
+torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices);
+
+torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
+    const torch::Tensor& batch_indices, const torch::Tensor& stored_indices);
+
 }  // namespace djl::pytorch
 
 #endif  // DJL_PYTORCH_ROW_OPS_H

@@ -29,6 +29,8 @@ inline constexpr char kMaskedCategoricalThreadsPerBlock[] =
     "DJL_ROCM_MASKED_CATEGORICAL_THREADS_PER_BLOCK";
 inline constexpr char kScatterRowsThreadsPerBlock[] =
     "DJL_ROCM_SCATTER_ROWS_THREADS_PER_BLOCK";
+inline constexpr char kPaddedBatchGatherThreadsPerBlock[] =
+    "DJL_ROCM_PADDED_BATCH_GATHER_THREADS_PER_BLOCK";
 
 }  // namespace launch_environment
 
@@ -46,6 +48,7 @@ struct RocmKernelLaunchConfig {
   int fused_adam_update_threads_per_block;
   int masked_categorical_threads_per_block;
   int scatter_rows_threads_per_block;
+  int padded_batch_gather_threads_per_block;
 };
 
 /** Returns the immutable launch configuration loaded from the process environment. */

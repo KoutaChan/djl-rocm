@@ -73,6 +73,175 @@ public interface NDArrayEx {
                 .reshape(new Shape(outputShape));
     }
 
+    /** Selects one-based per-batch table entries while preserving zero padding. */
+    default NDArray paddedBatchGather(NDArray storedIndices) {
+        NDArray source = getArray();
+        Shape sourceShape = source.getShape();
+        Shape indexShape = storedIndices.getShape();
+        if (sourceShape.dimension() < 2
+                || indexShape.dimension() < 1
+                || sourceShape.get(0) <= 0
+                || sourceShape.get(1) <= 0
+                || indexShape.get(0) != sourceShape.get(0)) {
+            throw new IllegalArgumentException(
+                    "padded batch gather requires source [B,N,...] and indices [B,...]: "
+                            + sourceShape
+                            + " / "
+                            + indexShape);
+        }
+        long batchCount = sourceShape.get(0);
+        long entries = sourceShape.get(1);
+        long indicesPerBatch = indexShape.size() / batchCount;
+        NDArray present = storedIndices.gt(0).logicalAnd(storedIndices.lte(entries)).stopGradient();
+        NDArray batchOffsets =
+                source.getManager()
+                        .arange(batchCount)
+                        .toType(DataType.INT64, false)
+                        .mul(entries)
+                        .reshape(batchCount, 1);
+        NDArray rowIndices =
+                storedIndices
+                        .reshape(batchCount, indicesPerBatch)
+                        .toType(DataType.INT64, false)
+                        .maximum(1)
+                        .minimum(entries)
+                        .sub(1)
+                        .add(batchOffsets)
+                        .reshape(indexShape.size())
+                        .stopGradient();
+        return zeroPaddedGatherResult(source, storedIndices, present, rowIndices, 2);
+    }
+
+    /** Selects one-based entries from two per-batch table dimensions. */
+    default NDArray paddedBatchGather(NDArray outerStoredIndices, NDArray innerStoredIndices) {
+        NDArray source = getArray();
+        Shape sourceShape = source.getShape();
+        Shape indexShape = outerStoredIndices.getShape();
+        if (sourceShape.dimension() < 3
+                || indexShape.dimension() < 1
+                || !indexShape.equals(innerStoredIndices.getShape())
+                || sourceShape.get(0) <= 0
+                || sourceShape.get(1) <= 0
+                || sourceShape.get(2) <= 0
+                || indexShape.get(0) != sourceShape.get(0)) {
+            throw new IllegalArgumentException(
+                    "two-dimensional padded batch gather requires source [B,N,M,...] and "
+                            + "matching indices [B,...]: "
+                            + sourceShape
+                            + " / "
+                            + indexShape
+                            + " / "
+                            + innerStoredIndices.getShape());
+        }
+        long batchCount = sourceShape.get(0);
+        long outerEntries = sourceShape.get(1);
+        long innerEntries = sourceShape.get(2);
+        long indicesPerBatch = indexShape.size() / batchCount;
+        NDArray present =
+                outerStoredIndices
+                        .gt(0)
+                        .logicalAnd(outerStoredIndices.lte(outerEntries))
+                        .logicalAnd(innerStoredIndices.gt(0))
+                        .logicalAnd(innerStoredIndices.lte(innerEntries))
+                        .stopGradient();
+        NDArray batchOffsets =
+                source.getManager()
+                        .arange(batchCount)
+                        .toType(DataType.INT64, false)
+                        .mul(Math.multiplyExact(outerEntries, innerEntries))
+                        .reshape(batchCount, 1);
+        NDArray rowIndices =
+                outerStoredIndices
+                        .reshape(batchCount, indicesPerBatch)
+                        .toType(DataType.INT64, false)
+                        .maximum(1)
+                        .minimum(outerEntries)
+                        .sub(1)
+                        .mul(innerEntries)
+                        .add(
+                                innerStoredIndices
+                                        .reshape(batchCount, indicesPerBatch)
+                                        .toType(DataType.INT64, false)
+                                        .maximum(1)
+                                        .minimum(innerEntries)
+                                        .sub(1))
+                        .add(batchOffsets)
+                        .reshape(indexShape.size())
+                        .stopGradient();
+        return zeroPaddedGatherResult(source, outerStoredIndices, present, rowIndices, 3);
+    }
+
+    /** Selects one-based table entries using explicit zero-based batch indices. */
+    default NDArray paddedBatchGatherByBatchIndices(NDArray batchIndices, NDArray storedIndices) {
+        NDArray source = getArray();
+        Shape sourceShape = source.getShape();
+        if (sourceShape.dimension() < 2
+                || sourceShape.get(0) <= 0
+                || sourceShape.get(1) <= 0
+                || !batchIndices.getShape().equals(storedIndices.getShape())) {
+            throw new IllegalArgumentException(
+                    "explicit-batch padded gather requires source [B,N,...] and matching index "
+                            + "shapes: "
+                            + sourceShape
+                            + " / "
+                            + batchIndices.getShape()
+                            + " / "
+                            + storedIndices.getShape());
+        }
+        long batchCount = sourceShape.get(0);
+        long entries = sourceShape.get(1);
+        NDArray present =
+                storedIndices
+                        .gt(0)
+                        .logicalAnd(storedIndices.lte(entries))
+                        .logicalAnd(batchIndices.gte(0))
+                        .logicalAnd(batchIndices.lt(batchCount))
+                        .stopGradient();
+        NDArray rowIndices =
+                batchIndices
+                        .toType(DataType.INT64, false)
+                        .maximum(0)
+                        .minimum(batchCount - 1)
+                        .mul(entries)
+                        .add(
+                                storedIndices
+                                        .toType(DataType.INT64, false)
+                                        .maximum(1)
+                                        .minimum(entries)
+                                        .sub(1))
+                        .reshape(storedIndices.getShape().size())
+                        .stopGradient();
+        return zeroPaddedGatherResult(source, storedIndices, present, rowIndices, 2);
+    }
+
+    /** Builds the portable padded-gather result after its flattened row indices are known. */
+    static NDArray zeroPaddedGatherResult(
+            NDArray source,
+            NDArray storedIndices,
+            NDArray present,
+            NDArray rowIndices,
+            int indexedDimensions) {
+        Shape sourceShape = source.getShape();
+        Shape indexShape = storedIndices.getShape();
+        long tableRows = sourceShape.slice(0, indexedDimensions).size();
+        Shape trailingShape = sourceShape.slice(indexedDimensions);
+        long rowWidth = trailingShape.size();
+        NDArray gathered = NDArrays.gatherRows(source.reshape(tableRows, rowWidth), rowIndices);
+        long[] outputDimensions = new long[indexShape.dimension() + trailingShape.dimension()];
+        System.arraycopy(indexShape.getShape(), 0, outputDimensions, 0, indexShape.dimension());
+        System.arraycopy(
+                trailingShape.getShape(),
+                0,
+                outputDimensions,
+                indexShape.dimension(),
+                trailingShape.dimension());
+        NDArray paddingMask = present.toType(source.getDataType(), false);
+        for (int axis = 0; axis < trailingShape.dimension(); axis++) {
+            paddingMask = paddingMask.expandDims(indexShape.dimension());
+        }
+        return gathered.reshape(new Shape(outputDimensions)).mul(paddingMask);
+    }
+
     /** Returns float32 probabilities normalized over nonzero mask entries. */
     default NDArray maskedSoftmax(NDArray mask, int axis) {
         NDArray logits = getArray().toType(DataType.FLOAT32, false);

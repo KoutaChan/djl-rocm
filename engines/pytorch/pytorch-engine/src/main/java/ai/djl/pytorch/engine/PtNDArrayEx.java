@@ -60,6 +60,38 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray paddedBatchGather(NDArray storedIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.paddedBatchGather(storedIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.paddedBatchGather(array, manager.from(storedIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray paddedBatchGather(NDArray outerStoredIndices, NDArray innerStoredIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.paddedBatchGather(outerStoredIndices, innerStoredIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.paddedBatchGather(
+                array, manager.from(outerStoredIndices), manager.from(innerStoredIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray paddedBatchGatherByBatchIndices(NDArray batchIndices, NDArray storedIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.paddedBatchGatherByBatchIndices(batchIndices, storedIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.paddedBatchGatherByBatchIndices(
+                array, manager.from(batchIndices), manager.from(storedIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray maskedSoftmax(NDArray mask, int axis) {
         PtNDManager manager = array.getManager();
         return JniUtils.maskedSoftmax(array, manager.from(mask), axis);

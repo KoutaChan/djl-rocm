@@ -53,6 +53,60 @@ public final class NDArrays {
     }
 
     /**
+     * Selects entries from a separate table in every batch while preserving padding.
+     *
+     * <p>The source must be shaped {@code [batch, entries, ...]}. Stored indices are one-based and
+     * shaped {@code [batch, ...]}; zero identifies padding and produces an all-zero result. The
+     * returned shape appends every source dimension after {@code entries} to the stored-index
+     * shape.
+     *
+     * @param source batched source tables
+     * @param storedIndices one-based table indices, with zero reserved for padding
+     * @return selected entries with padding replaced by zero
+     */
+    public static NDArray paddedBatchGather(NDArray source, NDArray storedIndices) {
+        return source.getNDArrayInternal().paddedBatchGather(storedIndices);
+    }
+
+    /**
+     * Selects entries from two table dimensions in every batch while preserving padding.
+     *
+     * <p>The source must be shaped {@code [batch, outerEntries, innerEntries, ...]}. Both stored
+     * index tensors are one-based, have the same shape {@code [batch, ...]}, and reserve zero for
+     * padding. An output entry is zero when either stored index is zero. The returned shape appends
+     * every source dimension after {@code innerEntries} to the stored-index shape.
+     *
+     * @param source batched two-dimensional source tables
+     * @param outerStoredIndices one-based indices for the outer table dimension
+     * @param innerStoredIndices one-based indices for the inner table dimension
+     * @return selected entries with padding replaced by zero
+     */
+    public static NDArray paddedBatchGather(
+            NDArray source, NDArray outerStoredIndices, NDArray innerStoredIndices) {
+        return source.getNDArrayInternal()
+                .paddedBatchGather(outerStoredIndices, innerStoredIndices);
+    }
+
+    /**
+     * Selects entries from explicitly identified batch rows while preserving padding.
+     *
+     * <p>The source must be shaped {@code [batch, entries, ...]}. Batch indices are zero-based,
+     * stored indices are one-based, and both index tensors must have the same shape. A zero stored
+     * index identifies padding and produces an all-zero result. The returned shape appends every
+     * source dimension after {@code entries} to the stored-index shape.
+     *
+     * @param source batched source tables
+     * @param batchIndices zero-based source batch indices
+     * @param storedIndices one-based table indices, with zero reserved for padding
+     * @return selected entries with padding replaced by zero
+     */
+    public static NDArray paddedBatchGatherByBatchIndices(
+            NDArray source, NDArray batchIndices, NDArray storedIndices) {
+        return source.getNDArrayInternal()
+                .paddedBatchGatherByBatchIndices(batchIndices, storedIndices);
+    }
+
+    /**
      * Normalizes logits over legal elements while returning zero for masked elements.
      *
      * <p>Computation and output use {@link DataType#FLOAT32}. A row with no legal element returns

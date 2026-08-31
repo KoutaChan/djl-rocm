@@ -443,6 +443,51 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchS
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGather(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jstored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jstored_indices_handle);
+  auto result = djl::pytorch::padded_batch_gather(*tensor_ptr, *stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGather2d(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jouter_stored_indices_handle,
+    jlong jinner_stored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* outer_stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jouter_stored_indices_handle);
+  const auto* inner_stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jinner_stored_indices_handle);
+  auto result = djl::pytorch::padded_batch_gather_2d(
+      *tensor_ptr, *outer_stored_indices_ptr, *inner_stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGatherByBatchIndices(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jbatch_indices_handle,
+    jlong jstored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* batch_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jbatch_indices_handle);
+  const auto* stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jstored_indices_handle);
+  auto result = djl::pytorch::padded_batch_gather_by_batch_indices(
+      *tensor_ptr, *batch_indices_ptr, *stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIndexAdd(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle, jlong jdata_handle, jint jaxis) {
   API_BEGIN()

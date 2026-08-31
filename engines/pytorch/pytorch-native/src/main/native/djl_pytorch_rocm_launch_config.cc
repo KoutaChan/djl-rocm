@@ -60,6 +60,7 @@ RocmKernelLaunchConfig load_launch_config() {
       read_positive_integer(launch_environment::kFusedAdamUpdateThreadsPerBlock, 256),
       read_positive_integer(launch_environment::kMaskedCategoricalThreadsPerBlock, 256),
       read_positive_integer(launch_environment::kScatterRowsThreadsPerBlock, 256),
+      read_positive_integer(launch_environment::kPaddedBatchGatherThreadsPerBlock, 256),
   };
 }
 

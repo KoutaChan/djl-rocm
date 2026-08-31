@@ -836,6 +836,34 @@ public final class JniUtils {
                         rows.getHandle(), rowIndices.getHandle(), rowCount));
     }
 
+    /** Selects one-based entries from an independent table in each batch. */
+    public static PtNDArray paddedBatchGather(PtNDArray source, PtNDArray storedIndices) {
+        return new PtNDArray(
+                source.getManager(),
+                PyTorchLibrary.LIB.torchPaddedBatchGather(
+                        source.getHandle(), storedIndices.getHandle()));
+    }
+
+    /** Selects one-based entries from two independent table dimensions in each batch. */
+    public static PtNDArray paddedBatchGather(
+            PtNDArray source, PtNDArray outerStoredIndices, PtNDArray innerStoredIndices) {
+        return new PtNDArray(
+                source.getManager(),
+                PyTorchLibrary.LIB.torchPaddedBatchGather2d(
+                        source.getHandle(),
+                        outerStoredIndices.getHandle(),
+                        innerStoredIndices.getHandle()));
+    }
+
+    /** Selects one-based table entries from explicit zero-based batch rows. */
+    public static PtNDArray paddedBatchGatherByBatchIndices(
+            PtNDArray source, PtNDArray batchIndices, PtNDArray storedIndices) {
+        return new PtNDArray(
+                source.getManager(),
+                PyTorchLibrary.LIB.torchPaddedBatchGatherByBatchIndices(
+                        source.getHandle(), batchIndices.getHandle(), storedIndices.getHandle()));
+    }
+
     /** Returns {@code ndArray.index_add(axis, index, value)} without mutating the input tensor. */
     public static PtNDArray indexAdd(
             PtNDArray ndArray, PtNDArray index, PtNDArray value, int axis) {

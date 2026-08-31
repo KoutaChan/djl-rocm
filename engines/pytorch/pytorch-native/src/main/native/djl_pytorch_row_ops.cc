@@ -29,6 +29,61 @@ torch::Tensor scatter_rows_reference(
   return torch::zeros(output_shape, rows.options()).index_copy(0, row_indices, rows);
 }
 
+bool is_index_type(const torch::Tensor& indices) {
+  return indices.scalar_type() == torch::kInt16 || indices.scalar_type() == torch::kInt32 ||
+      indices.scalar_type() == torch::kInt64;
+}
+
+std::vector<int64_t> padded_gather_output_shape(
+    const torch::Tensor& source, const torch::Tensor& stored_indices, int64_t indexed_dimensions) {
+  auto output_shape = stored_indices.sizes().vec();
+  output_shape.insert(
+      output_shape.end(), source.sizes().begin() + indexed_dimensions, source.sizes().end());
+  return output_shape;
+}
+
+torch::Tensor padded_gather_reference(const torch::Tensor& source,
+    const torch::Tensor& batch_indices, const torch::Tensor& outer_stored_indices,
+    const torch::Tensor& inner_stored_indices) {
+  const bool has_inner_indices = inner_stored_indices.defined();
+  const int64_t indexed_dimensions = has_inner_indices ? 3 : 2;
+  const int64_t outer_entries = source.size(1);
+  const int64_t inner_entries = has_inner_indices ? source.size(2) : 1;
+  auto outer = outer_stored_indices.to(torch::kInt64);
+  auto present = outer.gt(0).logical_and(outer.le(outer_entries));
+  auto row_indices = outer.clamp(1, outer_entries).sub(1);
+  if (has_inner_indices) {
+    auto inner = inner_stored_indices.to(torch::kInt64);
+    present = present.logical_and(inner.gt(0)).logical_and(inner.le(inner_entries));
+    row_indices = row_indices.mul(inner_entries).add(inner.clamp(1, inner_entries).sub(1));
+  }
+  auto batches = batch_indices.to(torch::kInt64);
+  present = present.logical_and(batches.ge(0)).logical_and(batches.lt(source.size(0)));
+  row_indices = batches.clamp(0, source.size(0) - 1)
+                    .mul(outer_entries * inner_entries)
+                    .add(row_indices)
+                    .reshape({-1});
+
+  const int64_t table_rows = source.size(0) * outer_entries * inner_entries;
+  const int64_t row_width = source.numel() / table_rows;
+  auto output_shape =
+      padded_gather_output_shape(source, outer_stored_indices, indexed_dimensions);
+  auto gathered = source.reshape({table_rows, row_width}).index_select(0, row_indices);
+  auto padding_mask = present.to(source.scalar_type());
+  for (int64_t axis = indexed_dimensions; axis < source.dim(); ++axis) {
+    padding_mask = padding_mask.unsqueeze(-1);
+  }
+  return gathered.reshape(output_shape).mul(padding_mask);
+}
+
+torch::Tensor implicit_batch_indices(const torch::Tensor& stored_indices, int64_t batch_count) {
+  auto shape = std::vector<int64_t>(stored_indices.dim(), 1);
+  shape[0] = batch_count;
+  return torch::arange(batch_count, stored_indices.options().dtype(torch::kInt64))
+      .reshape(shape)
+      .expand(stored_indices.sizes());
+}
+
 #if defined(DJL_USE_ROCM_KERNELS)
 
 class ScatterRowsFunction : public torch::autograd::Function<ScatterRowsFunction> {
@@ -72,6 +127,70 @@ torch::Tensor scatter_rows(
   }
 #endif
   return scatter_rows_reference(rows, indices, row_count);
+}
+
+torch::Tensor padded_batch_gather(
+    const torch::Tensor& source, const torch::Tensor& stored_indices) {
+  TORCH_CHECK(source.dim() >= 2,
+      "padded batch gather requires source with at least two dimensions");
+  TORCH_CHECK(stored_indices.dim() >= 1 && stored_indices.size(0) == source.size(0),
+      "stored indices must begin with the source batch dimension");
+  TORCH_CHECK(source.size(0) > 0 && source.size(1) > 0,
+      "padded batch gather requires nonempty batch and table dimensions");
+  TORCH_CHECK(is_index_type(stored_indices), "stored indices must be int16, int32, or int64");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() &&
+      rocm::supports_padded_batch_gather(source, stored_indices)) {
+    return rocm::padded_batch_gather_forward(source, stored_indices);
+  }
+#endif
+  return padded_gather_reference(
+      source, implicit_batch_indices(stored_indices, source.size(0)), stored_indices, {});
+}
+
+torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices) {
+  TORCH_CHECK(source.dim() >= 3,
+      "two-dimensional padded batch gather requires source with at least three dimensions");
+  TORCH_CHECK(outer_stored_indices.sizes() == inner_stored_indices.sizes(),
+      "outer and inner stored indices must have identical shapes");
+  TORCH_CHECK(outer_stored_indices.dim() >= 1 &&
+          outer_stored_indices.size(0) == source.size(0),
+      "stored indices must begin with the source batch dimension");
+  TORCH_CHECK(source.size(0) > 0 && source.size(1) > 0 && source.size(2) > 0,
+      "padded batch gather requires nonempty batch and table dimensions");
+  TORCH_CHECK(is_index_type(outer_stored_indices) && is_index_type(inner_stored_indices),
+      "stored indices must be int16, int32, or int64");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() && rocm::supports_padded_batch_gather_2d(
+          source, outer_stored_indices, inner_stored_indices)) {
+    return rocm::padded_batch_gather_2d_forward(
+        source, outer_stored_indices, inner_stored_indices);
+  }
+#endif
+  return padded_gather_reference(source,
+      implicit_batch_indices(outer_stored_indices, source.size(0)),
+      outer_stored_indices, inner_stored_indices);
+}
+
+torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
+    const torch::Tensor& batch_indices, const torch::Tensor& stored_indices) {
+  TORCH_CHECK(source.dim() >= 2,
+      "padded batch gather requires source with at least two dimensions");
+  TORCH_CHECK(batch_indices.sizes() == stored_indices.sizes(),
+      "batch and stored indices must have identical shapes");
+  TORCH_CHECK(source.size(0) > 0 && source.size(1) > 0,
+      "padded batch gather requires nonempty batch and table dimensions");
+  TORCH_CHECK(is_index_type(batch_indices) && is_index_type(stored_indices),
+      "batch and stored indices must be int16, int32, or int64");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() && rocm::supports_padded_batch_gather_by_batch_indices(
+          source, batch_indices, stored_indices)) {
+    return rocm::padded_batch_gather_by_batch_indices_forward(
+        source, batch_indices, stored_indices);
+  }
+#endif
+  return padded_gather_reference(source, batch_indices, stored_indices, {});
 }
 
 }  // namespace djl::pytorch

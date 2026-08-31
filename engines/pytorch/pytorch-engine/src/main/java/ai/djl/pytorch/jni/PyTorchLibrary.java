@@ -407,6 +407,14 @@ final class PyTorchLibrary {
 
     native long torchScatterRows(long handle, long index, long rowCount);
 
+    native long torchPaddedBatchGather(long handle, long storedIndices);
+
+    native long torchPaddedBatchGather2d(
+            long handle, long outerStoredIndices, long innerStoredIndices);
+
+    native long torchPaddedBatchGatherByBatchIndices(
+            long handle, long batchIndices, long storedIndices);
+
     native long torchIndexAdd(long handle, long index, long value, int axis);
 
     native long torchMaskedSelect(long handle, long maskHandle);
