@@ -628,10 +628,11 @@ public final class FusionRecipe {
     /**
      * A value that packs batch-major tensor segments into one contiguous tensor.
      *
-     * <p>All sources share the same named leading dimension, data type, rank, and trailing inner
-     * shape. Their first inner axes are appended in source order. The result preserves the source
-     * data type. This stage is intended for assembling a persistent inference memory from already
-     * computed segments without materializing one intermediate tensor per concatenation step.
+     * <p>All sources share the same named leading dimension, data type, and trailing hidden width.
+     * A source may contain fixed group axes before its token axis. Each selected token range is
+     * appended for every group in row-major order. The result preserves the source data type. This
+     * stage is intended for assembling a persistent inference memory from already computed
+     * segments without materializing one intermediate tensor per concatenation step.
      */
     public static final class SegmentedOutputPack extends Value {
 
@@ -2238,10 +2239,10 @@ public final class FusionRecipe {
         /**
          * Adds a segmented output-pack value.
          *
-         * <p>Each source must have one named leading dimension followed by at least two fixed inner
-         * dimensions. Sources must share the same leading dimension, floating-point data type,
-         * rank, and trailing inner shape. The first inner axes are concatenated in source order.
-         * The result is contiguous and preserves the source data type.
+         * <p>Each source must have one named leading dimension followed by at least a token and a
+         * hidden-width dimension. Sources must share the same leading dimension, floating-point
+         * data type, and hidden width. Fixed group axes before the token axis are flattened in
+         * row-major order. The result is contiguous and preserves the source data type.
          *
          * @param name the value name
          * @param sources the batch-major tensor segments to pack in order
