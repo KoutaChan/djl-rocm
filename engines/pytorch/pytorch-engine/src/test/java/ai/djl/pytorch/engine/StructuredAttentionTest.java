@@ -135,7 +135,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
-    public void groupedPackedAttentionNativeFloatingMasksMatchPortableDtypeBoundaries() {
+    public void groupedPackedAttentionProductionShapeMatchesPortableDtypeBoundaries() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             return;
@@ -151,6 +151,8 @@ public class StructuredAttentionTest {
                 int heads = 4;
                 int keyFeatures = 16;
                 int valueFeatures = 16;
+                Assert.assertTrue(keyTokens > valueFeatures);
+                Assert.assertTrue(valueFeatures < 32);
                 int queryWidth = heads * keyFeatures;
                 int packedWidth = queryWidth + heads * valueFeatures;
                 NDArray query =

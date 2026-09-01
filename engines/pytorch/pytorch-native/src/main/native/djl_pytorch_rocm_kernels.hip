@@ -2553,14 +2553,21 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
 
     const int64_t output_offset =
         ((matrix * query_tokens + query_token) * heads + head) * value_features;
-    for (int feature = lane; feature < value_features;
-         feature += query_group_width) {
+    for (int feature_base = 0; feature_base < value_features;
+         feature_base += query_group_width) {
+      const int feature = feature_base + lane;
       float context = 0.0f;
       for (int key_token = 0; key_token < key_tokens; ++key_token) {
-        context += __shfl(probability, key_token, query_group_width) *
-            shared_values[key_token * value_features + feature];
+        const float token_probability =
+            __shfl(probability, key_token, query_group_width);
+        if (feature < value_features) {
+          context += token_probability *
+              shared_values[key_token * value_features + feature];
+        }
       }
-      output[output_offset + feature] = static_cast<scalar_t>(context);
+      if (feature < value_features) {
+        output[output_offset + feature] = static_cast<scalar_t>(context);
+      }
     }
   }
 }
