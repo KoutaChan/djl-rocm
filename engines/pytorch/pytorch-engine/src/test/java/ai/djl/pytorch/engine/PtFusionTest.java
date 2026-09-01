@@ -336,10 +336,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmBinaryBranchBlendMatchesPresenceSemantics() {
+    public void gpuBinaryBranchBlendMatchesPresenceSemantics() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         BinaryBranchBlendFixture fixture = new BinaryBranchBlendFixture();
         Device device = Device.gpu(0);
@@ -412,10 +412,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSingleQueryReadoutMatchesMaterializedReferenceAcrossDevicesAndTypes() {
+    public void gpuSingleQueryReadoutMatchesMaterializedReferenceAcrossDevicesAndTypes() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         int deviceCount = Math.min(2, engine.getGpuCount());
         int[] batches = {1, 31, 256, 384};
@@ -488,10 +488,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmIndexedLocalTransformerMatchesSparseReferenceAcrossDevicesAndTypes() {
+    public void gpuIndexedLocalTransformerMatchesSparseReferenceAcrossDevicesAndTypes() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         int maximumBatch = 384;
         int[] batches = {1, 31, 256, 384};
@@ -558,10 +558,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSegmentedIndexedLocalTransformerMatchesSparseReferenceAcrossDevicesAndTypes() {
+    public void gpuSegmentedIndexedLocalTransformerMatchesSparseReferenceAcrossDevicesAndTypes() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         int maximumBatch = 384;
         int[] batches = {1, 31, 256, 384};
@@ -638,10 +638,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmTransformerEncoderStackMatchesEagerReference() {
+    public void gpuTransformerEncoderStackMatchesEagerReference() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         Device device = Device.gpu(0);
         for (DataType dataType : new DataType[] {DataType.FLOAT32, DataType.FLOAT16}) {
@@ -843,10 +843,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmPreparationRejectsMalformedClosedCommandIr() {
+    public void gpuPreparationRejectsMalformedClosedCommandIr() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         ByteBuffer valid = PtFusionDescriptor.encode(fixture.recipe);
@@ -956,10 +956,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmOutputPackUsesPersistentRingStorage() {
+    public void gpuOutputPackUsesPersistentRingStorage() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);
@@ -1000,10 +1000,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmOutputPackConvertsIntoConfiguredType() {
+    public void gpuOutputPackConvertsIntoConfiguredType() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         Device device = Device.gpu(0);
         for (DataType outputType :
@@ -1057,10 +1057,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSegmentedOutputPackIsBitExactAcrossTypesAndSlots() {
+    public void gpuSegmentedOutputPackIsBitExactAcrossTypesAndSlots() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         Device device = Device.gpu(0);
         for (DataType dataType :
@@ -1138,10 +1138,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSegmentedOutputPackConvertsMixedSourcesInOneLaunch() {
+    public void gpuSegmentedOutputPackConvertsMixedSourcesInOneLaunch() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         Device device = Device.gpu(0);
         FusionRecipe.Builder builder = FusionRecipe.builder("mixed-segmented-output-pack-test");
@@ -1194,10 +1194,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmAffineSumMatchesBroadcastReferenceAcrossDataTypes() {
+    public void gpuAffineSumMatchesBroadcastReferenceAcrossDataTypes() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         for (DataType dataType :
                 new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
@@ -1291,10 +1291,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmAffineSumConvertsSingleDynamicSourceToProjectionDataType() {
+    public void gpuAffineSumConvertsSingleDynamicSourceToProjectionDataType() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         for (DataType projectionDataType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
             MixedDirectAffineFixture fixture = new MixedDirectAffineFixture(projectionDataType);
@@ -1335,10 +1335,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmAffineSumConvertsMixedSourcesAndFixedPrecomputeInputs() {
+    public void gpuAffineSumConvertsMixedSourcesAndFixedPrecomputeInputs() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         for (DataType projectionDataType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
             MixedSourceAffineFixture fixture = new MixedSourceAffineFixture(projectionDataType);
@@ -1405,10 +1405,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmAffineSumUsesDirectOutputForOneUnbiasedTerm() {
+    public void gpuAffineSumUsesDirectOutputForOneUnbiasedTerm() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         DirectAffineFixture fixture = new DirectAffineFixture();
         Device device = Device.gpu(0);
@@ -1439,10 +1439,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmAffineSumSeparatesFixedRuntimeAndPrecomputedConstantGroups() {
+    public void gpuAffineSumSeparatesFixedRuntimeAndPrecomputedConstantGroups() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FixedRuntimeAffineFixture fixture = new FixedRuntimeAffineFixture();
         Device device = Device.gpu(0);
@@ -1500,10 +1500,10 @@ public class PtFusionTest {
 
     @Test
     @SuppressWarnings("try")
-    public void rocmAffineSumWaitsForBindingAcrossStreams() {
+    public void gpuAffineSumWaitsForBindingAcrossStreams() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         AffineFixture fixture = new AffineFixture(DataType.FLOAT32);
         Device device = Device.gpu(0);
@@ -1561,10 +1561,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmIndexedAffineGathersProjectsScattersAndClearsAcrossDataTypes() {
+    public void gpuIndexedAffineGathersProjectsScattersAndClearsAcrossDataTypes() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         Device device = Device.gpu(0);
         for (DataType dataType :
@@ -1634,10 +1634,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmIndexedAffineRoundsSiluBeforeOutputProjection() {
+    public void gpuIndexedAffineRoundsSiluBeforeOutputProjection() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         Device device = Device.gpu(0);
         IndexedAffineFixture fixture = new IndexedAffineFixture(DataType.FLOAT16);
@@ -1683,10 +1683,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmIndexedAffineSupportsWideUnbiasedInt64InvocationReuse() {
+    public void gpuIndexedAffineSupportsWideUnbiasedInt64InvocationReuse() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         WideIndexedAffineFixture fixture = new WideIndexedAffineFixture();
         Device device = Device.gpu(0);
@@ -1735,10 +1735,10 @@ public class PtFusionTest {
 
     @Test
     @SuppressWarnings("try")
-    public void rocmMixedAffineBindKeepsFixedSourceAliveAcrossStreams() {
+    public void gpuMixedAffineBindKeepsFixedSourceAliveAcrossStreams() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         MixedSourceAffineFixture fixture = new MixedSourceAffineFixture(DataType.FLOAT16);
         Device device = Device.gpu(0);
@@ -1806,10 +1806,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSessionCreationRollsBackForUnavailableManager() {
+    public void gpuSessionCreationRollsBackForUnavailableManager() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);
@@ -1836,10 +1836,10 @@ public class PtFusionTest {
 
     @Test
     @SuppressWarnings("try")
-    public void rocmSessionWaitsForAllocationAndReusesSlotAcrossStreams() {
+    public void gpuSessionWaitsForAllocationAndReusesSlotAcrossStreams() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);
@@ -1891,10 +1891,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmDuplicateExportsAliasOnePersistentValue() {
+    public void gpuDuplicateExportsAliasOnePersistentValue() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         DuplicateOutputFixture fixture = new DuplicateOutputFixture();
         Device device = Device.gpu(0);
@@ -1921,10 +1921,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmNestedOutputPackUsesConstantAndIntermediateStorage() {
+    public void gpuNestedOutputPackUsesConstantAndIntermediateStorage() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         NestedFixture fixture = new NestedFixture();
         Device device = Device.gpu(0);
@@ -1955,10 +1955,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmConstantBindingRequiresMaximumShape() {
+    public void gpuConstantBindingRequiresMaximumShape() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         NestedFixture fixture = new NestedFixture();
         Device device = Device.gpu(0);
@@ -1974,10 +1974,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmOutputPackRejectsInputRowsBelowActiveExtent() {
+    public void gpuOutputPackRejectsInputRowsBelowActiveExtent() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);
@@ -2003,10 +2003,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmOutputPackRejectsInputRowsAbovePreparedMaximum() {
+    public void gpuOutputPackRejectsInputRowsAbovePreparedMaximum() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);
@@ -2027,10 +2027,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmOutputPackValidatesEveryCommandBeforeLaunching() {
+    public void gpuOutputPackValidatesEveryCommandBeforeLaunching() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         MultiOutputFixture fixture = new MultiOutputFixture();
         Device device = Device.gpu(0);
@@ -2066,10 +2066,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSessionSurvivesNdScopeAndSequentialThreadMigration() {
+    public void gpuSessionSurvivesNdScopeAndSequentialThreadMigration() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);
@@ -2123,10 +2123,10 @@ public class PtFusionTest {
     }
 
     @Test
-    public void rocmSingleUseFacadesRejectExpiredGenerations() {
+    public void gpuSingleUseFacadesRejectExpiredGenerations() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
-            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         FusionFixture fixture = new FusionFixture();
         Device device = Device.gpu(0);

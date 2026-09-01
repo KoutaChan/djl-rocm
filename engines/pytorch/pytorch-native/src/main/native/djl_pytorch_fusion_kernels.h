@@ -13,7 +13,7 @@
 #ifndef DJL_TORCH_DJL_PYTORCH_FUSION_KERNELS_H
 #define DJL_TORCH_DJL_PYTORCH_FUSION_KERNELS_H
 
-#include <torch/torch.h>
+#include <torch/types.h>
 
 #include <cstdint>
 #include <memory>
@@ -31,15 +31,16 @@ inline constexpr int32_t kMaximumIndexedLocalTransformerSegments = 8;
 class LinearBiasSiluPlan;
 
 /**
- * Creates a reusable ROCm linear epilogue plan.
+ * Creates a reusable accelerator linear epilogue plan.
  *
- * <p>The plan caches shape-specific hipBLASLt descriptors and algorithms. It owns only host-side
- * metadata; inputs, weights, outputs, and the PyTorch BLAS workspace remain externally owned.
+ * <p>The ROCm backend caches shape-specific hipBLASLt descriptors and algorithms. Other backends
+ * may use the ordinary PyTorch path. The plan owns only host-side metadata; inputs, weights,
+ * outputs, and the PyTorch BLAS workspace remain externally owned.
  */
 std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan();
 
 /**
- * Executes {@code output = silu(input * weight + bias)} with a hipBLASLt epilogue when supported.
+ * Executes {@code output = silu(input * weight + bias)} with a backend epilogue when supported.
  *
  * <p>All tensors are two-dimensional row-major matrices except the one-dimensional bias. The
  * weight is laid out as {@code [inputWidth, outputWidth]}. The method returns {@code false} for a

@@ -46,6 +46,7 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_accelerator.cc"
     "src/main/native/djl_pytorch_fusion.h"
     "src/main/native/djl_pytorch_fusion.cc"
+    "src/main/native/djl_pytorch_fusion_backend.h"
     "src/main/native/djl_pytorch_fusion_kernels.h"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
@@ -104,6 +105,15 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         PROPERTIES LANGUAGE HIP)
+endif()
+
+if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
+    enable_language(CUDA)
+    list(APPEND SOURCE_FILES
+        "src/main/native/djl_pytorch_fusion_kernels.cu")
+    set_source_files_properties(
+        "src/main/native/djl_pytorch_fusion_kernels.cu"
+        PROPERTIES LANGUAGE CUDA)
 endif()
 
 if(PT_VERSION)
@@ -179,6 +189,10 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         REQUIRED)
     target_include_directories(djl_torch PRIVATE ${HIPBLASLT_INCLUDE_DIR})
     target_link_libraries(djl_torch ${HIPBLASLT_LIBRARY})
+endif()
+if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
+    target_compile_definitions(djl_torch PRIVATE DJL_USE_FUSION_KERNELS DJL_USE_CUDA_FUSION_KERNELS)
+    set_property(TARGET djl_torch PROPERTY CUDA_STANDARD 17)
 endif()
 
 # build host

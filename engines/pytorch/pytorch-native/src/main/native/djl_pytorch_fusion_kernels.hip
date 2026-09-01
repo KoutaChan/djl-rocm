@@ -11,11 +11,12 @@
  * and limitations under the License.
  */
 #include "djl_pytorch_fusion_kernels.h"
+#include "djl_pytorch_fusion_backend.h"
 
+#if defined(DJL_USE_ROCM_KERNELS)
 #include <ATen/hip/HIPContextLight.h>
-#include <c10/hip/HIPStream.h>
-#include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,8 @@ namespace djl::pytorch::fusion {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+
+#if defined(DJL_USE_ROCM_KERNELS)
 
 void CheckHipBlasLt(hipblasStatus_t status, const char* operation) {
   TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS, operation,
@@ -148,7 +151,7 @@ class LinearBiasSiluExecutable {
         weight.const_data_ptr(), weight_, input.const_data_ptr(), input_,
         &beta, output.const_data_ptr(), output_, output.data_ptr(), output_,
         &algorithm_, workspace, workspace_size_,
-        at::hip::getCurrentHIPStream(output.get_device()).stream()),
+        backend::GetCurrentStream(output.get_device())),
         "hipblasLtMatmul(Swish-bias)");
   }
 
@@ -160,6 +163,8 @@ class LinearBiasSiluExecutable {
   hipblasLtMatmulAlgo_t algorithm_{};
   size_t workspace_size_ = 0;
 };
+
+#endif
 
 int64_t CheckedMultiply(int64_t left, int64_t right, const char* name) {
   TORCH_CHECK(left >= 0 && right >= 0, name, " factors must not be negative");
@@ -1656,12 +1661,13 @@ __global__ void indexed_local_finalize_kernel(scalar_t* output, const scalar_t* 
   }
 }
 
-void CheckHipLaunch(const char* kernel_name) {
-  const hipError_t error = hipGetLastError();
-  TORCH_CHECK(error == hipSuccess, kernel_name, " launch failed: ", hipGetErrorString(error));
+void CheckKernelLaunch(const char* kernel_name) {
+  backend::CheckLastLaunch(kernel_name);
 }
 
 }  // namespace
+
+#if defined(DJL_USE_ROCM_KERNELS)
 
 class LinearBiasSiluPlan {
  public:
@@ -1718,10 +1724,26 @@ bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>& plan,
   return true;
 }
 
+#else
+
+class LinearBiasSiluPlan {};
+
+std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan() {
+  return std::make_shared<LinearBiasSiluPlan>();
+}
+
+bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>&,
+    torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&) {
+  return false;
+}
+
+#endif
+
 template <typename output_t>
 void LaunchOutputPackTyped(const OutputPackArguments& arguments,
-    int32_t source_count, uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((output_pack_kernel<output_t>),
+    int32_t source_count, uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((output_pack_kernel<output_t>),
       dim3(block_count, source_count), dim3(kThreadsPerBlock), 0, stream,
       arguments);
 }
@@ -1750,32 +1772,32 @@ void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
   const int64_t required_blocks = RequiredBlockCount(maximum_elements);
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   switch (output.scalar_type()) {
     case torch::kFloat16:
       LaunchOutputPackTyped<c10::Half>(
-          arguments, source_count, block_count, stream.stream());
+          arguments, source_count, block_count, stream);
       break;
     case torch::kBFloat16:
       LaunchOutputPackTyped<c10::BFloat16>(
-          arguments, source_count, block_count, stream.stream());
+          arguments, source_count, block_count, stream);
       break;
     case torch::kFloat32:
       LaunchOutputPackTyped<float>(
-          arguments, source_count, block_count, stream.stream());
+          arguments, source_count, block_count, stream);
       break;
     default:
       TORCH_CHECK(false,
           "fusion output pack requires FLOAT16, BFLOAT16, or FLOAT32 output");
   }
-  CheckHipLaunch("fusion output pack");
+  CheckKernelLaunch("fusion output pack");
 }
 
 template <typename scalar_t>
 void LaunchSegmentedOutputPackTyped(
     const SegmentedOutputPackArguments& arguments, int32_t source_count,
-    uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((segmented_output_pack_kernel<scalar_t>),
+    uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((segmented_output_pack_kernel<scalar_t>),
       dim3(block_count, source_count), dim3(kThreadsPerBlock), 0, stream,
       arguments);
 }
@@ -1813,31 +1835,31 @@ void LaunchSegmentedOutputPack(const SegmentedOutputPackSource* sources,
   const int64_t required_blocks = RequiredBlockCount(maximum_elements);
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   switch (output.scalar_type()) {
     case torch::kFloat16:
       LaunchSegmentedOutputPackTyped<c10::Half>(
-          arguments, source_count, block_count, stream.stream());
+          arguments, source_count, block_count, stream);
       break;
     case torch::kBFloat16:
       LaunchSegmentedOutputPackTyped<c10::BFloat16>(
-          arguments, source_count, block_count, stream.stream());
+          arguments, source_count, block_count, stream);
       break;
     case torch::kFloat32:
       LaunchSegmentedOutputPackTyped<float>(
-          arguments, source_count, block_count, stream.stream());
+          arguments, source_count, block_count, stream);
       break;
     default:
       TORCH_CHECK(false,
           "segmented output pack supports FLOAT16, BFLOAT16, and FLOAT32");
   }
-  CheckHipLaunch("fusion segmented output pack");
+  CheckKernelLaunch("fusion segmented output pack");
 }
 
 template <typename baseline_t, typename selected_t>
 void LaunchBinaryBranchBlendTyped(const BinaryBranchBlendArguments& arguments,
-    uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((binary_branch_blend_kernel<baseline_t, selected_t>),
+    uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((binary_branch_blend_kernel<baseline_t, selected_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream, arguments);
 }
 
@@ -1867,10 +1889,10 @@ void LaunchBinaryBranchBlend(const torch::Tensor& baseline_context,
       static_cast<int32_t>(selected_presence.scalar_type());
   const uint32_t block_count = static_cast<uint32_t>(
       std::min<int64_t>(row_count, 65535));
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
 #define LAUNCH_BINARY_BRANCH_BLEND(baseline_type, selected_type) \
   LaunchBinaryBranchBlendTyped<baseline_type, selected_type>( \
-      arguments, block_count, stream.stream())
+      arguments, block_count, stream)
   switch (baseline_context.scalar_type()) {
     case torch::kFloat16:
       if (selected_context.scalar_type() == torch::kFloat16) {
@@ -1903,7 +1925,7 @@ void LaunchBinaryBranchBlend(const torch::Tensor& baseline_context,
       TORCH_CHECK(false, "unsupported binary branch baseline data type");
   }
 #undef LAUNCH_BINARY_BRANCH_BLEND
-  CheckHipLaunch("fusion binary branch blend");
+  CheckKernelLaunch("fusion binary branch blend");
 }
 
 void LaunchAffineInputPack(const AffineInputPackSource* sources,
@@ -1931,27 +1953,27 @@ void LaunchAffineInputPack(const AffineInputPackSource* sources,
   const int64_t required_blocks = RequiredBlockCount(maximum_elements);
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   switch (output.scalar_type()) {
     case torch::kFloat16:
-      hipLaunchKernelGGL(affine_input_pack_kernel<c10::Half>,
+      DJL_FUSION_LAUNCH_KERNEL(affine_input_pack_kernel<c10::Half>,
           dim3(block_count, source_count), dim3(kThreadsPerBlock), 0,
-          stream.stream(), arguments);
+          stream, arguments);
       break;
     case torch::kBFloat16:
-      hipLaunchKernelGGL(affine_input_pack_kernel<c10::BFloat16>,
+      DJL_FUSION_LAUNCH_KERNEL(affine_input_pack_kernel<c10::BFloat16>,
           dim3(block_count, source_count), dim3(kThreadsPerBlock), 0,
-          stream.stream(), arguments);
+          stream, arguments);
       break;
     case torch::kFloat32:
-      hipLaunchKernelGGL(affine_input_pack_kernel<float>,
+      DJL_FUSION_LAUNCH_KERNEL(affine_input_pack_kernel<float>,
           dim3(block_count, source_count), dim3(kThreadsPerBlock), 0,
-          stream.stream(), arguments);
+          stream, arguments);
       break;
     default:
       TORCH_CHECK(false, "unsupported affine input-pack data type");
   }
-  CheckHipLaunch("fusion affine input pack");
+  CheckKernelLaunch("fusion affine input pack");
 }
 
 void LaunchAffineFinalize(const AffineSumSource* sources, int32_t source_count,
@@ -1992,30 +2014,30 @@ void LaunchAffineFinalize(const AffineSumSource* sources, int32_t source_count,
   const int64_t required_blocks = RequiredBlockCount(element_count);
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   switch (output.scalar_type()) {
     case torch::kFloat16:
-      hipLaunchKernelGGL(affine_finalize_kernel<c10::Half>, dim3(block_count),
-          dim3(kThreadsPerBlock), 0, stream.stream(), arguments);
+      DJL_FUSION_LAUNCH_KERNEL(affine_finalize_kernel<c10::Half>, dim3(block_count),
+          dim3(kThreadsPerBlock), 0, stream, arguments);
       break;
     case torch::kBFloat16:
-      hipLaunchKernelGGL(affine_finalize_kernel<c10::BFloat16>, dim3(block_count),
-          dim3(kThreadsPerBlock), 0, stream.stream(), arguments);
+      DJL_FUSION_LAUNCH_KERNEL(affine_finalize_kernel<c10::BFloat16>, dim3(block_count),
+          dim3(kThreadsPerBlock), 0, stream, arguments);
       break;
     case torch::kFloat32:
-      hipLaunchKernelGGL(affine_finalize_kernel<float>, dim3(block_count),
-          dim3(kThreadsPerBlock), 0, stream.stream(), arguments);
+      DJL_FUSION_LAUNCH_KERNEL(affine_finalize_kernel<float>, dim3(block_count),
+          dim3(kThreadsPerBlock), 0, stream, arguments);
       break;
     default:
       TORCH_CHECK(false, "unsupported affine finalize data type");
   }
-  CheckHipLaunch("fusion affine finalize");
+  CheckKernelLaunch("fusion affine finalize");
 }
 
 template <typename output_t, typename index_t>
 void LaunchIndexedAffineInputPackTyped(const IndexedAffineInputPackArguments& arguments,
-    uint32_t block_count, int32_t source_count, hipStream_t stream) {
-  hipLaunchKernelGGL((indexed_affine_input_pack_kernel<output_t, index_t>),
+    uint32_t block_count, int32_t source_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((indexed_affine_input_pack_kernel<output_t, index_t>),
       dim3(block_count, source_count), dim3(kThreadsPerBlock), 0, stream, arguments);
 }
 
@@ -2049,10 +2071,10 @@ void LaunchIndexedAffineInputPack(const IndexedAffineSource* sources,
   const int64_t required_blocks = RequiredBlockCount(maximum_elements);
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
 #define LAUNCH_INDEXED_PACK(output_type, index_type) \
   LaunchIndexedAffineInputPackTyped<output_type, index_type>( \
-      arguments, block_count, source_count, stream.stream())
+      arguments, block_count, source_count, stream)
   switch (output.scalar_type()) {
     case torch::kFloat16:
       if (index_data_type == torch::kInt32) {
@@ -2079,13 +2101,13 @@ void LaunchIndexedAffineInputPack(const IndexedAffineSource* sources,
       TORCH_CHECK(false, "unsupported indexed-affine input-pack data type");
   }
 #undef LAUNCH_INDEXED_PACK
-  CheckHipLaunch("fusion indexed-affine input pack");
+  CheckKernelLaunch("fusion indexed-affine input pack");
 }
 
 template <typename scalar_t, typename index_t>
 void LaunchIndexedAffineFinalizeTyped(const IndexedAffineFinalizeArguments& arguments,
-    uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((indexed_affine_finalize_kernel<scalar_t, index_t>),
+    uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((indexed_affine_finalize_kernel<scalar_t, index_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream, arguments);
 }
 
@@ -2094,17 +2116,16 @@ void LaunchIndexedAffineFinalize(const void* indices,
     const void* hidden_bias, const void* output_weight, const void* output_bias,
     torch::Tensor& output, int64_t active_rows, int64_t destination_rows,
     int64_t hidden_width, int64_t output_width, AffineActivation activation) {
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   const int64_t output_elements = CheckedMultiply(destination_rows, output_width,
       "fusion indexed-affine output element count");
   const int64_t output_bytes = CheckedMultiply(output_elements,
       static_cast<int64_t>(output.element_size()),
       "fusion indexed-affine output byte count");
   if (output_bytes != 0) {
-    const hipError_t memset_error = hipMemsetAsync(
-        output.data_ptr(), 0, static_cast<std::size_t>(output_bytes), stream.stream());
-    TORCH_CHECK(memset_error == hipSuccess, "fusion indexed-affine output clear failed: ",
-        hipGetErrorString(memset_error));
+    backend::MemsetAsync(output.data_ptr(), 0,
+        static_cast<std::size_t>(output_bytes), stream,
+        "fusion indexed-affine output clear");
   }
   if (active_rows == 0) {
     return;
@@ -2132,7 +2153,7 @@ void LaunchIndexedAffineFinalize(const void* indices,
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
 #define LAUNCH_INDEXED_FINALIZE(scalar_type, index_type) \
   LaunchIndexedAffineFinalizeTyped<scalar_type, index_type>( \
-      arguments, block_count, stream.stream())
+      arguments, block_count, stream)
   switch (output.scalar_type()) {
     case torch::kFloat16:
       if (index_data_type == torch::kInt32) {
@@ -2159,7 +2180,7 @@ void LaunchIndexedAffineFinalize(const void* indices,
       TORCH_CHECK(false, "unsupported indexed-affine finalize data type");
   }
 #undef LAUNCH_INDEXED_FINALIZE
-  CheckHipLaunch("fusion indexed-affine finalize");
+  CheckKernelLaunch("fusion indexed-affine finalize");
 }
 
 template <typename scalar_t, typename norm_t>
@@ -2167,12 +2188,12 @@ void LaunchTransformerCopyAndLayerNormTyped(const torch::Tensor& input,
     torch::Tensor& state, torch::Tensor& normalized,
     const torch::Tensor& weight, const torch::Tensor& bias,
     int64_t active_rows, float epsilon, bool copy_input,
-    hipStream_t stream) {
+    backend::Stream stream) {
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count = static_cast<uint32_t>(
       (active_rows + maximum_waves_per_block - 1) /
       maximum_waves_per_block);
-  hipLaunchKernelGGL(
+  DJL_FUSION_LAUNCH_KERNEL(
       (transformer_copy_layer_norm_kernel<scalar_t, norm_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
       input.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
@@ -2192,11 +2213,11 @@ void LaunchTransformerCopyAndLayerNorm(const torch::Tensor& input,
   if (active_rows == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(state.get_device());
+  const auto stream = backend::GetCurrentStream(state.get_device());
 #define LAUNCH_TRANSFORMER_COPY_LAYER_NORM(scalar_type, norm_type) \
   LaunchTransformerCopyAndLayerNormTyped<scalar_type, norm_type>( \
       input, state, normalized, weight, bias, active_rows, epsilon, \
-      copy_input, stream.stream())
+      copy_input, stream)
   if (input.scalar_type() == torch::kFloat16) {
     if (weight.scalar_type() == torch::kFloat32) {
       LAUNCH_TRANSFORMER_COPY_LAYER_NORM(c10::Half, float);
@@ -2215,14 +2236,14 @@ void LaunchTransformerCopyAndLayerNorm(const torch::Tensor& input,
     TORCH_CHECK(false, "unsupported transformer encoder data type");
   }
 #undef LAUNCH_TRANSFORMER_COPY_LAYER_NORM
-  CheckHipLaunch("fusion transformer copy LayerNorm");
+  CheckKernelLaunch("fusion transformer copy LayerNorm");
 }
 
 template <typename scalar_t>
 void LaunchTransformerAttentionTyped(const torch::Tensor& query_key_value,
     torch::Tensor& context, int64_t batch_count, int64_t token_count,
-    hipStream_t stream) {
-  hipLaunchKernelGGL(
+    backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL(
       (transformer_attention_kernel<scalar_t>),
       dim3(batch_count), dim3(kThreadsPerBlock), 0, stream,
       query_key_value.data_ptr<scalar_t>(), context.data_ptr<scalar_t>(),
@@ -2242,10 +2263,10 @@ void LaunchTransformerAttention(const torch::Tensor& query_key_value,
     return;
   }
   const auto stream =
-      at::hip::getCurrentHIPStream(query_key_value.get_device());
+      backend::GetCurrentStream(query_key_value.get_device());
 #define LAUNCH_TRANSFORMER_ATTENTION(scalar_type) \
   LaunchTransformerAttentionTyped<scalar_type>(query_key_value, context, \
-      batch_count, token_count, stream.stream())
+      batch_count, token_count, stream)
   if (query_key_value.scalar_type() == torch::kFloat16) {
     LAUNCH_TRANSFORMER_ATTENTION(c10::Half);
   } else if (query_key_value.scalar_type() == torch::kBFloat16) {
@@ -2256,7 +2277,7 @@ void LaunchTransformerAttention(const torch::Tensor& query_key_value,
     TORCH_CHECK(false, "unsupported transformer encoder data type");
   }
 #undef LAUNCH_TRANSFORMER_ATTENTION
-  CheckHipLaunch("fusion transformer attention");
+  CheckKernelLaunch("fusion transformer attention");
 }
 
 template <typename scalar_t>
@@ -2266,8 +2287,8 @@ void LaunchIndexedRelationAttentionBiasTyped(
     const torch::Tensor& pair_bias, torch::Tensor& attention_bias,
     int64_t batch_count, int64_t attention_heads, int64_t token_count,
     int64_t relation_count, int64_t padded_token_count, float scale,
-    uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL(
+    uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL(
       (indexed_relation_attention_bias_kernel<scalar_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
       relation_logits.data_ptr<scalar_t>(), relation_ids.data_ptr<int16_t>(),
@@ -2298,12 +2319,12 @@ void LaunchIndexedRelationAttentionBias(
   }
   const uint32_t block_count = static_cast<uint32_t>(
       std::min<int64_t>(RequiredBlockCount(element_count), 65535));
-  const auto stream = at::hip::getCurrentHIPStream(attention_bias.get_device());
+  const auto stream = backend::GetCurrentStream(attention_bias.get_device());
 #define LAUNCH_INDEXED_RELATION_ATTENTION_BIAS(scalar_type) \
   LaunchIndexedRelationAttentionBiasTyped<scalar_type>(relation_logits, \
       relation_ids, pair_bias, attention_bias, batch_count, attention_heads, \
       token_count, relation_count, padded_token_count, scale, block_count, \
-      stream.stream())
+      stream)
   if (attention_bias.scalar_type() == torch::kFloat16) {
     LAUNCH_INDEXED_RELATION_ATTENTION_BIAS(c10::Half);
   } else if (attention_bias.scalar_type() == torch::kBFloat16) {
@@ -2314,7 +2335,7 @@ void LaunchIndexedRelationAttentionBias(
     TORCH_CHECK(false, "unsupported indexed-relation attention data type");
   }
 #undef LAUNCH_INDEXED_RELATION_ATTENTION_BIAS
-  CheckHipLaunch("fusion indexed-relation attention bias");
+  CheckKernelLaunch("fusion indexed-relation attention bias");
 }
 
 void LaunchTransformerBiasSilu(torch::Tensor& values,
@@ -2327,10 +2348,10 @@ void LaunchTransformerBiasSilu(torch::Tensor& values,
   }
   const uint32_t block_count = static_cast<uint32_t>(
       std::min<int64_t>(RequiredBlockCount(element_count), 65535));
-  const auto stream = at::hip::getCurrentHIPStream(values.get_device());
+  const auto stream = backend::GetCurrentStream(values.get_device());
 #define LAUNCH_TRANSFORMER_SILU(scalar_type) \
-  hipLaunchKernelGGL((transformer_bias_silu_kernel<scalar_type>), \
-      dim3(block_count), dim3(kThreadsPerBlock), 0, stream.stream(), \
+  DJL_FUSION_LAUNCH_KERNEL((transformer_bias_silu_kernel<scalar_type>), \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, \
       values.data_ptr<scalar_type>(), bias.data_ptr<scalar_type>(), \
       element_count, width, round_bias_before_activation)
   if (values.scalar_type() == torch::kFloat16) {
@@ -2343,7 +2364,7 @@ void LaunchTransformerBiasSilu(torch::Tensor& values,
     TORCH_CHECK(false, "unsupported transformer encoder data type");
   }
 #undef LAUNCH_TRANSFORMER_SILU
-  CheckHipLaunch("fusion transformer bias SiLU");
+  CheckKernelLaunch("fusion transformer bias SiLU");
 }
 
 template <typename scalar_t, typename norm_t>
@@ -2351,12 +2372,12 @@ void LaunchTransformerResidualLayerNormTyped(torch::Tensor& state,
     const torch::Tensor& update, const torch::Tensor& update_bias,
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     torch::Tensor& normalized, int64_t active_rows, float epsilon,
-    bool round_update_before_residual, hipStream_t stream) {
+    bool round_update_before_residual, backend::Stream stream) {
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count = static_cast<uint32_t>(
       (active_rows + maximum_waves_per_block - 1) /
       maximum_waves_per_block);
-  hipLaunchKernelGGL(
+  DJL_FUSION_LAUNCH_KERNEL(
       (transformer_residual_layer_norm_kernel<scalar_t, norm_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
       state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
@@ -2375,11 +2396,11 @@ void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
   if (active_rows == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(state.get_device());
+  const auto stream = backend::GetCurrentStream(state.get_device());
 #define LAUNCH_TRANSFORMER_RESIDUAL_NORM(scalar_type, norm_type) \
   LaunchTransformerResidualLayerNormTyped<scalar_type, norm_type>( \
       state, update, update_bias, norm_weight, norm_bias, normalized, \
-      active_rows, epsilon, round_update_before_residual, stream.stream())
+      active_rows, epsilon, round_update_before_residual, stream)
   if (state.scalar_type() == torch::kFloat16) {
     if (norm_weight.scalar_type() == torch::kFloat32) {
       LAUNCH_TRANSFORMER_RESIDUAL_NORM(c10::Half, float);
@@ -2398,15 +2419,15 @@ void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
     TORCH_CHECK(false, "unsupported transformer encoder data type");
   }
 #undef LAUNCH_TRANSFORMER_RESIDUAL_NORM
-  CheckHipLaunch("fusion transformer residual LayerNorm");
+  CheckKernelLaunch("fusion transformer residual LayerNorm");
 }
 
 template <typename memory_t, typename scalar_t, typename mask_t>
 void LaunchSingleQueryReadoutSeedInputTyped(const torch::Tensor& memory,
     const torch::Tensor& query_source, const torch::Tensor& valid_mask,
     torch::Tensor& seed_input, int64_t batch_count, int64_t token_count,
-    int64_t query_token_count, int64_t query_index, hipStream_t stream) {
-  hipLaunchKernelGGL(
+    int64_t query_token_count, int64_t query_index, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL(
       (single_query_seed_input_kernel<memory_t, scalar_t, mask_t>),
       dim3(batch_count), dim3(kThreadsPerBlock), 0, stream,
       memory.data_ptr<memory_t>(), query_source.data_ptr<memory_t>(),
@@ -2425,11 +2446,11 @@ void LaunchSingleQueryReadoutSeedInput(const torch::Tensor& memory,
   if (batch_count == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(memory.get_device());
+  const auto stream = backend::GetCurrentStream(memory.get_device());
 #define LAUNCH_SINGLE_QUERY_SEED(memory_type, compute_t, mask_type) \
   LaunchSingleQueryReadoutSeedInputTyped<memory_type, compute_t, mask_type>( \
       memory, query_source, valid_mask, seed_input, batch_count, token_count, \
-      query_token_count, query_index, stream.stream())
+      query_token_count, query_index, stream)
 #define DISPATCH_SINGLE_QUERY_SEED_MASK(memory_type, compute_t) \
   switch (valid_mask.scalar_type()) { \
     case torch::kBool: \
@@ -2476,7 +2497,7 @@ void LaunchSingleQueryReadoutSeedInput(const torch::Tensor& memory,
 #undef DISPATCH_SINGLE_QUERY_SEED_MEMORY
 #undef DISPATCH_SINGLE_QUERY_SEED_MASK
 #undef LAUNCH_SINGLE_QUERY_SEED
-  CheckHipLaunch("fusion single-query readout seed input");
+  CheckKernelLaunch("fusion single-query readout seed input");
 }
 
 template <typename memory_t, typename scalar_t, typename mask_t>
@@ -2487,8 +2508,8 @@ void LaunchSingleQueryReadoutAttentionTyped(
     const torch::Tensor& key_value_weight, torch::Tensor& state,
     torch::Tensor& context, int64_t batch_count, int64_t readout_count,
     int64_t token_count, int64_t attention_heads, int64_t attention_width,
-    hipStream_t stream) {
-  hipLaunchKernelGGL(
+    backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL(
       (single_query_attention_kernel<memory_t, scalar_t, mask_t>),
       dim3(batch_count, readout_count * attention_heads),
       dim3(kThreadsPerBlock), 0, stream,
@@ -2515,12 +2536,12 @@ void LaunchSingleQueryReadoutAttention(const torch::Tensor& seed_products,
   if (batch_count == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(memory.get_device());
+  const auto stream = backend::GetCurrentStream(memory.get_device());
 #define LAUNCH_SINGLE_QUERY_ATTENTION(memory_type, compute_t, mask_type) \
   LaunchSingleQueryReadoutAttentionTyped<memory_type, compute_t, mask_type>( \
       seed_products, seed_bias, memory, valid_mask, query_weight, query_bias, \
       key_value_weight, state, context, batch_count, readout_count, token_count, \
-      attention_heads, attention_width, stream.stream())
+      attention_heads, attention_width, stream)
 #define DISPATCH_SINGLE_QUERY_ATTENTION_MASK(memory_type, compute_t) \
   switch (valid_mask.scalar_type()) { \
     case torch::kBool: \
@@ -2567,7 +2588,7 @@ void LaunchSingleQueryReadoutAttention(const torch::Tensor& seed_products,
 #undef DISPATCH_SINGLE_QUERY_ATTENTION_MEMORY
 #undef DISPATCH_SINGLE_QUERY_ATTENTION_MASK
 #undef LAUNCH_SINGLE_QUERY_ATTENTION
-  CheckHipLaunch("fusion single-query readout attention");
+  CheckKernelLaunch("fusion single-query readout attention");
 }
 
 template <typename scalar_t, typename norm_t>
@@ -2576,13 +2597,13 @@ void LaunchSingleQueryReadoutResidualLayerNormTyped(torch::Tensor& state,
     const torch::Tensor& update_bias, const torch::Tensor& norm_weight,
     const torch::Tensor& norm_bias, torch::Tensor& output,
     int64_t batch_count, int64_t readout_count, int64_t output_batch_stride,
-    float epsilon, bool batch_major_output, hipStream_t stream) {
+    float epsilon, bool batch_major_output, backend::Stream stream) {
   const int64_t active_rows = batch_count * readout_count;
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count = static_cast<uint32_t>(
       (active_rows + maximum_waves_per_block - 1) /
       maximum_waves_per_block);
-  hipLaunchKernelGGL(
+  DJL_FUSION_LAUNCH_KERNEL(
       (single_query_residual_layer_norm_kernel<scalar_t, norm_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
       state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
@@ -2603,12 +2624,12 @@ void LaunchSingleQueryReadoutResidualLayerNorm(torch::Tensor& state,
   if (batch_count == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(state.get_device());
+  const auto stream = backend::GetCurrentStream(state.get_device());
 #define LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(scalar_type, norm_type) \
   LaunchSingleQueryReadoutResidualLayerNormTyped<scalar_type, norm_type>( \
       state, update, state_bias, update_bias, norm_weight, norm_bias, output, \
       batch_count, readout_count, output_batch_stride, epsilon, \
-      batch_major_output, stream.stream())
+      batch_major_output, stream)
   if (state.scalar_type() == torch::kFloat16) {
     if (norm_weight.scalar_type() == torch::kFloat32) {
       LAUNCH_SINGLE_QUERY_RESIDUAL_NORM(c10::Half, float);
@@ -2627,20 +2648,20 @@ void LaunchSingleQueryReadoutResidualLayerNorm(torch::Tensor& state,
     TORCH_CHECK(false, "unsupported single-query readout data type");
   }
 #undef LAUNCH_SINGLE_QUERY_RESIDUAL_NORM
-  CheckHipLaunch("fusion single-query readout residual LayerNorm");
+  CheckKernelLaunch("fusion single-query readout residual LayerNorm");
 }
 
 template <typename scalar_t, typename norm_t>
 void LaunchSingleQueryReadoutLayerNormTyped(const torch::Tensor& input,
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     torch::Tensor& output, int64_t batch_count, int64_t readout_count,
-    float epsilon, hipStream_t stream) {
+    float epsilon, backend::Stream stream) {
   const int64_t active_rows = batch_count * readout_count;
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count = static_cast<uint32_t>(
       (active_rows + maximum_waves_per_block - 1) /
       maximum_waves_per_block);
-  hipLaunchKernelGGL(
+  DJL_FUSION_LAUNCH_KERNEL(
       (single_query_layer_norm_kernel<scalar_t, norm_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
       input.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(),
@@ -2657,11 +2678,11 @@ void LaunchSingleQueryReadoutLayerNorm(const torch::Tensor& input,
   if (batch_count == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(input.get_device());
+  const auto stream = backend::GetCurrentStream(input.get_device());
 #define LAUNCH_SINGLE_QUERY_NORM(scalar_type, norm_type) \
   LaunchSingleQueryReadoutLayerNormTyped<scalar_type, norm_type>( \
       input, norm_weight, norm_bias, output, batch_count, readout_count, \
-      epsilon, stream.stream())
+      epsilon, stream)
   if (input.scalar_type() == torch::kFloat16) {
     if (norm_weight.scalar_type() == torch::kFloat32) {
       LAUNCH_SINGLE_QUERY_NORM(c10::Half, float);
@@ -2680,7 +2701,7 @@ void LaunchSingleQueryReadoutLayerNorm(const torch::Tensor& input,
     TORCH_CHECK(false, "unsupported single-query readout data type");
   }
 #undef LAUNCH_SINGLE_QUERY_NORM
-  CheckHipLaunch("fusion single-query readout LayerNorm");
+  CheckKernelLaunch("fusion single-query readout LayerNorm");
 }
 
 void LaunchSingleQueryReadoutBiasSilu(torch::Tensor& values,
@@ -2695,10 +2716,10 @@ void LaunchSingleQueryReadoutBiasSilu(torch::Tensor& values,
   }
   const uint32_t block_count = static_cast<uint32_t>(
       std::min<int64_t>(RequiredBlockCount(element_count), 65535));
-  const auto stream = at::hip::getCurrentHIPStream(values.get_device());
+  const auto stream = backend::GetCurrentStream(values.get_device());
 #define LAUNCH_SINGLE_QUERY_SILU(scalar_type) \
-  hipLaunchKernelGGL((single_query_bias_silu_kernel<scalar_type>), \
-      dim3(block_count), dim3(kThreadsPerBlock), 0, stream.stream(), \
+  DJL_FUSION_LAUNCH_KERNEL((single_query_bias_silu_kernel<scalar_type>), \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, \
       values.data_ptr<scalar_type>(), bias.data_ptr<scalar_type>(), \
       batch_count, readout_count, width)
   if (values.scalar_type() == torch::kFloat16) {
@@ -2711,7 +2732,7 @@ void LaunchSingleQueryReadoutBiasSilu(torch::Tensor& values,
     TORCH_CHECK(false, "unsupported single-query readout data type");
   }
 #undef LAUNCH_SINGLE_QUERY_SILU
-  CheckHipLaunch("fusion single-query readout bias SiLU");
+  CheckKernelLaunch("fusion single-query readout bias SiLU");
 }
 
 template <typename scalar_t, typename index_t>
@@ -2719,9 +2740,9 @@ void LaunchIndexedLocalGatherNormalizeTyped(const torch::Tensor& input, const to
     const torch::Tensor& input_norm_weight, const torch::Tensor& input_norm_bias,
     const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
     torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, float epsilon,
-    uint32_t block_count, hipStream_t stream) {
+    uint32_t block_count, backend::Stream stream) {
   const IndexedLocalDenseInput<scalar_t> dense_input{input.data_ptr<scalar_t>()};
-  hipLaunchKernelGGL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
                          IndexedLocalDenseInput<scalar_t>>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream, dense_input, indices.data_ptr<index_t>(),
       input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()),
@@ -2736,7 +2757,7 @@ void LaunchIndexedLocalGatherNormalizeSegmentsTyped(
     const torch::Tensor& indices, const torch::Tensor& input_norm_weight, const torch::Tensor& input_norm_bias,
     const torch::Tensor& attention_norm_weight, const torch::Tensor& attention_norm_bias, torch::Tensor& output,
     torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t token_count,
-    float epsilon, uint32_t block_count, hipStream_t stream) {
+    float epsilon, uint32_t block_count, backend::Stream stream) {
   IndexedLocalSegmentedInput<scalar_t> segmented_input{};
   segmented_input.segment_count = input_segment_count;
   segmented_input.token_count = token_count;
@@ -2745,7 +2766,7 @@ void LaunchIndexedLocalGatherNormalizeSegmentsTyped(
     segmented_input.token_offsets[segment] = input_segments[segment].token_offset;
     segmented_input.token_counts[segment] = input_segments[segment].token_count;
   }
-  hipLaunchKernelGGL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
                          IndexedLocalSegmentedInput<scalar_t>>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream, segmented_input, indices.data_ptr<index_t>(),
       input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()),
@@ -2755,13 +2776,13 @@ void LaunchIndexedLocalGatherNormalizeSegmentsTyped(
 }
 
 void LaunchIndexedLocalTransformerClear(torch::Tensor& output, int64_t dense_rows, int64_t hidden_width) {
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   const int64_t output_bytes =
       CheckedMultiply(CheckedMultiply(dense_rows, hidden_width, "indexed local transformer output elements"),
           static_cast<int64_t>(output.element_size()), "indexed local transformer output bytes");
-  const hipError_t error =
-      hipMemsetAsync(output.data_ptr(), 0, static_cast<std::size_t>(output_bytes), stream.stream());
-  TORCH_CHECK(error == hipSuccess, "indexed local transformer output clear failed: ", hipGetErrorString(error));
+  backend::MemsetAsync(output.data_ptr(), 0,
+      static_cast<std::size_t>(output_bytes), stream,
+      "indexed local transformer output clear");
 }
 
 void LaunchIndexedLocalTransformerGatherNormalize(const torch::Tensor& input, const torch::Tensor& indices,
@@ -2776,11 +2797,11 @@ void LaunchIndexedLocalTransformerGatherNormalize(const torch::Tensor& input, co
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count =
       static_cast<uint32_t>((active_rows + maximum_waves_per_block - 1) / maximum_waves_per_block);
-  const auto stream = at::hip::getCurrentHIPStream(input.get_device());
+  const auto stream = backend::GetCurrentStream(input.get_device());
 #define LAUNCH_INDEXED_LOCAL_GATHER(scalar_type, index_type)                                                           \
   LaunchIndexedLocalGatherNormalizeTyped<scalar_type, index_type>(input, indices, input_norm_weight, input_norm_bias,  \
       attention_norm_weight, attention_norm_bias, output, normalized, active_offset, active_rows, dense_rows, epsilon, \
-      block_count, stream.stream())
+      block_count, stream)
   if (input.scalar_type() == torch::kFloat16) {
     if (index_data_type == torch::kInt32) {
       LAUNCH_INDEXED_LOCAL_GATHER(c10::Half, int32_t);
@@ -2803,7 +2824,7 @@ void LaunchIndexedLocalTransformerGatherNormalize(const torch::Tensor& input, co
     TORCH_CHECK(false, "unsupported indexed local transformer data type");
   }
 #undef LAUNCH_INDEXED_LOCAL_GATHER
-  CheckHipLaunch("fusion indexed local transformer gather LayerNorm");
+  CheckKernelLaunch("fusion indexed local transformer gather LayerNorm");
 }
 
 void LaunchIndexedLocalTransformerGatherNormalizeSegments(
@@ -2833,12 +2854,12 @@ void LaunchIndexedLocalTransformerGatherNormalizeSegments(
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count =
       static_cast<uint32_t>((active_rows + maximum_waves_per_block - 1) / maximum_waves_per_block);
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
 #define LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(scalar_type, index_type)                               \
   LaunchIndexedLocalGatherNormalizeSegmentsTyped<scalar_type, index_type>(                           \
       input_segments, input_segment_count, indices, input_norm_weight, input_norm_bias,              \
       attention_norm_weight, attention_norm_bias, output, normalized, active_offset, active_rows,   \
-      dense_rows, token_count, epsilon, block_count, stream.stream())
+      dense_rows, token_count, epsilon, block_count, stream)
   if (input_data_type == torch::kFloat16) {
     if (index_data_type == torch::kInt32) {
       LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER(c10::Half, int32_t);
@@ -2861,13 +2882,13 @@ void LaunchIndexedLocalTransformerGatherNormalizeSegments(
     TORCH_CHECK(false, "unsupported segmented indexed local transformer data type");
   }
 #undef LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER
-  CheckHipLaunch("fusion segmented indexed local transformer gather LayerNorm");
+  CheckKernelLaunch("fusion segmented indexed local transformer gather LayerNorm");
 }
 
 template <typename scalar_t, typename index_t>
 void LaunchIndexedLocalAttentionTyped(torch::Tensor& query_key_value, const torch::Tensor& indices, int64_t active_rows,
-    int64_t dense_rows, int64_t token_count, uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((indexed_local_attention_kernel<scalar_t, index_t>), dim3(block_count), dim3(kThreadsPerBlock), 0,
+    int64_t dense_rows, int64_t token_count, uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_attention_kernel<scalar_t, index_t>), dim3(block_count), dim3(kThreadsPerBlock), 0,
       stream, query_key_value.data_ptr<scalar_t>(), indices.data_ptr<index_t>(), active_rows, dense_rows, token_count);
 }
 
@@ -2881,10 +2902,10 @@ void LaunchIndexedLocalTransformerAttention(torch::Tensor& query_key_value, cons
     return;
   }
   const uint32_t block_count = static_cast<uint32_t>(dense_rows / token_count);
-  const auto stream = at::hip::getCurrentHIPStream(query_key_value.get_device());
+  const auto stream = backend::GetCurrentStream(query_key_value.get_device());
 #define LAUNCH_INDEXED_LOCAL_ATTENTION(scalar_type, index_type) \
   LaunchIndexedLocalAttentionTyped<scalar_type, index_type>(    \
-      query_key_value, indices, active_rows, dense_rows, token_count, block_count, stream.stream())
+      query_key_value, indices, active_rows, dense_rows, token_count, block_count, stream)
   if (query_key_value.scalar_type() == torch::kFloat16) {
     if (index_data_type == torch::kInt32) {
       LAUNCH_INDEXED_LOCAL_ATTENTION(c10::Half, int32_t);
@@ -2907,15 +2928,15 @@ void LaunchIndexedLocalTransformerAttention(torch::Tensor& query_key_value, cons
     TORCH_CHECK(false, "unsupported indexed local transformer data type");
   }
 #undef LAUNCH_INDEXED_LOCAL_ATTENTION
-  CheckHipLaunch("fusion indexed local transformer attention");
+  CheckKernelLaunch("fusion indexed local transformer attention");
 }
 
 template <typename scalar_t, typename index_t>
 void LaunchIndexedLocalResidualNormalizeTyped(torch::Tensor& output, const torch::Tensor& update,
     const torch::Tensor& update_bias, const torch::Tensor& indices, const torch::Tensor& norm_weight,
     const torch::Tensor& norm_bias, torch::Tensor& normalized, int64_t active_offset, int64_t active_rows,
-    int64_t dense_rows, float epsilon, uint32_t block_count, hipStream_t stream) {
-  hipLaunchKernelGGL((indexed_local_residual_normalize_kernel<scalar_t, index_t>), dim3(block_count),
+    int64_t dense_rows, float epsilon, uint32_t block_count, backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_residual_normalize_kernel<scalar_t, index_t>), dim3(block_count),
       dim3(kThreadsPerBlock), 0, stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
       indices.data_ptr<index_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),
       static_cast<int32_t>(norm_weight.scalar_type()), normalized.data_ptr<scalar_t>(), active_offset, active_rows,
@@ -2933,10 +2954,10 @@ void LaunchIndexedLocalTransformerResidualLayerNorm(torch::Tensor& output, const
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count =
       static_cast<uint32_t>((active_rows + maximum_waves_per_block - 1) / maximum_waves_per_block);
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
 #define LAUNCH_INDEXED_LOCAL_RESIDUAL(scalar_type, index_type)                                                         \
   LaunchIndexedLocalResidualNormalizeTyped<scalar_type, index_type>(output, update, update_bias, indices, norm_weight, \
-      norm_bias, normalized, active_offset, active_rows, dense_rows, epsilon, block_count, stream.stream())
+      norm_bias, normalized, active_offset, active_rows, dense_rows, epsilon, block_count, stream)
   if (output.scalar_type() == torch::kFloat16) {
     if (index_data_type == torch::kInt32) {
       LAUNCH_INDEXED_LOCAL_RESIDUAL(c10::Half, int32_t);
@@ -2959,7 +2980,7 @@ void LaunchIndexedLocalTransformerResidualLayerNorm(torch::Tensor& output, const
     TORCH_CHECK(false, "unsupported indexed local transformer data type");
   }
 #undef LAUNCH_INDEXED_LOCAL_RESIDUAL
-  CheckHipLaunch("fusion indexed local transformer residual LayerNorm");
+  CheckKernelLaunch("fusion indexed local transformer residual LayerNorm");
 }
 
 void LaunchIndexedLocalTransformerBiasSilu(
@@ -2971,8 +2992,8 @@ template <typename scalar_t, typename index_t>
 void LaunchIndexedLocalFinalizeTyped(torch::Tensor& output, const torch::Tensor& update, const torch::Tensor& indices,
     const torch::Tensor& update_bias, const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     int64_t active_offset, int64_t active_rows, int64_t dense_rows, float epsilon, uint32_t block_count,
-    hipStream_t stream) {
-  hipLaunchKernelGGL((indexed_local_finalize_kernel<scalar_t, index_t>), dim3(block_count), dim3(kThreadsPerBlock), 0,
+    backend::Stream stream) {
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_finalize_kernel<scalar_t, index_t>), dim3(block_count), dim3(kThreadsPerBlock), 0,
       stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(), indices.data_ptr<index_t>(),
       update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),
       static_cast<int32_t>(norm_weight.scalar_type()), active_offset, active_rows, dense_rows, epsilon);
@@ -2983,7 +3004,7 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
     const torch::Tensor& norm_weight, const torch::Tensor& norm_bias, int64_t active_offset, int64_t active_rows,
     int64_t dense_rows, int64_t hidden_width, float epsilon) {
   TORCH_CHECK(hidden_width == kIndexedLocalHiddenWidth, "indexed local transformer requires hidden width 256");
-  const auto stream = at::hip::getCurrentHIPStream(output.get_device());
+  const auto stream = backend::GetCurrentStream(output.get_device());
   if (active_rows == 0) {
     return;
   }
@@ -2992,7 +3013,7 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
       static_cast<uint32_t>((active_rows + maximum_waves_per_block - 1) / maximum_waves_per_block);
 #define LAUNCH_INDEXED_LOCAL_FINALIZE(scalar_type, index_type)                                                \
   LaunchIndexedLocalFinalizeTyped<scalar_type, index_type>(output, update, indices, update_bias, norm_weight, \
-      norm_bias, active_offset, active_rows, dense_rows, epsilon, block_count, stream.stream())
+      norm_bias, active_offset, active_rows, dense_rows, epsilon, block_count, stream)
   if (output.scalar_type() == torch::kFloat16) {
     if (index_data_type == torch::kInt32) {
       LAUNCH_INDEXED_LOCAL_FINALIZE(c10::Half, int32_t);
@@ -3015,7 +3036,7 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
     TORCH_CHECK(false, "unsupported indexed local transformer data type");
   }
 #undef LAUNCH_INDEXED_LOCAL_FINALIZE
-  CheckHipLaunch("fusion indexed local transformer finalize");
+  CheckKernelLaunch("fusion indexed local transformer finalize");
 }
 
 template <typename score_t, typename mask_t, typename value_t>
@@ -3024,12 +3045,12 @@ void LaunchMappedGroupedMaskedSoftmaxPoolTyped(
     const torch::Tensor& values, const torch::Tensor& destination_metadata,
     torch::Tensor& contexts, torch::Tensor& presence, int64_t batch_count,
     int64_t candidate_count, int64_t group_count, int64_t width,
-    int64_t destination_count, hipStream_t stream) {
+    int64_t destination_count, backend::Stream stream) {
   const int64_t row_count = CheckedMultiply(
       batch_count, destination_count, "mapped grouped pool row count");
   const uint32_t block_count = static_cast<uint32_t>(
       std::min<int64_t>(row_count, 65535));
-  hipLaunchKernelGGL(
+  DJL_FUSION_LAUNCH_KERNEL(
       (mapped_grouped_masked_softmax_pool_kernel<
           score_t, mask_t, value_t>),
       dim3(block_count), dim3(kThreadsPerBlock), 0, stream,
@@ -3059,12 +3080,12 @@ void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
   if (batch_count == 0) {
     return;
   }
-  const auto stream = at::hip::getCurrentHIPStream(scores.get_device());
+  const auto stream = backend::GetCurrentStream(scores.get_device());
 #define LAUNCH_MAPPED_POOL(score_type, mask_type, value_type) \
   LaunchMappedGroupedMaskedSoftmaxPoolTyped<score_type, mask_type, value_type>( \
       scores, masks, values, destination_metadata, contexts, presence, \
       batch_count, candidate_count, group_count, width, destination_count, \
-      stream.stream())
+      stream)
 #define DISPATCH_MAPPED_POOL_VALUE(score_type, mask_type) \
   switch (values.scalar_type()) { \
     case torch::kFloat16: \
@@ -3109,7 +3130,7 @@ void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
 #undef DISPATCH_MAPPED_POOL_MASK
 #undef DISPATCH_MAPPED_POOL_VALUE
 #undef LAUNCH_MAPPED_POOL
-  CheckHipLaunch("fusion mapped grouped masked-softmax pool");
+  CheckKernelLaunch("fusion mapped grouped masked-softmax pool");
 }
 
 }  // namespace djl::pytorch::fusion
