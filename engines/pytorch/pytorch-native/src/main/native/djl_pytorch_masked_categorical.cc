@@ -15,6 +15,8 @@
 
 #include <torch/csrc/autograd/custom_function.h>
 
+#include <vector>
+
 #if defined(DJL_USE_ROCM_KERNELS)
 #include "djl_pytorch_rocm_kernels.h"
 #endif
@@ -191,6 +193,38 @@ class MaskedLogSumExpFunction : public torch::autograd::Function<MaskedLogSumExp
   }
 };
 
+class IndexedMaskedSoftmaxPoolValueFunction
+    : public torch::autograd::Function<IndexedMaskedSoftmaxPoolValueFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& logits, const torch::Tensor& mask,
+      const torch::Tensor& values, std::vector<int64_t> choice_indices) {
+    context->save_for_backward({logits, mask});
+    context->saved_data["value_shape"] = values.sizes().vec();
+    context->saved_data["value_type"] = static_cast<int64_t>(values.scalar_type());
+    context->saved_data["choice_indices"] = choice_indices;
+    return rocm::indexed_masked_softmax_pool_forward(
+        logits, mask, values, choice_indices);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto value_shape = context->saved_data["value_shape"].toIntVector();
+    const auto value_type = static_cast<torch::ScalarType>(
+        context->saved_data["value_type"].toInt());
+    const auto choice_indices =
+        context->saved_data["choice_indices"].toIntVector();
+    auto value_gradient = context->needs_input_grad(2)
+        ? rocm::indexed_masked_softmax_pool_value_backward(
+              gradient_outputs.at(0), saved.at(0), saved.at(1), value_shape,
+              value_type, choice_indices)
+        : torch::Tensor();
+    return {torch::Tensor(), torch::Tensor(), value_gradient, torch::Tensor()};
+  }
+};
+
 #endif
 
 }  // namespace
@@ -242,6 +276,13 @@ torch::Tensor indexed_masked_softmax_pool(const torch::Tensor& logits,
           contiguous_logits, contiguous_mask, contiguous_values, choice_indices)) {
     return rocm::indexed_masked_softmax_pool_forward(
         contiguous_logits, contiguous_mask, contiguous_values, choice_indices);
+  }
+  if (at::GradMode::is_enabled() && !logits.requires_grad() &&
+      values.requires_grad() &&
+      rocm::supports_indexed_masked_softmax_pool(
+          contiguous_logits, contiguous_mask, contiguous_values, choice_indices)) {
+    return IndexedMaskedSoftmaxPoolValueFunction::apply(contiguous_logits,
+        contiguous_mask, contiguous_values, choice_indices.vec());
   }
 #endif
   return indexed_masked_softmax_pool_reference(logits, mask, values, choice_indices);

@@ -413,7 +413,9 @@ __global__ void indexed_masked_softmax_pool_kernel(const logit_t* logits,
           }
         }
         for (int index = 0; index < selected.count; ++index) {
-          probabilities[index] /= denominator;
+          if (probabilities[index] != 0.0f) {
+            probabilities[index] /= denominator;
+          }
         }
       } else {
         for (int index = 0; index < selected.count; ++index) {
@@ -435,6 +437,71 @@ __global__ void indexed_masked_softmax_pool_kernel(const logit_t* logits,
         }
       }
       output[output_offset + feature] = pooled;
+    }
+    __syncthreads();
+  }
+}
+
+template <typename logit_t, typename mask_t, typename value_t>
+__global__ void indexed_masked_softmax_pool_value_backward_kernel(
+    const float* gradient_output, const logit_t* logits, const mask_t* mask,
+    value_t* gradient_values, int64_t row_count, int64_t choice_count,
+    int64_t feature_count, IndexedPoolChoices selected) {
+  __shared__ float probabilities[kMaximumIndexedPoolChoices];
+  for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x) {
+    if (threadIdx.x == 0) {
+      float maximum = -INFINITY;
+      int selected_count = 0;
+      for (int index = 0; index < selected.count; ++index) {
+        const int64_t offset = row * choice_count + selected.columns[index];
+        const bool legal = static_cast<float>(mask[offset]) != 0.0f;
+        probabilities[index] = legal ? 1.0f : 0.0f;
+        if (legal) {
+          maximum = maximum_propagating_nan(
+              maximum, static_cast<float>(logits[offset]));
+          ++selected_count;
+        }
+      }
+      float denominator = 0.0f;
+      if (selected_count > 0) {
+        for (int index = 0; index < selected.count; ++index) {
+          if (probabilities[index] != 0.0f) {
+            const int64_t offset = row * choice_count + selected.columns[index];
+            probabilities[index] =
+                expf(static_cast<float>(logits[offset]) - maximum);
+            denominator += probabilities[index];
+          }
+        }
+        for (int index = 0; index < selected.count; ++index) {
+          if (probabilities[index] != 0.0f) {
+            probabilities[index] /= denominator;
+          }
+        }
+      } else {
+        for (int index = 0; index < selected.count; ++index) {
+          probabilities[index] = 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+    const int64_t value_row_offset = row * choice_count * feature_count;
+    for (int64_t index = threadIdx.x; index < choice_count * feature_count;
+         index += blockDim.x) {
+      gradient_values[value_row_offset + index] = static_cast<value_t>(0.0f);
+    }
+    __syncthreads();
+    for (int64_t index = threadIdx.x;
+         index < static_cast<int64_t>(selected.count) * feature_count;
+         index += blockDim.x) {
+      const int selected_index = static_cast<int>(index / feature_count);
+      const int64_t feature = index - selected_index * feature_count;
+      const int64_t choice = selected.columns[selected_index];
+      const float probability = probabilities[selected_index];
+      gradient_values[value_row_offset + choice * feature_count + feature] =
+          probability == 0.0f
+              ? static_cast<value_t>(0.0f)
+              : static_cast<value_t>(probability *
+                    gradient_output[row * feature_count + feature]);
     }
     __syncthreads();
   }
@@ -504,6 +571,84 @@ void dispatch_indexed_pool_mask_type(const torch::Tensor& logits,
       break;
     default:
       TORCH_CHECK(false, "unsupported indexed masked softmax pool mask data type");
+  }
+}
+
+template <typename logit_t, typename mask_t, typename value_t>
+void launch_indexed_masked_softmax_pool_value_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& logits,
+    const torch::Tensor& mask, torch::Tensor& gradient_values, int blocks,
+    int threads, hipStream_t stream, int64_t row_count, int64_t choice_count,
+    int64_t feature_count, IndexedPoolChoices selected) {
+  hipLaunchKernelGGL(
+      (indexed_masked_softmax_pool_value_backward_kernel<
+          logit_t, mask_t, value_t>),
+      dim3(blocks), dim3(threads), 0, stream,
+      gradient_output.data_ptr<float>(), logits.data_ptr<logit_t>(),
+      mask.data_ptr<mask_t>(), gradient_values.data_ptr<value_t>(), row_count,
+      choice_count, feature_count, selected);
+}
+
+template <typename logit_t, typename mask_t>
+void dispatch_indexed_pool_value_gradient_type(
+    const torch::Tensor& gradient_output, const torch::Tensor& logits,
+    const torch::Tensor& mask, torch::Tensor& gradient_values, int blocks,
+    int threads, hipStream_t stream, int64_t row_count, int64_t choice_count,
+    int64_t feature_count, IndexedPoolChoices selected) {
+  switch (gradient_values.scalar_type()) {
+    case torch::kFloat32:
+      launch_indexed_masked_softmax_pool_value_backward<logit_t, mask_t, float>(
+          gradient_output, logits, mask, gradient_values, blocks, threads,
+          stream, row_count, choice_count, feature_count, selected);
+      break;
+    case torch::kFloat16:
+      launch_indexed_masked_softmax_pool_value_backward<
+          logit_t, mask_t, c10::Half>(gradient_output, logits, mask,
+          gradient_values, blocks, threads, stream, row_count, choice_count,
+          feature_count, selected);
+      break;
+    case torch::kBFloat16:
+      launch_indexed_masked_softmax_pool_value_backward<
+          logit_t, mask_t, c10::BFloat16>(gradient_output, logits, mask,
+          gradient_values, blocks, threads, stream, row_count, choice_count,
+          feature_count, selected);
+      break;
+    default:
+      TORCH_CHECK(false,
+          "unsupported indexed masked softmax pool value gradient data type");
+  }
+}
+
+template <typename logit_t>
+void dispatch_indexed_pool_value_gradient_mask_type(
+    const torch::Tensor& gradient_output, const torch::Tensor& logits,
+    const torch::Tensor& mask, torch::Tensor& gradient_values, int blocks,
+    int threads, hipStream_t stream, int64_t row_count, int64_t choice_count,
+    int64_t feature_count, IndexedPoolChoices selected) {
+  switch (mask.scalar_type()) {
+    case torch::kBool:
+      dispatch_indexed_pool_value_gradient_type<logit_t, bool>(gradient_output,
+          logits, mask, gradient_values, blocks, threads, stream, row_count,
+          choice_count, feature_count, selected);
+      break;
+    case torch::kFloat32:
+      dispatch_indexed_pool_value_gradient_type<logit_t, float>(gradient_output,
+          logits, mask, gradient_values, blocks, threads, stream, row_count,
+          choice_count, feature_count, selected);
+      break;
+    case torch::kFloat16:
+      dispatch_indexed_pool_value_gradient_type<logit_t, c10::Half>(
+          gradient_output, logits, mask, gradient_values, blocks, threads,
+          stream, row_count, choice_count, feature_count, selected);
+      break;
+    case torch::kBFloat16:
+      dispatch_indexed_pool_value_gradient_type<logit_t, c10::BFloat16>(
+          gradient_output, logits, mask, gradient_values, blocks, threads,
+          stream, row_count, choice_count, feature_count, selected);
+      break;
+    default:
+      TORCH_CHECK(false,
+          "unsupported indexed masked softmax pool mask data type");
   }
 }
 
@@ -3498,6 +3643,43 @@ torch::Tensor indexed_masked_softmax_pool_forward(const torch::Tensor& logits,
       });
   check_hip_kernel_launch("indexed_masked_softmax_pool");
   return output;
+}
+
+torch::Tensor indexed_masked_softmax_pool_value_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& logits,
+    const torch::Tensor& mask, at::IntArrayRef value_shape,
+    torch::ScalarType value_type, at::IntArrayRef choice_indices) {
+  c10::DeviceGuard device_guard(logits.device());
+  auto contiguous_gradient = gradient_output.to(torch::kFloat32).contiguous();
+  auto gradient_values =
+      torch::empty(value_shape, logits.options().dtype(value_type));
+  const int64_t choice_count = logits.size(-1);
+  const int64_t row_count = logits.numel() / choice_count;
+  if (row_count == 0) {
+    return gradient_values;
+  }
+  const int64_t feature_count = value_shape.back();
+  IndexedPoolChoices selected{};
+  selected.count = static_cast<int32_t>(choice_indices.size());
+  for (size_t index = 0; index < choice_indices.size(); ++index) {
+    selected.columns[index] = static_cast<int32_t>(choice_indices[index]);
+  }
+  const auto& properties = device_properties(logits.get_device());
+  const int threads = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().masked_categorical_threads_per_block,
+      launch_environment::kMaskedCategoricalThreadsPerBlock, true);
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(row_count, static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(logits.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+      logits.scalar_type(), "indexed_masked_softmax_pool_value_gradient_logits", [&] {
+        dispatch_indexed_pool_value_gradient_mask_type<scalar_t>(
+            contiguous_gradient, logits, mask, gradient_values, blocks, threads,
+            stream, row_count, choice_count, feature_count, selected);
+      });
+  check_hip_kernel_launch("indexed_masked_softmax_pool_value_backward");
+  return gradient_values;
 }
 
 torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,

@@ -65,6 +65,11 @@ torch::Tensor indexed_masked_softmax_pool_forward(const torch::Tensor& logits,
     const torch::Tensor& mask, const torch::Tensor& values,
     at::IntArrayRef choice_indices);
 
+torch::Tensor indexed_masked_softmax_pool_value_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& logits,
+    const torch::Tensor& mask, at::IntArrayRef value_shape,
+    torch::ScalarType value_type, at::IntArrayRef choice_indices);
+
 torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torch::Tensor& mask);
 
 torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,
