@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "djl_pytorch_fusion_kernels.h"
+#include "djl_pytorch_rocm_attention.h"
 
 namespace djl::pytorch::fusion {
 namespace {
@@ -3123,6 +3124,9 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
           3, 0, command.token_count);
 
       torch::Tensor attention_context;
+#if defined(DJL_USE_ROCM_KERNELS)
+      djl::pytorch::prepare_rocm_attention_backend();
+#endif
       if (query_key_value.scalar_type() == torch::kFloat32) {
         attention_context = at::scaled_dot_product_attention(
             queries.transpose(1, 2), keys.transpose(1, 2),

@@ -14,6 +14,7 @@ package ai.djl.pytorch.engine;
 
 import ai.djl.Device;
 import ai.djl.engine.Engine;
+import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 
@@ -22,6 +23,9 @@ import org.testng.SkipException;
 import org.testng.annotations.Test;
 
 import java.nio.FloatBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -209,6 +213,39 @@ public class StreamTest {
         verifyAsynchronousPinnedCopies(Device.gpu(0));
     }
 
+    @Test
+    public void concurrentScaledDotProductAttentionOnGpu() throws Exception {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This concurrent attention test requires a PyTorch GPU.");
+        }
+
+        int deviceCount = Math.min(engine.getGpuCount(), 2);
+        int streamsPerDevice = 4;
+        int workerCount = deviceCount * streamsPerDevice;
+        CyclicBarrier start = new CyclicBarrier(workerCount);
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+        List<Future<?>> futures = new ArrayList<>(workerCount);
+        try {
+            for (int deviceIndex = 0; deviceIndex < deviceCount; ++deviceIndex) {
+                Device device = Device.gpu(deviceIndex);
+                for (int streamIndex = 0; streamIndex < streamsPerDevice; ++streamIndex) {
+                    futures.add(
+                            executor.submit(
+                                    () -> {
+                                        runScaledDotProductAttention(engine, device, start);
+                                        return null;
+                                    }));
+                }
+            }
+            for (Future<?> future : futures) {
+                future.get(120, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     private void verifyCurrentStreamCopies(Device device) {
         PtEngine engine = (PtEngine) Engine.getInstance();
         try (PtNDManager host = (PtNDManager) engine.newBaseManager(Device.cpu());
@@ -239,6 +276,34 @@ public class StreamTest {
             float[] actual = new float[expected.length];
             target.getByteBuffer().asFloatBuffer().get(actual);
             Assert.assertEquals(actual, expected);
+        }
+    }
+
+    private static void runScaledDotProductAttention(
+            PtEngine engine, Device device, CyclicBarrier start) throws Exception {
+        Shape queryShape = new Shape(128, 4, 34, 32);
+        Shape maskShape = new Shape(128, 4, 34, 34);
+        try (PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                PtStream stream = engine.newStream(device);
+                PtStreamScope ignored = stream.openScope()) {
+            NDArray query = manager.randomNormal(queryShape).toType(DataType.FLOAT16, false);
+            NDArray key = manager.randomNormal(queryShape).toType(DataType.FLOAT16, false);
+            NDArray value = manager.randomNormal(queryShape).toType(DataType.FLOAT16, false);
+            NDArray mask =
+                    manager.randomNormal(maskShape).toType(DataType.FLOAT16, false).mul(0.01f);
+
+            start.await(30, TimeUnit.SECONDS);
+            NDArray output =
+                    query.getNDArrayInternal()
+                            .scaledDotProductAttention(key, value, mask, 0.0, false);
+
+            assertFinite(output);
+        }
+    }
+
+    private static void assertFinite(NDArray array) {
+        for (float value : array.toType(DataType.FLOAT32, false).toFloatArray()) {
+            Assert.assertTrue(Float.isFinite(value), "Expected only finite tensor values.");
         }
     }
 

@@ -23,6 +23,7 @@
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_layer_norm.h"
 #include "djl_pytorch_masked_categorical.h"
+#include "djl_pytorch_rocm_attention.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_routing_masks.h"
 #include "djl_pytorch_structured_attention.h"
@@ -48,6 +49,7 @@ torch::Tensor scaled_dot_product_attention_preserving_mask_autograd(const torch:
     const torch::Tensor& key, const torch::Tensor& value, const std::optional<torch::Tensor>& mask,
     double dropout, bool causal, const std::optional<double>& scale) {
 #if defined(DJL_USE_ROCM_KERNELS)
+  djl::pytorch::prepare_rocm_attention_backend();
   if (at::GradMode::is_enabled() && mask.has_value() && mask->requires_grad() && !query.requires_grad() &&
       !key.requires_grad() && !value.requires_grad()) {
     return std::get<0>(

@@ -50,6 +50,8 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_fusion_kernels.h"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
+    "src/main/native/djl_pytorch_rocm_attention.h"
+    "src/main/native/djl_pytorch_rocm_attention.cc"
     "src/main/native/djl_pytorch_masked_categorical.h"
     "src/main/native/djl_pytorch_masked_categorical.cc"
     "src/main/native/djl_pytorch_routing_masks.h"
@@ -194,6 +196,27 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         REQUIRED)
     target_include_directories(djl_torch PRIVATE ${HIPBLASLT_INCLUDE_DIR})
     target_link_libraries(djl_torch ${HIPBLASLT_LIBRARY})
+
+    # AOTriton is packaged with ROCm-enabled libtorch. Its device-property caches in
+    # releases up to 0.11.2 are initialized lazily without internal synchronization.
+    # Link its public utility API when available so DJL can initialize those caches
+    # before concurrent SDPA dispatch begins.
+    find_path(AOTRITON_INCLUDE_DIR
+        NAMES aotriton/util.h
+        PATHS "${TORCH_INSTALL_PREFIX}/include"
+        NO_DEFAULT_PATH)
+    find_library(AOTRITON_LIBRARY
+        NAMES aotriton_v2
+        PATHS "${TORCH_INSTALL_PREFIX}/lib" "${TORCH_INSTALL_PREFIX}/lib64"
+        NO_DEFAULT_PATH)
+    if(AOTRITON_INCLUDE_DIR AND AOTRITON_LIBRARY)
+        target_compile_definitions(djl_torch PRIVATE DJL_USE_AOTRITON)
+        target_include_directories(djl_torch PRIVATE ${AOTRITON_INCLUDE_DIR})
+        target_link_libraries(djl_torch ${AOTRITON_LIBRARY})
+        message(STATUS "AOTriton SDPA cache initialization enabled: ${AOTRITON_LIBRARY}")
+    else()
+        message(STATUS "AOTriton public utility API not found; SDPA cache initialization disabled")
+    endif()
 endif()
 if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
     target_compile_definitions(djl_torch PRIVATE DJL_USE_FUSION_KERNELS DJL_USE_CUDA_FUSION_KERNELS)
