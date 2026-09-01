@@ -549,6 +549,25 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDList residualAddLayerNorm(
+            NDArray residual,
+            NDArray update,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.residualAddLayerNorm(
+                manager.from(residual),
+                manager.from(update),
+                normalizedShape,
+                manager.from(gamma),
+                manager.from(beta),
+                eps);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDList layerNormAndCast(
             NDArray input,
             Shape normalizedShape,

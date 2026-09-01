@@ -21,11 +21,16 @@ namespace {
 // Bound register-backed specializations; wider rows retain the original two-pass kernel.
 constexpr int kResidualCachedValuesPerLaneLimit = 16;
 constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
+constexpr int kLayerNormAffinePartialMaximumBlocks = 1024;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
 constexpr int kMaximumIndexedPoolChoices = 16;
+
+template <typename residual_t, typename update_t>
+using residual_sum_t = std::conditional_t<
+    std::is_same_v<residual_t, update_t>, residual_t, float>;
 
 struct CategoricalMaskRules {
   int32_t count;
@@ -43,9 +48,13 @@ void check_hip_kernel_launch(const char* kernel_name) {
   TORCH_CHECK(error == hipSuccess, kernel_name, " launch failed: ", hipGetErrorString(error));
 }
 
+bool is_fused_floating_type(torch::ScalarType type) {
+  return type == torch::kFloat32 || type == torch::kFloat16 ||
+         type == torch::kBFloat16;
+}
+
 bool is_fused_floating(const torch::Tensor& tensor) {
-  return tensor.scalar_type() == torch::kFloat32 || tensor.scalar_type() == torch::kFloat16 ||
-         tensor.scalar_type() == torch::kBFloat16;
+  return is_fused_floating_type(tensor.scalar_type());
 }
 
 bool is_embedding_index_type(const torch::Tensor& tensor) {
@@ -2247,6 +2256,229 @@ __global__ void autocast_layer_norm_kernel(const input_t* input, const parameter
   }
 }
 
+template <int cached_values_per_lane, typename residual_t, typename update_t,
+    typename summed_t>
+__global__ void residual_add_layer_norm_forward_kernel(
+    const residual_t* residual, const update_t* update, const float* weight,
+    const float* bias, float* normalized, summed_t* summed_residual,
+    float* mean_output, float* reciprocal_standard_deviation_output,
+    int64_t row_count, int64_t width, float epsilon) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+  if (row >= row_count) {
+    return;
+  }
+
+  float cached_values[cached_values_per_lane];
+  float mean = 0.0f;
+  float moment = 0.0f;
+  int count = 0;
+  const int64_t row_offset = row * width;
+#pragma unroll
+  for (int cached_index = 0; cached_index < cached_values_per_lane;
+       cached_index++) {
+    const int64_t feature =
+        lane + static_cast<int64_t>(cached_index) * warpSize;
+    if (feature < width) {
+      const int64_t index = row_offset + feature;
+      const summed_t rounded_value = static_cast<summed_t>(
+          static_cast<float>(residual[index]) + static_cast<float>(update[index]));
+      const float value = static_cast<float>(rounded_value);
+      summed_residual[index] = rounded_value;
+      cached_values[cached_index] = value;
+      count++;
+      const float delta = value - mean;
+      mean += delta / count;
+      moment += delta * (value - mean);
+    }
+  }
+
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    const float other_mean = __shfl_down(mean, offset);
+    const float other_moment = __shfl_down(moment, offset);
+    const int other_count = __shfl_down(count, offset);
+    if (lane + offset < warpSize && other_count > 0) {
+      const int combined_count = count + other_count;
+      const float delta = other_mean - mean;
+      moment += other_moment +
+          delta * delta * static_cast<float>(count) *
+              static_cast<float>(other_count) /
+              static_cast<float>(combined_count);
+      mean += delta * static_cast<float>(other_count) /
+          static_cast<float>(combined_count);
+      count = combined_count;
+    }
+  }
+  mean = __shfl(mean, 0);
+  const float reciprocal_standard_deviation =
+      rsqrtf(__shfl(moment, 0) / static_cast<float>(width) + epsilon);
+  if (lane == 0 && mean_output != nullptr) {
+    mean_output[row] = mean;
+    reciprocal_standard_deviation_output[row] = reciprocal_standard_deviation;
+  }
+
+#pragma unroll
+  for (int cached_index = 0; cached_index < cached_values_per_lane;
+       cached_index++) {
+    const int64_t feature =
+        lane + static_cast<int64_t>(cached_index) * warpSize;
+    if (feature < width) {
+      const float standardized =
+          (cached_values[cached_index] - mean) * reciprocal_standard_deviation;
+      normalized[row_offset + feature] =
+          standardized * weight[feature] + bias[feature];
+    }
+  }
+}
+
+template <int cached_values_per_lane, typename residual_t, typename update_t,
+    typename summed_t>
+__global__ void residual_add_layer_norm_input_gradient_kernel(
+    const float* normalized_gradient, const summed_t* summed_gradient,
+    const summed_t* summed_residual, const float* weight, const float* mean,
+    const float* reciprocal_standard_deviation, residual_t* residual_gradient,
+    update_t* update_gradient, float* affine_partials, int64_t row_count,
+    int64_t width) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  float cached_weight_gradient[cached_values_per_lane] = {};
+  float cached_bias_gradient[cached_values_per_lane] = {};
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < row_count;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    float cached_standardized[cached_values_per_lane];
+    float cached_scaled_gradient[cached_values_per_lane];
+    float scaled_gradient_sum = 0.0f;
+    float scaled_standardized_gradient_sum = 0.0f;
+    const int64_t row_offset = row * width;
+    const float row_mean = mean[row];
+    const float row_reciprocal_standard_deviation =
+        reciprocal_standard_deviation[row];
+#pragma unroll
+    for (int cached_index = 0; cached_index < cached_values_per_lane;
+         cached_index++) {
+      const int64_t feature =
+          lane + static_cast<int64_t>(cached_index) * warpSize;
+      if (feature < width) {
+        const int64_t index = row_offset + feature;
+        const float standardized =
+            (static_cast<float>(summed_residual[index]) - row_mean) *
+            row_reciprocal_standard_deviation;
+        const float gradient = normalized_gradient == nullptr
+            ? 0.0f
+            : normalized_gradient[index];
+        const float scaled_gradient = gradient * weight[feature];
+        cached_standardized[cached_index] = standardized;
+        cached_scaled_gradient[cached_index] = scaled_gradient;
+        cached_weight_gradient[cached_index] += gradient * standardized;
+        cached_bias_gradient[cached_index] += gradient;
+        scaled_gradient_sum += scaled_gradient;
+        scaled_standardized_gradient_sum += scaled_gradient * standardized;
+      }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      scaled_gradient_sum += __shfl_down(scaled_gradient_sum, offset);
+      scaled_standardized_gradient_sum +=
+          __shfl_down(scaled_standardized_gradient_sum, offset);
+    }
+    scaled_gradient_sum = __shfl(scaled_gradient_sum, 0);
+    scaled_standardized_gradient_sum =
+        __shfl(scaled_standardized_gradient_sum, 0);
+    const float inverse_width = 1.0f / static_cast<float>(width);
+
+#pragma unroll
+    for (int cached_index = 0; cached_index < cached_values_per_lane;
+         cached_index++) {
+      const int64_t feature =
+          lane + static_cast<int64_t>(cached_index) * warpSize;
+      if (feature < width) {
+        const int64_t index = row_offset + feature;
+        const float layer_norm_gradient = row_reciprocal_standard_deviation *
+            (cached_scaled_gradient[cached_index] -
+                scaled_gradient_sum * inverse_width -
+                cached_standardized[cached_index] *
+                    scaled_standardized_gradient_sum * inverse_width);
+        const float direct_gradient = summed_gradient == nullptr
+            ? 0.0f
+            : static_cast<float>(summed_gradient[index]);
+        const summed_t rounded_layer_norm_gradient =
+            static_cast<summed_t>(layer_norm_gradient);
+        const summed_t rounded_gradient = static_cast<summed_t>(
+            direct_gradient + static_cast<float>(rounded_layer_norm_gradient));
+        const float gradient = static_cast<float>(rounded_gradient);
+        if (residual_gradient != nullptr) {
+          residual_gradient[index] = static_cast<residual_t>(gradient);
+        }
+        if (update_gradient != nullptr) {
+          update_gradient[index] = static_cast<update_t>(gradient);
+        }
+      }
+    }
+  }
+
+  if (affine_partials != nullptr) {
+    extern __shared__ float partial_sums[];
+    float* partial_weight = partial_sums;
+    float* partial_bias =
+        partial_sums + static_cast<int64_t>(waves_per_block) * width;
+#pragma unroll
+    for (int cached_index = 0; cached_index < cached_values_per_lane;
+         cached_index++) {
+      const int64_t feature =
+          lane + static_cast<int64_t>(cached_index) * warpSize;
+      if (feature < width) {
+        const int64_t shared_index =
+            static_cast<int64_t>(wave) * width + feature;
+        partial_weight[shared_index] = cached_weight_gradient[cached_index];
+        partial_bias[shared_index] = cached_bias_gradient[cached_index];
+      }
+    }
+    __syncthreads();
+    const int64_t output_offset =
+        static_cast<int64_t>(blockIdx.x) * 2 * width;
+    for (int64_t feature = threadIdx.x; feature < width;
+         feature += blockDim.x) {
+      float weight_sum = 0.0f;
+      float bias_sum = 0.0f;
+      for (int source_wave = 0; source_wave < waves_per_block; source_wave++) {
+        const int64_t shared_index =
+            static_cast<int64_t>(source_wave) * width + feature;
+        weight_sum += partial_weight[shared_index];
+        bias_sum += partial_bias[shared_index];
+      }
+      affine_partials[output_offset + feature] = weight_sum;
+      affine_partials[output_offset + width + feature] = bias_sum;
+    }
+  }
+}
+
+__global__ void layer_norm_affine_partial_reduction_kernel(
+    const float* affine_partials, float* weight_gradient, float* bias_gradient,
+    int64_t partial_count, int64_t width) {
+  const int64_t feature =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (feature >= width) {
+    return;
+  }
+  float weight_sum = 0.0f;
+  float bias_sum = 0.0f;
+  for (int64_t partial = 0; partial < partial_count; partial++) {
+    const int64_t offset = partial * 2 * width;
+    weight_sum += affine_partials[offset + feature];
+    bias_sum += affine_partials[offset + width + feature];
+  }
+  if (weight_gradient != nullptr) {
+    weight_gradient[feature] = weight_sum;
+  }
+  if (bias_gradient != nullptr) {
+    bias_gradient[feature] = bias_sum;
+  }
+}
+
 const hipDeviceProp_t& device_properties(int device) {
   static const std::vector<hipDeviceProp_t> all_properties = [] {
     int device_count;
@@ -2404,6 +2636,245 @@ void dispatch_autocast_layer_norm_cached_values_per_lane(
   } else {
     TORCH_CHECK(false, "unsupported autocast LayerNorm cache values per lane: ", values_per_lane);
   }
+}
+
+template <int cached_values_per_lane, typename residual_t, typename update_t,
+    typename summed_t>
+void launch_residual_add_layer_norm_forward_typed(
+    const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    torch::Tensor& normalized, torch::Tensor& summed_residual,
+    torch::Tensor& mean, torch::Tensor& reciprocal_standard_deviation,
+    dim3 grid, dim3 block, hipStream_t stream, int64_t row_count,
+    int64_t width, float epsilon) {
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_forward_kernel<
+                         cached_values_per_lane, residual_t, update_t, summed_t>),
+      grid, block, 0, stream, residual.data_ptr<residual_t>(),
+      update.data_ptr<update_t>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
+      normalized.data_ptr<float>(), summed_residual.data_ptr<summed_t>(),
+      mean.defined() ? mean.data_ptr<float>() : nullptr,
+      reciprocal_standard_deviation.defined()
+          ? reciprocal_standard_deviation.data_ptr<float>()
+          : nullptr,
+      row_count, width, epsilon);
+}
+
+template <int cached_values_per_lane, typename residual_t, typename update_t>
+void dispatch_residual_add_layer_norm_forward_sum_type(
+    const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    torch::Tensor& normalized, torch::Tensor& summed_residual,
+    torch::Tensor& mean, torch::Tensor& reciprocal_standard_deviation,
+    dim3 grid, dim3 block, hipStream_t stream, int64_t row_count,
+    int64_t width, float epsilon) {
+  using summed_t = residual_sum_t<residual_t, update_t>;
+  launch_residual_add_layer_norm_forward_typed<cached_values_per_lane,
+      residual_t, update_t, summed_t>(residual, update, weight, bias, normalized,
+      summed_residual, mean, reciprocal_standard_deviation, grid, block, stream,
+      row_count, width, epsilon);
+}
+
+template <int cached_values_per_lane, typename residual_t>
+void dispatch_residual_add_layer_norm_forward_update_type(
+    const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    torch::Tensor& normalized, torch::Tensor& summed_residual,
+    torch::Tensor& mean, torch::Tensor& reciprocal_standard_deviation,
+    dim3 grid, dim3 block, hipStream_t stream, int64_t row_count,
+    int64_t width, float epsilon) {
+  switch (update.scalar_type()) {
+    case torch::kFloat32:
+      dispatch_residual_add_layer_norm_forward_sum_type<cached_values_per_lane,
+          residual_t, float>(residual, update, weight, bias, normalized,
+          summed_residual, mean, reciprocal_standard_deviation, grid, block,
+          stream, row_count, width, epsilon);
+      break;
+    case torch::kFloat16:
+      dispatch_residual_add_layer_norm_forward_sum_type<cached_values_per_lane,
+          residual_t, c10::Half>(residual, update, weight, bias, normalized,
+          summed_residual, mean, reciprocal_standard_deviation, grid, block,
+          stream, row_count, width, epsilon);
+      break;
+    case torch::kBFloat16:
+      dispatch_residual_add_layer_norm_forward_sum_type<cached_values_per_lane,
+          residual_t, c10::BFloat16>(residual, update, weight, bias, normalized,
+          summed_residual, mean, reciprocal_standard_deviation, grid, block,
+          stream, row_count, width, epsilon);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported residual update data type");
+  }
+}
+
+template <int cached_values_per_lane>
+void dispatch_residual_add_layer_norm_forward_types(
+    const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    torch::Tensor& normalized, torch::Tensor& summed_residual,
+    torch::Tensor& mean, torch::Tensor& reciprocal_standard_deviation,
+    dim3 grid, dim3 block, hipStream_t stream, int64_t row_count,
+    int64_t width, float epsilon) {
+  switch (residual.scalar_type()) {
+    case torch::kFloat32:
+      dispatch_residual_add_layer_norm_forward_update_type<cached_values_per_lane,
+          float>(residual, update, weight, bias, normalized, summed_residual,
+          mean, reciprocal_standard_deviation, grid, block, stream, row_count,
+          width, epsilon);
+      break;
+    case torch::kFloat16:
+      dispatch_residual_add_layer_norm_forward_update_type<cached_values_per_lane,
+          c10::Half>(residual, update, weight, bias, normalized, summed_residual,
+          mean, reciprocal_standard_deviation, grid, block, stream, row_count,
+          width, epsilon);
+      break;
+    case torch::kBFloat16:
+      dispatch_residual_add_layer_norm_forward_update_type<cached_values_per_lane,
+          c10::BFloat16>(residual, update, weight, bias, normalized,
+          summed_residual, mean, reciprocal_standard_deviation, grid, block,
+          stream, row_count, width, epsilon);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported residual data type");
+  }
+}
+
+template <int cached_values_per_lane, typename residual_t, typename update_t,
+    typename summed_t>
+void launch_residual_add_layer_norm_input_gradient_typed(
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& summed_gradient,
+    const torch::Tensor& summed_residual, const torch::Tensor& weight,
+    const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& residual_gradient, torch::Tensor& update_gradient,
+    torch::Tensor& affine_partials, dim3 grid, dim3 block,
+    size_t shared_memory_bytes, hipStream_t stream, int64_t row_count,
+    int64_t width) {
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_input_gradient_kernel<
+                         cached_values_per_lane, residual_t, update_t, summed_t>),
+      grid, block, shared_memory_bytes, stream,
+      normalized_gradient.defined() ? normalized_gradient.data_ptr<float>() : nullptr,
+      summed_gradient.defined() ? summed_gradient.data_ptr<summed_t>() : nullptr,
+      summed_residual.data_ptr<summed_t>(), weight.data_ptr<float>(),
+      mean.data_ptr<float>(), reciprocal_standard_deviation.data_ptr<float>(),
+      residual_gradient.defined() ? residual_gradient.data_ptr<residual_t>() : nullptr,
+      update_gradient.defined() ? update_gradient.data_ptr<update_t>() : nullptr,
+      affine_partials.defined() ? affine_partials.data_ptr<float>() : nullptr,
+      row_count, width);
+}
+
+template <int cached_values_per_lane, typename residual_t, typename update_t>
+void dispatch_residual_add_layer_norm_input_gradient_sum_type(
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& summed_gradient,
+    const torch::Tensor& summed_residual, const torch::Tensor& weight,
+    const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& residual_gradient, torch::Tensor& update_gradient,
+    torch::Tensor& affine_partials, dim3 grid, dim3 block,
+    size_t shared_memory_bytes, hipStream_t stream, int64_t row_count,
+    int64_t width) {
+  using summed_t = residual_sum_t<residual_t, update_t>;
+  launch_residual_add_layer_norm_input_gradient_typed<cached_values_per_lane,
+      residual_t, update_t, summed_t>(normalized_gradient, summed_gradient,
+      summed_residual, weight, mean, reciprocal_standard_deviation,
+      residual_gradient, update_gradient, affine_partials, grid, block,
+      shared_memory_bytes, stream, row_count, width);
+}
+
+template <int cached_values_per_lane, typename residual_t>
+void dispatch_residual_add_layer_norm_input_gradient_update_type(
+    torch::ScalarType update_type, const torch::Tensor& normalized_gradient,
+    const torch::Tensor& summed_gradient,
+    const torch::Tensor& summed_residual, const torch::Tensor& weight,
+    const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& residual_gradient, torch::Tensor& update_gradient,
+    torch::Tensor& affine_partials, dim3 grid, dim3 block,
+    size_t shared_memory_bytes, hipStream_t stream, int64_t row_count,
+    int64_t width) {
+  switch (update_type) {
+    case torch::kFloat32:
+      dispatch_residual_add_layer_norm_input_gradient_sum_type<
+          cached_values_per_lane, residual_t, float>(normalized_gradient,
+          summed_gradient, summed_residual, weight, mean,
+          reciprocal_standard_deviation, residual_gradient, update_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    case torch::kFloat16:
+      dispatch_residual_add_layer_norm_input_gradient_sum_type<
+          cached_values_per_lane, residual_t, c10::Half>(normalized_gradient,
+          summed_gradient, summed_residual, weight, mean,
+          reciprocal_standard_deviation, residual_gradient, update_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    case torch::kBFloat16:
+      dispatch_residual_add_layer_norm_input_gradient_sum_type<
+          cached_values_per_lane, residual_t, c10::BFloat16>(normalized_gradient,
+          summed_gradient, summed_residual, weight, mean,
+          reciprocal_standard_deviation, residual_gradient, update_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported residual update gradient data type");
+  }
+}
+
+template <int cached_values_per_lane>
+void dispatch_residual_add_layer_norm_input_gradient_types(
+    torch::ScalarType residual_type, torch::ScalarType update_type,
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& summed_gradient,
+    const torch::Tensor& summed_residual, const torch::Tensor& weight,
+    const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& residual_gradient, torch::Tensor& update_gradient,
+    torch::Tensor& affine_partials, dim3 grid, dim3 block,
+    size_t shared_memory_bytes, hipStream_t stream, int64_t row_count,
+    int64_t width) {
+  switch (residual_type) {
+    case torch::kFloat32:
+      dispatch_residual_add_layer_norm_input_gradient_update_type<
+          cached_values_per_lane, float>(update_type, normalized_gradient,
+          summed_gradient, summed_residual, weight, mean,
+          reciprocal_standard_deviation, residual_gradient, update_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    case torch::kFloat16:
+      dispatch_residual_add_layer_norm_input_gradient_update_type<
+          cached_values_per_lane, c10::Half>(update_type, normalized_gradient,
+          summed_gradient, summed_residual, weight, mean,
+          reciprocal_standard_deviation, residual_gradient, update_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    case torch::kBFloat16:
+      dispatch_residual_add_layer_norm_input_gradient_update_type<
+          cached_values_per_lane, c10::BFloat16>(update_type,
+          normalized_gradient, summed_gradient, summed_residual, weight, mean,
+          reciprocal_standard_deviation, residual_gradient, update_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported residual gradient data type");
+  }
+}
+
+void launch_layer_norm_affine_partial_reduction(
+    const torch::Tensor& affine_partials,
+    torch::Tensor& weight_gradient, torch::Tensor& bias_gradient,
+    dim3 grid, dim3 block, hipStream_t stream, int64_t partial_count,
+    int64_t width) {
+  hipLaunchKernelGGL(layer_norm_affine_partial_reduction_kernel, grid, block, 0,
+      stream, affine_partials.data_ptr<float>(),
+      weight_gradient.defined() ? weight_gradient.data_ptr<float>() : nullptr,
+      bias_gradient.defined() ? bias_gradient.data_ptr<float>() : nullptr,
+      partial_count, width);
 }
 
 struct IndexedRelationBiasLaunchPlan {
@@ -3532,6 +4003,46 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
              residual.scalar_type(), update.scalar_type(), weight.scalar_type()) &&
          update.device() == residual.device() && weight.device() == residual.device() &&
          bias.device() == residual.device();
+}
+
+bool supports_residual_add_layer_norm(const torch::Tensor& residual,
+    const torch::Tensor& update, const torch::Tensor& weight,
+    const torch::Tensor& bias, at::IntArrayRef normalized_shape,
+    torch::ScalarType summed_type, torch::ScalarType normalized_type) {
+  if (!residual.is_cuda() || !update.is_cuda() || !weight.is_cuda() ||
+      !bias.is_cuda() || !residual.is_contiguous() || !update.is_contiguous() ||
+      !weight.is_contiguous() || !bias.is_contiguous() || residual.dim() < 1 ||
+      residual.size(-1) <= 0 || residual.sizes() != update.sizes() ||
+      normalized_shape.size() != 1 ||
+      normalized_shape[0] != residual.size(-1) || weight.dim() != 1 ||
+      weight.size(0) != residual.size(-1) || bias.sizes() != weight.sizes() ||
+      !is_fused_floating(residual) || !is_fused_floating(update) ||
+      summed_type != at::result_type(residual, update) ||
+      !is_fused_floating_type(summed_type) || weight.scalar_type() != torch::kFloat32 ||
+      bias.scalar_type() != torch::kFloat32 || normalized_type != torch::kFloat32 ||
+      update.device() != residual.device() || weight.device() != residual.device() ||
+      bias.device() != residual.device()) {
+    return false;
+  }
+  const auto& properties = device_properties(residual.get_device());
+  const int64_t width = residual.size(-1);
+  const int64_t cached_values_per_lane =
+      (width + properties.warpSize - 1) / properties.warpSize;
+  if (cached_values_per_lane > kResidualCachedValuesPerLaneLimit) {
+    return false;
+  }
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int64_t waves_per_block = threads_per_block / properties.warpSize;
+  const int64_t row_count = residual.numel() / width;
+  const int64_t grid_size =
+      (row_count + waves_per_block - 1) / waves_per_block;
+  const size_t affine_shared_memory_bytes =
+      static_cast<size_t>(waves_per_block) * 2 * width * sizeof(float);
+  return grid_size <= static_cast<int64_t>(properties.maxGridSize[0]) &&
+      affine_shared_memory_bytes <=
+          static_cast<size_t>(properties.sharedMemPerBlock);
 }
 
 bool supports_masked_embedding_residual_to_owned_tokens(const torch::Tensor& tokens,
@@ -5390,6 +5901,193 @@ torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, cons
   }
   check_hip_kernel_launch("residual_add_layer_norm");
   return output;
+}
+
+ResidualAddLayerNormForwardResult residual_add_layer_norm_forward(
+    const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    at::IntArrayRef normalized_shape, float epsilon,
+    torch::ScalarType summed_type, torch::ScalarType normalized_type,
+    bool capture_statistics) {
+  TORCH_CHECK(supports_residual_add_layer_norm(residual, update, weight, bias,
+                  normalized_shape, summed_type, normalized_type),
+      "residual add LayerNorm received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(residual.device());
+  const auto contiguous_options =
+      residual.options().memory_format(torch::MemoryFormat::Contiguous);
+  torch::Tensor normalized =
+      torch::empty(residual.sizes(), contiguous_options.dtype(normalized_type));
+  torch::Tensor summed_residual =
+      torch::empty(residual.sizes(), contiguous_options.dtype(summed_type));
+  const int64_t width = residual.size(-1);
+  const int64_t row_count = residual.numel() / width;
+  torch::Tensor mean = capture_statistics
+      ? torch::empty({row_count}, contiguous_options.dtype(torch::kFloat32))
+      : torch::Tensor();
+  torch::Tensor reciprocal_standard_deviation = capture_statistics
+      ? torch::empty({row_count}, contiguous_options.dtype(torch::kFloat32))
+      : torch::Tensor();
+  if (row_count == 0) {
+    return {std::move(normalized), std::move(summed_residual), std::move(mean),
+        std::move(reciprocal_standard_deviation)};
+  }
+
+  const auto& properties = device_properties(residual.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int waves_per_block = threads_per_block / properties.warpSize;
+  const int cached_values_per_lane =
+      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
+  const dim3 grid((row_count + waves_per_block - 1) / waves_per_block);
+  const dim3 block(threads_per_block);
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(residual.get_device()).stream();
+  dispatch_residual_cached_values_per_lane(
+      cached_values_per_lane, [&](auto cached_values) {
+        constexpr int compiled_cached_values = decltype(cached_values)::value;
+        dispatch_residual_add_layer_norm_forward_types<compiled_cached_values>(
+            residual, update, weight, bias, normalized, summed_residual, mean,
+            reciprocal_standard_deviation, grid, block, stream, row_count,
+            width, epsilon);
+      });
+  check_hip_kernel_launch("residual add LayerNorm forward");
+  return {std::move(normalized), std::move(summed_residual), std::move(mean),
+      std::move(reciprocal_standard_deviation)};
+}
+
+ResidualAddLayerNormGradients residual_add_layer_norm_backward(
+    const torch::Tensor& normalized_gradient, const torch::Tensor& summed_gradient,
+    const torch::Tensor& summed_residual, const torch::Tensor& weight,
+    const torch::Tensor& mean, const torch::Tensor& reciprocal_standard_deviation,
+    torch::ScalarType residual_type, torch::ScalarType update_type,
+    bool needs_residual_gradient, bool needs_update_gradient,
+    bool needs_weight_gradient, bool needs_bias_gradient) {
+  TORCH_CHECK(summed_residual.is_cuda() && summed_residual.is_contiguous() &&
+          is_fused_floating(summed_residual),
+      "residual add LayerNorm backward requires a contiguous ROCm sum");
+  TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() &&
+          weight.scalar_type() == torch::kFloat32 && weight.dim() == 1 &&
+          weight.size(0) == summed_residual.size(-1),
+      "residual add LayerNorm backward requires contiguous FP32 affine weights");
+  TORCH_CHECK(mean.is_cuda() && reciprocal_standard_deviation.is_cuda() &&
+          mean.device() == summed_residual.device() &&
+          reciprocal_standard_deviation.device() == summed_residual.device() &&
+          mean.is_contiguous() && reciprocal_standard_deviation.is_contiguous() &&
+          mean.scalar_type() == torch::kFloat32 &&
+          reciprocal_standard_deviation.scalar_type() == torch::kFloat32 &&
+          mean.numel() == summed_residual.numel() / summed_residual.size(-1) &&
+          reciprocal_standard_deviation.numel() == mean.numel(),
+      "residual add LayerNorm backward statistics must be contiguous FP32 tensors");
+  TORCH_CHECK(is_fused_floating_type(residual_type) &&
+          is_fused_floating_type(update_type),
+      "residual add LayerNorm backward input data type is unsupported");
+  TORCH_CHECK(!normalized_gradient.defined() ||
+          (normalized_gradient.is_cuda() &&
+              normalized_gradient.device() == summed_residual.device() &&
+              normalized_gradient.sizes() == summed_residual.sizes() &&
+              normalized_gradient.scalar_type() == torch::kFloat32),
+      "residual add LayerNorm normalized gradient is incompatible");
+  TORCH_CHECK(!summed_gradient.defined() ||
+          (summed_gradient.is_cuda() &&
+              summed_gradient.device() == summed_residual.device() &&
+              summed_gradient.sizes() == summed_residual.sizes() &&
+              summed_gradient.scalar_type() == summed_residual.scalar_type()),
+      "residual add LayerNorm sum gradient is incompatible");
+
+  c10::DeviceGuard device_guard(summed_residual.device());
+  const torch::Tensor contiguous_normalized_gradient =
+      normalized_gradient.defined() ? normalized_gradient.contiguous() : torch::Tensor();
+  const torch::Tensor contiguous_summed_gradient =
+      summed_gradient.defined() ? summed_gradient.contiguous() : torch::Tensor();
+  const auto gradient_options =
+      summed_residual.options().memory_format(torch::MemoryFormat::Contiguous);
+  torch::Tensor residual_gradient = needs_residual_gradient
+      ? torch::empty(summed_residual.sizes(), gradient_options.dtype(residual_type))
+      : torch::Tensor();
+  torch::Tensor update_gradient;
+  torch::Tensor kernel_update_gradient;
+  if (needs_update_gradient) {
+    if (needs_residual_gradient && residual_type == update_type) {
+      update_gradient = residual_gradient;
+    } else {
+      update_gradient =
+          torch::empty(summed_residual.sizes(), gradient_options.dtype(update_type));
+      kernel_update_gradient = update_gradient;
+    }
+  }
+  torch::Tensor weight_gradient =
+      needs_weight_gradient && contiguous_normalized_gradient.defined()
+      ? torch::empty_like(weight)
+      : torch::Tensor();
+  torch::Tensor bias_gradient =
+      needs_bias_gradient && contiguous_normalized_gradient.defined()
+      ? torch::empty_like(weight)
+      : torch::Tensor();
+
+  const int64_t width = summed_residual.size(-1);
+  const int64_t row_count = summed_residual.numel() / width;
+  if (row_count == 0) {
+    if (weight_gradient.defined()) {
+      weight_gradient.zero_();
+    }
+    if (bias_gradient.defined()) {
+      bias_gradient.zero_();
+    }
+    return {std::move(residual_gradient), std::move(update_gradient),
+        std::move(weight_gradient), std::move(bias_gradient)};
+  }
+
+  const auto& properties = device_properties(summed_residual.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int waves_per_block = threads_per_block / properties.warpSize;
+  const int cached_values_per_lane =
+      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(summed_residual.get_device()).stream();
+  const bool needs_affine_gradient =
+      weight_gradient.defined() || bias_gradient.defined();
+  if (needs_residual_gradient || needs_update_gradient || needs_affine_gradient) {
+    const int64_t required_block_count =
+        (row_count + waves_per_block - 1) / waves_per_block;
+    const int64_t partial_count = std::min<int64_t>(required_block_count,
+        std::min<int64_t>(kLayerNormAffinePartialMaximumBlocks,
+            properties.maxGridSize[0]));
+    torch::Tensor affine_partials = needs_affine_gradient
+        ? torch::empty({partial_count, 2, width},
+              gradient_options.dtype(torch::kFloat32))
+        : torch::Tensor();
+    const size_t shared_memory_bytes = needs_affine_gradient
+        ? static_cast<size_t>(waves_per_block) * 2 * width * sizeof(float)
+        : 0;
+    const dim3 input_grid(partial_count);
+    const dim3 input_block(threads_per_block);
+    dispatch_residual_cached_values_per_lane(
+        cached_values_per_lane, [&](auto cached_values) {
+          constexpr int compiled_cached_values = decltype(cached_values)::value;
+          dispatch_residual_add_layer_norm_input_gradient_types<
+              compiled_cached_values>(residual_type, update_type,
+              contiguous_normalized_gradient, contiguous_summed_gradient,
+              summed_residual, weight, mean, reciprocal_standard_deviation,
+              residual_gradient, kernel_update_gradient, affine_partials,
+              input_grid, input_block, shared_memory_bytes, stream, row_count,
+              width);
+        });
+    check_hip_kernel_launch("residual add LayerNorm backward partials");
+    if (needs_affine_gradient) {
+      const dim3 affine_block(threads_per_block);
+      const dim3 affine_grid(
+          (width + threads_per_block - 1) / threads_per_block);
+      launch_layer_norm_affine_partial_reduction(affine_partials,
+          weight_gradient, bias_gradient, affine_grid, affine_block, stream,
+          partial_count, width);
+      check_hip_kernel_launch("residual add LayerNorm affine gradient");
+    }
+  }
+  return {std::move(residual_gradient), std::move(update_gradient),
+      std::move(weight_gradient), std::move(bias_gradient)};
 }
 
 torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,

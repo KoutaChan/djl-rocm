@@ -238,6 +238,40 @@ bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const tor
 torch::Tensor add_to_owned_residual_and_layer_norm(torch::Tensor& residual, const torch::Tensor& update,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon);
 
+struct ResidualAddLayerNormForwardResult {
+  torch::Tensor normalized;
+  torch::Tensor summed_residual;
+  torch::Tensor mean;
+  torch::Tensor reciprocal_standard_deviation;
+};
+
+struct ResidualAddLayerNormGradients {
+  torch::Tensor residual;
+  torch::Tensor update;
+  torch::Tensor weight;
+  torch::Tensor bias;
+};
+
+bool supports_residual_add_layer_norm(const torch::Tensor& residual,
+    const torch::Tensor& update, const torch::Tensor& weight,
+    const torch::Tensor& bias, at::IntArrayRef normalized_shape,
+    torch::ScalarType summed_type, torch::ScalarType normalized_type);
+
+ResidualAddLayerNormForwardResult residual_add_layer_norm_forward(
+    const torch::Tensor& residual, const torch::Tensor& update,
+    const torch::Tensor& weight, const torch::Tensor& bias,
+    at::IntArrayRef normalized_shape, float epsilon,
+    torch::ScalarType summed_type, torch::ScalarType normalized_type,
+    bool capture_statistics);
+
+ResidualAddLayerNormGradients residual_add_layer_norm_backward(
+    const torch::Tensor& normalized_gradient, const torch::Tensor& summed_gradient,
+    const torch::Tensor& summed_residual, const torch::Tensor& weight,
+    const torch::Tensor& mean, const torch::Tensor& reciprocal_standard_deviation,
+    torch::ScalarType residual_type, torch::ScalarType update_type,
+    bool needs_residual_gradient, bool needs_update_gradient,
+    bool needs_weight_gradient, bool needs_bias_gradient);
+
 bool supports_masked_embedding_residual_to_owned_tokens(const torch::Tensor& tokens,
     const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
     const torch::Tensor& valid_mask);

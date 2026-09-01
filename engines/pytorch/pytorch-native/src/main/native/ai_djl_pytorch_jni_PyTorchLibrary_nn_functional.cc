@@ -21,6 +21,7 @@
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_jni_exception.h"
+#include "djl_pytorch_layer_norm.h"
 #include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_routing_masks.h"
@@ -813,6 +814,38 @@ JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLayer
   std::vector<jlong> jptrs(2);
   jptrs[0] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(normalized)));
   jptrs[1] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(converted)));
+  env->SetLongArrayRegion(jarray, 0, 2, jptrs.data());
+  return jarray;
+#endif
+  API_END_RETURN()
+}
+
+JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNResidualAddLayerNorm(
+    JNIEnv* env, jobject jthis, jlong jresidual, jlong jupdate,
+    jlongArray jnormalizedshape, jlong jweight, jlong jbias, jdouble jeps) {
+  API_BEGIN()
+#if defined(__ANDROID__)
+  env->ThrowNew(ENGINE_EXCEPTION_CLASS, "residualAddLayerNorm is not supported on Android.");
+  return nullptr;
+#else
+  const auto* residual_ptr = reinterpret_cast<torch::Tensor*>(jresidual);
+  const auto* update_ptr = reinterpret_cast<torch::Tensor*>(jupdate);
+  const auto normalized_shape_vec =
+      djl::utils::jni::GetVecFromJLongArray(env, jnormalizedshape);
+  torch::Tensor weight = {};
+  torch::Tensor bias = {};
+  if (jweight != djl::utils::jni::NULL_PTR) {
+    weight = *reinterpret_cast<torch::Tensor*>(jweight);
+  }
+  if (jbias != djl::utils::jni::NULL_PTR) {
+    bias = *reinterpret_cast<torch::Tensor*>(jbias);
+  }
+  auto outputs = djl::pytorch::residual_add_layer_norm(
+      *residual_ptr, *update_ptr, normalized_shape_vec, weight, bias, jeps);
+  jlongArray jarray = env->NewLongArray(2);
+  std::vector<jlong> jptrs(2);
+  jptrs[0] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs[0])));
+  jptrs[1] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs[1])));
   env->SetLongArrayRegion(jarray, 0, 2, jptrs.data());
   return jarray;
 #endif

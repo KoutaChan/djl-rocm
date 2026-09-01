@@ -2362,6 +2362,26 @@ public final class JniUtils {
                         eps));
     }
 
+    /** Adds a residual update and returns the normalized output followed by the sum. */
+    public static NDList residualAddLayerNorm(
+            PtNDArray residual,
+            PtNDArray update,
+            Shape normalizedShape,
+            PtNDArray gamma,
+            PtNDArray beta,
+            double eps) {
+        long[] handles =
+                PyTorchLibrary.LIB.torchNNResidualAddLayerNorm(
+                        residual.getHandle(),
+                        update.getHandle(),
+                        normalizedShape.getShape(),
+                        gamma.getHandle(),
+                        beta.getHandle(),
+                        eps);
+        PtNDManager manager = residual.getManager();
+        return new NDList(new PtNDArray(manager, handles[0]), new PtNDArray(manager, handles[1]));
+    }
+
     /** Applies LayerNorm and returns its ordinary output together with a converted copy. */
     public static NDList layerNormAndCast(
             PtNDArray ndArray,

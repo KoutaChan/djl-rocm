@@ -56,6 +56,8 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_routing_masks.cc"
     "src/main/native/djl_pytorch_row_ops.h"
     "src/main/native/djl_pytorch_row_ops.cc"
+    "src/main/native/djl_pytorch_layer_norm.h"
+    "src/main/native/djl_pytorch_layer_norm.cc"
     "src/main/native/djl_pytorch_flat_gradient.h"
     "src/main/native/djl_pytorch_flat_gradient.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"

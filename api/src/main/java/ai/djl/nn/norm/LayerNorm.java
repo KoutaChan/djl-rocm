@@ -112,6 +112,35 @@ public class LayerNorm extends AbstractBlock {
     }
 
     /**
+     * Adds an update to a residual tensor, then applies Layer Normalization to the sum.
+     *
+     * <p>The operation does not modify either input. The first output is the normalized tensor and
+     * follows the engine's ordinary LayerNorm data type policy. The second output is the residual
+     * sum and follows the engine's ordinary addition promotion and rounding rules. Returning the
+     * sum allows a following residual block to reuse it without performing the addition again.
+     * Engines may fuse the addition and LayerNorm while preserving autograd behavior for both
+     * outputs.
+     *
+     * @param residual the residual tensor
+     * @param update the update to add to the residual tensor
+     * @param normalizedShape dimensions to calculate average and variance from
+     * @param gamma gamma weight {@code NDArray}
+     * @param beta beta weight {@code NDArray}
+     * @param eps a value added to the denominator for numerical stability
+     * @return an {@code NDList} containing the normalized tensor followed by the residual sum
+     */
+    public static NDList residualAddLayerNorm(
+            NDArray residual,
+            NDArray update,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps) {
+        NDArrayEx ex = residual.getNDArrayInternal();
+        return ex.residualAddLayerNorm(residual, update, normalizedShape, gamma, beta, eps);
+    }
+
+    /**
      * Applies Layer Normalization and returns both its ordinary output and a converted copy.
      *
      * <p>This operation is useful when one consumer needs the engine's native LayerNorm output type

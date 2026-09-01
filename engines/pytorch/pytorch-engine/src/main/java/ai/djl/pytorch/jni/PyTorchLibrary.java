@@ -742,6 +742,14 @@ final class PyTorchLibrary {
             long biasHandle,
             double eps);
 
+    native long[] torchNNResidualAddLayerNorm(
+            long residualHandle,
+            long updateHandle,
+            long[] normalizedShape,
+            long weightHandle,
+            long biasHandle,
+            double eps);
+
     native long[] torchNNLayerNormAndCast(
             long inputHandle,
             long[] normalizedShape,

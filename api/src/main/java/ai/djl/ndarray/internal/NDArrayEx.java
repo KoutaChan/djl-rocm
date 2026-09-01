@@ -853,6 +853,34 @@ public interface NDArrayEx {
     NDList layerNorm(NDArray input, Shape normalizedShape, NDArray gamma, NDArray beta, float eps);
 
     /**
+     * Adds an update to a residual tensor and normalizes the resulting sum.
+     *
+     * <p>The default implementation composes ordinary addition and LayerNorm operations. Engines
+     * may override this method to fuse them while preserving the same data type and autograd
+     * semantics.
+     *
+     * @param residual residual tensor
+     * @param update update tensor
+     * @param normalizedShape dimensions normalized by LayerNorm
+     * @param gamma affine scale
+     * @param beta affine bias
+     * @param eps numerical-stability epsilon
+     * @return normalized tensor followed by the residual sum
+     */
+    default NDList residualAddLayerNorm(
+            NDArray residual,
+            NDArray update,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps) {
+        NDArray summedResidual = residual.add(update);
+        NDArray normalized =
+                layerNorm(summedResidual, normalizedShape, gamma, beta, eps).singletonOrThrow();
+        return new NDList(normalized, summedResidual);
+    }
+
+    /**
      * Applies LayerNorm and returns its ordinary output together with a converted copy.
      *
      * <p>The default implementation composes the existing LayerNorm and type-conversion operations.
