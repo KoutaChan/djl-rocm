@@ -21,6 +21,7 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.training.GradientCollector;
+import ai.djl.util.Float16Utils;
 
 import org.testng.Assert;
 import org.testng.SkipException;
@@ -104,6 +105,40 @@ public class PtConcatToTypeTest {
                         stridedActual.toType(DataType.FLOAT32, false).toFloatArray(),
                         stridedExpected.toType(DataType.FLOAT32, false).toFloatArray());
             }
+        }
+    }
+
+    @Test
+    public void gpuProductionRankFourPathMatchesExplicitFloat32ToFloat16Pack() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("GPU is unavailable");
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            int rows = 5;
+            int[] widths = {256, 64, 256, 64};
+            NDList sources = new NDList(widths.length);
+            float[] expected = new float[rows * 640];
+            int offset = 0;
+            for (int width : widths) {
+                float[] values = new float[rows * width];
+                for (int row = 0; row < rows; ++row) {
+                    for (int column = 0; column < width; ++column) {
+                        float value = row * 0.25f + column * 0.003f + offset + 0.0003f;
+                        values[row * width + column] = value;
+                        expected[row * 640 + offset + column] =
+                                Float16Utils.halfToFloat(Float16Utils.floatToHalf(value));
+                    }
+                }
+                sources.add(manager.create(values, new Shape(rows, 1, 1, width)));
+                offset += width;
+            }
+
+            NDArray actual = NDArrays.concatToType(sources, -1, DataType.FLOAT16);
+
+            Assert.assertEquals(actual.getDataType(), DataType.FLOAT16);
+            Assert.assertEquals(actual.getShape(), new Shape(rows, 1, 1, 640));
+            Assert.assertEquals(actual.toFloatArray(), expected);
         }
     }
 
