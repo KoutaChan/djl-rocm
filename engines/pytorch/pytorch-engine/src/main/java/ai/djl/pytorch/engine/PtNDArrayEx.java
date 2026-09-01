@@ -1090,11 +1090,7 @@ public class PtNDArrayEx implements NDArrayEx {
         }
         PtNDManager manager = array.getManager();
         return JniUtils.groupedPackedScaledDotProductAttention(
-                array,
-                manager.from(packedKeyValue),
-                manager.from(mask),
-                heads,
-                (float) scale);
+                array, manager.from(packedKeyValue), manager.from(mask), heads, (float) scale);
     }
 
     /** {@inheritDoc} */

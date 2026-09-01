@@ -234,8 +234,7 @@ public class StructuredAttentionTest {
             NDArray query =
                     manager.randomNormal(new Shape(batch, queryWidth, queryTokens)).swapAxes(1, 2);
             NDArray packedKeyValue =
-                    manager
-                            .randomNormal(new Shape(batch, groups, packedWidth, keyTokens))
+                    manager.randomNormal(new Shape(batch, groups, packedWidth, keyTokens))
                             .swapAxes(2, 3);
             NDArray mask = manager.ones(new Shape(batch, groups, keyTokens), DataType.INT32);
             mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
