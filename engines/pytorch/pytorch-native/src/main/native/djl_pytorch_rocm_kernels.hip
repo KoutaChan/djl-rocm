@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -27,6 +28,7 @@ constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
 constexpr int kMaximumIndexedPoolChoices = 16;
+constexpr int kWeightedRowStatisticsThreadsPerBlock = 256;
 
 template <typename residual_t, typename update_t>
 using residual_sum_t = std::conditional_t<
@@ -913,6 +915,90 @@ __global__ void segmented_lookup_sum_kernel(const scalar_t* lookup_table,
     }
     __syncthreads();
   }
+}
+
+template <typename value_t, typename weight_t>
+__global__ void weighted_row_statistics_kernel(const value_t* values,
+    const weight_t* weights, float* output, int64_t row_count,
+    int64_t column_count) {
+  __shared__ float weighted_sums[kWeightedRowStatisticsThreadsPerBlock];
+  __shared__ float weight_sums[kWeightedRowStatisticsThreadsPerBlock];
+  __shared__ float minima[kWeightedRowStatisticsThreadsPerBlock];
+  __shared__ float maxima[kWeightedRowStatisticsThreadsPerBlock];
+  __shared__ int flags[kWeightedRowStatisticsThreadsPerBlock];
+
+  for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x) {
+    float weighted_sum = 0.0f;
+    float weight_sum = 0.0f;
+    float minimum = FLT_MAX;
+    float maximum = -FLT_MAX;
+    int flag = 0;
+    for (int64_t column = threadIdx.x; column < column_count;
+         column += blockDim.x) {
+      const float weight = static_cast<float>(weights[column]);
+      if (!isfinite(weight) || weight < 0.0f) {
+        flag |= 2;
+        continue;
+      }
+      if (weight > 0.0f) {
+        flag |= 1;
+        const float value = static_cast<float>(values[row * column_count + column]);
+        if (!isfinite(value)) {
+          flag |= 2;
+          continue;
+        }
+        weighted_sum += value * weight;
+        weight_sum += weight;
+        minimum = fminf(minimum, value);
+        maximum = fmaxf(maximum, value);
+      }
+    }
+    weighted_sums[threadIdx.x] = weighted_sum;
+    weight_sums[threadIdx.x] = weight_sum;
+    minima[threadIdx.x] = minimum;
+    maxima[threadIdx.x] = maximum;
+    flags[threadIdx.x] = flag;
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+      if (threadIdx.x < offset) {
+        weighted_sums[threadIdx.x] += weighted_sums[threadIdx.x + offset];
+        weight_sums[threadIdx.x] += weight_sums[threadIdx.x + offset];
+        minima[threadIdx.x] = fminf(minima[threadIdx.x], minima[threadIdx.x + offset]);
+        maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + offset]);
+        flags[threadIdx.x] |= flags[threadIdx.x + offset];
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      if ((flags[0] & 2) != 0) {
+        output[row] = NAN;
+        output[row_count + row] = NAN;
+        output[2 * row_count + row] = NAN;
+      } else if ((flags[0] & 1) == 0) {
+        output[row] = 0.0f;
+        output[row_count + row] = 0.0f;
+        output[2 * row_count + row] = 0.0f;
+      } else {
+        output[row] = weighted_sums[0] / weight_sums[0];
+        output[row_count + row] = minima[0];
+        output[2 * row_count + row] = maxima[0];
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename value_t, typename weight_t>
+void launch_weighted_row_statistics_kernel(const torch::Tensor& values,
+    const torch::Tensor& weights, torch::Tensor& output, int blocks,
+    hipStream_t stream) {
+  hipLaunchKernelGGL(
+      HIP_KERNEL_NAME(weighted_row_statistics_kernel<value_t, weight_t>),
+      dim3(blocks), dim3(kWeightedRowStatisticsThreadsPerBlock), 0, stream,
+      values.data_ptr<value_t>(), weights.data_ptr<weight_t>(),
+      output.data_ptr<float>(), values.size(0), values.size(1));
 }
 
 struct MaskedEmbeddingResidualArguments {
@@ -4491,6 +4577,19 @@ bool supports_segmented_lookup_sum(
       has_supported_padded_gather_index_layout(stored_indices, lookup_table.device());
 }
 
+bool supports_weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights) {
+  const bool supported_values = values.scalar_type() == torch::kFloat32 ||
+      values.scalar_type() == torch::kBFloat16;
+  const bool supported_weights = weights.scalar_type() == torch::kFloat32 ||
+      weights.scalar_type() == torch::kBFloat16;
+  return values.is_cuda() && values.is_contiguous() && values.dim() == 2 &&
+      values.size(0) > 0 && values.size(1) > 0 && supported_values &&
+      weights.is_cuda() && weights.is_contiguous() && weights.dim() == 1 &&
+      weights.size(0) == values.size(1) && supported_weights &&
+      weights.device() == values.device();
+}
+
 bool supports_padded_batch_gather(
     const torch::Tensor& source, const torch::Tensor& stored_indices) {
   return has_contiguous_padded_gather_rows(source, 2) &&
@@ -5165,6 +5264,41 @@ torch::Tensor segmented_lookup_sum_forward(
   TORCH_CHECK(supports_segmented_lookup_sum(lookup_table, stored_indices),
       "segmented lookup sum received an unsupported ROCm tensor layout");
   return launch_segmented_lookup_sum(lookup_table, stored_indices);
+}
+
+torch::Tensor weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights) {
+  TORCH_CHECK(supports_weighted_row_statistics(values, weights),
+      "weighted row statistics received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(values.device());
+  auto output = torch::empty({3, values.size(0)},
+      values.options().dtype(torch::kFloat32));
+  const auto& properties = device_properties(values.get_device());
+  TORCH_CHECK(properties.maxThreadsPerBlock >= kWeightedRowStatisticsThreadsPerBlock,
+      "weighted row statistics requires at least 256 threads per block");
+  const int blocks = static_cast<int>(std::min<int64_t>(
+      values.size(0), static_cast<int64_t>(properties.maxGridSize[0])));
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(values.get_device()).stream();
+
+  if (values.scalar_type() == torch::kFloat32) {
+    if (weights.scalar_type() == torch::kFloat32) {
+      launch_weighted_row_statistics_kernel<float, float>(
+          values, weights, output, blocks, stream);
+    } else {
+      launch_weighted_row_statistics_kernel<float, c10::BFloat16>(
+          values, weights, output, blocks, stream);
+    }
+  } else if (weights.scalar_type() == torch::kFloat32) {
+    launch_weighted_row_statistics_kernel<c10::BFloat16, float>(
+        values, weights, output, blocks, stream);
+  } else {
+    launch_weighted_row_statistics_kernel<c10::BFloat16, c10::BFloat16>(
+        values, weights, output, blocks, stream);
+  }
+
+  check_hip_kernel_launch("weighted_row_statistics");
+  return output;
 }
 
 torch::Tensor padded_batch_gather_forward(

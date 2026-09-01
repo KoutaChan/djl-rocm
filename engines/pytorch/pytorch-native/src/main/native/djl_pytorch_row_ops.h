@@ -31,6 +31,13 @@ torch::Tensor segmented_lookup_sum(
     const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
 
 /**
+ * Returns packed float32 weighted mean, minimum, and maximum values for each row.
+ * This diagnostic reduction is not differentiable.
+ */
+torch::Tensor weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights);
+
+/**
  * Selects one-based rows from each batch while mapping padding and out-of-range indices to zero.
  * Repeated selections accumulate into the source gradient.
  */

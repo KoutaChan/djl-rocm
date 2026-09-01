@@ -413,6 +413,112 @@ public interface NDArrayEx {
         return NDArrays.where(floatMask, masked.softmax(axis), logits.zerosLike());
     }
 
+    /** Summarizes rows with a weighted mean and active extrema using portable operations. */
+    default NDArray weightedRowStatistics(NDArray weights) {
+        NDArray values = getArray();
+        Shape valueShape = values.getShape();
+        Shape weightShape = weights.getShape();
+        DataType valueType = values.getDataType();
+        DataType weightType = weights.getDataType();
+        if (valueShape.dimension() != 2
+                || weightShape.dimension() != 1
+                || valueShape.get(0) <= 0
+                || valueShape.get(1) <= 0
+                || weightShape.get(0) != valueShape.get(1)) {
+            throw new IllegalArgumentException(
+                    "weighted row statistics require values [rows, columns] and weights "
+                            + "[columns]: "
+                            + valueShape
+                            + " / "
+                            + weightShape);
+        }
+        if ((valueType != DataType.FLOAT32 && valueType != DataType.BFLOAT16)
+                || (weightType != DataType.FLOAT32 && weightType != DataType.BFLOAT16)) {
+            throw new IllegalArgumentException(
+                    "weighted row statistics require FLOAT32 or BFLOAT16 inputs: "
+                            + valueType
+                            + " / "
+                            + weightType);
+        }
+        if (!values.getDevice().equals(weights.getDevice())) {
+            throw new IllegalArgumentException(
+                    "weighted row statistics inputs must use the same device");
+        }
+
+        NDManager outputManager = values.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(values, weights);
+            NDArray floatValues = values.toType(DataType.FLOAT32, false).stopGradient();
+            NDArray floatWeights = weights.toType(DataType.FLOAT32, false).stopGradient();
+            NDArray active = floatWeights.gt(0.0f);
+            NDArray activeWeights = NDArrays.where(active, floatWeights, floatWeights.zerosLike());
+            NDArray activeRows =
+                    active.reshape(1, valueShape.get(1)).broadcast(valueShape).stopGradient();
+            NDArray selectedValues =
+                    NDArrays.where(activeRows, floatValues, floatValues.zerosLike());
+            NDArray weightSum = activeWeights.sum();
+            NDArray hasActiveWeight = weightSum.gt(0.0f);
+            NDArray activeRowMask =
+                    hasActiveWeight.broadcast(new Shape(valueShape.get(0))).stopGradient();
+            NDArray zeros = scope.zeros(new Shape(valueShape.get(0)), DataType.FLOAT32);
+
+            NDArray means =
+                    NDArrays.where(
+                            activeRowMask,
+                            selectedValues
+                                    .mul(activeWeights.reshape(1, valueShape.get(1)))
+                                    .sum(new int[] {1})
+                                    .div(weightSum),
+                            zeros);
+            NDArray inactive = active.logicalNot();
+            NDArray floatInactive =
+                    inactive.toType(DataType.FLOAT32, false).reshape(1, valueShape.get(1));
+            NDArray minima =
+                    NDArrays.where(
+                            activeRowMask,
+                            selectedValues
+                                    .add(floatInactive.mul(Float.MAX_VALUE))
+                                    .min(new int[] {1}),
+                            zeros);
+            NDArray maxima =
+                    NDArrays.where(
+                            activeRowMask,
+                            selectedValues
+                                    .add(floatInactive.mul(-Float.MAX_VALUE))
+                                    .max(new int[] {1}),
+                            zeros);
+            NDArray validWeights =
+                    floatWeights
+                            .isNaN()
+                            .logicalOr(floatWeights.isInfinite())
+                            .logicalOr(floatWeights.lt(0.0f))
+                            .any()
+                            .logicalNot();
+            NDArray validRows =
+                    floatValues
+                            .isNaN()
+                            .logicalOr(floatValues.isInfinite())
+                            .logicalAnd(activeRows)
+                            .sum(new int[] {1})
+                            .eq(0)
+                            .logicalAnd(
+                                    validWeights
+                                            .broadcast(new Shape(valueShape.get(0)))
+                                            .stopGradient());
+            NDArray packed = NDArrays.stack(new NDList(means, minima, maxima));
+            NDArray result =
+                    NDArrays.where(
+                                    validRows
+                                            .reshape(1, valueShape.get(0))
+                                            .broadcast(3, valueShape.get(0)),
+                                    packed,
+                                    packed.zerosLike().add(Float.NaN))
+                            .stopGradient();
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
     /** Pools values with independently masked softmax weights for several groups. */
     default NDArray groupedMaskedSoftmaxPool(NDArray mask, NDArray values) {
         NDArray logits = getArray();

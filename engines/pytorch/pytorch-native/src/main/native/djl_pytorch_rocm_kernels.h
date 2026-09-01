@@ -36,6 +36,12 @@ bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_i
 bool supports_segmented_lookup_sum(
     const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
 
+bool supports_weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights);
+
+torch::Tensor weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights);
+
 bool supports_padded_batch_gather(
     const torch::Tensor& source, const torch::Tensor& stored_indices);
 

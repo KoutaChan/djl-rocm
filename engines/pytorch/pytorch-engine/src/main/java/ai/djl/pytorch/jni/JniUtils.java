@@ -1064,6 +1064,14 @@ public final class JniUtils {
                 PyTorchLibrary.LIB.torchMaskedSoftmax(logits.getHandle(), mask.getHandle(), axis));
     }
 
+    /** Returns packed float32 weighted mean, minimum, and maximum values for each row. */
+    public static PtNDArray weightedRowStatistics(PtNDArray values, PtNDArray weights) {
+        return new PtNDArray(
+                values.getManager(),
+                PyTorchLibrary.LIB.torchWeightedRowStatistics(
+                        values.getHandle(), weights.getHandle()));
+    }
+
     /** Pools values with independently masked softmax weights for several groups. */
     public static PtNDArray groupedMaskedSoftmaxPool(
             PtNDArray logits, PtNDArray mask, PtNDArray values) {

@@ -186,6 +186,16 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray weightedRowStatistics(NDArray weights) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.weightedRowStatistics(weights);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.weightedRowStatistics(array, manager.from(weights));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray groupedMaskedSoftmaxPool(NDArray mask, NDArray values) {
         PtNDManager manager = array.getManager();
         return JniUtils.groupedMaskedSoftmaxPool(array, manager.from(mask), manager.from(values));

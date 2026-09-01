@@ -294,6 +294,8 @@ final class PyTorchLibrary {
 
     native long torchMaskedSoftmax(long logits, long mask, long axis);
 
+    native long torchWeightedRowStatistics(long values, long weights);
+
     native long torchGroupedMaskedSoftmaxPool(long logits, long mask, long values);
 
     native long torchIndexedMaskedSoftmaxPool(

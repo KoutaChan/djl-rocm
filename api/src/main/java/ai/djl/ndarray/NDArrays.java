@@ -339,6 +339,28 @@ public final class NDArrays {
     }
 
     /**
+     * Summarizes each row with a weighted mean and the active minimum and maximum.
+     *
+     * <p>{@code values} must have shape {@code [rows, columns]} and {@code weights} must have shape
+     * {@code [columns]}. A column participates when its weight is greater than zero. The returned
+     * float32 tensor has shape {@code [3, rows]}, with weighted means in row zero, minima in row
+     * one, and maxima in row two. All three statistics are zero when every weight is zero.
+     *
+     * <p>Weights must be finite and nonnegative. A non-finite or negative weight makes every output
+     * statistic NaN. A non-finite value makes the three statistics for its row NaN only when the
+     * corresponding weight is positive. Values in zero-weight columns are ignored. This diagnostic
+     * operation stops gradients. Engines may fuse the complete reduction while retaining these
+     * semantics.
+     *
+     * @param values values shaped {@code [rows, columns]}
+     * @param weights nonnegative weights shaped {@code [columns]}
+     * @return packed float32 row statistics shaped {@code [3, rows]}
+     */
+    public static NDArray weightedRowStatistics(NDArray values, NDArray weights) {
+        return values.getNDArrayInternal().weightedRowStatistics(weights);
+    }
+
+    /**
      * Pools values with independently masked softmax weights for several groups.
      *
      * <p>The logits are shaped {@code [..., choices]}, the mask is shaped {@code [..., choices,

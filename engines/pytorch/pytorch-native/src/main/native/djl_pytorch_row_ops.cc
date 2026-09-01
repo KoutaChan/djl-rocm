@@ -18,6 +18,8 @@
 #include <ATen/ops/embedding_dense_backward.h>
 #include <torch/csrc/autograd/custom_function.h>
 
+#include <limits>
+
 #if defined(DJL_USE_ROCM_KERNELS)
 #include "djl_pytorch_rocm_kernels.h"
 #endif
@@ -49,6 +51,40 @@ torch::Tensor segmented_lookup_sum_reference(
   return lookup_table.index_select(0, row_indices)
       .reshape(gathered_shape)
       .sum(stored_indices.dim() - 1);
+}
+
+torch::Tensor weighted_row_statistics_reference(
+    const torch::Tensor& values, const torch::Tensor& weights) {
+  at::NoGradGuard no_grad;
+  auto float_values = values.detach().to(torch::kFloat32);
+  auto float_weights = weights.detach().to(torch::kFloat32);
+  auto active = float_weights.gt(0.0f);
+  auto active_weights = torch::where(active, float_weights, torch::zeros_like(float_weights));
+  auto selected_values =
+      torch::where(active.unsqueeze(0), float_values, torch::zeros_like(float_values));
+  auto weight_sum = active_weights.sum();
+  auto has_active_weight = weight_sum.gt(0.0f);
+  auto zeros = torch::zeros({values.size(0)}, float_values.options());
+
+  auto means = torch::where(has_active_weight,
+      selected_values.mul(active_weights.unsqueeze(0)).sum(1).div(weight_sum), zeros);
+  auto minima = torch::where(has_active_weight,
+      std::get<0>(torch::where(active.unsqueeze(0), float_values,
+          torch::full_like(float_values, std::numeric_limits<float>::max())).min(1)),
+      zeros);
+  auto maxima = torch::where(has_active_weight,
+      std::get<0>(torch::where(active.unsqueeze(0), float_values,
+          torch::full_like(float_values, -std::numeric_limits<float>::max())).max(1)),
+      zeros);
+
+  auto valid_weights = torch::isfinite(float_weights).logical_and(float_weights.ge(0.0f)).all();
+  auto valid_rows = torch::isfinite(float_values)
+                        .logical_or(active.unsqueeze(0).logical_not())
+                        .all(1)
+                        .logical_and(valid_weights);
+  auto packed = torch::stack({means, minima, maxima});
+  return torch::where(valid_rows.unsqueeze(0), packed,
+      torch::full_like(packed, std::numeric_limits<float>::quiet_NaN()));
 }
 
 bool is_index_type(const torch::Tensor& indices) {
@@ -348,6 +384,27 @@ torch::Tensor segmented_lookup_sum(
   }
 #endif
   return segmented_lookup_sum_reference(lookup_table, stored_indices);
+}
+
+torch::Tensor weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights) {
+  TORCH_CHECK(values.dim() == 2 && values.size(0) > 0 && values.size(1) > 0,
+      "weighted row statistics values must have shape [rows, columns]");
+  TORCH_CHECK(weights.dim() == 1 && weights.size(0) == values.size(1),
+      "weighted row statistics weights must have shape [columns]");
+  TORCH_CHECK((values.scalar_type() == torch::kFloat32 ||
+                  values.scalar_type() == torch::kBFloat16) &&
+          (weights.scalar_type() == torch::kFloat32 ||
+                  weights.scalar_type() == torch::kBFloat16),
+      "weighted row statistics require float32 or bfloat16 inputs");
+  TORCH_CHECK(values.device() == weights.device(),
+      "weighted row statistics inputs must use the same device");
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (rocm::supports_weighted_row_statistics(values, weights)) {
+    return rocm::weighted_row_statistics(values, weights);
+  }
+#endif
+  return weighted_row_statistics_reference(values, weights);
 }
 
 torch::Tensor padded_batch_gather(
