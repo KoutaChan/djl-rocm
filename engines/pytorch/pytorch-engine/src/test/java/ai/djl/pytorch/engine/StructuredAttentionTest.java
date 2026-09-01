@@ -204,8 +204,12 @@ public class StructuredAttentionTest {
                 NDArray actual =
                         NDArrays.groupedPackedScaledDotProductAttention(
                                 query, packedKeyValue, mask, heads, 0.5);
-                float[] expectedValues = expected.toFloatArray();
-                float[] actualValues = actual.toFloatArray();
+
+                Assert.assertEquals(actual.getDataType(), dataType);
+                Assert.assertEquals(expected.getDataType(), dataType);
+
+                float[] expectedValues = expected.toType(DataType.FLOAT32, false).toFloatArray();
+                float[] actualValues = actual.toType(DataType.FLOAT32, false).toFloatArray();
 
                 if (dataType == DataType.FLOAT16) {
                     assertAllNaN(expectedValues);
