@@ -656,6 +656,16 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void mappedGroupedAttentionNativeBackwardMatchesProductionGeometry() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        engine.setRandomSeed(20260913);
+        verifyMappedGroupedAttentionProductionGradients(engine, DataType.BFLOAT16);
+    }
+
+    @Test
     public void bfloat16FallbackComparisonDoesNotRelaxNativeTolerance() {
         float[] actualAtQuantizationBoundary = {1.53125f};
         float[] expected = {1.5625f};
@@ -1012,8 +1022,14 @@ public class StructuredAttentionTest {
             Assert.assertFalse(indexedDeltas.hasGradient());
         }
 
-        verifyMappedGroupedAttentionPartialGradients(engine, device, dataType, true, false);
-        verifyMappedGroupedAttentionPartialGradients(engine, device, dataType, false, true);
+        verifyMappedGroupedAttentionPartialGradients(
+                engine, device, dataType, true, false, false, false);
+        verifyMappedGroupedAttentionPartialGradients(
+                engine, device, dataType, false, true, false, false);
+        verifyMappedGroupedAttentionPartialGradients(
+                engine, device, dataType, false, false, true, false);
+        verifyMappedGroupedAttentionPartialGradients(
+                engine, device, dataType, false, false, false, true);
     }
 
     private static void verifyMappedGroupedAttentionPartialGradients(
@@ -1021,7 +1037,9 @@ public class StructuredAttentionTest {
             Device device,
             DataType dataType,
             boolean queryGradient,
-            boolean deltaTableGradient) {
+            boolean sharedGradient,
+            boolean deltaTableGradient,
+            boolean indexedDeltaGradient) {
         try (NDManager manager = engine.newBaseManager(device)) {
             int queries = 4;
             int heads = 2;
@@ -1030,17 +1048,28 @@ public class StructuredAttentionTest {
             int sharedTokens = 5;
             int indexedTokens = 3;
             int packedWidth = heads * (keyFeatures + valueFeatures);
-            NDArray query = manager.randomNormal(new Shape(queries, heads, keyFeatures), dataType);
-            NDArray shared =
+            NDArray queryValues =
+                    manager.randomNormal(new Shape(queries, heads, keyFeatures), dataType);
+            NDArray sharedValues =
                     manager.randomNormal(new Shape(2, sharedTokens, packedWidth), dataType);
-            NDArray deltaTable = manager.randomNormal(new Shape(3, packedWidth), dataType);
-            NDArray indexedDeltas =
+            NDArray deltaTableValues = manager.randomNormal(new Shape(3, packedWidth), dataType);
+            NDArray indexedDeltaValues =
                     manager.randomNormal(new Shape(queries, indexedTokens, packedWidth), dataType);
+            NDArray query = queryValues.duplicate();
+            NDArray shared = sharedValues.duplicate();
+            NDArray deltaTable = deltaTableValues.duplicate();
+            NDArray indexedDeltas = indexedDeltaValues.duplicate();
             if (queryGradient) {
                 query.setRequiresGradient(true);
             }
+            if (sharedGradient) {
+                shared.setRequiresGradient(true);
+            }
             if (deltaTableGradient) {
                 deltaTable.setRequiresGradient(true);
+            }
+            if (indexedDeltaGradient) {
+                indexedDeltas.setRequiresGradient(true);
             }
             NDArray groupIndices = manager.create(new int[] {1, 0, 1, 0});
             NDArray deltaIndices =
@@ -1070,18 +1099,58 @@ public class StructuredAttentionTest {
                 collector.backward(output.mul(output).sum());
             }
 
+            NDArray referenceQuery = queryValues.duplicate();
+            NDArray referenceShared = sharedValues.duplicate();
+            NDArray referenceDeltaTable = deltaTableValues.duplicate();
+            NDArray referenceIndexedDeltas = indexedDeltaValues.duplicate();
+            referenceQuery.setRequiresGradient(queryGradient);
+            referenceShared.setRequiresGradient(sharedGradient);
+            referenceDeltaTable.setRequiresGradient(deltaTableGradient);
+            referenceIndexedDeltas.setRequiresGradient(indexedDeltaGradient);
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        mappedGroupedAttentionReference(
+                                referenceQuery,
+                                referenceShared,
+                                groupIndices,
+                                referenceDeltaTable,
+                                deltaIndices,
+                                referenceIndexedDeltas,
+                                indexedIds,
+                                0.27);
+                collector.backward(output.mul(output).sum());
+            }
+
+            float tolerance = gradientTolerance(dataType);
+
             if (queryGradient) {
                 assertFiniteNonzeroGradient(query);
+                assertGradientClose(query, referenceQuery, tolerance);
             } else {
                 Assert.assertFalse(query.hasGradient());
+                Assert.assertFalse(referenceQuery.hasGradient());
             }
-            Assert.assertFalse(shared.hasGradient());
+            if (sharedGradient) {
+                assertFiniteNonzeroGradient(shared);
+                assertGradientClose(shared, referenceShared, tolerance);
+            } else {
+                Assert.assertFalse(shared.hasGradient());
+                Assert.assertFalse(referenceShared.hasGradient());
+            }
             if (deltaTableGradient) {
                 assertFiniteNonzeroGradient(deltaTable);
+                assertGradientClose(deltaTable, referenceDeltaTable, tolerance);
             } else {
                 Assert.assertFalse(deltaTable.hasGradient());
+                Assert.assertFalse(referenceDeltaTable.hasGradient());
             }
-            Assert.assertFalse(indexedDeltas.hasGradient());
+            if (indexedDeltaGradient) {
+                assertFiniteNonzeroGradient(indexedDeltas);
+                assertGradientClose(indexedDeltas, referenceIndexedDeltas, tolerance);
+            } else {
+                Assert.assertFalse(indexedDeltas.hasGradient());
+                Assert.assertFalse(referenceIndexedDeltas.hasGradient());
+            }
         }
     }
 
@@ -1488,6 +1557,120 @@ public class StructuredAttentionTest {
                                 indexedIds,
                                 0.27);
                 collector.backward(output.mul(outputGradientValues).sum());
+            }
+
+            assertFiniteNonzeroGradient(query, shared, deltaTable, indexedDeltas);
+            float tolerance = gradientTolerance(dataType);
+            assertGradientClose(query, referenceQuery, tolerance);
+            assertGradientClose(shared, referenceShared, tolerance);
+            assertGradientClose(deltaTable, referenceDeltaTable, tolerance);
+            assertGradientClose(indexedDeltas, referenceIndexedDeltas, tolerance);
+        }
+    }
+
+    private static void verifyMappedGroupedAttentionProductionGradients(
+            Engine engine, DataType dataType) {
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            int queries = 7;
+            int groups = 3;
+            int heads = 4;
+            int keyFeatures = 8;
+            int valueFeatures = 16;
+            int sharedTokens = 34;
+            int indexedTokens = 13;
+            int deltaRows = 17;
+            int packedWidth = heads * (keyFeatures + valueFeatures);
+            NDArray queryValues =
+                    manager.randomNormal(new Shape(queries, heads, keyFeatures), dataType);
+            NDArray sharedValues =
+                    manager.randomNormal(
+                            new Shape(groups, sharedTokens, packedWidth), dataType);
+            NDArray deltaTableValues =
+                    manager.randomNormal(new Shape(deltaRows, packedWidth), dataType);
+            NDArray indexedDeltaValues =
+                    manager.randomNormal(
+                            new Shape(queries, indexedTokens, packedWidth), dataType);
+            NDArray outputGradientValues =
+                    manager.randomNormal(
+                            new Shape(queries, heads, valueFeatures), dataType);
+            int[] groupIds = new int[queries];
+            int[] deltaIds = new int[queries * sharedTokens];
+            int[] indexedIds = new int[queries * indexedTokens];
+            for (int query = 0; query < queries; query++) {
+                groupIds[query] = (query * 2 + 1) % groups;
+            }
+            for (int index = 0; index < deltaIds.length; index++) {
+                deltaIds[index] = (index * 5 + 3) % deltaRows;
+            }
+            for (int index = 0; index < indexedIds.length; index++) {
+                indexedIds[index] =
+                        index % 5 == 0 ? 0 : (index * 7 + 3) % sharedTokens + 1;
+            }
+            NDArray groupIndices = manager.create(groupIds);
+            NDArray deltaIndices =
+                    manager.create(deltaIds, new Shape(queries, sharedTokens));
+            NDArray storedIndexedIds =
+                    manager.create(indexedIds, new Shape(queries, indexedTokens));
+
+            NDArray query = requiringGradient(queryValues.duplicate());
+            NDArray shared = requiringGradient(sharedValues.duplicate());
+            NDArray deltaTable = requiringGradient(deltaTableValues.duplicate());
+            NDArray indexedDeltas = requiringGradient(indexedDeltaValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                                query,
+                                shared,
+                                groupIndices,
+                                deltaTable,
+                                deltaIndices,
+                                indexedDeltas,
+                                storedIndexedIds,
+                                1.0 / Math.sqrt(keyFeatures));
+                collector.backward(output.mul(outputGradientValues).sum());
+            }
+
+            NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+            NDArray referenceShared = requiringGradient(sharedValues.duplicate());
+            NDArray referenceDeltaTable = requiringGradient(deltaTableValues.duplicate());
+            NDArray referenceIndexedDeltas = requiringGradient(indexedDeltaValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        mappedGroupedAttentionReference(
+                                referenceQuery,
+                                referenceShared,
+                                groupIndices,
+                                referenceDeltaTable,
+                                deltaIndices,
+                                referenceIndexedDeltas,
+                                storedIndexedIds,
+                                1.0 / Math.sqrt(keyFeatures));
+                collector.backward(output.mul(outputGradientValues).sum());
+            }
+
+            try (NDArray indexedGradient = indexedDeltas.getGradient();
+                    NDArray values = indexedGradient.toType(DataType.FLOAT32, false)) {
+                float[] gradients = values.toFloatArray();
+                for (int queryIndex = 0; queryIndex < queries; queryIndex++) {
+                    for (int token = 0; token < indexedTokens; token++) {
+                        if (indexedIds[queryIndex * indexedTokens + token] != 0) {
+                            continue;
+                        }
+                        int offset =
+                                (queryIndex * indexedTokens + token) * packedWidth;
+                        for (int feature = 0; feature < packedWidth; feature++) {
+                            Assert.assertEquals(
+                                    gradients[offset + feature],
+                                    0f,
+                                    "padded indexed gradient at query="
+                                            + queryIndex
+                                            + ", token="
+                                            + token
+                                            + ", feature="
+                                            + feature);
+                        }
+                    }
+                }
             }
 
             assertFiniteNonzeroGradient(query, shared, deltaTable, indexedDeltas);
