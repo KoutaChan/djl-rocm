@@ -100,11 +100,22 @@ torch::Tensor segmented_lookup_sum_forward(
 torch::Tensor padded_batch_gather_forward(
     const torch::Tensor& source, const torch::Tensor& stored_indices);
 
+torch::Tensor padded_batch_gather_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& stored_indices, at::IntArrayRef source_shape);
+
 torch::Tensor padded_batch_gather_2d_forward(const torch::Tensor& source,
     const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices);
 
+torch::Tensor padded_batch_gather_2d_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices,
+    at::IntArrayRef source_shape);
+
 torch::Tensor padded_batch_gather_by_batch_indices_forward(const torch::Tensor& source,
     const torch::Tensor& batch_indices, const torch::Tensor& stored_indices);
+
+torch::Tensor padded_batch_gather_by_batch_indices_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& batch_indices, const torch::Tensor& stored_indices,
+    at::IntArrayRef source_shape);
 
 bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids);

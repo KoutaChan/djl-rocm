@@ -1030,6 +1030,71 @@ __global__ void padded_batch_gather_kernel(const scalar_t* source,
   }
 }
 
+template <int group_width, typename scalar_t, typename stored_index_t,
+    bool has_inner_indices, bool has_explicit_batch_indices>
+__global__ void padded_batch_gather_backward_kernel(const scalar_t* gradient_output,
+    const void* batch_indices, const stored_index_t* outer_stored_indices,
+    const stored_index_t* inner_stored_indices, float* source_gradient,
+    PaddedBatchGatherIndexType batch_index_type,
+    PaddedBatchGatherIndexLayout batch_layout, PaddedBatchGatherIndexLayout outer_layout,
+    PaddedBatchGatherIndexLayout inner_layout, int64_t output_rows,
+    int64_t indices_per_batch, int64_t batch_count, int64_t outer_entries,
+    int64_t inner_entries, int64_t row_width) {
+  const int lane = threadIdx.x % group_width;
+  const int group = threadIdx.x / group_width;
+  const int groups_per_block = blockDim.x / group_width;
+  extern __shared__ int64_t destination_offsets[];
+  for (int64_t first_row = static_cast<int64_t>(blockIdx.x) * groups_per_block;
+       first_row < output_rows;
+       first_row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t output_row = first_row + group;
+    if (lane == 0) {
+      int64_t destination_offset = -1;
+      if (output_row < output_rows) {
+        const int64_t outer_offset =
+            padded_batch_gather_index_offset(output_row, outer_layout);
+        const int64_t outer_index =
+            static_cast<int64_t>(outer_stored_indices[outer_offset]);
+        int64_t inner_index = 1;
+        if constexpr (has_inner_indices) {
+          const int64_t inner_offset =
+              padded_batch_gather_index_offset(output_row, inner_layout);
+          inner_index = static_cast<int64_t>(inner_stored_indices[inner_offset]);
+        }
+        int64_t batch_index = output_row / indices_per_batch;
+        if constexpr (has_explicit_batch_indices) {
+          const int64_t batch_offset =
+              padded_batch_gather_index_offset(output_row, batch_layout);
+          batch_index = padded_batch_gather_index_value(
+              batch_indices, batch_offset, batch_index_type);
+        }
+        if (batch_index >= 0 && batch_index < batch_count && outer_index > 0 &&
+            outer_index <= outer_entries && inner_index > 0 && inner_index <= inner_entries) {
+          const int64_t destination_row =
+              (batch_index * outer_entries + outer_index - 1) * inner_entries +
+              inner_index - 1;
+          destination_offset = destination_row * row_width;
+        }
+      }
+      destination_offsets[group] = destination_offset;
+    }
+    __syncthreads();
+    if (output_row < output_rows) {
+      const int64_t destination_offset = destination_offsets[group];
+      const int64_t output_offset = output_row * row_width;
+      if (destination_offset >= 0) {
+        for (int64_t column = lane; column < row_width; column += group_width) {
+          // A float accumulator gives all supported source dtypes one atomic path and
+          // preserves repeated low-precision contributions until the final cast.
+          atomicAdd(source_gradient + destination_offset + column,
+              static_cast<float>(gradient_output[output_offset + column]));
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <int queries_per_wave, typename scalar_t, typename index_t>
 __global__ void indexed_relation_bias_kernel(const scalar_t* relation_logits, const scalar_t* relation_bias,
     const index_t* relation_ids, scalar_t* output, int64_t query_chunk_count, int64_t work_item_count,
@@ -2652,6 +2717,133 @@ torch::Tensor dispatch_padded_batch_gather(const torch::Tensor& source,
   }
 }
 
+template <bool has_inner_indices, bool has_explicit_batch_indices, typename stored_index_t>
+torch::Tensor launch_padded_batch_gather_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& batch_indices, const torch::Tensor& outer_stored_indices,
+    const torch::Tensor& inner_stored_indices, at::IntArrayRef source_shape) {
+  constexpr int64_t indexed_dimensions = has_inner_indices ? 3 : 2;
+  TORCH_CHECK(static_cast<int64_t>(source_shape.size()) >= indexed_dimensions,
+      "padded batch gather source-gradient shape has insufficient dimensions");
+  const int64_t batch_count = source_shape[0];
+  const int64_t outer_entries = source_shape[1];
+  const int64_t inner_entries = has_inner_indices ? source_shape[2] : 1;
+  TORCH_CHECK(batch_count > 0 && outer_entries > 0 && inner_entries > 0,
+      "padded batch gather source-gradient shape must have nonempty indexed dimensions");
+  TORCH_CHECK(gradient_output.is_cuda() && is_fused_floating(gradient_output),
+      "padded batch gather output gradient must be a floating-point ROCm tensor");
+  TORCH_CHECK(has_supported_padded_gather_index_layout(
+                  outer_stored_indices, gradient_output.device()),
+      "padded batch gather stored-index gradient layout is unsupported");
+  if constexpr (has_inner_indices) {
+    TORCH_CHECK(inner_stored_indices.scalar_type() == outer_stored_indices.scalar_type() &&
+            has_supported_padded_gather_index_layout(
+                inner_stored_indices, gradient_output.device()),
+        "padded batch gather inner-index gradient layout is unsupported");
+  }
+  if constexpr (has_explicit_batch_indices) {
+    TORCH_CHECK(has_supported_padded_gather_index_layout(
+                    batch_indices, gradient_output.device()),
+        "padded batch gather batch-index gradient layout is unsupported");
+  }
+
+  c10::DeviceGuard device_guard(gradient_output.device());
+  const torch::Tensor contiguous_gradient_output = gradient_output.contiguous();
+  auto source_gradient_accumulator = torch::zeros(source_shape,
+      gradient_output.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
+  const int64_t source_rows = batch_count * outer_entries * inner_entries;
+  const int64_t row_width = source_gradient_accumulator.numel() / source_rows;
+  const int64_t output_rows = outer_stored_indices.numel();
+  TORCH_CHECK(contiguous_gradient_output.numel() == output_rows * row_width,
+      "padded batch gather output gradient shape is incompatible with saved indices");
+  if (output_rows == 0) {
+    return gradient_output.scalar_type() == torch::kFloat32
+        ? source_gradient_accumulator
+        : source_gradient_accumulator.to(gradient_output.scalar_type());
+  }
+
+  const auto& properties = device_properties(gradient_output.get_device());
+  const int group_width = padded_batch_gather_group_width(row_width, properties.warpSize);
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().padded_batch_gather_threads_per_block,
+      launch_environment::kPaddedBatchGatherThreadsPerBlock, false);
+  TORCH_CHECK(threads_per_block % group_width == 0,
+      launch_environment::kPaddedBatchGatherThreadsPerBlock,
+      " must be divisible by the selected gather group width ", group_width);
+  const int groups_per_block = threads_per_block / group_width;
+  const int64_t required_blocks = (output_rows + groups_per_block - 1) / groups_per_block;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  const size_t shared_memory_bytes =
+      static_cast<size_t>(groups_per_block) * sizeof(int64_t);
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(gradient_output.get_device()).stream();
+
+  PaddedBatchGatherIndexLayout batch_layout{};
+  PaddedBatchGatherIndexLayout inner_layout{};
+  if constexpr (has_explicit_batch_indices) {
+    batch_layout = padded_batch_gather_index_layout(batch_indices);
+  }
+  if constexpr (has_inner_indices) {
+    inner_layout = padded_batch_gather_index_layout(inner_stored_indices);
+  }
+  const auto outer_layout = padded_batch_gather_index_layout(outer_stored_indices);
+  const void* batch_data = nullptr;
+  PaddedBatchGatherIndexType batch_index_type = PaddedBatchGatherIndexType::kInt16;
+  const stored_index_t* inner_data = nullptr;
+  if constexpr (has_explicit_batch_indices) {
+    batch_data = batch_indices.data_ptr();
+    batch_index_type = padded_batch_gather_index_type(batch_indices);
+  }
+  if constexpr (has_inner_indices) {
+    inner_data = inner_stored_indices.data_ptr<stored_index_t>();
+  }
+  const int64_t indices_per_batch = has_explicit_batch_indices
+      ? 1
+      : outer_stored_indices.numel() / batch_count;
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+      gradient_output.scalar_type(), "padded_batch_gather_backward", [&] {
+        dispatch_padded_batch_gather_group_width(group_width, [&](auto width) {
+          constexpr int compiled_group_width = decltype(width)::value;
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(padded_batch_gather_backward_kernel<compiled_group_width,
+                  scalar_t, stored_index_t, has_inner_indices, has_explicit_batch_indices>),
+              dim3(blocks), dim3(threads_per_block), shared_memory_bytes, stream,
+              contiguous_gradient_output.data_ptr<scalar_t>(), batch_data,
+              outer_stored_indices.data_ptr<stored_index_t>(), inner_data,
+              source_gradient_accumulator.data_ptr<float>(), batch_index_type,
+              batch_layout, outer_layout, inner_layout, output_rows, indices_per_batch,
+              batch_count, outer_entries, inner_entries, row_width);
+        });
+      });
+  check_hip_kernel_launch("padded batch gather backward");
+  return gradient_output.scalar_type() == torch::kFloat32
+      ? source_gradient_accumulator
+      : source_gradient_accumulator.to(gradient_output.scalar_type());
+}
+
+template <bool has_inner_indices, bool has_explicit_batch_indices>
+torch::Tensor dispatch_padded_batch_gather_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& batch_indices, const torch::Tensor& outer_stored_indices,
+    const torch::Tensor& inner_stored_indices, at::IntArrayRef source_shape) {
+  switch (outer_stored_indices.scalar_type()) {
+    case torch::kInt16:
+      return launch_padded_batch_gather_backward<
+          has_inner_indices, has_explicit_batch_indices, int16_t>(gradient_output,
+          batch_indices, outer_stored_indices, inner_stored_indices, source_shape);
+    case torch::kInt32:
+      return launch_padded_batch_gather_backward<
+          has_inner_indices, has_explicit_batch_indices, int32_t>(gradient_output,
+          batch_indices, outer_stored_indices, inner_stored_indices, source_shape);
+    case torch::kInt64:
+      return launch_padded_batch_gather_backward<
+          has_inner_indices, has_explicit_batch_indices, int64_t>(gradient_output,
+          batch_indices, outer_stored_indices, inner_stored_indices, source_shape);
+    default:
+      TORCH_CHECK(false, "unsupported padded batch gather stored-index gradient data type");
+  }
+}
+
 torch::Tensor launch_segmented_lookup_sum(
     const torch::Tensor& lookup_table, const torch::Tensor& stored_indices) {
   const int64_t segment_count = stored_indices.size(-1);
@@ -4223,6 +4415,12 @@ torch::Tensor padded_batch_gather_forward(
       source, {}, stored_indices, {});
 }
 
+torch::Tensor padded_batch_gather_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& stored_indices, at::IntArrayRef source_shape) {
+  return dispatch_padded_batch_gather_backward<false, false>(
+      gradient_output, {}, stored_indices, {}, source_shape);
+}
+
 torch::Tensor padded_batch_gather_2d_forward(const torch::Tensor& source,
     const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices) {
   TORCH_CHECK(supports_padded_batch_gather_2d(
@@ -4232,6 +4430,13 @@ torch::Tensor padded_batch_gather_2d_forward(const torch::Tensor& source,
       source, {}, outer_stored_indices, inner_stored_indices);
 }
 
+torch::Tensor padded_batch_gather_2d_backward(const torch::Tensor& gradient_output,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices,
+    at::IntArrayRef source_shape) {
+  return dispatch_padded_batch_gather_backward<true, false>(gradient_output, {},
+      outer_stored_indices, inner_stored_indices, source_shape);
+}
+
 torch::Tensor padded_batch_gather_by_batch_indices_forward(const torch::Tensor& source,
     const torch::Tensor& batch_indices, const torch::Tensor& stored_indices) {
   TORCH_CHECK(supports_padded_batch_gather_by_batch_indices(
@@ -4239,6 +4444,13 @@ torch::Tensor padded_batch_gather_by_batch_indices_forward(const torch::Tensor& 
       "explicit-batch padded gather received an unsupported ROCm tensor layout");
   return dispatch_padded_batch_gather<false, true>(
       source, batch_indices, stored_indices, {});
+}
+
+torch::Tensor padded_batch_gather_by_batch_indices_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& batch_indices,
+    const torch::Tensor& stored_indices, at::IntArrayRef source_shape) {
+  return dispatch_padded_batch_gather_backward<false, true>(gradient_output,
+      batch_indices, stored_indices, {}, source_shape);
 }
 
 torch::Tensor indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,

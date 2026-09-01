@@ -30,12 +30,24 @@ torch::Tensor scatter_rows(
 torch::Tensor segmented_lookup_sum(
     const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
 
+/**
+ * Selects one-based rows from each batch while mapping padding and out-of-range indices to zero.
+ * Repeated selections accumulate into the source gradient.
+ */
 torch::Tensor padded_batch_gather(
     const torch::Tensor& source, const torch::Tensor& stored_indices);
 
+/**
+ * Selects one-based outer and inner rows while mapping invalid index pairs to zero.
+ * Repeated selections accumulate into the source gradient.
+ */
 torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
     const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices);
 
+/**
+ * Selects one-based rows from explicit zero-based batches while mapping invalid pairs to zero.
+ * Repeated selections accumulate into the source gradient.
+ */
 torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
     const torch::Tensor& batch_indices, const torch::Tensor& stored_indices);
 

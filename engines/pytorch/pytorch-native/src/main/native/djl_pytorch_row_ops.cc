@@ -13,6 +13,7 @@
 
 #include "djl_pytorch_row_ops.h"
 
+#include <ATen/Context.h>
 #include <ATen/ops/embedding.h>
 #include <ATen/ops/embedding_dense_backward.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -175,6 +176,73 @@ class ScatterRowsFunction : public torch::autograd::Function<ScatterRowsFunction
   }
 };
 
+class PaddedBatchGatherFunction
+    : public torch::autograd::Function<PaddedBatchGatherFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& source, const torch::Tensor& stored_indices) {
+    context->save_for_backward({stored_indices});
+    context->saved_data["source_shape"] = source.sizes().vec();
+    return rocm::padded_batch_gather_forward(source, stored_indices);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto stored_indices = context->get_saved_variables().at(0);
+    const auto source_shape = context->saved_data["source_shape"].toIntVector();
+    auto source_gradient = rocm::padded_batch_gather_backward(
+        gradient_outputs.at(0), stored_indices, source_shape);
+    return {source_gradient, torch::Tensor()};
+  }
+};
+
+class PaddedBatchGather2dFunction
+    : public torch::autograd::Function<PaddedBatchGather2dFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& source, const torch::Tensor& outer_stored_indices,
+      const torch::Tensor& inner_stored_indices) {
+    context->save_for_backward({outer_stored_indices, inner_stored_indices});
+    context->saved_data["source_shape"] = source.sizes().vec();
+    return rocm::padded_batch_gather_2d_forward(
+        source, outer_stored_indices, inner_stored_indices);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto source_shape = context->saved_data["source_shape"].toIntVector();
+    auto source_gradient = rocm::padded_batch_gather_2d_backward(
+        gradient_outputs.at(0), saved.at(0), saved.at(1), source_shape);
+    return {source_gradient, torch::Tensor(), torch::Tensor()};
+  }
+};
+
+class PaddedBatchGatherByBatchIndicesFunction
+    : public torch::autograd::Function<PaddedBatchGatherByBatchIndicesFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& source, const torch::Tensor& batch_indices,
+      const torch::Tensor& stored_indices) {
+    context->save_for_backward({batch_indices, stored_indices});
+    context->saved_data["source_shape"] = source.sizes().vec();
+    return rocm::padded_batch_gather_by_batch_indices_forward(
+        source, batch_indices, stored_indices);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto source_shape = context->saved_data["source_shape"].toIntVector();
+    auto source_gradient = rocm::padded_batch_gather_by_batch_indices_backward(
+        gradient_outputs.at(0), saved.at(0), saved.at(1), source_shape);
+    return {source_gradient, torch::Tensor(), torch::Tensor()};
+  }
+};
+
 #endif
 
 }  // namespace
@@ -292,8 +360,14 @@ torch::Tensor padded_batch_gather(
       "padded batch gather requires nonempty batch and table dimensions");
   TORCH_CHECK(is_index_type(stored_indices), "stored indices must be int16, int32, or int64");
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (!at::GradMode::is_enabled() &&
+  const bool needs_source_gradient = at::GradMode::is_enabled() && source.requires_grad();
+  const bool deterministic_fallback =
+      needs_source_gradient && at::globalContext().deterministicAlgorithms();
+  if (!deterministic_fallback &&
       rocm::supports_padded_batch_gather(source, stored_indices)) {
+    if (needs_source_gradient) {
+      return PaddedBatchGatherFunction::apply(source, stored_indices);
+    }
     return rocm::padded_batch_gather_forward(source, stored_indices);
   }
 #endif
@@ -315,8 +389,15 @@ torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
   TORCH_CHECK(is_index_type(outer_stored_indices) && is_index_type(inner_stored_indices),
       "stored indices must be int16, int32, or int64");
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (!at::GradMode::is_enabled() && rocm::supports_padded_batch_gather_2d(
+  const bool needs_source_gradient = at::GradMode::is_enabled() && source.requires_grad();
+  const bool deterministic_fallback =
+      needs_source_gradient && at::globalContext().deterministicAlgorithms();
+  if (!deterministic_fallback && rocm::supports_padded_batch_gather_2d(
           source, outer_stored_indices, inner_stored_indices)) {
+    if (needs_source_gradient) {
+      return PaddedBatchGather2dFunction::apply(
+          source, outer_stored_indices, inner_stored_indices);
+    }
     return rocm::padded_batch_gather_2d_forward(
         source, outer_stored_indices, inner_stored_indices);
   }
@@ -337,8 +418,15 @@ torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
   TORCH_CHECK(is_index_type(batch_indices) && is_index_type(stored_indices),
       "batch and stored indices must be int16, int32, or int64");
 #if defined(DJL_USE_ROCM_KERNELS)
-  if (!at::GradMode::is_enabled() && rocm::supports_padded_batch_gather_by_batch_indices(
+  const bool needs_source_gradient = at::GradMode::is_enabled() && source.requires_grad();
+  const bool deterministic_fallback =
+      needs_source_gradient && at::globalContext().deterministicAlgorithms();
+  if (!deterministic_fallback && rocm::supports_padded_batch_gather_by_batch_indices(
           source, batch_indices, stored_indices)) {
+    if (needs_source_gradient) {
+      return PaddedBatchGatherByBatchIndicesFunction::apply(
+          source, batch_indices, stored_indices);
+    }
     return rocm::padded_batch_gather_by_batch_indices_forward(
         source, batch_indices, stored_indices);
   }
