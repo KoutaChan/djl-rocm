@@ -32,23 +32,53 @@ gradlew compileJNI
 This task will send a Jni library copy to `pytorch-engine` model to test locally.
 
 ## GPU build
-Note: PyTorch C++ library requires CUDA path set in the system.
 
-Use the following task to build pytorch JNI library for GPU:
+GPU builds require a PyTorch/libtorch distribution and compiler toolchain for the same accelerator
+flavor. Fusion Plan is enabled automatically when the JNI library is built for CUDA or ROCm. Its
+shared command implementation is in `djl_pytorch_fusion_kernels.hip`; CUDA compiles the thin
+`djl_pytorch_fusion_kernels.cu` entry point, and `djl_pytorch_fusion_backend.h` isolates the runtime
+and launch differences. Keep changes to common command behavior in the shared source so CUDA and
+ROCm do not drift.
 
-### Mac/Linux
+### NVIDIA CUDA
+
+Install a CUDA toolkit compatible with the selected libtorch flavor and make `nvcc` available to
+CMake. Set `TORCH_CUDA_ARCH_LIST` to the compute capabilities that the binary must support, then pass
+the libtorch flavor through the `cuda` Gradle property. For example, from this directory:
 
 ```sh
-# compile CUDA 11.X version of JNI
-./gradlew compileJNI -Pcu11
+export TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0"
+./gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
 ```
 
-## Windows
+On Windows, run the equivalent command from a Visual Studio developer environment with the CUDA
+toolkit on `PATH`:
 
 ```cmd
-# compile CUDA 11.X version of JNI
-gradlew compileJNI -Pcu11
+set "TORCH_CUDA_ARCH_LIST=8.0 8.6 8.9 9.0"
+gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
 ```
+
+The build scripts configure CMake with `USE_CUDA=1` and `USE_ROCM=0`. The resulting native library
+must be loaded with a CUDA PyTorch runtime of the same version and flavor.
+
+### AMD ROCm
+
+Use a ROCm development environment compatible with the selected PyTorch ROCm distribution. CMake
+must be able to find HIP, hipBLASLt, and the ROCm libraries through the standard installation prefix
+or `ROCM_PATH`. Set `PYTORCH_ROCM_ARCH` to a semicolon-separated set of target architectures when the
+default build matrix is broader than needed:
+
+```sh
+export PYTORCH_ROCM_ARCH="gfx942;gfx1100"
+./gradlew compileJNI -Pcuda=rocm7.1 -Ppt_version=2.11.0
+```
+
+The ROCm flavor configures both `USE_CUDA=1` and `USE_ROCM=1` because hipified libtorch retains the
+`torch::cuda` API namespace. The resulting native library must be loaded with a matching ROCm
+PyTorch runtime. The provided ROCm Gradle flavor uses `build.sh` on Linux. A direct Windows build
+also requires a CMake generator and host compiler combination supported by the installed HIP
+toolchain.
 
 ### Format C++ code
 It uses clang-format to format the code.
@@ -116,11 +146,12 @@ To implement a simple pytorch feature, generally you can do the following steps.
     ```
     
     **Note**:
-    In case your need test with GPU, the compilation needs to be the following:
+    To test with a GPU build, select the matching libtorch flavor. For example:
     
     ```sh
-    ./gradlew cleanJNI 
-    ./gradlew compileJNI -Pcu11
+    ./gradlew cleanJNI
+    TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0" \
+        ./gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
     ```
 
 3. Document the api and add the unit tests.
