@@ -832,9 +832,14 @@ public class PtFusionTest {
     @Test
     public void cpuPreparationFailsBeforeNativeSubmission() {
         FusionFixture fixture = new FusionFixture();
-        Assert.assertThrows(
-                UnsupportedOperationException.class,
-                () -> Engine.getInstance().newFusionCompiler(Device.cpu()).prepare(fixture.recipe));
+        UnsupportedOperationException failure =
+                Assert.expectThrows(
+                        UnsupportedOperationException.class,
+                        () ->
+                                Engine.getInstance()
+                                        .newFusionCompiler(Device.cpu())
+                                        .prepare(fixture.recipe));
+        Assert.assertTrue(failure.getMessage().contains("CUDA or ROCm device"));
     }
 
     @Test

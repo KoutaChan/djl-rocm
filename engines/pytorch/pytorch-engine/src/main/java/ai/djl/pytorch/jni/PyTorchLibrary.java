@@ -64,6 +64,8 @@ final class PyTorchLibrary {
 
     native void torchDeleteAcceleratorGraph(long handle);
 
+    native int torchGetFusionBackend();
+
     native long torchPrepareFusionPlan(int[] device, ByteBuffer descriptor);
 
     native long torchBindFusionPlan(long planHandle, ByteBuffer constantHandles);
