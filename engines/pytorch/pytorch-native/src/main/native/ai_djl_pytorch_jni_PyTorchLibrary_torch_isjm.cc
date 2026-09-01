@@ -147,6 +147,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchConcatToType
     }
   }
   if (native) {
+    c10::DeviceGuard device_guard(device);
     output_sizes[rank - 1] = output_width;
     torch::Tensor output = torch::empty(
         output_sizes, tensors.front().options().dtype(output_type));
