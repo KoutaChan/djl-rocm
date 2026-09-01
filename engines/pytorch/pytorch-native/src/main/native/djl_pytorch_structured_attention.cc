@@ -13,6 +13,7 @@
 
 #include "djl_pytorch_structured_attention.h"
 
+#include <ATen/Context.h>
 #include <torch/csrc/autograd/custom_function.h>
 
 #include <algorithm>
@@ -247,6 +248,40 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
   }
 };
 
+class MappedGroupedIndexedAttentionFunction
+    : public torch::autograd::Function<MappedGroupedIndexedAttentionFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& query, const torch::Tensor& shared_key_values,
+      const torch::Tensor& shared_group_indices, const torch::Tensor& shared_delta_table,
+      const torch::Tensor& shared_delta_indices, const torch::Tensor& indexed_deltas,
+      const torch::Tensor& indexed_shared_ids, double scale) {
+    auto result = rocm::mapped_grouped_indexed_attention_forward(query, shared_key_values,
+        shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
+        indexed_shared_ids, static_cast<float>(scale), true);
+    context->save_for_backward({query, shared_key_values, shared_group_indices,
+        shared_delta_table, shared_delta_indices, indexed_deltas, indexed_shared_ids,
+        result.probabilities});
+    context->saved_data["scale"] = scale;
+    return result.output;
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto scale = context->saved_data["scale"].toDouble();
+    auto gradients = rocm::mapped_grouped_indexed_attention_backward(saved.at(0),
+        saved.at(1), saved.at(2), saved.at(3), saved.at(4), saved.at(5), saved.at(6),
+        saved.at(7), gradient_outputs.at(0), static_cast<float>(scale),
+        context->needs_input_grad(0), context->needs_input_grad(1),
+        context->needs_input_grad(3), context->needs_input_grad(5));
+    return {gradients.query, gradients.shared_key_values, torch::Tensor(),
+        gradients.shared_delta_table, torch::Tensor(), gradients.indexed_deltas,
+        torch::Tensor(), torch::Tensor()};
+  }
+};
+
 #endif
 
 }  // namespace
@@ -321,12 +356,26 @@ torch::Tensor mapped_grouped_indexed_attention(const torch::Tensor& query,
 #if defined(DJL_USE_ROCM_KERNELS)
   const bool needs_autograd = requires_autograd(
       {&query, &shared_key_values, &shared_delta_table, &indexed_deltas});
-  if (!needs_autograd && rocm::supports_mapped_grouped_indexed_attention_forward(query,
-                            shared_key_values, shared_group_indices, shared_delta_table,
-                            shared_delta_indices, indexed_deltas, indexed_shared_ids)) {
+  const bool needs_atomic_table_gradient = needs_autograd &&
+      (shared_key_values.requires_grad() || shared_delta_table.requires_grad());
+  const bool deterministic_fallback =
+      needs_atomic_table_gradient && at::globalContext().deterministicAlgorithms();
+  if (!deterministic_fallback &&
+      rocm::supports_mapped_grouped_indexed_attention_forward(query, shared_key_values,
+          shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
+          indexed_shared_ids) &&
+      (!needs_autograd || rocm::supports_mapped_grouped_indexed_attention_backward(query,
+          shared_key_values, shared_group_indices, shared_delta_table,
+          shared_delta_indices, indexed_deltas, indexed_shared_ids))) {
+    if (needs_autograd) {
+      return MappedGroupedIndexedAttentionFunction::apply(query, shared_key_values,
+          shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
+          indexed_shared_ids, scale);
+    }
     return rocm::mapped_grouped_indexed_attention_forward(query, shared_key_values,
         shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
-        indexed_shared_ids, static_cast<float>(scale));
+        indexed_shared_ids, static_cast<float>(scale), false)
+        .output;
   }
 #endif
   return mapped_grouped_indexed_attention_reference(query, shared_key_values, shared_group_indices,

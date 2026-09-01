@@ -1181,7 +1181,8 @@ public final class JniUtils {
     }
 
     /**
-     * Applies grouped indexed attention through explicit group and shared-delta lookup mappings.
+     * Applies differentiable grouped indexed attention through explicit group and shared-delta
+     * lookup mappings.
      *
      * @param query queries shaped {@code [query,heads,keyFeatures]}
      * @param sharedKeyValues packed shared data shaped {@code [groups,sharedTokens,packedWidth]}

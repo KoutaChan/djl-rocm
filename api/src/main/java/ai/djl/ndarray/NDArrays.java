@@ -715,8 +715,8 @@ public final class NDArrays {
      * <p>The query leading dimensions are preserved. Group indices have exactly those leading
      * dimensions, shared-delta indices append the shared-token dimension, and auxiliary tensors
      * append their indexed-token dimension. All group and delta indices must be in range. Engines
-     * may use a forward-only fused implementation when gradients are not required; the portable
-     * implementation remains differentiable.
+     * may load both mapped tables directly and provide a fused differentiable implementation; the
+     * portable implementation remains differentiable for unsupported layouts.
      *
      * @param query query tensor shaped {@code [queryDimensions..., heads, keyFeatures]}
      * @param sharedKeyValues packed shared data shaped {@code [groups, sharedTokens, packedWidth]}

@@ -167,10 +167,36 @@ bool supports_mapped_grouped_indexed_attention_forward(const torch::Tensor& quer
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids);
 
-torch::Tensor mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
+bool supports_mapped_grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
-    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, float scale);
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids);
+
+struct MappedGroupedIndexedAttentionForwardResult {
+  torch::Tensor output;
+  torch::Tensor probabilities;
+};
+
+MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, float scale,
+    bool capture_probabilities);
+
+struct MappedGroupedIndexedAttentionGradients {
+  torch::Tensor query;
+  torch::Tensor shared_key_values;
+  torch::Tensor shared_delta_table;
+  torch::Tensor indexed_deltas;
+};
+
+MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids,
+    const torch::Tensor& probabilities, const torch::Tensor& gradient_output, float scale,
+    bool needs_query_gradient, bool needs_shared_key_value_gradient,
+    bool needs_shared_delta_table_gradient, bool needs_indexed_delta_gradient);
 
 struct GroupedIndexedAttentionGradients {
   torch::Tensor query;

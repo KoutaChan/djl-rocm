@@ -56,6 +56,8 @@ RocmKernelLaunchConfig load_launch_config() {
           launch_environment::kGroupedIndexedAttentionSharedKeyValueGradientThreadsPerBlock, 256),
       read_compiled_work_size(
           launch_environment::kGroupedIndexedAttentionSharedKeyValueGradientFeaturesPerBlock, 8),
+      read_positive_integer(
+          launch_environment::kMappedGroupedIndexedAttentionPackedGradientThreadsPerBlock, 256),
       read_positive_integer(launch_environment::kResidualAddLayerNormThreadsPerBlock, 256),
       read_positive_integer(launch_environment::kFusedAdamUpdateThreadsPerBlock, 256),
       read_positive_integer(launch_environment::kMaskedCategoricalThreadsPerBlock, 256),

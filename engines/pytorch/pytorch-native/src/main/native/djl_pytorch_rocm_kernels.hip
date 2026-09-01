@@ -1351,6 +1351,7 @@ __global__ void mapped_grouped_indexed_attention_kernel(const scalar_t* query,
     const scalar_t* shared_key_values, const int32_t* shared_group_indices,
     const scalar_t* shared_delta_table, const int32_t* shared_delta_indices,
     const scalar_t* indexed_deltas, const int32_t* indexed_shared_ids, scalar_t* output,
+    float* probabilities,
     int64_t query_head_count, MappedGroupedIndexedAttentionLayout layout, float scale) {
   extern __shared__ unsigned char shared_storage[];
   const int lane = threadIdx.x % warpSize;
@@ -1443,6 +1444,15 @@ __global__ void mapped_grouped_indexed_attention_kernel(const scalar_t* query,
     local_sum += __shfl_down(local_sum, offset);
   }
   const float inverse_sum = active ? 1.0f / __shfl(local_sum, 0) : 0.0f;
+  if (active && probabilities != nullptr) {
+    for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
+      float probability = token_weights[attended_token] * inverse_sum;
+      if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+        probability = round_mapped_attention_value<scalar_t>(probability);
+      }
+      probabilities[query_head * total_tokens + attended_token] = probability;
+    }
+  }
   __syncthreads();
 
   if (!active) {
@@ -1494,7 +1504,8 @@ void launch_mapped_grouped_indexed_attention(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids,
-    torch::Tensor& output, int64_t grid_size, int block_threads, size_t shared_memory_bytes,
+    torch::Tensor& output, torch::Tensor& probabilities, int64_t grid_size, int block_threads,
+    size_t shared_memory_bytes,
     hipStream_t stream, int64_t query_head_count,
     const MappedGroupedIndexedAttentionLayout& layout, float scale) {
   hipLaunchKernelGGL(HIP_KERNEL_NAME(mapped_grouped_indexed_attention_kernel<scalar_t>),
@@ -1502,8 +1513,207 @@ void launch_mapped_grouped_indexed_attention(const torch::Tensor& query,
       query.data_ptr<scalar_t>(), shared_key_values.data_ptr<scalar_t>(),
       shared_group_indices.data_ptr<int32_t>(), shared_delta_table.data_ptr<scalar_t>(),
       shared_delta_indices.data_ptr<int32_t>(), indexed_deltas.data_ptr<scalar_t>(),
-      indexed_shared_ids.data_ptr<int32_t>(), output.data_ptr<scalar_t>(), query_head_count,
-      layout, scale);
+      indexed_shared_ids.data_ptr<int32_t>(), output.data_ptr<scalar_t>(),
+      probabilities.defined() ? probabilities.data_ptr<float>() : nullptr,
+      query_head_count, layout, scale);
+}
+
+template <typename scalar_t>
+__global__ void mapped_grouped_indexed_attention_score_query_gradient_kernel(
+    const scalar_t* query, const scalar_t* shared_key_values,
+    const int32_t* shared_group_indices, const scalar_t* shared_delta_table,
+    const int32_t* shared_delta_indices, const scalar_t* indexed_deltas,
+    const int32_t* indexed_shared_ids, const float* probabilities,
+    const scalar_t* gradient_output, float* score_gradients,
+    scalar_t* query_gradient, int64_t query_head_count,
+    MappedGroupedIndexedAttentionLayout layout, float scale) {
+  extern __shared__ unsigned char shared_storage[];
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  const int64_t total_tokens = layout.shared_tokens + layout.indexed_tokens;
+  float* all_probabilities = reinterpret_cast<float*>(shared_storage);
+  float* all_score_gradients = all_probabilities + waves_per_block * total_tokens;
+  float* all_query_values = all_score_gradients + waves_per_block * total_tokens;
+  float* all_output_gradients = all_query_values + waves_per_block * layout.key_features;
+  float* token_probabilities = all_probabilities + wave * total_tokens;
+  float* token_score_gradients = all_score_gradients + wave * total_tokens;
+  float* query_values = all_query_values + wave * layout.key_features;
+  float* output_gradients = all_output_gradients + wave * layout.value_features;
+
+  const int64_t query_head = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+  const bool active = query_head < query_head_count;
+  const int64_t query_index = query_head / layout.heads;
+  const int64_t head = query_head % layout.heads;
+  const int64_t group = active ? static_cast<int64_t>(shared_group_indices[query_index]) : 0;
+  const int64_t key_offset = head * layout.key_features;
+  const int64_t value_offset = layout.heads * layout.key_features + head * layout.value_features;
+
+  if (active) {
+    for (int64_t feature = lane; feature < layout.key_features; feature += warpSize) {
+      query_values[feature] = static_cast<float>(
+          query[(query_index * layout.heads + head) * layout.key_features + feature]);
+    }
+    for (int64_t feature = lane; feature < layout.value_features; feature += warpSize) {
+      output_gradients[feature] = static_cast<float>(
+          gradient_output[query_head * layout.value_features + feature]);
+    }
+  }
+  __syncthreads();
+
+  float local_weighted_gradient = 0.0f;
+  if (active) {
+    for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
+      const bool shared_token = attended_token < layout.shared_tokens;
+      const int64_t token = shared_token ? attended_token : attended_token - layout.shared_tokens;
+      const int64_t stored_id =
+          shared_token ? attended_token + 1
+                       : static_cast<int64_t>(
+                             indexed_shared_ids[query_index * layout.indexed_tokens + token]);
+      const bool present = stored_id > 0 && stored_id <= layout.shared_tokens;
+      const int64_t shared_index = stored_id - 1;
+      const float probability = probabilities[query_head * total_tokens + attended_token];
+      float probability_gradient = 0.0f;
+      if (present) {
+        const int64_t base_offset =
+            (group * layout.shared_tokens + shared_index) * layout.packed_width;
+        const int64_t delta_offset =
+            shared_token
+                ? static_cast<int64_t>(
+                      shared_delta_indices[query_index * layout.shared_tokens + token]) *
+                      layout.packed_width
+                : (query_index * layout.indexed_tokens + token) * layout.packed_width;
+        for (int64_t feature = 0; feature < layout.value_features; feature++) {
+          const int64_t packed_feature = value_offset + feature;
+          const float base =
+              static_cast<float>(shared_key_values[base_offset + packed_feature]);
+          const float delta =
+              shared_token
+                  ? static_cast<float>(shared_delta_table[delta_offset + packed_feature])
+                  : static_cast<float>(indexed_deltas[delta_offset + packed_feature]);
+          const float value = round_mapped_attention_value<scalar_t>(base + delta);
+          probability_gradient += output_gradients[feature] * value;
+        }
+      }
+      token_probabilities[attended_token] = probability;
+      token_score_gradients[attended_token] = probability_gradient;
+      local_weighted_gradient += probability * probability_gradient;
+    }
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    local_weighted_gradient += __shfl_down(local_weighted_gradient, offset);
+  }
+  const float weighted_gradient = __shfl(local_weighted_gradient, 0);
+  if (active) {
+    for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
+      const float score_gradient = token_probabilities[attended_token] *
+          (token_score_gradients[attended_token] - weighted_gradient);
+      token_score_gradients[attended_token] = score_gradient;
+      score_gradients[query_head * total_tokens + attended_token] = score_gradient;
+    }
+  }
+  __syncthreads();
+
+  if (!active || query_gradient == nullptr) {
+    return;
+  }
+  for (int64_t feature = lane; feature < layout.key_features; feature += warpSize) {
+    float gradient = 0.0f;
+    for (int64_t attended_token = 0; attended_token < total_tokens; attended_token++) {
+      const bool shared_token = attended_token < layout.shared_tokens;
+      const int64_t token = shared_token ? attended_token : attended_token - layout.shared_tokens;
+      const int64_t stored_id =
+          shared_token ? attended_token + 1
+                       : static_cast<int64_t>(
+                             indexed_shared_ids[query_index * layout.indexed_tokens + token]);
+      if (stored_id <= 0 || stored_id > layout.shared_tokens) {
+        continue;
+      }
+      const int64_t shared_index = stored_id - 1;
+      const int64_t base_offset =
+          (group * layout.shared_tokens + shared_index) * layout.packed_width;
+      const int64_t delta_offset =
+          shared_token
+              ? static_cast<int64_t>(
+                    shared_delta_indices[query_index * layout.shared_tokens + token]) *
+                    layout.packed_width
+              : (query_index * layout.indexed_tokens + token) * layout.packed_width;
+      const int64_t packed_feature = key_offset + feature;
+      const float base = static_cast<float>(shared_key_values[base_offset + packed_feature]);
+      const float delta =
+          shared_token
+              ? static_cast<float>(shared_delta_table[delta_offset + packed_feature])
+              : static_cast<float>(indexed_deltas[delta_offset + packed_feature]);
+      const float key = round_mapped_attention_value<scalar_t>(base + delta);
+      gradient += token_score_gradients[attended_token] * key;
+    }
+    query_gradient[query_head * layout.key_features + feature] =
+        static_cast<scalar_t>(gradient * scale);
+  }
+}
+
+template <typename scalar_t>
+__global__ void mapped_grouped_indexed_attention_packed_gradient_kernel(
+    const scalar_t* query, const int32_t* shared_group_indices,
+    const int32_t* shared_delta_indices, const int32_t* indexed_shared_ids,
+    const float* probabilities, const float* score_gradients,
+    const scalar_t* gradient_output, float* shared_key_value_gradient,
+    float* shared_delta_table_gradient, scalar_t* indexed_delta_gradient,
+    int64_t element_count, MappedGroupedIndexedAttentionLayout layout, float scale) {
+  const int64_t total_tokens = layout.shared_tokens + layout.indexed_tokens;
+  const int64_t key_width = layout.heads * layout.key_features;
+  for (int64_t element = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       element < element_count;
+       element += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t packed_feature = element % layout.packed_width;
+    const int64_t query_token = element / layout.packed_width;
+    const int64_t attended_token = query_token % total_tokens;
+    const int64_t query_index = query_token / total_tokens;
+    const bool shared_token = attended_token < layout.shared_tokens;
+    const int64_t token = shared_token ? attended_token : attended_token - layout.shared_tokens;
+    const int64_t stored_id =
+        shared_token ? attended_token + 1
+                     : static_cast<int64_t>(
+                           indexed_shared_ids[query_index * layout.indexed_tokens + token]);
+    const bool present = stored_id > 0 && stored_id <= layout.shared_tokens;
+    float gradient = 0.0f;
+    if (present) {
+      int64_t head;
+      if (packed_feature < key_width) {
+        head = packed_feature / layout.key_features;
+        const int64_t feature = packed_feature - head * layout.key_features;
+        gradient = scale *
+            score_gradients[(query_index * layout.heads + head) * total_tokens + attended_token] *
+            static_cast<float>(
+                query[(query_index * layout.heads + head) * layout.key_features + feature]);
+      } else {
+        const int64_t value_feature = packed_feature - key_width;
+        head = value_feature / layout.value_features;
+        const int64_t feature = value_feature - head * layout.value_features;
+        gradient = probabilities[(query_index * layout.heads + head) * total_tokens + attended_token] *
+            static_cast<float>(
+                gradient_output[(query_index * layout.heads + head) * layout.value_features + feature]);
+      }
+      const int64_t group = static_cast<int64_t>(shared_group_indices[query_index]);
+      const int64_t shared_index = stored_id - 1;
+      if (shared_key_value_gradient != nullptr) {
+        atomicAdd(shared_key_value_gradient +
+                (group * layout.shared_tokens + shared_index) * layout.packed_width + packed_feature,
+            gradient);
+      }
+      if (shared_token && shared_delta_table_gradient != nullptr) {
+        const int64_t delta_index = static_cast<int64_t>(
+            shared_delta_indices[query_index * layout.shared_tokens + token]);
+        atomicAdd(shared_delta_table_gradient + delta_index * layout.packed_width + packed_feature,
+            gradient);
+      }
+    }
+    if (!shared_token && indexed_delta_gradient != nullptr) {
+      indexed_delta_gradient[
+          (query_index * layout.indexed_tokens + token) * layout.packed_width + packed_feature] =
+          static_cast<scalar_t>(gradient);
+    }
+  }
 }
 
 template <typename scalar_t, typename index_t, bool contiguous>
@@ -2151,6 +2361,25 @@ struct GroupedIndexedAttentionSharedKeyValueGradientLaunchPlan {
   int64_t grid_size;
   size_t shared_memory_bytes;
 };
+
+struct MappedGroupedIndexedAttentionPackedGradientLaunchPlan {
+  int threads_per_block;
+  int grid_size;
+};
+
+MappedGroupedIndexedAttentionPackedGradientLaunchPlan
+mapped_grouped_indexed_attention_packed_gradient_launch_plan(
+    const torch::Tensor& query, int64_t total_tokens, int64_t packed_width) {
+  const auto& properties = device_properties(query.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().mapped_grouped_indexed_attention_packed_gradient_threads_per_block,
+      launch_environment::kMappedGroupedIndexedAttentionPackedGradientThreadsPerBlock, false);
+  const int64_t element_count = query.size(0) * total_tokens * packed_width;
+  const int64_t required_blocks = (element_count + threads_per_block - 1) / threads_per_block;
+  const int grid_size = static_cast<int>(
+      std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
+  return {threads_per_block, grid_size};
+}
 
 std::optional<GroupedIndexedAttentionSharedKeyValueGradientLaunchPlan>
 grouped_indexed_attention_shared_key_value_gradient_launch_plan(
@@ -2971,6 +3200,24 @@ bool supports_mapped_grouped_indexed_attention_forward(const torch::Tensor& quer
   const int64_t value_features = (packed_width - heads * query.size(2)) / heads;
   return grouped_indexed_attention_launch_plan(
       query, shared_tokens, indexed_tokens, value_features, false).has_value();
+}
+
+bool supports_mapped_grouped_indexed_attention_backward(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
+  if (!is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
+          shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
+          indexed_shared_ids)) {
+    return false;
+  }
+  const int64_t heads = query.size(1);
+  const int64_t shared_tokens = shared_key_values.size(1);
+  const int64_t packed_width = shared_key_values.size(2);
+  const int64_t indexed_tokens = indexed_deltas.size(1);
+  const int64_t value_features = (packed_width - heads * query.size(2)) / heads;
+  return grouped_indexed_attention_launch_plan(
+      query, shared_tokens, indexed_tokens, value_features, true).has_value();
 }
 
 bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
@@ -4394,10 +4641,11 @@ GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const tor
   return {output, log_sum_exp};
 }
 
-torch::Tensor mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
+MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
-    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, float scale) {
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, float scale,
+    bool capture_probabilities) {
   TORCH_CHECK(supports_mapped_grouped_indexed_attention_forward(query, shared_key_values,
                   shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
                   indexed_shared_ids),
@@ -4412,6 +4660,11 @@ torch::Tensor mapped_grouped_indexed_attention_forward(const torch::Tensor& quer
   c10::DeviceGuard device_guard(query.device());
   torch::Tensor output = torch::empty(
       {query_count, heads, value_features}, query.options().memory_format(torch::MemoryFormat::Contiguous));
+  torch::Tensor probabilities =
+      capture_probabilities
+          ? torch::empty({query_count, heads, shared_tokens + indexed_tokens},
+                query.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous))
+          : torch::Tensor();
   const auto launch_plan = grouped_indexed_attention_launch_plan(
       query, shared_tokens, indexed_tokens, value_features, false);
   TORCH_CHECK(launch_plan.has_value(),
@@ -4424,11 +4677,125 @@ torch::Tensor mapped_grouped_indexed_attention_forward(const torch::Tensor& quer
       torch::kHalf, torch::kBFloat16, query.scalar_type(), "mapped_grouped_indexed_attention", [&] {
         launch_mapped_grouped_indexed_attention<scalar_t>(query, shared_key_values,
             shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
-            indexed_shared_ids, output, launch_plan->grid_size, launch_plan->block_threads,
-            launch_plan->shared_memory_bytes, stream, query_head_count, layout, scale);
+            indexed_shared_ids, output, probabilities, launch_plan->grid_size,
+            launch_plan->block_threads, launch_plan->shared_memory_bytes, stream,
+            query_head_count, layout, scale);
       });
   check_hip_kernel_launch("mapped_grouped_indexed_attention");
-  return output;
+  return {output, probabilities};
+}
+
+MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward(
+    const torch::Tensor& query, const torch::Tensor& shared_key_values,
+    const torch::Tensor& shared_group_indices, const torch::Tensor& shared_delta_table,
+    const torch::Tensor& shared_delta_indices, const torch::Tensor& indexed_deltas,
+    const torch::Tensor& indexed_shared_ids, const torch::Tensor& probabilities,
+    const torch::Tensor& gradient_output, float scale, bool needs_query_gradient,
+    bool needs_shared_key_value_gradient, bool needs_shared_delta_table_gradient,
+    bool needs_indexed_delta_gradient) {
+  TORCH_CHECK(supports_mapped_grouped_indexed_attention_backward(query, shared_key_values,
+                  shared_group_indices, shared_delta_table, shared_delta_indices,
+                  indexed_deltas, indexed_shared_ids),
+      "mapped grouped indexed attention backward received an unsupported ROCm tensor layout");
+  const int64_t query_count = query.size(0);
+  const int64_t heads = query.size(1);
+  const int64_t key_features = query.size(2);
+  const int64_t shared_tokens = shared_key_values.size(1);
+  const int64_t indexed_tokens = indexed_deltas.size(1);
+  const int64_t packed_width = shared_key_values.size(2);
+  const int64_t value_features = (packed_width - heads * key_features) / heads;
+  const int64_t total_tokens = shared_tokens + indexed_tokens;
+  TORCH_CHECK(probabilities.dim() == 3 && probabilities.size(0) == query_count &&
+                  probabilities.size(1) == heads && probabilities.size(2) == total_tokens &&
+                  probabilities.scalar_type() == torch::kFloat32 && probabilities.is_contiguous(),
+      "mapped grouped indexed attention probability shape, dtype, or layout mismatch");
+  TORCH_CHECK(gradient_output.dim() == 3 && gradient_output.size(0) == query_count &&
+                  gradient_output.size(1) == heads && gradient_output.size(2) == value_features,
+      "mapped grouped indexed attention output gradient shape mismatch");
+  TORCH_CHECK(gradient_output.scalar_type() == query.scalar_type(),
+      "mapped grouped indexed attention output gradient dtype mismatch");
+  TORCH_CHECK(gradient_output.device() == query.device() && probabilities.device() == query.device(),
+      "mapped grouped indexed attention backward inputs must be on the same device");
+
+  c10::DeviceGuard device_guard(query.device());
+  const auto gradient_options = query.options().memory_format(torch::MemoryFormat::Contiguous);
+  torch::Tensor query_gradient =
+      needs_query_gradient
+          ? torch::empty({query_count, heads, key_features}, gradient_options)
+          : torch::Tensor();
+  torch::Tensor shared_key_value_accumulator =
+      needs_shared_key_value_gradient
+          ? torch::zeros(shared_key_values.sizes(), gradient_options.dtype(torch::kFloat32))
+          : torch::Tensor();
+  torch::Tensor shared_delta_table_accumulator =
+      needs_shared_delta_table_gradient
+          ? torch::zeros(shared_delta_table.sizes(), gradient_options.dtype(torch::kFloat32))
+          : torch::Tensor();
+  torch::Tensor indexed_delta_gradient =
+      needs_indexed_delta_gradient ? torch::empty(indexed_deltas.sizes(), gradient_options)
+                                   : torch::Tensor();
+  torch::Tensor score_gradients =
+      torch::empty({query_count, heads, total_tokens},
+          gradient_options.dtype(torch::kFloat32));
+  const auto score_query_launch_plan = grouped_indexed_attention_launch_plan(
+      query, shared_tokens, indexed_tokens, value_features, true);
+  TORCH_CHECK(score_query_launch_plan.has_value(),
+      "mapped grouped indexed attention backward launch exceeds this device's limits");
+  const auto packed_launch_plan = mapped_grouped_indexed_attention_packed_gradient_launch_plan(
+      query, total_tokens, packed_width);
+  const MappedGroupedIndexedAttentionLayout layout{
+      heads, key_features, value_features, shared_tokens, indexed_tokens, packed_width};
+  const torch::Tensor contiguous_gradient_output = gradient_output.contiguous();
+  const int64_t query_head_count = query_count * heads;
+  const int64_t packed_gradient_element_count = query_count * total_tokens * packed_width;
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(query.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, query.scalar_type(),
+      "mapped_grouped_indexed_attention_backward", [&] {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(mapped_grouped_indexed_attention_score_query_gradient_kernel<scalar_t>),
+            dim3(score_query_launch_plan->grid_size),
+            dim3(score_query_launch_plan->block_threads),
+            score_query_launch_plan->shared_memory_bytes, stream,
+            query.data_ptr<scalar_t>(), shared_key_values.data_ptr<scalar_t>(),
+            shared_group_indices.data_ptr<int32_t>(), shared_delta_table.data_ptr<scalar_t>(),
+            shared_delta_indices.data_ptr<int32_t>(), indexed_deltas.data_ptr<scalar_t>(),
+            indexed_shared_ids.data_ptr<int32_t>(), probabilities.data_ptr<float>(),
+            contiguous_gradient_output.data_ptr<scalar_t>(), score_gradients.data_ptr<float>(),
+            needs_query_gradient ? query_gradient.data_ptr<scalar_t>() : nullptr,
+            query_head_count, layout, scale);
+        if (needs_shared_key_value_gradient || needs_shared_delta_table_gradient ||
+            needs_indexed_delta_gradient) {
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(mapped_grouped_indexed_attention_packed_gradient_kernel<scalar_t>),
+              dim3(packed_launch_plan.grid_size), dim3(packed_launch_plan.threads_per_block),
+              0, stream, query.data_ptr<scalar_t>(),
+              shared_group_indices.data_ptr<int32_t>(),
+              shared_delta_indices.data_ptr<int32_t>(),
+              indexed_shared_ids.data_ptr<int32_t>(), probabilities.data_ptr<float>(),
+              score_gradients.data_ptr<float>(),
+              contiguous_gradient_output.data_ptr<scalar_t>(),
+              needs_shared_key_value_gradient
+                  ? shared_key_value_accumulator.data_ptr<float>()
+                  : nullptr,
+              needs_shared_delta_table_gradient
+                  ? shared_delta_table_accumulator.data_ptr<float>()
+                  : nullptr,
+              needs_indexed_delta_gradient ? indexed_delta_gradient.data_ptr<scalar_t>() : nullptr,
+              packed_gradient_element_count, layout, scale);
+        }
+      });
+  check_hip_kernel_launch("mapped_grouped_indexed_attention_backward");
+  torch::Tensor shared_key_value_gradient =
+      needs_shared_key_value_gradient
+          ? shared_key_value_accumulator.to(query.scalar_type())
+          : torch::Tensor();
+  torch::Tensor shared_delta_table_gradient =
+      needs_shared_delta_table_gradient
+          ? shared_delta_table_accumulator.to(query.scalar_type())
+          : torch::Tensor();
+  return {query_gradient, shared_key_value_gradient, shared_delta_table_gradient,
+      indexed_delta_gradient};
 }
 
 GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch::Tensor& query,

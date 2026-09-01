@@ -1545,7 +1545,8 @@ public interface NDArrayEx {
      *
      * <p>The portable implementation materializes the two mapped inputs and delegates to the
      * ordinary grouped operation. Engine implementations may instead load both source tables
-     * directly. Group and shared-delta indices are zero-based; indexed shared IDs remain one-based
+     * directly in forward and accumulate their mapped gradients without materializing query-local
+     * copies. Group and shared-delta indices are zero-based; indexed shared IDs remain one-based
      * with zero padding.
      *
      * @param sharedKeyValues packed shared data shaped {@code [groups,sharedTokens,packedWidth]}

@@ -21,6 +21,8 @@ inline constexpr char kGroupedIndexedAttentionSharedKeyValueGradientThreadsPerBl
     "DJL_ROCM_GROUPED_INDEXED_ATTENTION_SHARED_KEY_VALUE_GRADIENT_THREADS_PER_BLOCK";
 inline constexpr char kGroupedIndexedAttentionSharedKeyValueGradientFeaturesPerBlock[] =
     "DJL_ROCM_GROUPED_INDEXED_ATTENTION_SHARED_KEY_VALUE_GRADIENT_FEATURES_PER_BLOCK";
+inline constexpr char kMappedGroupedIndexedAttentionPackedGradientThreadsPerBlock[] =
+    "DJL_ROCM_MAPPED_GROUPED_INDEXED_ATTENTION_PACKED_GRADIENT_THREADS_PER_BLOCK";
 inline constexpr char kResidualAddLayerNormThreadsPerBlock[] =
     "DJL_ROCM_RESIDUAL_ADD_LAYER_NORM_THREADS_PER_BLOCK";
 inline constexpr char kFusedAdamUpdateThreadsPerBlock[] =
@@ -44,6 +46,7 @@ struct RocmKernelLaunchConfig {
   int grouped_indexed_attention_backward_max_threads_per_block;
   int grouped_indexed_attention_shared_key_value_gradient_threads_per_block;
   int grouped_indexed_attention_shared_key_value_gradient_features_per_block;
+  int mapped_grouped_indexed_attention_packed_gradient_threads_per_block;
   int residual_add_layer_norm_threads_per_block;
   int fused_adam_update_threads_per_block;
   int masked_categorical_threads_per_block;
