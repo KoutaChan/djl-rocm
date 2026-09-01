@@ -211,6 +211,22 @@ public final class PtEngine extends Engine {
         return new PtGradientCollector();
     }
 
+    /**
+     * Creates an accumulator that writes gradients directly into a caller-owned flat tensor.
+     *
+     * <p>The parameter order defines the non-overlapping slices of {@code gradient}. Parameters and
+     * the destination must be same-device, same-type PyTorch tensors and remain owned by the
+     * caller. On an accelerator, one accumulator is confined to the stream of its first operation.
+     *
+     * @param parameters ordered leaf parameters whose gradients are collected
+     * @param gradient contiguous rank-1 destination tensor
+     * @return a reusable flat gradient accumulator
+     */
+    public PtFlatGradientAccumulator newFlatGradientAccumulator(
+            NDList parameters, NDArray gradient) {
+        return new PtFlatGradientAccumulator(parameters, gradient);
+    }
+
     /** {@inheritDoc} */
     @Override
     public GradientCollectorMode getGradientCollectorMode() {

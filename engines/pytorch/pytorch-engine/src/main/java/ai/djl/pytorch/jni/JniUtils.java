@@ -2642,6 +2642,27 @@ public final class JniUtils {
                 ndArray.getHandle(), gradNd.getHandle(), keepGraph, createGraph);
     }
 
+    public static long createFlatGradientAccumulator(PtNDArray[] parameters, PtNDArray gradient) {
+        long[] parameterHandles =
+                Arrays.stream(parameters).mapToLong(PtNDArray::getHandle).toArray();
+        return PyTorchLibrary.LIB.torchCreateFlatGradientAccumulator(
+                parameterHandles, gradient.getHandle());
+    }
+
+    public static void backwardFlatGradientAccumulator(
+            long accumulatorHandle, PtNDArray target, PtNDArray targetGradient) {
+        PyTorchLibrary.LIB.torchFlatGradientAccumulatorBackward(
+                accumulatorHandle, target.getHandle(), targetGradient.getHandle());
+    }
+
+    public static void zeroFlatGradientAccumulator(long accumulatorHandle) {
+        PyTorchLibrary.LIB.torchZeroFlatGradientAccumulator(accumulatorHandle);
+    }
+
+    public static void deleteFlatGradientAccumulator(long accumulatorHandle) {
+        PyTorchLibrary.LIB.torchDeleteFlatGradientAccumulator(accumulatorHandle);
+    }
+
     public static long distributedCreateReducer(
             long[] parameterHandles,
             String masterHost,

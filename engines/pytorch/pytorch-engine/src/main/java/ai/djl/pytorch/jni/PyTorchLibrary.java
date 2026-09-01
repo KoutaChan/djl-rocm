@@ -827,6 +827,15 @@ final class PyTorchLibrary {
     native void torchBackward(
             long inputHandle, long gradHandle, boolean keepGraph, boolean createGraph);
 
+    native long torchCreateFlatGradientAccumulator(long[] parameterHandles, long gradientHandle);
+
+    native void torchFlatGradientAccumulatorBackward(
+            long accumulatorHandle, long targetHandle, long targetGradientHandle);
+
+    native void torchZeroFlatGradientAccumulator(long accumulatorHandle);
+
+    native void torchDeleteFlatGradientAccumulator(long accumulatorHandle);
+
     native long distributedCreateReducer(
             long[] parameterHandles,
             String masterHost,
