@@ -20,6 +20,7 @@
 namespace djl::pytorch::gradient {
 
 struct FlatGradientAccumulator;
+struct FlatGradientPacker;
 
 FlatGradientAccumulator* NewFlatGradientAccumulator(
     std::vector<torch::Tensor> parameters, torch::Tensor gradient);
@@ -27,6 +28,16 @@ void BackwardFlatGradientAccumulator(FlatGradientAccumulator* accumulator,
     const torch::Tensor& target, const torch::Tensor& target_gradient);
 void ZeroFlatGradientAccumulator(FlatGradientAccumulator* accumulator);
 void DeleteFlatGradientAccumulator(FlatGradientAccumulator* accumulator);
+
+FlatGradientPacker* NewFlatGradientPacker(
+    std::vector<torch::Tensor> parameters, torch::Tensor destination);
+void PackAndClearFlatGradients(
+    FlatGradientPacker* packer, bool zero_missing_gradients);
+void AccumulateAndClearFlatGradients(
+    FlatGradientPacker* packer, bool zero_missing_gradients);
+void ZeroFlatGradientPackerDestination(FlatGradientPacker* packer);
+void ClearFlatGradientPackerParameterGradients(FlatGradientPacker* packer);
+void DeleteFlatGradientPacker(FlatGradientPacker* packer);
 
 }  // namespace djl::pytorch::gradient
 

@@ -227,6 +227,26 @@ public final class PtEngine extends Engine {
         return new PtFlatGradientAccumulator(parameters, gradient);
     }
 
+    /**
+     * Creates a reusable plan that packs leaf gradients into a caller-owned flat tensor.
+     *
+     * <p>The parameter order defines the non-overlapping slices of {@code destination}. The
+     * parameters and destination must be same-device PyTorch tensors. The destination must be a
+     * contiguous, floating-point rank-1 tensor whose element count equals the total parameter
+     * element count. Its data type may differ from the parameter data types.
+     *
+     * <p>On an accelerator, the first operation binds the packer to the current device stream. All
+     * later operations must use that stream. The parameter arrays and destination remain
+     * caller-owned and must outlive the packer.
+     *
+     * @param parameters ordered parameters whose leaf gradients are packed
+     * @param destination contiguous rank-1 destination tensor
+     * @return a reusable flat gradient packer
+     */
+    public PtFlatGradientPacker newFlatGradientPacker(NDList parameters, NDArray destination) {
+        return new PtFlatGradientPacker(parameters, destination);
+    }
+
     /** {@inheritDoc} */
     @Override
     public GradientCollectorMode getGradientCollectorMode() {

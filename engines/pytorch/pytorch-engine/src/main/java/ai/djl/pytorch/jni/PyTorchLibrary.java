@@ -836,6 +836,20 @@ final class PyTorchLibrary {
 
     native void torchDeleteFlatGradientAccumulator(long accumulatorHandle);
 
+    native long torchCreateFlatGradientPacker(long[] parameterHandles, long destinationHandle);
+
+    native void torchFlatGradientPackerPackAndClear(
+            long packerHandle, boolean zeroMissingGradients);
+
+    native void torchFlatGradientPackerAccumulateAndClear(
+            long packerHandle, boolean zeroMissingGradients);
+
+    native void torchZeroFlatGradientPackerDestination(long packerHandle);
+
+    native void torchClearFlatGradientPackerParameterGradients(long packerHandle);
+
+    native void torchDeleteFlatGradientPacker(long packerHandle);
+
     native long distributedCreateReducer(
             long[] parameterHandles,
             String masterHost,

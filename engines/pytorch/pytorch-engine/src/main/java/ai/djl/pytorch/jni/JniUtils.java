@@ -2578,6 +2578,10 @@ public final class JniUtils {
         return new Shape(PyTorchLibrary.LIB.torchSizes(ndArray.getHandle()));
     }
 
+    public static boolean isContiguous(PtNDArray ndArray) {
+        return PyTorchLibrary.LIB.torchIsContiguous(ndArray.getHandle());
+    }
+
     public static ByteBuffer getByteBuffer(PtNDArray ndArray, boolean tryDirect) {
         if (ndArray.getDevice().equals(Device.cpu())) {
             if (tryDirect
@@ -2661,6 +2665,36 @@ public final class JniUtils {
 
     public static void deleteFlatGradientAccumulator(long accumulatorHandle) {
         PyTorchLibrary.LIB.torchDeleteFlatGradientAccumulator(accumulatorHandle);
+    }
+
+    public static long createFlatGradientPacker(PtNDArray[] parameters, PtNDArray destination) {
+        long[] parameterHandles =
+                Arrays.stream(parameters).mapToLong(PtNDArray::getHandle).toArray();
+        return PyTorchLibrary.LIB.torchCreateFlatGradientPacker(
+                parameterHandles, destination.getHandle());
+    }
+
+    public static void packAndClearFlatGradientPacker(
+            long packerHandle, boolean zeroMissingGradients) {
+        PyTorchLibrary.LIB.torchFlatGradientPackerPackAndClear(packerHandle, zeroMissingGradients);
+    }
+
+    public static void accumulateAndClearFlatGradientPacker(
+            long packerHandle, boolean zeroMissingGradients) {
+        PyTorchLibrary.LIB.torchFlatGradientPackerAccumulateAndClear(
+                packerHandle, zeroMissingGradients);
+    }
+
+    public static void zeroFlatGradientPackerDestination(long packerHandle) {
+        PyTorchLibrary.LIB.torchZeroFlatGradientPackerDestination(packerHandle);
+    }
+
+    public static void clearFlatGradientPackerParameterGradients(long packerHandle) {
+        PyTorchLibrary.LIB.torchClearFlatGradientPackerParameterGradients(packerHandle);
+    }
+
+    public static void deleteFlatGradientPacker(long packerHandle) {
+        PyTorchLibrary.LIB.torchDeleteFlatGradientPacker(packerHandle);
     }
 
     public static long distributedCreateReducer(

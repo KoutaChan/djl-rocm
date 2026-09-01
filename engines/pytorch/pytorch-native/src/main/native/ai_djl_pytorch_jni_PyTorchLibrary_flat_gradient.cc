@@ -82,3 +82,86 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteFlatGradientAccumulator(
           jaccumulator_handle));
   API_END()
 }
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateFlatGradientPacker(
+    JNIEnv* env, jobject jthis, jlongArray jparameter_handles,
+    jlong jdestination_handle) {
+  API_BEGIN()
+  (void) jthis;
+  const auto parameter_handles =
+      djl::utils::jni::GetVecFromJLongArray(env, jparameter_handles);
+  std::vector<torch::Tensor> parameters;
+  parameters.reserve(parameter_handles.size());
+  for (const auto handle : parameter_handles) {
+    TORCH_CHECK(handle != djl::utils::jni::NULL_PTR,
+        "Flat gradient parameter handle must not be null.");
+    parameters.push_back(*reinterpret_cast<torch::Tensor*>(handle));
+  }
+  TORCH_CHECK(jdestination_handle != djl::utils::jni::NULL_PTR,
+      "Flat gradient destination handle must not be null.");
+  auto destination = *reinterpret_cast<torch::Tensor*>(jdestination_handle);
+  return reinterpret_cast<uintptr_t>(
+      djl::pytorch::gradient::NewFlatGradientPacker(
+          std::move(parameters), std::move(destination)));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFlatGradientPackerPackAndClear(
+    JNIEnv* env, jobject jthis, jlong jpacker_handle,
+    jboolean jzero_missing_gradients) {
+  API_BEGIN()
+  (void) jthis;
+  djl::pytorch::gradient::PackAndClearFlatGradients(
+      reinterpret_cast<djl::pytorch::gradient::FlatGradientPacker*>(
+          jpacker_handle),
+      jzero_missing_gradients == JNI_TRUE);
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFlatGradientPackerAccumulateAndClear(
+    JNIEnv* env, jobject jthis, jlong jpacker_handle,
+    jboolean jzero_missing_gradients) {
+  API_BEGIN()
+  (void) jthis;
+  djl::pytorch::gradient::AccumulateAndClearFlatGradients(
+      reinterpret_cast<djl::pytorch::gradient::FlatGradientPacker*>(
+          jpacker_handle),
+      jzero_missing_gradients == JNI_TRUE);
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchZeroFlatGradientPackerDestination(
+    JNIEnv* env, jobject jthis, jlong jpacker_handle) {
+  API_BEGIN()
+  (void) jthis;
+  djl::pytorch::gradient::ZeroFlatGradientPackerDestination(
+      reinterpret_cast<djl::pytorch::gradient::FlatGradientPacker*>(
+          jpacker_handle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchClearFlatGradientPackerParameterGradients(
+    JNIEnv* env, jobject jthis, jlong jpacker_handle) {
+  API_BEGIN()
+  (void) jthis;
+  djl::pytorch::gradient::ClearFlatGradientPackerParameterGradients(
+      reinterpret_cast<djl::pytorch::gradient::FlatGradientPacker*>(
+          jpacker_handle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteFlatGradientPacker(
+    JNIEnv* env, jobject jthis, jlong jpacker_handle) {
+  API_BEGIN()
+  (void) jthis;
+  djl::pytorch::gradient::DeleteFlatGradientPacker(
+      reinterpret_cast<djl::pytorch::gradient::FlatGradientPacker*>(
+          jpacker_handle));
+  API_END()
+}
