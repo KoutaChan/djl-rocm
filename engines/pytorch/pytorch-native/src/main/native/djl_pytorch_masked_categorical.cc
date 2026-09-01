@@ -225,6 +225,35 @@ class IndexedMaskedSoftmaxPoolValueFunction
   }
 };
 
+class GroupedMaskedSoftmaxPoolValueFunction
+    : public torch::autograd::Function<GroupedMaskedSoftmaxPoolValueFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& logits, const torch::Tensor& mask,
+      const torch::Tensor& values) {
+    context->save_for_backward({logits, mask});
+    context->saved_data["value_shape"] = values.sizes().vec();
+    context->saved_data["value_type"] =
+        static_cast<int64_t>(values.scalar_type());
+    return rocm::grouped_masked_softmax_pool_forward(logits, mask, values);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto value_shape = context->saved_data["value_shape"].toIntVector();
+    const auto value_type = static_cast<torch::ScalarType>(
+        context->saved_data["value_type"].toInt());
+    auto value_gradient = context->needs_input_grad(2)
+        ? rocm::grouped_masked_softmax_pool_value_backward(
+              gradient_outputs.at(0), saved.at(0), saved.at(1), value_shape,
+              value_type)
+        : torch::Tensor();
+    return {torch::Tensor(), torch::Tensor(), value_gradient};
+  }
+};
+
 #endif
 
 }  // namespace
@@ -256,6 +285,14 @@ torch::Tensor grouped_masked_softmax_pool(
       rocm::supports_grouped_masked_softmax_pool(
           contiguous_logits, boolean_mask, contiguous_values)) {
     return rocm::grouped_masked_softmax_pool_forward(
+        contiguous_logits, boolean_mask, contiguous_values);
+  }
+  if (at::GradMode::is_enabled() && !logits.requires_grad() &&
+      values.requires_grad() &&
+      !at::globalContext().deterministicAlgorithms() &&
+      rocm::supports_grouped_masked_softmax_pool_value_backward(
+          contiguous_logits, boolean_mask, contiguous_values)) {
+    return GroupedMaskedSoftmaxPoolValueFunction::apply(
         contiguous_logits, boolean_mask, contiguous_values);
   }
 #endif

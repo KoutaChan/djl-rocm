@@ -176,6 +176,60 @@ public class MaskedCategoricalTest {
     }
 
     @Test
+    public void groupedMaskedSoftmaxPoolValueGradientMatchesCpuReference() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        verifyGroupedPoolValueGradientParity(engine, DataType.FLOAT32, 2e-5f);
+        verifyGroupedPoolValueGradientParity(engine, DataType.FLOAT16, 3e-3f);
+        verifyGroupedPoolValueGradientParity(engine, DataType.BFLOAT16, 3e-2f);
+    }
+
+    @Test
+    public void groupedMaskedSoftmaxPoolValueGradientSupportsStridedInputs() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        verifyStridedGroupedPoolValueGradientParity(engine);
+    }
+
+    @Test
+    public void groupedMaskedSoftmaxPoolValueGradientUsesPortableFallbacks() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        verifyGroupedPoolLogitAndValueGradientParity(engine);
+        verifyUnsupportedGroupedPoolValueGradientParity(engine, 65, 3);
+        verifyUnsupportedGroupedPoolValueGradientParity(engine, 4, 32768);
+    }
+
+    @Test
+    public void groupedMaskedSoftmaxPoolValueGradientSupportsEmptyRows() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.zeros(new Shape(0, 3));
+            NDArray mask = manager.zeros(new Shape(0, 3, 2), DataType.BOOLEAN);
+            NDArray values = manager.zeros(new Shape(0, 3, 4));
+            values.setRequiresGradient(true);
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            Assert.assertEquals(pooled.getShape(), new Shape(2, 0, 4));
+            collector.backward(pooled.sum());
+            Assert.assertTrue(values.hasGradient());
+            try (NDArray gradient = values.getGradient()) {
+                Assert.assertEquals(gradient.getShape(), values.getShape());
+                Assert.assertEquals(gradient.size(), 0L);
+            }
+        }
+    }
+
+    @Test
     public void indexedMaskedSoftmaxPoolValueGradientPreservesNonFiniteSemantics() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -528,6 +582,234 @@ public class MaskedCategoricalTest {
             try (NDArray gradient = values.getGradient().toType(DataType.FLOAT32, false)) {
                 assertClose(gradient.toFloatArray(), expectedGradient, tolerance);
             }
+        }
+    }
+
+    private static void verifyGroupedPoolValueGradientParity(
+            Engine engine, DataType dataType, float tolerance) {
+        final int rowCount = 4;
+        final int choiceCount = 4;
+        final int groupCount = 3;
+        final int featureCount = 3;
+        float[] logitsData = new float[rowCount * choiceCount];
+        boolean[] maskData = new boolean[rowCount * choiceCount * groupCount];
+        float[] valueData = new float[rowCount * choiceCount * featureCount];
+        float[] lossWeightData = new float[groupCount * rowCount * featureCount];
+        for (int row = 0; row < rowCount; ++row) {
+            for (int choice = 0; choice < choiceCount; ++choice) {
+                logitsData[row * choiceCount + choice] = ((row * 7 + choice * 5) % 13 - 6) * 0.25f;
+                for (int group = 0; group < groupCount; ++group) {
+                    boolean legal = (row + choice * 2 + group) % 3 != 0;
+                    if ((row == 1 && group == 2) || row == 3) {
+                        legal = false;
+                    }
+                    maskData[(row * choiceCount + choice) * groupCount + group] = legal;
+                }
+                for (int feature = 0; feature < featureCount; ++feature) {
+                    valueData[(row * choiceCount + choice) * featureCount + feature] =
+                            ((row * 11 + choice * 7 + feature * 3) % 23 - 11) * 0.125f;
+                }
+            }
+        }
+        for (int group = 0; group < groupCount; ++group) {
+            for (int row = 0; row < rowCount; ++row) {
+                for (int feature = 0; feature < featureCount; ++feature) {
+                    lossWeightData[(group * rowCount + row) * featureCount + feature] =
+                            ((group * 17 + row * 5 + feature * 11) % 19 - 9) * 0.1875f;
+                }
+            }
+        }
+
+        float[] expectedOutput;
+        float[] expectedGradient;
+        try (NDManager manager = engine.newBaseManager(Device.cpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(logitsData, new Shape(2, 2, choiceCount));
+            NDArray mask = manager.create(maskData, new Shape(2, 2, choiceCount, groupCount));
+            NDArray values = manager.create(valueData, new Shape(2, 2, choiceCount, featureCount));
+            values.setRequiresGradient(true);
+            NDArray lossWeights =
+                    manager.create(lossWeightData, new Shape(groupCount, 2, 2, featureCount));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.mul(lossWeights).sum());
+            expectedOutput = pooled.toFloatArray();
+            expectedGradient = values.getGradient().toFloatArray();
+        }
+
+        try (NDManager manager = engine.newBaseManager(Device.gpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits =
+                    manager.create(logitsData, new Shape(2, 2, choiceCount))
+                            .toType(dataType, false);
+            NDArray mask = manager.create(maskData, new Shape(2, 2, choiceCount, groupCount));
+            NDArray values =
+                    manager.create(valueData, new Shape(2, 2, choiceCount, featureCount))
+                            .toType(dataType, false);
+            values.setRequiresGradient(true);
+            NDArray lossWeights =
+                    manager.create(lossWeightData, new Shape(groupCount, 2, 2, featureCount));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.mul(lossWeights).sum());
+            assertClose(pooled.toFloatArray(), expectedOutput, tolerance);
+            try (NDArray gradient = values.getGradient().toType(DataType.FLOAT32, false)) {
+                assertClose(gradient.toFloatArray(), expectedGradient, tolerance);
+            }
+        }
+    }
+
+    private static void verifyStridedGroupedPoolValueGradientParity(Engine engine) {
+        final int rowCount = 3;
+        final int choiceCount = 4;
+        final int groupCount = 2;
+        final int featureCount = 3;
+        float[] logitBaseData = new float[choiceCount * rowCount];
+        boolean[] maskBaseData = new boolean[rowCount * groupCount * choiceCount];
+        float[] valueBaseData = new float[rowCount * featureCount * choiceCount];
+        float[] lossWeightData = new float[rowCount * groupCount * featureCount];
+        for (int index = 0; index < logitBaseData.length; ++index) {
+            logitBaseData[index] = (index % 9 - 4) * 0.3125f;
+        }
+        for (int row = 0; row < rowCount; ++row) {
+            for (int group = 0; group < groupCount; ++group) {
+                for (int choice = 0; choice < choiceCount; ++choice) {
+                    maskBaseData[(row * groupCount + group) * choiceCount + choice] =
+                            row != 2 && (row + group + choice) % 3 != 0;
+                }
+            }
+        }
+        for (int index = 0; index < valueBaseData.length; ++index) {
+            valueBaseData[index] = (index % 17 - 8) * 0.15625f;
+        }
+        for (int index = 0; index < lossWeightData.length; ++index) {
+            lossWeightData[index] = (index % 11 - 5) * 0.21875f;
+        }
+
+        float[] expectedOutput;
+        float[] expectedBaseGradient;
+        try (NDManager manager = engine.newBaseManager(Device.cpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits =
+                    manager.create(logitBaseData, new Shape(choiceCount, rowCount)).transpose(1, 0);
+            NDArray mask =
+                    manager.create(maskBaseData, new Shape(rowCount, groupCount, choiceCount))
+                            .transpose(0, 2, 1);
+            NDArray valueBase =
+                    manager.create(valueBaseData, new Shape(rowCount, featureCount, choiceCount));
+            valueBase.setRequiresGradient(true);
+            NDArray values = valueBase.transpose(0, 2, 1);
+            NDArray lossWeights =
+                    manager.create(lossWeightData, new Shape(rowCount, groupCount, featureCount));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.transpose(1, 0, 2).mul(lossWeights).sum());
+            expectedOutput = pooled.toFloatArray();
+            expectedBaseGradient = valueBase.getGradient().toFloatArray();
+        }
+
+        try (NDManager manager = engine.newBaseManager(Device.gpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits =
+                    manager.create(logitBaseData, new Shape(choiceCount, rowCount)).transpose(1, 0);
+            NDArray mask =
+                    manager.create(maskBaseData, new Shape(rowCount, groupCount, choiceCount))
+                            .transpose(0, 2, 1);
+            NDArray valueBase =
+                    manager.create(valueBaseData, new Shape(rowCount, featureCount, choiceCount));
+            valueBase.setRequiresGradient(true);
+            NDArray values = valueBase.transpose(0, 2, 1);
+            NDArray lossWeights =
+                    manager.create(lossWeightData, new Shape(rowCount, groupCount, featureCount));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.transpose(1, 0, 2).mul(lossWeights).sum());
+            assertClose(pooled.toFloatArray(), expectedOutput, 2e-5f);
+            assertClose(valueBase.getGradient().toFloatArray(), expectedBaseGradient, 2e-5f);
+        }
+    }
+
+    private static void verifyGroupedPoolLogitAndValueGradientParity(Engine engine) {
+        float[] logitsData = {0.25f, -0.5f, 1.0f, 0.75f, -1.25f, 0.5f};
+        boolean[] maskData = {
+            true, false, true, true, false, true,
+            true, true, false, false, true, false
+        };
+        float[] valueData = {
+            1f, 2f, 3f, 4f, 5f, 6f,
+            -1f, -2f, -3f, -4f, -5f, -6f
+        };
+        float[] lossWeightData = {0.5f, -1f, 0.25f, 0.75f, -0.5f, 1.25f, -0.25f, 0.125f};
+        float[] expectedLogitGradient;
+        float[] expectedValueGradient;
+        try (NDManager manager = engine.newBaseManager(Device.cpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(logitsData, new Shape(2, 3));
+            logits.setRequiresGradient(true);
+            NDArray mask = manager.create(maskData, new Shape(2, 3, 2));
+            NDArray values = manager.create(valueData, new Shape(2, 3, 2));
+            values.setRequiresGradient(true);
+            NDArray lossWeights = manager.create(lossWeightData, new Shape(2, 2, 2));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.mul(lossWeights).sum());
+            expectedLogitGradient = logits.getGradient().toFloatArray();
+            expectedValueGradient = values.getGradient().toFloatArray();
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(logitsData, new Shape(2, 3));
+            logits.setRequiresGradient(true);
+            NDArray mask = manager.create(maskData, new Shape(2, 3, 2));
+            NDArray values = manager.create(valueData, new Shape(2, 3, 2));
+            values.setRequiresGradient(true);
+            NDArray lossWeights = manager.create(lossWeightData, new Shape(2, 2, 2));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.mul(lossWeights).sum());
+            assertClose(logits.getGradient().toFloatArray(), expectedLogitGradient, 2e-5f);
+            assertClose(values.getGradient().toFloatArray(), expectedValueGradient, 2e-5f);
+        }
+    }
+
+    private static void verifyUnsupportedGroupedPoolValueGradientParity(
+            Engine engine, int choiceCount, int groupCount) {
+        final int featureCount = 2;
+        float[] logitsData = new float[choiceCount];
+        boolean[] maskData = new boolean[choiceCount * groupCount];
+        float[] valueData = new float[choiceCount * featureCount];
+        float[] lossWeightData = new float[groupCount * featureCount];
+        for (int choice = 0; choice < choiceCount; ++choice) {
+            logitsData[choice] = (choice % 13 - 6) * 0.125f;
+            for (int group = 0; group < groupCount; ++group) {
+                maskData[choice * groupCount + group] = (choice + group) % 5 != 0;
+            }
+            for (int feature = 0; feature < featureCount; ++feature) {
+                valueData[choice * featureCount + feature] =
+                        ((choice * 3 + feature * 7) % 19 - 9) * 0.0625f;
+            }
+        }
+        for (int index = 0; index < lossWeightData.length; ++index) {
+            lossWeightData[index] = (index % 17 - 8) * 0.09375f;
+        }
+        float[] expectedGradient;
+        try (NDManager manager = engine.newBaseManager(Device.cpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(logitsData, new Shape(1, choiceCount));
+            NDArray mask = manager.create(maskData, new Shape(1, choiceCount, groupCount));
+            NDArray values = manager.create(valueData, new Shape(1, choiceCount, featureCount));
+            values.setRequiresGradient(true);
+            NDArray lossWeights =
+                    manager.create(lossWeightData, new Shape(groupCount, 1, featureCount));
+            collector.backward(
+                    NDArrays.groupedMaskedSoftmaxPool(logits, mask, values).mul(lossWeights).sum());
+            expectedGradient = values.getGradient().toFloatArray();
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu());
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(logitsData, new Shape(1, choiceCount));
+            NDArray mask = manager.create(maskData, new Shape(1, choiceCount, groupCount));
+            NDArray values = manager.create(valueData, new Shape(1, choiceCount, featureCount));
+            values.setRequiresGradient(true);
+            NDArray lossWeights =
+                    manager.create(lossWeightData, new Shape(groupCount, 1, featureCount));
+            collector.backward(
+                    NDArrays.groupedMaskedSoftmaxPool(logits, mask, values).mul(lossWeights).sum());
+            assertClose(values.getGradient().toFloatArray(), expectedGradient, 2e-5f);
         }
     }
 

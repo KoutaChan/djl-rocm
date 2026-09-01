@@ -57,6 +57,15 @@ bool supports_grouped_masked_softmax_pool(
 torch::Tensor grouped_masked_softmax_pool_forward(
     const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& values);
 
+bool supports_grouped_masked_softmax_pool_value_backward(
+    const torch::Tensor& logits, const torch::Tensor& mask,
+    const torch::Tensor& values);
+
+torch::Tensor grouped_masked_softmax_pool_value_backward(
+    const torch::Tensor& gradient_output, const torch::Tensor& logits,
+    const torch::Tensor& mask, at::IntArrayRef value_shape,
+    torch::ScalarType value_type);
+
 bool supports_indexed_masked_softmax_pool(const torch::Tensor& logits,
     const torch::Tensor& mask, const torch::Tensor& values,
     at::IntArrayRef choice_indices);
