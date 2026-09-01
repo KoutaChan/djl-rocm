@@ -815,6 +815,42 @@ public final class NDArrays {
         return addBroadcastResidualToOwnedAndSilu(values, residual, null);
     }
 
+    /**
+     * Adds a bias and a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * <p>The values must be shaped {@code [batch, items, features]}, the bias {@code [features]},
+     * and the residual {@code [batch, 1, features]}. If present, the mask must be shaped {@code
+     * [batch, items]} and is applied after SiLU. All arrays must use the same floating-point data
+     * type. Low-precision implementations preserve the staged rounding of {@code values += bias}
+     * followed by {@code values += residual}. This operation is intended for inference graphs where
+     * the caller exclusively owns {@code values}; it does not support automatic differentiation.
+     *
+     * @param values owned values to update
+     * @param bias feature bias added before the residual
+     * @param residual residual broadcast across the item dimension
+     * @param mask optional item mask, or {@code null}
+     * @return {@code values}, updated in place
+     */
+    public static NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray values, NDArray bias, NDArray residual, NDArray mask) {
+        return values.getNDArrayInternal()
+                .addBiasAndBroadcastResidualToOwnedAndSilu(bias, residual, mask);
+    }
+
+    /**
+     * Adds a bias and a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * @param values owned values to update
+     * @param bias feature bias added before the residual
+     * @param residual residual broadcast across the item dimension
+     * @return {@code values}, updated in place
+     * @see #addBiasAndBroadcastResidualToOwnedAndSilu(NDArray, NDArray, NDArray, NDArray)
+     */
+    public static NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray values, NDArray bias, NDArray residual) {
+        return addBiasAndBroadcastResidualToOwnedAndSilu(values, bias, residual, null);
+    }
+
     private static NDArray canonicalRelationKeys(
             NDArray relationKeys,
             long[] leadingDimensions,
@@ -2782,6 +2818,32 @@ public final class NDArrays {
         }
         NDArray array = arrays.head();
         return array.getNDArrayInternal().concat(arrays.subNDList(1), axis);
+    }
+
+    /**
+     * Converts floating-point arrays to one data type while concatenating them.
+     *
+     * <p>The result is equivalent to converting each input to {@code dataType} and concatenating
+     * the converted arrays along {@code axis}. Engines may combine the conversions and
+     * concatenation into one operation. The portable implementation remains differentiable.
+     *
+     * @param arrays arrays with matching dimensions except along {@code axis}
+     * @param axis axis along which the arrays are joined
+     * @param dataType floating-point data type of the result
+     * @return converted and concatenated array
+     */
+    public static NDArray concatToType(NDList arrays, int axis, DataType dataType) {
+        Preconditions.checkArgument(!arrays.isEmpty(), "need at least one array to concatenate");
+        Preconditions.checkArgument(dataType.isFloating(), "output data type must be floating");
+        for (NDArray array : arrays) {
+            Preconditions.checkArgument(
+                    array.getDataType().isFloating(), "all arrays must be floating-point");
+        }
+        if (arrays.size() == 1) {
+            return arrays.singletonOrThrow().toType(dataType, true);
+        }
+        NDArray array = arrays.head();
+        return array.getNDArrayInternal().concatToType(arrays.subNDList(1), axis, dataType);
     }
 
     /**

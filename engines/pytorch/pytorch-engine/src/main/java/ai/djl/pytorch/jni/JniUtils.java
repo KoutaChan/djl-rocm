@@ -1023,6 +1023,14 @@ public final class JniUtils {
         return new PtNDArray(arrays[0].getManager(), PyTorchLibrary.LIB.torchCat(pointers, dim));
     }
 
+    /** Converts floating-point arrays while concatenating them along an existing axis. */
+    public static PtNDArray concatToType(PtNDArray[] arrays, long dim, DataType dataType) {
+        long[] pointers = Arrays.stream(arrays).mapToLong(PtNDArray::getHandle).toArray();
+        return new PtNDArray(
+                arrays[0].getManager(),
+                PyTorchLibrary.LIB.torchConcatToType(pointers, dim, dataType.ordinal()));
+    }
+
     public static PtNDArray tile(PtNDArray ndArray, long[] repeats) {
         return new PtNDArray(
                 ndArray.getManager(), PyTorchLibrary.LIB.torchRepeat(ndArray.getHandle(), repeats));
@@ -1234,6 +1242,17 @@ public final class JniUtils {
             PtNDArray values, PtNDArray residual, PtNDArray mask) {
         PyTorchLibrary.LIB.torchAddBroadcastResidualToOwnedAndSilu(
                 values.getHandle(), residual.getHandle(), mask == null ? 0L : mask.getHandle());
+        return values;
+    }
+
+    /** Adds a bias and broadcast residual to caller-owned values before SiLU. */
+    public static PtNDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            PtNDArray values, PtNDArray bias, PtNDArray residual, PtNDArray mask) {
+        PyTorchLibrary.LIB.torchAddBiasAndBroadcastResidualToOwnedAndSilu(
+                values.getHandle(),
+                bias.getHandle(),
+                residual.getHandle(),
+                mask == null ? 0L : mask.getHandle());
         return values;
     }
 

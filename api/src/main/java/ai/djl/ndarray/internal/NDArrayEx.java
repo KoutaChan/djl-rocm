@@ -54,6 +54,16 @@ public interface NDArrayEx {
         return embeddings.reshape(new Shape(packedShape)).concat(features, dimensions - 1);
     }
 
+    /** Converts floating-point arrays while concatenating them along an existing axis. */
+    default NDArray concatToType(NDList arrays, int axis, DataType dataType) {
+        NDList converted = new NDList(arrays.size() + 1);
+        converted.add(getArray().toType(dataType, false));
+        for (NDArray array : arrays) {
+            converted.add(array.toType(dataType, false));
+        }
+        return NDArrays.concat(converted, axis);
+    }
+
     /** Selects leading-axis rows while preserving all trailing dimensions. */
     default NDArray gatherRows(NDArray rowIndices) {
         NDArray rows = getArray();
@@ -1629,6 +1639,27 @@ public interface NDArrayEx {
             } else {
                 scope.tempAttachAll(values, residual, mask);
             }
+            values.addi(residual);
+            values.muli(Activation.sigmoid(values));
+            if (mask != null) {
+                values.muli(mask.expandDims(2));
+            }
+            return values;
+        }
+    }
+
+    /** Adds a bias and broadcast residual to owned values before SiLU and an optional mask. */
+    default NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray bias, NDArray residual, NDArray mask) {
+        NDArray values = getArray();
+        NDManager outputManager = values.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            if (mask == null) {
+                scope.tempAttachAll(values, bias, residual);
+            } else {
+                scope.tempAttachAll(values, bias, residual, mask);
+            }
+            values.addi(bias);
             values.addi(residual);
             values.muli(Activation.sigmoid(values));
             if (mask != null) {

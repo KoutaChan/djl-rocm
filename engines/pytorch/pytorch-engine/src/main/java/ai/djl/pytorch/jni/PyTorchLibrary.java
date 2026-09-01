@@ -355,6 +355,9 @@ final class PyTorchLibrary {
 
     native void torchAddBroadcastResidualToOwnedAndSilu(long values, long residual, long mask);
 
+    native void torchAddBiasAndBroadcastResidualToOwnedAndSilu(
+            long values, long bias, long residual, long mask);
+
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
 
     native long torchArgMax(long handle);
@@ -555,6 +558,8 @@ final class PyTorchLibrary {
     native long torchStack(long[] handles, long dim);
 
     native long torchCat(long[] handles, long dim);
+
+    native long torchConcatToType(long[] handles, long dim, int dataType);
 
     native long torchRepeat(long handle, long[] repeats);
 

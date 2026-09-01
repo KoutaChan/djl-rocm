@@ -731,15 +731,20 @@ __device__ float round_masked_embedding_value(float value) {
 
 template <typename scalar_t>
 __global__ void broadcast_residual_to_owned_silu_kernel(scalar_t* values,
-    const scalar_t* residual, const scalar_t* mask, int64_t row_count,
-    int64_t items_per_batch, int64_t width) {
+    const scalar_t* bias, const scalar_t* residual, const scalar_t* mask,
+    int64_t row_count, int64_t items_per_batch, int64_t width) {
   for (int64_t row = blockIdx.x; row < row_count; row += gridDim.x) {
     const int64_t batch = row / items_per_batch;
     const int64_t row_offset = row * width;
     const int64_t residual_offset = batch * width;
     for (int64_t column = threadIdx.x; column < width; column += blockDim.x) {
+      const scalar_t biased = bias == nullptr
+          ? values[row_offset + column]
+          : static_cast<scalar_t>(
+                static_cast<float>(values[row_offset + column]) +
+                static_cast<float>(bias[column]));
       const scalar_t updated = static_cast<scalar_t>(
-          static_cast<float>(values[row_offset + column]) +
+          static_cast<float>(biased) +
           static_cast<float>(residual[residual_offset + column]));
       const float value = static_cast<float>(updated);
       const scalar_t activated =
@@ -2573,10 +2578,19 @@ bool supports_broadcast_residual_to_owned_silu(const torch::Tensor& values,
        mask->scalar_type() == values.scalar_type() && mask->device() == values.device());
 }
 
-void add_broadcast_residual_to_owned_and_silu(
-    torch::Tensor& values, const torch::Tensor& residual, const torch::Tensor* mask) {
-  TORCH_CHECK(supports_broadcast_residual_to_owned_silu(values, residual, mask),
-      "broadcast residual SiLU received an unsupported ROCm tensor layout");
+bool supports_bias_and_broadcast_residual_to_owned_silu(
+    const torch::Tensor& values, const torch::Tensor& bias,
+    const torch::Tensor& residual, const torch::Tensor* mask) {
+  return supports_broadcast_residual_to_owned_silu(values, residual, mask) &&
+      bias.is_cuda() && bias.is_contiguous() && bias.dim() == 1 &&
+      bias.size(0) == values.size(2) &&
+      bias.scalar_type() == values.scalar_type() &&
+      bias.device() == values.device();
+}
+
+void launch_bias_and_broadcast_residual_to_owned_silu(
+    torch::Tensor& values, const torch::Tensor* bias,
+    const torch::Tensor& residual, const torch::Tensor* mask) {
   c10::DeviceGuard device_guard(values.device());
   const int64_t row_count = values.size(0) * values.size(1);
   if (row_count == 0) {
@@ -2587,15 +2601,35 @@ void add_broadcast_residual_to_owned_and_silu(
   const hipStream_t stream = c10::hip::getCurrentHIPStream(values.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, values.scalar_type(),
-      "broadcast_residual_to_owned_silu", [&] {
+      "bias_broadcast_residual_to_owned_silu", [&] {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(broadcast_residual_to_owned_silu_kernel<scalar_t>),
             dim3(block_count), dim3(kBroadcastResidualSiluThreadsPerBlock), 0, stream,
-            values.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(),
+            values.data_ptr<scalar_t>(),
+            bias == nullptr ? nullptr : bias->data_ptr<scalar_t>(),
+            residual.data_ptr<scalar_t>(),
             mask == nullptr ? nullptr : mask->data_ptr<scalar_t>(), row_count,
             values.size(1), values.size(2));
       });
-  check_hip_kernel_launch("broadcast residual to owned SiLU");
+  check_hip_kernel_launch("bias and broadcast residual to owned SiLU");
+}
+
+void add_broadcast_residual_to_owned_and_silu(
+    torch::Tensor& values, const torch::Tensor& residual, const torch::Tensor* mask) {
+  TORCH_CHECK(supports_broadcast_residual_to_owned_silu(values, residual, mask),
+      "broadcast residual SiLU received an unsupported ROCm tensor layout");
+  launch_bias_and_broadcast_residual_to_owned_silu(
+      values, nullptr, residual, mask);
+}
+
+void add_bias_and_broadcast_residual_to_owned_and_silu(
+    torch::Tensor& values, const torch::Tensor& bias,
+    const torch::Tensor& residual, const torch::Tensor* mask) {
+  TORCH_CHECK(supports_bias_and_broadcast_residual_to_owned_silu(
+          values, bias, residual, mask),
+      "bias and broadcast residual SiLU received an unsupported ROCm tensor layout");
+  launch_bias_and_broadcast_residual_to_owned_silu(
+      values, &bias, residual, mask);
 }
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,

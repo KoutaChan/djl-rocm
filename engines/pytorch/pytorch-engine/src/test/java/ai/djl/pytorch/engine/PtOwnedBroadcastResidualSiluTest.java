@@ -36,6 +36,8 @@ public class PtOwnedBroadcastResidualSiluTest {
     public void cpuFallbackMatchesEagerCompositionWithAndWithoutMask() {
         verify(Device.cpu(), DataType.FLOAT32, false);
         verify(Device.cpu(), DataType.FLOAT32, true);
+        verifyBias(Device.cpu(), DataType.FLOAT32, false);
+        verifyBias(Device.cpu(), DataType.FLOAT32, true);
     }
 
     @Test
@@ -48,6 +50,20 @@ public class PtOwnedBroadcastResidualSiluTest {
                 new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
             verify(Device.gpu(), dataType, false);
             verify(Device.gpu(), dataType, true);
+            verifyBias(Device.gpu(), dataType, false);
+            verifyBias(Device.gpu(), dataType, true);
+        }
+    }
+
+    @Test
+    public void biasEpiloguePreservesNanAndInfinitySemantics() {
+        verifyBiasNonFinite(Device.cpu(), DataType.FLOAT32);
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() > 0) {
+            for (DataType dataType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                verifyBiasNonFinite(Device.gpu(), dataType);
+            }
         }
     }
 
@@ -90,5 +106,76 @@ public class PtOwnedBroadcastResidualSiluTest {
         NDArray activated = Activation.swish(values.add(residual), 1.0f);
         NDArray expected = mask == null ? activated : activated.mul(mask.expandDims(2));
         return expected.toType(DataType.FLOAT32, false).toFloatArray();
+    }
+
+    private static void verifyBias(Device device, DataType dataType, boolean masked) {
+        try (NDManager manager = Engine.getInstance().newBaseManager(device)) {
+            NDArray values =
+                    manager.arange(BATCH * ITEMS * WIDTH)
+                            .reshape(BATCH, ITEMS, WIDTH)
+                            .sub(9.5f)
+                            .div(7.0f)
+                            .toType(dataType, false);
+            NDArray bias =
+                    manager.create(new float[] {0.0625f, -0.1875f, 0.3125f, -0.4375f})
+                            .toType(dataType, false);
+            NDArray residual =
+                    manager.create(
+                                    new float[] {
+                                        0.25f, -0.5f, 0.75f, -1.0f,
+                                        -0.125f, 0.375f, -0.625f, 0.875f
+                                    },
+                                    new Shape(BATCH, 1, WIDTH))
+                            .toType(dataType, false);
+            NDArray mask =
+                    masked
+                            ? manager.create(
+                                            new float[] {1, 0, 1, 0, 1, 1}, new Shape(BATCH, ITEMS))
+                                    .toType(dataType, false)
+                            : null;
+            NDArray staged = values.add(bias).add(residual);
+            NDArray activated = Activation.swish(staged, 1.0f);
+            NDArray expected = mask == null ? activated : activated.mul(mask.expandDims(2));
+            float[] expectedValues = expected.toType(DataType.FLOAT32, false).toFloatArray();
+
+            NDArray result =
+                    NDArrays.addBiasAndBroadcastResidualToOwnedAndSilu(
+                            values, bias, residual, mask);
+
+            Assert.assertSame(result, values);
+            Assert.assertEquals(
+                    result.toType(DataType.FLOAT32, false).toFloatArray(),
+                    expectedValues,
+                    dataType == DataType.FLOAT32 ? 1.0e-6f : 2.0e-3f);
+        }
+    }
+
+    private static void verifyBiasNonFinite(Device device, DataType dataType) {
+        try (NDManager manager = Engine.getInstance().newBaseManager(device)) {
+            NDArray values =
+                    manager.create(new float[] {0, 0, 0, 0}, new Shape(1, 1, WIDTH))
+                            .toType(dataType, false);
+            NDArray bias =
+                    manager.create(
+                                    new float[] {
+                                        Float.NaN,
+                                        Float.POSITIVE_INFINITY,
+                                        Float.NEGATIVE_INFINITY,
+                                        0.5f
+                                    })
+                            .toType(dataType, false);
+            NDArray residual =
+                    manager.create(new float[] {1, -1, 1, -0.25f}, new Shape(1, 1, WIDTH))
+                            .toType(dataType, false);
+
+            NDArray result =
+                    NDArrays.addBiasAndBroadcastResidualToOwnedAndSilu(values, bias, residual);
+            float[] actual = result.toType(DataType.FLOAT32, false).toFloatArray();
+
+            Assert.assertTrue(Float.isNaN(actual[0]));
+            Assert.assertEquals(actual[1], Float.POSITIVE_INFINITY);
+            Assert.assertTrue(Float.isNaN(actual[2]));
+            Assert.assertEquals(actual[3], 0.25f / (1.0f + (float) Math.exp(-0.25f)), 2.0e-3f);
+        }
     }
 }

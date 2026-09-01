@@ -175,6 +175,14 @@ bool supports_broadcast_residual_to_owned_silu(const torch::Tensor& values,
 void add_broadcast_residual_to_owned_and_silu(
     torch::Tensor& values, const torch::Tensor& residual, const torch::Tensor* mask);
 
+bool supports_bias_and_broadcast_residual_to_owned_silu(
+    const torch::Tensor& values, const torch::Tensor& bias,
+    const torch::Tensor& residual, const torch::Tensor* mask);
+
+void add_bias_and_broadcast_residual_to_owned_and_silu(
+    torch::Tensor& values, const torch::Tensor& bias,
+    const torch::Tensor& residual, const torch::Tensor* mask);
+
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, at::IntArrayRef normalized_shape);
 

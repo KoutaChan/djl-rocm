@@ -62,6 +62,21 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray concatToType(NDList arrays, int axis, DataType dataType) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.concatToType(arrays, axis, dataType);
+        }
+        PtNDManager manager = array.getManager();
+        PtNDArray[] inputs = new PtNDArray[arrays.size() + 1];
+        inputs[0] = array;
+        for (int index = 0; index < arrays.size(); ++index) {
+            inputs[index + 1] = manager.from(arrays.get(index));
+        }
+        return JniUtils.concatToType(inputs, axis, dataType);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray gatherRows(NDArray rowIndices) {
         PtNDManager manager = array.getManager();
         return JniUtils.gatherRows(array, manager.from(rowIndices));
@@ -1143,6 +1158,21 @@ public class PtNDArrayEx implements NDArrayEx {
         PtNDManager manager = array.getManager();
         return JniUtils.addBroadcastResidualToOwnedAndSilu(
                 array, manager.from(residual), mask == null ? null : manager.from(mask));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray bias, NDArray residual, NDArray mask) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.addBiasAndBroadcastResidualToOwnedAndSilu(bias, residual, mask);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.addBiasAndBroadcastResidualToOwnedAndSilu(
+                array,
+                manager.from(bias),
+                manager.from(residual),
+                mask == null ? null : manager.from(mask));
     }
 
     /** {@inheritDoc} */
