@@ -20,6 +20,7 @@ import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.training.GradientCollector;
 import ai.djl.util.Float16Utils;
 
@@ -134,7 +135,18 @@ public class PtConcatToTypeTest {
                 offset += width;
             }
 
-            NDArray actual = NDArrays.concatToType(sources, -1, DataType.FLOAT16);
+            String profileFile = System.getProperty("ai.djl.pytorch.concatToType.profileFile");
+            NDArray actual;
+            if (profileFile != null) {
+                JniUtils.startProfile(true, true, false);
+            }
+            try {
+                actual = NDArrays.concatToType(sources, -1, DataType.FLOAT16);
+            } finally {
+                if (profileFile != null) {
+                    JniUtils.stopProfile(profileFile);
+                }
+            }
 
             Assert.assertEquals(actual.getDataType(), DataType.FLOAT16);
             Assert.assertEquals(actual.getShape(), new Shape(rows, 1, 1, 640));
