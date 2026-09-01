@@ -2404,39 +2404,45 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
 
 struct GroupedPackedAttentionLaunchPlan {
   int block_threads;
-  int64_t query_head_count;
-  int64_t grid_size;
   size_t shared_memory_bytes;
 };
 
 std::optional<GroupedPackedAttentionLaunchPlan> grouped_packed_attention_launch_plan(
     const torch::Tensor& query, const torch::Tensor& packed_key_value, int64_t heads) {
   constexpr int kRequestedThreadsPerBlock = 256;
+  // A logical group owns one query and keeps every short-row probability in registers.
+  constexpr int kQueryGroupWidth = 32;
   const auto& properties = device_properties(query.get_device());
   const int64_t key_features = query.size(2) / heads;
   const int64_t value_features = (packed_key_value.size(3) - query.size(2)) / heads;
   const int64_t key_tokens = packed_key_value.size(2);
-  const int64_t query_head_count = query.size(0) * packed_key_value.size(1) *
-      query.size(1) * heads;
-  const size_t shared_memory_per_wave =
-      static_cast<size_t>(key_tokens + key_features) * sizeof(float);
-  const int maximum_waves_by_threads =
-      std::min(kRequestedThreadsPerBlock, properties.maxThreadsPerBlock) /
-      properties.warpSize;
-  const int maximum_waves_by_memory = static_cast<int>(
-      static_cast<size_t>(properties.sharedMemPerBlock) / shared_memory_per_wave);
-  const int waves_per_block = static_cast<int>(std::min<int64_t>(
-      std::min(maximum_waves_by_threads, maximum_waves_by_memory), query_head_count));
-  if (waves_per_block <= 0 || value_features <= 0) {
+  const int64_t maximum_int = std::numeric_limits<int>::max();
+  const int maximum_threads =
+      std::min(kRequestedThreadsPerBlock, properties.maxThreadsPerBlock);
+  const int block_threads =
+      maximum_threads - maximum_threads % kQueryGroupWidth;
+  if (properties.warpSize % kQueryGroupWidth != 0 || block_threads <= 0 ||
+      key_tokens > kQueryGroupWidth || key_features > kQueryGroupWidth ||
+      value_features <= 0 ||
+      query.size(0) > maximum_int || query.size(1) > maximum_int ||
+      packed_key_value.size(1) > maximum_int ||
+      key_tokens > maximum_int || heads > maximum_int || value_features > maximum_int ||
+      query.size(2) > maximum_int || packed_key_value.size(3) > maximum_int ||
+      key_tokens > maximum_int / key_features ||
+      key_tokens > maximum_int / value_features ||
+      heads > properties.maxGridSize[0] ||
+      packed_key_value.size(1) > properties.maxGridSize[1] ||
+      query.size(0) > properties.maxGridSize[2]) {
     return std::nullopt;
   }
-  const int64_t grid_size =
-      (query_head_count + waves_per_block - 1) / waves_per_block;
-  if (grid_size > static_cast<int64_t>(properties.maxGridSize[0])) {
+  const size_t key_value_bytes = static_cast<size_t>(key_tokens) *
+      static_cast<size_t>(key_features + value_features) * sizeof(float);
+  const size_t mask_bytes = static_cast<size_t>(key_tokens) * sizeof(unsigned char);
+  const size_t shared_memory_bytes = key_value_bytes + mask_bytes;
+  if (shared_memory_bytes > static_cast<size_t>(properties.sharedMemPerBlock)) {
     return std::nullopt;
   }
-  return GroupedPackedAttentionLaunchPlan{waves_per_block * properties.warpSize,
-      query_head_count, grid_size, shared_memory_per_wave * waves_per_block};
+  return GroupedPackedAttentionLaunchPlan{block_threads, shared_memory_bytes};
 }
 
 template <typename scalar_t>
@@ -2447,104 +2453,115 @@ __device__ __forceinline__ float round_grouped_attention_boundary(float value) {
   return static_cast<float>(static_cast<scalar_t>(value));
 }
 
-template <typename scalar_t, typename mask_t>
+template <typename mask_t>
+__device__ __forceinline__ bool grouped_attention_mask_present(mask_t value) {
+  return static_cast<float>(value) != 0.0f;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float grouped_attention_masked_score() {
+  return round_grouped_attention_boundary<scalar_t>(-1.0e30f);
+}
+
+template <int query_group_width, typename scalar_t, typename mask_t>
 __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     const scalar_t* packed_key_value, const mask_t* mask, scalar_t* output,
-    int64_t query_head_count, int64_t query_tokens, int64_t groups,
-    int64_t key_tokens, int64_t heads, int64_t key_features,
-    int64_t value_features, float scale) {
-  extern __shared__ float shared_storage[];
-  const int lane = threadIdx.x % warpSize;
-  const int wave = threadIdx.x / warpSize;
-  const int waves_per_block = blockDim.x / warpSize;
-  float* all_token_weights = shared_storage;
-  float* all_query_values =
-      all_token_weights + waves_per_block * key_tokens;
-  float* token_weights = all_token_weights + wave * key_tokens;
-  float* query_values = all_query_values + wave * key_features;
-  const int64_t query_head =
-      static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
-  const bool active = query_head < query_head_count;
-  const int64_t head = active ? query_head % heads : 0;
-  const int64_t query_token = active ? (query_head / heads) % query_tokens : 0;
-  const int64_t group =
-      active ? (query_head / (heads * query_tokens)) % groups : 0;
-  const int64_t batch =
-      active ? query_head / (heads * query_tokens * groups) : 0;
-  const int64_t query_width = heads * key_features;
-  const int64_t packed_width =
-      query_width + heads * value_features;
-  const int64_t matrix = batch * groups + group;
+    int query_tokens, int groups, int key_tokens, int heads,
+    int key_features, int value_features, float scale) {
+  extern __shared__ unsigned char shared_storage[];
+  const int lane = threadIdx.x % query_group_width;
+  const int query_group = threadIdx.x / query_group_width;
+  const int query_groups_per_block = blockDim.x / query_group_width;
+  const int head = static_cast<int>(blockIdx.x);
+  const int group = static_cast<int>(blockIdx.y);
+  const int batch = static_cast<int>(blockIdx.z);
+  const int query_width = heads * key_features;
+  const int packed_width = query_width + heads * value_features;
+  const int64_t matrix = static_cast<int64_t>(batch) * groups + group;
+  const int key_elements = key_tokens * key_features;
+  const int value_elements = key_tokens * value_features;
+  auto* shared_keys = reinterpret_cast<float*>(shared_storage);
+  auto* shared_values = shared_keys + key_elements;
+  const size_t key_value_bytes =
+      static_cast<size_t>(key_elements + value_elements) * sizeof(float);
+  auto* shared_mask = shared_storage + key_value_bytes;
 
-  if (active) {
-    const int64_t query_offset =
-        (batch * query_tokens + query_token) * query_width + head * key_features;
-    for (int64_t feature = lane; feature < key_features; feature += warpSize) {
-      query_values[feature] = static_cast<float>(query[query_offset + feature]);
-    }
+  // Feature-major keys let adjacent token lanes read adjacent LDS banks.
+  for (int index = threadIdx.x; index < key_elements; index += blockDim.x) {
+    const int key_token = index / key_features;
+    const int feature = index - key_token * key_features;
+    const int64_t source_offset =
+        (matrix * key_tokens + key_token) * packed_width + head * key_features + feature;
+    shared_keys[feature * key_tokens + key_token] =
+        static_cast<float>(packed_key_value[source_offset]);
+  }
+  for (int index = threadIdx.x; index < value_elements; index += blockDim.x) {
+    const int key_token = index / value_features;
+    const int feature = index - key_token * value_features;
+    const int64_t source_offset =
+        (matrix * key_tokens + key_token) * packed_width + query_width +
+        head * value_features + feature;
+    shared_values[key_token * value_features + feature] =
+        static_cast<float>(packed_key_value[source_offset]);
+  }
+  for (int key_token = threadIdx.x; key_token < key_tokens;
+       key_token += blockDim.x) {
+    shared_mask[key_token] = static_cast<unsigned char>(grouped_attention_mask_present(
+        mask[matrix * key_tokens + key_token]));
   }
   __syncthreads();
 
-  float local_maximum = -std::numeric_limits<float>::infinity();
-  if (active) {
-    for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
-      const bool present =
-          static_cast<float>(mask[matrix * key_tokens + key_token]) != 0.0f;
-      float score = round_grouped_attention_boundary<scalar_t>(-1.0e30f);
+  for (int query_token = query_group; query_token < query_tokens;
+       query_token += query_groups_per_block) {
+    const int64_t query_offset =
+        (static_cast<int64_t>(batch) * query_tokens + query_token) * query_width +
+        head * key_features;
+    const float query_value = lane < key_features
+        ? static_cast<float>(query[query_offset + lane])
+        : 0.0f;
+    float score = -std::numeric_limits<float>::infinity();
+    if (lane < key_tokens) {
+      const bool present = shared_mask[lane] != 0;
+      score = grouped_attention_masked_score<scalar_t>();
       if (present) {
-        const int64_t key_offset =
-            (matrix * key_tokens + key_token) * packed_width + head * key_features;
         score = 0.0f;
-        for (int64_t feature = 0; feature < key_features; ++feature) {
-          score += query_values[feature] *
-              static_cast<float>(packed_key_value[key_offset + feature]);
+        for (int feature = 0; feature < key_features; ++feature) {
+          score += __shfl(
+                       query_value, static_cast<int>(feature), query_group_width) *
+              shared_keys[feature * key_tokens + lane];
         }
         score = round_grouped_attention_boundary<scalar_t>(score);
         score = round_grouped_attention_boundary<scalar_t>(score * scale);
       }
-      token_weights[key_token] = score;
-      local_maximum = fmaxf(local_maximum, score);
     }
-  }
-  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    local_maximum = fmaxf(local_maximum, __shfl_down(local_maximum, offset));
-  }
-  const float maximum = __shfl(local_maximum, 0);
+    float local_maximum = score;
+    for (int offset = query_group_width / 2; offset > 0; offset /= 2) {
+      local_maximum = maximum_propagating_nan(
+          local_maximum, __shfl_down(local_maximum, offset, query_group_width));
+    }
+    const float maximum = __shfl(local_maximum, 0, query_group_width);
 
-  float local_sum = 0.0f;
-  if (active) {
-    for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
-      const float weight = expf(token_weights[key_token] - maximum);
-      token_weights[key_token] = weight;
-      local_sum += weight;
+    const float weight = lane < key_tokens ? expf(score - maximum) : 0.0f;
+    float local_sum = weight;
+    for (int offset = query_group_width / 2; offset > 0; offset /= 2) {
+      local_sum += __shfl_down(local_sum, offset, query_group_width);
     }
-  }
-  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    local_sum += __shfl_down(local_sum, offset);
-  }
-  const float inverse_sum = active ? 1.0f / __shfl(local_sum, 0) : 0.0f;
-  if (active) {
-    for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
-      token_weights[key_token] = round_grouped_attention_boundary<scalar_t>(
-          token_weights[key_token] * inverse_sum);
-    }
-  }
-  __syncthreads();
+    const float inverse_sum = 1.0f / __shfl(local_sum, 0, query_group_width);
+    const float probability = lane < key_tokens
+        ? round_grouped_attention_boundary<scalar_t>(weight * inverse_sum)
+        : 0.0f;
 
-  if (!active) {
-    return;
-  }
-  const int64_t value_head_offset = query_width + head * value_features;
-  for (int64_t feature = lane; feature < value_features; feature += warpSize) {
-    float context = 0.0f;
-    for (int64_t key_token = 0; key_token < key_tokens; ++key_token) {
-      const int64_t value_offset =
-          (matrix * key_tokens + key_token) * packed_width +
-          value_head_offset + feature;
-      context += token_weights[key_token] *
-          static_cast<float>(packed_key_value[value_offset]);
+    const int64_t output_offset =
+        ((matrix * query_tokens + query_token) * heads + head) * value_features;
+    for (int feature = lane; feature < value_features;
+         feature += query_group_width) {
+      float context = 0.0f;
+      for (int key_token = 0; key_token < key_tokens; ++key_token) {
+        context += __shfl(probability, key_token, query_group_width) *
+            shared_values[key_token * value_features + feature];
+      }
+      output[output_offset + feature] = static_cast<scalar_t>(context);
     }
-    output[query_head * value_features + feature] = static_cast<scalar_t>(context);
   }
 }
 
@@ -2556,13 +2573,19 @@ void launch_grouped_packed_attention(const torch::Tensor& query,
   const int64_t key_features = query.size(2) / heads;
   const int64_t value_features =
       (packed_key_value.size(3) - query.size(2)) / heads;
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_packed_attention_kernel<scalar_t, mask_t>),
-      dim3(launch_plan.grid_size), dim3(launch_plan.block_threads),
+  constexpr int kQueryGroupWidth = 32;
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(
+      grouped_packed_attention_kernel<kQueryGroupWidth, scalar_t, mask_t>),
+      dim3(static_cast<unsigned int>(heads),
+          static_cast<unsigned int>(packed_key_value.size(1)),
+          static_cast<unsigned int>(query.size(0))),
+      dim3(launch_plan.block_threads),
       launch_plan.shared_memory_bytes, stream, query.data_ptr<scalar_t>(),
       packed_key_value.data_ptr<scalar_t>(), mask.data_ptr<mask_t>(),
-      output.data_ptr<scalar_t>(), launch_plan.query_head_count, query.size(1),
-      packed_key_value.size(1), packed_key_value.size(2), heads, key_features,
-      value_features, scale);
+      output.data_ptr<scalar_t>(), static_cast<int>(query.size(1)),
+      static_cast<int>(packed_key_value.size(1)),
+      static_cast<int>(packed_key_value.size(2)), static_cast<int>(heads),
+      static_cast<int>(key_features), static_cast<int>(value_features), scale);
 }
 
 template <typename scalar_t>
@@ -2581,6 +2604,14 @@ void dispatch_grouped_packed_attention(const torch::Tensor& query,
       return;
     case torch::kFloat32:
       launch_grouped_packed_attention<scalar_t, float>(query, packed_key_value, mask,
+          output, launch_plan, heads, scale, stream);
+      return;
+    case torch::kFloat16:
+      launch_grouped_packed_attention<scalar_t, c10::Half>(query, packed_key_value, mask,
+          output, launch_plan, heads, scale, stream);
+      return;
+    case torch::kBFloat16:
+      launch_grouped_packed_attention<scalar_t, c10::BFloat16>(query, packed_key_value, mask,
           output, launch_plan, heads, scale, stream);
       return;
     default:
@@ -2688,7 +2719,8 @@ bool supports_grouped_packed_attention(const torch::Tensor& query,
     return false;
   }
   const bool supported_mask = mask.scalar_type() == torch::kBool ||
-      mask.scalar_type() == torch::kInt32 || mask.scalar_type() == torch::kFloat32;
+      mask.scalar_type() == torch::kInt32 || mask.scalar_type() == torch::kFloat32 ||
+      mask.scalar_type() == torch::kFloat16 || mask.scalar_type() == torch::kBFloat16;
   return supported_mask &&
       grouped_packed_attention_launch_plan(query, packed_key_value, heads).has_value();
 }

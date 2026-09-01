@@ -135,7 +135,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
-    public void groupedPackedAttentionNativeMatchesPortableDtypeBoundaries() {
+    public void groupedPackedAttentionNativeFloatingMasksMatchPortableDtypeBoundaries() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             return;
@@ -144,13 +144,13 @@ public class StructuredAttentionTest {
                 new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
             engine.setRandomSeed(20260913);
             try (NDManager manager = engine.newBaseManager(Device.gpu())) {
-                int batch = 3;
-                int queryTokens = 7;
+                int batch = 2;
+                int queryTokens = 34;
                 int groups = 4;
-                int keyTokens = 11;
+                int keyTokens = 29;
                 int heads = 4;
-                int keyFeatures = 8;
-                int valueFeatures = 6;
+                int keyFeatures = 16;
+                int valueFeatures = 16;
                 int queryWidth = heads * keyFeatures;
                 int packedWidth = queryWidth + heads * valueFeatures;
                 NDArray query =
@@ -158,7 +158,7 @@ public class StructuredAttentionTest {
                 NDArray packedKeyValue =
                         manager.randomNormal(
                                 new Shape(batch, groups, keyTokens, packedWidth), dataType);
-                NDArray mask = manager.ones(new Shape(batch, groups, keyTokens), DataType.INT32);
+                NDArray mask = manager.ones(new Shape(batch, groups, keyTokens), dataType);
                 mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
 
                 NDArray expected =
@@ -189,7 +189,7 @@ public class StructuredAttentionTest {
                 int heads = 2;
                 NDArray query = manager.randomNormal(new Shape(1, 2, 8), dataType);
                 NDArray packedKeyValue = manager.randomNormal(new Shape(1, 1, 3, 16), dataType);
-                NDArray mask = manager.zeros(new Shape(1, 1, 3), DataType.INT32);
+                NDArray mask = manager.zeros(new Shape(1, 1, 3), dataType);
 
                 NDArray expected =
                         groupedPackedAttentionReference(query, packedKeyValue, mask, heads, 0.5);
