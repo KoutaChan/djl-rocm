@@ -17,6 +17,14 @@
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
 
+extern "C" JNIEXPORT jint JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetFusionBackend(
+    JNIEnv* env, jobject jthis) {
+  API_BEGIN()
+  return static_cast<jint>(djl::pytorch::fusion::GetFusionBackend());
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPrepareFusionPlan(
     JNIEnv* env, jobject jthis, jintArray jdevice, jobject jdescriptor) {

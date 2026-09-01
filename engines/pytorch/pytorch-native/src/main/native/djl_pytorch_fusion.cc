@@ -3448,14 +3448,25 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
 
 }  // namespace
 
+FusionBackend GetFusionBackend() {
+#if defined(DJL_USE_CUDA_FUSION_KERNELS)
+  return FusionBackend::kCuda;
+#elif defined(DJL_USE_ROCM_KERNELS)
+  return FusionBackend::kRocm;
+#else
+  return FusionBackend::kUnsupported;
+#endif
+}
+
 FusionPlan* PrepareFusionPlan(
     c10::Device device, const int64_t* descriptor, std::size_t descriptor_size) {
-#if defined(DJL_USE_ROCM_KERNELS)
-  TORCH_CHECK(device.is_cuda(), "PyTorch fusion requires a ROCm device");
+#if defined(DJL_USE_FUSION_KERNELS)
+  TORCH_CHECK(device.is_cuda(), "PyTorch fusion requires a CUDA or ROCm device");
   c10::DeviceGuard device_guard(device);
   return new FusionPlan(ParsePlan(device, descriptor, descriptor_size));
 #else
-  TORCH_CHECK(false, "PyTorch fusion requires a ROCm build");
+  TORCH_CHECK(false,
+      "PyTorch fusion requires native CUDA or ROCm fusion kernels");
 #endif
 }
 
@@ -3849,7 +3860,7 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
   TORCH_CHECK(buffer_index >= 0 &&
           static_cast<std::size_t>(buffer_index) < session->storages.size(),
       "fusion output buffer index is outside the session range");
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_FUSION_KERNELS)
   TORCH_CHECK(!session->poisoned,
       "fusion session is poisoned by an incomplete failed submission");
   const auto& plan = session->executable->plan;
@@ -3928,7 +3939,8 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
   }
   session->SetSubmissionStream(buffer_index, submission_stream);
 #else
-  TORCH_CHECK(false, "PyTorch fusion requires a ROCm build");
+  TORCH_CHECK(false,
+      "PyTorch fusion requires native CUDA or ROCm fusion kernels");
 #endif
 }
 

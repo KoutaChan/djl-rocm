@@ -184,6 +184,15 @@ public final class JniUtils {
                 new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}, descriptor);
     }
 
+    /**
+     * Returns the fusion backend compiled into the loaded native library.
+     *
+     * @return {@code 0} when unavailable, {@code 1} for CUDA, or {@code 2} for ROCm
+     */
+    public static int getFusionBackend() {
+        return PyTorchLibrary.LIB.torchGetFusionBackend();
+    }
+
     public static long bindFusionPlan(long planHandle, ByteBuffer constantHandles) {
         return PyTorchLibrary.LIB.torchBindFusionPlan(planHandle, constantHandles);
     }

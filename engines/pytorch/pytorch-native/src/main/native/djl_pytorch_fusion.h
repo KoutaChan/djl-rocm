@@ -24,6 +24,16 @@ struct FusionPlan;
 struct FusionExecutable;
 struct FusionSession;
 
+/** Identifies the accelerator runtime backing fusion kernel launches. */
+enum class FusionBackend : int32_t {
+  kUnsupported = 0,
+  kCuda = 1,
+  kRocm = 2,
+};
+
+/** Returns the fusion backend compiled into this native library. */
+FusionBackend GetFusionBackend();
+
 FusionPlan* PrepareFusionPlan(
     c10::Device device, const int64_t* descriptor, std::size_t descriptor_size);
 FusionExecutable* BindFusionPlan(const FusionPlan* plan,

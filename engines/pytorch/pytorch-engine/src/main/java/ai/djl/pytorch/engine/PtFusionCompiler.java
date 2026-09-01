@@ -24,8 +24,11 @@ import ai.djl.pytorch.jni.JniUtils;
 import java.nio.ByteBuffer;
 import java.util.Objects;
 
-/** PyTorch ROCm implementation of the bounded fusion compiler. */
+/** PyTorch accelerator implementation of the bounded fusion compiler. */
 final class PtFusionCompiler implements FusionCompiler {
+
+    private static final int FUSION_BACKEND_CUDA = 1;
+    private static final int FUSION_BACKEND_ROCM = 2;
 
     private final Device device;
 
@@ -45,7 +48,8 @@ final class PtFusionCompiler implements FusionCompiler {
         Objects.requireNonNull(recipe, "recipe");
         Objects.requireNonNull(config, "config");
         if (!device.isGpu()) {
-            throw new UnsupportedOperationException("PyTorch fusion requires a ROCm device.");
+            throw new UnsupportedOperationException(
+                    "PyTorch fusion requires a CUDA or ROCm device.");
         }
         for (FusionShapeProfile profile : config.getShapeProfiles()) {
             if (profile.getRecipe() != recipe) {
@@ -54,9 +58,10 @@ final class PtFusionCompiler implements FusionCompiler {
             }
         }
 
+        String backendName = fusionBackendName(JniUtils.getFusionBackend());
         ByteBuffer descriptor = PtFusionDescriptor.encode(recipe);
         FusionCompilationReport report =
-                FusionCompilationReport.builder("PyTorch ROCm AOT")
+                FusionCompilationReport.builder("PyTorch " + backendName + " AOT")
                         .optCommandCount(PtFusionDescriptor.commandCount(recipe))
                         .optExecutableStorageBytes(
                                 PtFusionDescriptor.executableStorageBytes(recipe))
@@ -76,5 +81,16 @@ final class PtFusionCompiler implements FusionCompiler {
             }
             throw failure;
         }
+    }
+
+    private static String fusionBackendName(int backend) {
+        if (backend == FUSION_BACKEND_CUDA) {
+            return "CUDA";
+        }
+        if (backend == FUSION_BACKEND_ROCM) {
+            return "ROCm";
+        }
+        throw new UnsupportedOperationException(
+                "The loaded PyTorch native library has no CUDA or ROCm fusion backend.");
     }
 }
