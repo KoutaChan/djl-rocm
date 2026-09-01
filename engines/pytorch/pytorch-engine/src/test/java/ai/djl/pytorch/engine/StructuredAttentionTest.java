@@ -259,6 +259,29 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void groupedPackedAttentionNativeBackwardMatchesTiledBoundaryShape() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        engine.setRandomSeed(20260921);
+        verifyGroupedPackedAttentionGradients(
+                engine,
+                Device.gpu(),
+                DataType.FLOAT32,
+                DataType.INT32,
+                true,
+                true,
+                1,
+                37,
+                4,
+                32,
+                4,
+                16,
+                17);
+    }
+
+    @Test
     public void groupedPackedAttentionNativeBackwardSupportsEveryMaskDtype() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -1162,14 +1185,37 @@ public class StructuredAttentionTest {
             DataType maskType,
             boolean queryGradient,
             boolean packedGradient) {
+        verifyGroupedPackedAttentionGradients(
+                engine,
+                device,
+                dataType,
+                maskType,
+                queryGradient,
+                packedGradient,
+                2,
+                7,
+                3,
+                5,
+                2,
+                4,
+                3);
+    }
+
+    private static void verifyGroupedPackedAttentionGradients(
+            Engine engine,
+            Device device,
+            DataType dataType,
+            DataType maskType,
+            boolean queryGradient,
+            boolean packedGradient,
+            int batch,
+            int queryTokens,
+            int groups,
+            int keyTokens,
+            int heads,
+            int keyFeatures,
+            int valueFeatures) {
         try (NDManager manager = engine.newBaseManager(device)) {
-            int batch = 2;
-            int queryTokens = 7;
-            int groups = 3;
-            int keyTokens = 5;
-            int heads = 2;
-            int keyFeatures = 4;
-            int valueFeatures = 3;
             int queryWidth = heads * keyFeatures;
             int packedWidth = queryWidth + heads * valueFeatures;
             NDArray queryValues =

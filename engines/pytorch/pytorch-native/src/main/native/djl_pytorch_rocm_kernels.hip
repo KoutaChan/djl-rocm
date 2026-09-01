@@ -3680,6 +3680,7 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
     float* score_gradient,
     int query_tokens, int groups, int key_tokens, int heads,
     int query_width, int value_features) {
+  extern __shared__ float shared_values[];
   const int lane = threadIdx.x % query_group_width;
   const int query_group = threadIdx.x / query_group_width;
   const int query_groups_per_block = blockDim.x / query_group_width;
@@ -3688,6 +3689,18 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
   const int batch = static_cast<int>(blockIdx.z);
   const int packed_width = query_width + heads * value_features;
   const int64_t matrix = static_cast<int64_t>(batch) * groups + group;
+
+  const int value_element_count = key_tokens * value_features;
+  for (int element = threadIdx.x; element < value_element_count;
+       element += blockDim.x) {
+    const int key_token = element / value_features;
+    const int feature = element - key_token * value_features;
+    const int64_t value_offset =
+        (matrix * key_tokens + key_token) * packed_width + query_width +
+        head * value_features + feature;
+    shared_values[element] = static_cast<float>(packed_key_value[value_offset]);
+  }
+  __syncthreads();
 
   for (int query_token = query_group; query_token < query_tokens;
        query_token += query_groups_per_block) {
@@ -3702,13 +3715,10 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
         : 0.0f;
     float probability_gradient = 0.0f;
     if (lane < key_tokens) {
-      const int64_t value_offset =
-          (matrix * key_tokens + lane) * packed_width + query_width +
-          head * value_features;
       for (int feature = 0; feature < value_features; ++feature) {
         probability_gradient +=
             static_cast<float>(gradient_output[output_offset + feature]) *
-            static_cast<float>(packed_key_value[value_offset + feature]);
+            shared_values[lane * value_features + feature];
       }
     }
     float local_weighted_gradient = probability * probability_gradient;
@@ -3725,41 +3735,50 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
   }
 }
 
-template <typename scalar_t>
+template <int query_group_width, typename scalar_t>
 __global__ void grouped_packed_attention_query_gradient_kernel(
     const scalar_t* packed_key_value,
     const float* score_gradient, scalar_t* query_gradient,
-    int64_t element_count, int query_tokens, int groups, int key_tokens,
+    int query_tokens, int groups, int key_tokens,
     int heads, int key_features, int packed_width, float scale) {
-  for (int64_t element = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       element < element_count;
-       element += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-    int64_t remaining = element;
-    const int feature = static_cast<int>(remaining % key_features);
-    remaining /= key_features;
-    const int head = static_cast<int>(remaining % heads);
-    remaining /= heads;
-    const int query_token = static_cast<int>(remaining % query_tokens);
-    const int64_t batch = remaining / query_tokens;
+  const int lane = threadIdx.x % query_group_width;
+  const int query_group = threadIdx.x / query_group_width;
+  const int query_groups_per_block = blockDim.x / query_group_width;
+  const int head = static_cast<int>(blockIdx.x);
+  const int64_t batch = static_cast<int64_t>(blockIdx.z);
+  const int query_width = heads * key_features;
+  for (int query_token = query_group; query_token < query_tokens;
+       query_token += query_groups_per_block) {
     float gradient = 0.0f;
     for (int group = 0; group < groups; ++group) {
       const int64_t matrix = batch * groups + group;
       const int64_t score_offset =
           ((matrix * query_tokens + query_token) * heads + head) * key_tokens;
+      const float lane_score_gradient =
+          lane < key_tokens ? score_gradient[score_offset + lane] : 0.0f;
       for (int key_token = 0; key_token < key_tokens; ++key_token) {
-        const int64_t key_offset =
-            (matrix * key_tokens + key_token) * packed_width +
-            head * key_features + feature;
-        gradient += score_gradient[score_offset + key_token] *
-            static_cast<float>(packed_key_value[key_offset]);
+        const float token_score_gradient =
+            __shfl(lane_score_gradient, key_token, query_group_width);
+        if (lane < key_features) {
+          const int64_t key_offset =
+              (matrix * key_tokens + key_token) * packed_width +
+              head * key_features + lane;
+          gradient += token_score_gradient *
+              static_cast<float>(packed_key_value[key_offset]);
+        }
       }
     }
-    query_gradient[element] = static_cast<scalar_t>(gradient * scale);
+    if (lane < key_features) {
+      const int64_t query_offset =
+          (batch * query_tokens + query_token) * query_width +
+          head * key_features + lane;
+      query_gradient[query_offset] = static_cast<scalar_t>(gradient * scale);
+    }
   }
 }
 
 template <typename scalar_t>
-__global__ void grouped_packed_attention_key_value_gradient_kernel(
+__global__ void grouped_packed_attention_key_value_gradient_elementwise_kernel(
     const scalar_t* query, const scalar_t* probabilities,
     const float* score_gradient, const scalar_t* gradient_output,
     scalar_t* packed_key_value_gradient, int64_t element_count,
@@ -3801,6 +3820,120 @@ __global__ void grouped_packed_attention_key_value_gradient_kernel(
       }
     }
     packed_key_value_gradient[element] =
+        static_cast<scalar_t>(key ? gradient * scale : gradient);
+  }
+}
+
+template <int maximum_elements_per_thread, int query_tile, typename scalar_t>
+__global__ void grouped_packed_attention_key_value_gradient_tiled_kernel(
+    const scalar_t* query, const scalar_t* probabilities,
+    const float* score_gradient, const scalar_t* gradient_output,
+    scalar_t* packed_key_value_gradient, int query_tokens, int groups,
+    int key_tokens, int heads, int key_features, int value_features,
+    int packed_width, float scale) {
+  extern __shared__ unsigned char shared_gradient_storage[];
+  const int head = static_cast<int>(blockIdx.x);
+  const int group = static_cast<int>(blockIdx.y);
+  const int batch = static_cast<int>(blockIdx.z);
+  const int query_width = heads * key_features;
+  const int features_per_token = key_features + value_features;
+  const int element_count = key_tokens * features_per_token;
+  const int64_t matrix = static_cast<int64_t>(batch) * groups + group;
+  float gradients[maximum_elements_per_thread] = {};
+
+  auto* shared_score_gradient =
+      reinterpret_cast<float*>(shared_gradient_storage);
+  auto* shared_probabilities =
+      shared_score_gradient + query_tile * key_tokens;
+  auto* shared_query = shared_probabilities + query_tile * key_tokens;
+  auto* shared_gradient_output = shared_query + query_tile * key_features;
+
+  for (int query_base = 0; query_base < query_tokens; query_base += query_tile) {
+    const int tile_queries = min(query_tile, query_tokens - query_base);
+    const int score_element_count = tile_queries * key_tokens;
+    for (int element = threadIdx.x; element < score_element_count;
+         element += blockDim.x) {
+      const int query_in_tile = element / key_tokens;
+      const int key_token = element - query_in_tile * key_tokens;
+      const int query_token = query_base + query_in_tile;
+      const int64_t score_offset =
+          ((matrix * query_tokens + query_token) * heads + head) * key_tokens +
+          key_token;
+      shared_score_gradient[element] = score_gradient[score_offset];
+      shared_probabilities[element] =
+          static_cast<float>(probabilities[score_offset]);
+    }
+    const int query_element_count = tile_queries * key_features;
+    for (int element = threadIdx.x; element < query_element_count;
+         element += blockDim.x) {
+      const int query_in_tile = element / key_features;
+      const int feature = element - query_in_tile * key_features;
+      const int query_token = query_base + query_in_tile;
+      const int64_t query_offset =
+          (static_cast<int64_t>(batch) * query_tokens + query_token) * query_width +
+          head * key_features + feature;
+      shared_query[element] = static_cast<float>(query[query_offset]);
+    }
+    const int output_element_count = tile_queries * value_features;
+    for (int element = threadIdx.x; element < output_element_count;
+         element += blockDim.x) {
+      const int query_in_tile = element / value_features;
+      const int feature = element - query_in_tile * value_features;
+      const int query_token = query_base + query_in_tile;
+      const int64_t output_offset =
+          ((matrix * query_tokens + query_token) * heads + head) * value_features +
+          feature;
+      shared_gradient_output[element] =
+          static_cast<float>(gradient_output[output_offset]);
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int element_in_thread = 0;
+         element_in_thread < maximum_elements_per_thread;
+         ++element_in_thread) {
+      const int element = threadIdx.x + element_in_thread * blockDim.x;
+      if (element >= element_count) {
+        continue;
+      }
+      const int key_token = element / features_per_token;
+      const int feature_in_token = element - key_token * features_per_token;
+      const bool key = feature_in_token < key_features;
+      const int feature = key ? feature_in_token : feature_in_token - key_features;
+      float gradient = gradients[element_in_thread];
+      for (int query_in_tile = 0; query_in_tile < tile_queries; ++query_in_tile) {
+        const int score_offset = query_in_tile * key_tokens + key_token;
+        if (key) {
+          gradient += shared_score_gradient[score_offset] *
+              shared_query[query_in_tile * key_features + feature];
+        } else {
+          gradient += shared_probabilities[score_offset] *
+              shared_gradient_output[query_in_tile * value_features + feature];
+        }
+      }
+      gradients[element_in_thread] = gradient;
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int element_in_thread = 0;
+       element_in_thread < maximum_elements_per_thread;
+       ++element_in_thread) {
+    const int element = threadIdx.x + element_in_thread * blockDim.x;
+    if (element >= element_count) {
+      continue;
+    }
+    const int key_token = element / features_per_token;
+    const int feature_in_token = element - key_token * features_per_token;
+    const bool key = feature_in_token < key_features;
+    const int feature = key ? feature_in_token : feature_in_token - key_features;
+    const int packed_feature = key ? head * key_features + feature
+                                   : query_width + head * value_features + feature;
+    const int64_t output_offset =
+        (matrix * key_tokens + key_token) * packed_width + packed_feature;
+    const float gradient = gradients[element_in_thread];
+    packed_key_value_gradient[output_offset] =
         static_cast<scalar_t>(key ? gradient * scale : gradient);
   }
 }
@@ -5318,6 +5451,28 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
     return static_cast<unsigned int>(std::min<int64_t>(
         required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   };
+  constexpr int kKeyValueGradientQueryTile = 8;
+  const int64_t key_value_elements_per_head =
+      key_tokens * (key_features + value_features);
+  const int64_t key_value_elements_per_thread =
+      (key_value_elements_per_head + element_threads - 1) / element_threads;
+  const int compiled_key_value_elements_per_thread =
+      key_value_elements_per_thread <= 1 ? 1
+      : key_value_elements_per_thread <= 2 ? 2
+      : key_value_elements_per_thread <= 4 ? 4
+      : key_value_elements_per_thread <= 8 ? 8
+                                           : 0;
+  const size_t key_value_shared_memory_bytes =
+      static_cast<size_t>(kKeyValueGradientQueryTile) *
+      static_cast<size_t>(2 * key_tokens + key_features + value_features) *
+      sizeof(float);
+  const size_t score_gradient_shared_memory_bytes =
+      static_cast<size_t>(key_tokens) * static_cast<size_t>(value_features) *
+      sizeof(float);
+  const bool use_tiled_key_value_gradient =
+      compiled_key_value_elements_per_thread != 0 &&
+      key_value_shared_memory_bytes <=
+          static_cast<size_t>(properties.sharedMemPerBlock);
   const hipStream_t stream =
       c10::hip::getCurrentHIPStream(query.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -5331,7 +5486,7 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
                   kQueryGroupWidth, scalar_t, mask_t>),
               dim3(static_cast<unsigned int>(heads), static_cast<unsigned int>(groups),
                   static_cast<unsigned int>(batch)),
-              dim3(launch_plan->block_threads), 0, stream,
+              dim3(launch_plan->block_threads), score_gradient_shared_memory_bytes, stream,
               packed_key_value.data_ptr<scalar_t>(), mask.data_ptr<mask_t>(),
               probabilities.data_ptr<scalar_t>(),
               contiguous_gradient_output.data_ptr<scalar_t>(),
@@ -5362,26 +5517,53 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
         }
         if (needs_query_gradient) {
           hipLaunchKernelGGL(HIP_KERNEL_NAME(
-              grouped_packed_attention_query_gradient_kernel<scalar_t>),
-              dim3(grid_size(query.numel())), dim3(element_threads), 0, stream,
+              grouped_packed_attention_query_gradient_kernel<
+                  kQueryGroupWidth, scalar_t>),
+              dim3(static_cast<unsigned int>(heads), 1,
+                  static_cast<unsigned int>(batch)),
+              dim3(launch_plan->block_threads), 0, stream,
               packed_key_value.data_ptr<scalar_t>(),
               score_gradient.data_ptr<float>(), query_gradient.data_ptr<scalar_t>(),
-              query.numel(), static_cast<int>(query_tokens), static_cast<int>(groups),
+              static_cast<int>(query_tokens), static_cast<int>(groups),
               static_cast<int>(key_tokens), static_cast<int>(heads),
               static_cast<int>(key_features), static_cast<int>(packed_width), scale);
         }
         if (needs_packed_key_value_gradient) {
-          hipLaunchKernelGGL(HIP_KERNEL_NAME(
-              grouped_packed_attention_key_value_gradient_kernel<scalar_t>),
-              dim3(grid_size(packed_key_value.numel())), dim3(element_threads), 0,
-              stream, query.data_ptr<scalar_t>(), probabilities.data_ptr<scalar_t>(),
-              score_gradient.data_ptr<float>(),
-              contiguous_gradient_output.data_ptr<scalar_t>(),
-              packed_key_value_gradient.data_ptr<scalar_t>(),
-              packed_key_value.numel(), static_cast<int>(query_tokens),
-              static_cast<int>(groups), static_cast<int>(key_tokens),
-              static_cast<int>(heads), static_cast<int>(key_features),
-              static_cast<int>(value_features), static_cast<int>(packed_width), scale);
+          if (use_tiled_key_value_gradient) {
+            dispatch_compiled_work_size(compiled_key_value_elements_per_thread,
+                "grouped packed attention key/value gradient elements per thread",
+                [&](auto elements_per_thread_tag) {
+                  constexpr int elements_per_thread =
+                      decltype(elements_per_thread_tag)::value;
+                  hipLaunchKernelGGL(HIP_KERNEL_NAME(
+                      grouped_packed_attention_key_value_gradient_tiled_kernel<
+                          elements_per_thread, kKeyValueGradientQueryTile, scalar_t>),
+                      dim3(static_cast<unsigned int>(heads),
+                          static_cast<unsigned int>(groups),
+                          static_cast<unsigned int>(batch)),
+                      dim3(element_threads), key_value_shared_memory_bytes, stream,
+                      query.data_ptr<scalar_t>(), probabilities.data_ptr<scalar_t>(),
+                      score_gradient.data_ptr<float>(),
+                      contiguous_gradient_output.data_ptr<scalar_t>(),
+                      packed_key_value_gradient.data_ptr<scalar_t>(),
+                      static_cast<int>(query_tokens), static_cast<int>(groups),
+                      static_cast<int>(key_tokens), static_cast<int>(heads),
+                      static_cast<int>(key_features), static_cast<int>(value_features),
+                      static_cast<int>(packed_width), scale);
+                });
+          } else {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(
+                grouped_packed_attention_key_value_gradient_elementwise_kernel<scalar_t>),
+                dim3(grid_size(packed_key_value.numel())), dim3(element_threads), 0,
+                stream, query.data_ptr<scalar_t>(), probabilities.data_ptr<scalar_t>(),
+                score_gradient.data_ptr<float>(),
+                contiguous_gradient_output.data_ptr<scalar_t>(),
+                packed_key_value_gradient.data_ptr<scalar_t>(),
+                packed_key_value.numel(), static_cast<int>(query_tokens),
+                static_cast<int>(groups), static_cast<int>(key_tokens),
+                static_cast<int>(heads), static_cast<int>(key_features),
+                static_cast<int>(value_features), static_cast<int>(packed_width), scale);
+          }
         }
       });
   check_hip_kernel_launch("grouped_packed_attention_backward");
