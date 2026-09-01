@@ -119,19 +119,19 @@ torch::Tensor grouped_packed_attention_fallback(const torch::Tensor& query,
   const int64_t key_features = query_width / heads;
   const int64_t value_width = packed_width - query_width;
   const int64_t value_features = value_width / heads;
-  auto queries = query.view({batch, query_tokens, heads, key_features})
+  auto queries = query.reshape({batch, query_tokens, heads, key_features})
                      .transpose(1, 2)
                      .unsqueeze(1)
                      .expand({batch, groups, heads, query_tokens, key_features});
   auto keys = packed_key_value.slice(3, 0, query_width)
-                  .view({batch, groups, key_tokens, heads, key_features})
+                  .reshape({batch, groups, key_tokens, heads, key_features})
                   .transpose(2, 3);
   auto values = packed_key_value.slice(3, query_width, packed_width)
-                    .view({batch, groups, key_tokens, heads, value_features})
+                    .reshape({batch, groups, key_tokens, heads, value_features})
                     .transpose(2, 3);
   auto valid = mask.ne(0)
                    .to(query.scalar_type())
-                   .view({batch, groups, 1, 1, key_tokens});
+                   .reshape({batch, groups, 1, 1, key_tokens});
   auto probabilities =
       queries.matmul(keys.transpose(3, 4))
           .mul(scale)

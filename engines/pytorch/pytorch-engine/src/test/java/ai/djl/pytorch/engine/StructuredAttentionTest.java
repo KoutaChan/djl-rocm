@@ -214,6 +214,42 @@ public class StructuredAttentionTest {
         }
     }
 
+    @Test
+    public void groupedPackedAttentionNonContiguousGpuInputsUsePortableFallback() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        engine.setRandomSeed(20260915);
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            int batch = 2;
+            int queryTokens = 7;
+            int groups = 3;
+            int keyTokens = 5;
+            int heads = 2;
+            int keyFeatures = 4;
+            int valueFeatures = 3;
+            int queryWidth = heads * keyFeatures;
+            int packedWidth = queryWidth + heads * valueFeatures;
+            NDArray query =
+                    manager.randomNormal(new Shape(batch, queryWidth, queryTokens)).swapAxes(1, 2);
+            NDArray packedKeyValue =
+                    manager
+                            .randomNormal(new Shape(batch, groups, packedWidth, keyTokens))
+                            .swapAxes(2, 3);
+            NDArray mask = manager.ones(new Shape(batch, groups, keyTokens), DataType.INT32);
+            mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+
+            NDArray expected =
+                    groupedPackedAttentionReference(query, packedKeyValue, mask, heads, 0.5);
+            NDArray actual =
+                    NDArrays.groupedPackedScaledDotProductAttention(
+                            query, packedKeyValue, mask, heads, 0.5);
+
+            assertClose(actual.toFloatArray(), expected.toFloatArray(), 2e-4f);
+        }
+    }
+
     private static void assertAllNaN(float[] values) {
         for (float value : values) {
             Assert.assertTrue(Float.isNaN(value), "expected NaN but found " + value);
