@@ -1082,6 +1082,23 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray canonicalGroupedPackedScaledDotProductAttention(
+            NDArray packedKeyValue, NDArray mask, long heads, double scale) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.canonicalGroupedPackedScaledDotProductAttention(
+                    packedKeyValue, mask, heads, scale);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.groupedPackedScaledDotProductAttention(
+                array,
+                manager.from(packedKeyValue),
+                manager.from(mask),
+                heads,
+                (float) scale);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray canonicalGroupedIndexedScaledDotProductAttention(
             NDArray sharedKeyValues,
             NDArray sharedDeltas,

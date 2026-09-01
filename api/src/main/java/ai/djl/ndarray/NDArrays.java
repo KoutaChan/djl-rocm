@@ -509,20 +509,11 @@ public final class NDArrays {
     }
 
     /**
-     * Applies grouped attention to packed key/value projections without requiring a head-major
-     * input layout.
+     * Applies grouped attention to packed token-major key/value projections.
      *
-     * <p>The query is shared by every group in the same leading row. Query features are stored as
-     * all head keys in the trailing dimension. The packed memory stores all head keys followed by
-     * all head values. A nonzero mask entry identifies a memory token that participates in the
-     * softmax. Engines may prepare backend-specific matrix layouts while keeping query-key and
-     * probability-value products on their regular batched-matrix-multiply path.
-     *
-     * <p>Leading dimensions are flattened only at the engine boundary. For example, a query shaped
-     * {@code [batch, queryTokens, heads * keyFeatures]} and memory shaped {@code [batch, groups,
-     * keyTokens, heads * (keyFeatures + valueFeatures)]} produce {@code [batch, groups,
-     * queryTokens, heads * valueFeatures]}.
-     *
+     * <p>The query is shared by every group in the same leading row. Packed memory stores all head
+     * keys followed by all head values. Nonzero mask entries participate in the softmax. Engines
+     * may fuse this sequence directly; the portable implementation stays differentiable.
      * @param query shared query projection shaped {@code [..., queryTokens, queryWidth]}
      * @param packedKeyValue grouped packed projection shaped {@code [..., groups, keyTokens,
      *     packedWidth]}

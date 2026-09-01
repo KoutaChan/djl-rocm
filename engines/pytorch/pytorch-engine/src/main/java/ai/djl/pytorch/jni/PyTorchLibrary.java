@@ -323,6 +323,9 @@ final class PyTorchLibrary {
     native long torchIndexedRelationBias(
             long relationLogits, long relationBias, long relationIds, float scale);
 
+    native long torchGroupedPackedScaledDotProductAttention(
+            long query, long packedKeyValue, long mask, long heads, float scale);
+
     native long torchGroupedIndexedScaledDotProductAttention(
             long query,
             long sharedKeyValues,

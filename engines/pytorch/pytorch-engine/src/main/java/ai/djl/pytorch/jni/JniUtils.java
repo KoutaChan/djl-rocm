@@ -1115,6 +1115,33 @@ public final class JniUtils {
     }
 
     /**
+     * Applies grouped packed attention while allowing the native backend to prepare matrix
+     * layouts around its batched matrix multiplications.
+     *
+     * @param query token-major shared query projection
+     * @param packedKeyValue token-major grouped key/value projection
+     * @param mask nonzero valid-token mask
+     * @param heads number of attention heads
+     * @param scale query-key score scale
+     * @return grouped attended values in token-major packed-head layout
+     */
+    public static PtNDArray groupedPackedScaledDotProductAttention(
+            PtNDArray query,
+            PtNDArray packedKeyValue,
+            PtNDArray mask,
+            long heads,
+            float scale) {
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchGroupedPackedScaledDotProductAttention(
+                        query.getHandle(),
+                        packedKeyValue.getHandle(),
+                        mask.getHandle(),
+                        heads,
+                        scale));
+    }
+
+    /**
      * Applies grouped indexed attention without materializing a complete key/value table per query.
      *
      * <p>Packed key/value tensors store all head keys followed by all head values. Positive indexed

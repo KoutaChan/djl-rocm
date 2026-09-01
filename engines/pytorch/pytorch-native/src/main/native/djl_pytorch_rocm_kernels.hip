@@ -2402,6 +2402,192 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
   return {std::move(normalized), std::move(converted)};
 }
 
+struct GroupedPackedAttentionLaunchPlan {
+  int block_threads;
+  int64_t query_head_count;
+  int64_t grid_size;
+  size_t shared_memory_bytes;
+};
+
+std::optional<GroupedPackedAttentionLaunchPlan> grouped_packed_attention_launch_plan(
+    const torch::Tensor& query, const torch::Tensor& packed_key_value, int64_t heads) {
+  constexpr int kRequestedThreadsPerBlock = 256;
+  const auto& properties = device_properties(query.get_device());
+  const int64_t key_features = query.size(2) / heads;
+  const int64_t value_features = (packed_key_value.size(3) - query.size(2)) / heads;
+  const int64_t key_tokens = packed_key_value.size(2);
+  const int64_t query_head_count = query.size(0) * packed_key_value.size(1) *
+      query.size(1) * heads;
+  const size_t shared_memory_per_wave =
+      static_cast<size_t>(key_tokens + key_features) * sizeof(float);
+  const int maximum_waves_by_threads =
+      std::min(kRequestedThreadsPerBlock, properties.maxThreadsPerBlock) /
+      properties.warpSize;
+  const int maximum_waves_by_memory = static_cast<int>(
+      static_cast<size_t>(properties.sharedMemPerBlock) / shared_memory_per_wave);
+  const int waves_per_block = static_cast<int>(std::min<int64_t>(
+      std::min(maximum_waves_by_threads, maximum_waves_by_memory), query_head_count));
+  if (waves_per_block <= 0 || value_features <= 0) {
+    return std::nullopt;
+  }
+  const int64_t grid_size =
+      (query_head_count + waves_per_block - 1) / waves_per_block;
+  if (grid_size > static_cast<int64_t>(properties.maxGridSize[0])) {
+    return std::nullopt;
+  }
+  return GroupedPackedAttentionLaunchPlan{waves_per_block * properties.warpSize,
+      query_head_count, grid_size, shared_memory_per_wave * waves_per_block};
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float round_grouped_attention_boundary(float value) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    return value;
+  }
+  return static_cast<float>(static_cast<scalar_t>(value));
+}
+
+template <typename scalar_t, typename mask_t>
+__global__ void grouped_packed_attention_kernel(const scalar_t* query,
+    const scalar_t* packed_key_value, const mask_t* mask, scalar_t* output,
+    int64_t query_head_count, int64_t query_tokens, int64_t groups,
+    int64_t key_tokens, int64_t heads, int64_t key_features,
+    int64_t value_features, float scale) {
+  extern __shared__ float shared_storage[];
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  float* all_token_weights = shared_storage;
+  float* all_query_values =
+      all_token_weights + waves_per_block * key_tokens;
+  float* token_weights = all_token_weights + wave * key_tokens;
+  float* query_values = all_query_values + wave * key_features;
+  const int64_t query_head =
+      static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+  const bool active = query_head < query_head_count;
+  const int64_t head = active ? query_head % heads : 0;
+  const int64_t query_token = active ? (query_head / heads) % query_tokens : 0;
+  const int64_t group =
+      active ? (query_head / (heads * query_tokens)) % groups : 0;
+  const int64_t batch =
+      active ? query_head / (heads * query_tokens * groups) : 0;
+  const int64_t query_width = heads * key_features;
+  const int64_t packed_width =
+      query_width + heads * value_features;
+  const int64_t matrix = batch * groups + group;
+
+  if (active) {
+    const int64_t query_offset =
+        (batch * query_tokens + query_token) * query_width + head * key_features;
+    for (int64_t feature = lane; feature < key_features; feature += warpSize) {
+      query_values[feature] = static_cast<float>(query[query_offset + feature]);
+    }
+  }
+  __syncthreads();
+
+  float local_maximum = -std::numeric_limits<float>::infinity();
+  if (active) {
+    for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
+      const bool present =
+          static_cast<float>(mask[matrix * key_tokens + key_token]) != 0.0f;
+      float score = round_grouped_attention_boundary<scalar_t>(-1.0e30f);
+      if (present) {
+        const int64_t key_offset =
+            (matrix * key_tokens + key_token) * packed_width + head * key_features;
+        score = 0.0f;
+        for (int64_t feature = 0; feature < key_features; ++feature) {
+          score += query_values[feature] *
+              static_cast<float>(packed_key_value[key_offset + feature]);
+        }
+        score = round_grouped_attention_boundary<scalar_t>(score);
+        score = round_grouped_attention_boundary<scalar_t>(score * scale);
+      }
+      token_weights[key_token] = score;
+      local_maximum = fmaxf(local_maximum, score);
+    }
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    local_maximum = fmaxf(local_maximum, __shfl_down(local_maximum, offset));
+  }
+  const float maximum = __shfl(local_maximum, 0);
+
+  float local_sum = 0.0f;
+  if (active) {
+    for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
+      const float weight = expf(token_weights[key_token] - maximum);
+      token_weights[key_token] = weight;
+      local_sum += weight;
+    }
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    local_sum += __shfl_down(local_sum, offset);
+  }
+  const float inverse_sum = active ? 1.0f / __shfl(local_sum, 0) : 0.0f;
+  if (active) {
+    for (int64_t key_token = lane; key_token < key_tokens; key_token += warpSize) {
+      token_weights[key_token] = round_grouped_attention_boundary<scalar_t>(
+          token_weights[key_token] * inverse_sum);
+    }
+  }
+  __syncthreads();
+
+  if (!active) {
+    return;
+  }
+  const int64_t value_head_offset = query_width + head * value_features;
+  for (int64_t feature = lane; feature < value_features; feature += warpSize) {
+    float context = 0.0f;
+    for (int64_t key_token = 0; key_token < key_tokens; ++key_token) {
+      const int64_t value_offset =
+          (matrix * key_tokens + key_token) * packed_width +
+          value_head_offset + feature;
+      context += token_weights[key_token] *
+          static_cast<float>(packed_key_value[value_offset]);
+    }
+    output[query_head * value_features + feature] = static_cast<scalar_t>(context);
+  }
+}
+
+template <typename scalar_t, typename mask_t>
+void launch_grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask,
+    torch::Tensor& output, const GroupedPackedAttentionLaunchPlan& launch_plan,
+    int64_t heads, float scale, hipStream_t stream) {
+  const int64_t key_features = query.size(2) / heads;
+  const int64_t value_features =
+      (packed_key_value.size(3) - query.size(2)) / heads;
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_packed_attention_kernel<scalar_t, mask_t>),
+      dim3(launch_plan.grid_size), dim3(launch_plan.block_threads),
+      launch_plan.shared_memory_bytes, stream, query.data_ptr<scalar_t>(),
+      packed_key_value.data_ptr<scalar_t>(), mask.data_ptr<mask_t>(),
+      output.data_ptr<scalar_t>(), launch_plan.query_head_count, query.size(1),
+      packed_key_value.size(1), packed_key_value.size(2), heads, key_features,
+      value_features, scale);
+}
+
+template <typename scalar_t>
+void dispatch_grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask,
+    torch::Tensor& output, const GroupedPackedAttentionLaunchPlan& launch_plan,
+    int64_t heads, float scale, hipStream_t stream) {
+  switch (mask.scalar_type()) {
+    case torch::kBool:
+      launch_grouped_packed_attention<scalar_t, bool>(query, packed_key_value, mask,
+          output, launch_plan, heads, scale, stream);
+      return;
+    case torch::kInt32:
+      launch_grouped_packed_attention<scalar_t, int32_t>(query, packed_key_value, mask,
+          output, launch_plan, heads, scale, stream);
+      return;
+    case torch::kFloat32:
+      launch_grouped_packed_attention<scalar_t, float>(query, packed_key_value, mask,
+          output, launch_plan, heads, scale, stream);
+      return;
+    default:
+      TORCH_CHECK(false, "unsupported grouped packed attention mask dtype");
+  }
+}
+
 }  // namespace
 
 bool supports_indexed_relation_bias_forward(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
@@ -2482,6 +2668,29 @@ bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
   return !needs_shared_key_value_gradient ||
       grouped_indexed_attention_shared_key_value_gradient_launch_plan(
           query, shared_key_values.size(0), shared_tokens, packed_width).has_value();
+}
+
+bool supports_grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads) {
+  if (!query.is_cuda() || !query.is_contiguous() || !packed_key_value.is_contiguous() ||
+      !mask.is_contiguous() || !is_fused_floating(query) ||
+      query.scalar_type() != packed_key_value.scalar_type() ||
+      query.device() != packed_key_value.device() || query.device() != mask.device() ||
+      query.dim() != 3 || packed_key_value.dim() != 4 || mask.dim() != 3 ||
+      query.size(0) != packed_key_value.size(0) ||
+      mask.size(0) != packed_key_value.size(0) ||
+      mask.size(1) != packed_key_value.size(1) ||
+      mask.size(2) != packed_key_value.size(2) || heads <= 0 || query.size(0) <= 0 ||
+      query.size(1) <= 0 || query.size(2) <= 0 || query.size(2) % heads != 0 ||
+      packed_key_value.size(1) <= 0 || packed_key_value.size(2) <= 0 ||
+      packed_key_value.size(3) <= query.size(2) ||
+      (packed_key_value.size(3) - query.size(2)) % heads != 0) {
+    return false;
+  }
+  const bool supported_mask = mask.scalar_type() == torch::kBool ||
+      mask.scalar_type() == torch::kInt32 || mask.scalar_type() == torch::kFloat32;
+  return supported_mask &&
+      grouped_packed_attention_launch_plan(query, packed_key_value, heads).has_value();
 }
 
 bool supports_owned_residual_layer_norm(const torch::Tensor& residual, const torch::Tensor& update,
@@ -3542,6 +3751,35 @@ torch::Tensor indexed_relation_bias_logit_gradient(const torch::Tensor& gradient
       });
   check_hip_kernel_launch("indexed_relation_bias_backward");
   return relation_logits_gradient;
+}
+
+torch::Tensor grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads,
+    float scale) {
+  TORCH_CHECK(supports_grouped_packed_attention(query, packed_key_value, mask, heads),
+      "grouped packed attention received an unsupported ROCm tensor layout");
+  c10::DeviceGuard device_guard(query.device());
+  const int64_t batch = query.size(0);
+  const int64_t query_tokens = query.size(1);
+  const int64_t query_width = query.size(2);
+  const int64_t groups = packed_key_value.size(1);
+  const int64_t packed_width = packed_key_value.size(3);
+  const int64_t value_features = (packed_width - query_width) / heads;
+  const auto options = query.options().memory_format(torch::MemoryFormat::Contiguous);
+  torch::Tensor output =
+      torch::empty({batch, groups, query_tokens, heads * value_features}, options);
+  const auto launch_plan =
+      grouped_packed_attention_launch_plan(query, packed_key_value, heads);
+  TORCH_CHECK(launch_plan.has_value(),
+      "grouped packed attention has no valid ROCm launch plan");
+  const hipStream_t stream = c10::hip::getCurrentHIPStream(query.get_device()).stream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf, torch::kBFloat16, query.scalar_type(), "grouped_packed_attention", [&] {
+        dispatch_grouped_packed_attention<scalar_t>(query, packed_key_value, mask,
+            output, *launch_plan, heads, scale, stream);
+      });
+  check_hip_kernel_launch("grouped_packed_attention");
+  return output;
 }
 
 GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const torch::Tensor& query,

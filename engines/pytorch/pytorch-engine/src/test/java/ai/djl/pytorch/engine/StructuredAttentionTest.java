@@ -135,6 +135,90 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void groupedPackedAttentionNativeMatchesPortableDtypeBoundaries() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            engine.setRandomSeed(20260913);
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                int batch = 3;
+                int queryTokens = 7;
+                int groups = 4;
+                int keyTokens = 11;
+                int heads = 4;
+                int keyFeatures = 8;
+                int valueFeatures = 6;
+                int queryWidth = heads * keyFeatures;
+                int packedWidth = queryWidth + heads * valueFeatures;
+                NDArray query =
+                        manager.randomNormal(new Shape(batch, queryTokens, queryWidth), dataType);
+                NDArray packedKeyValue =
+                        manager.randomNormal(
+                                new Shape(batch, groups, keyTokens, packedWidth), dataType);
+                NDArray mask = manager.ones(new Shape(batch, groups, keyTokens), DataType.INT32);
+                mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+
+                NDArray expected =
+                        groupedPackedAttentionReference(query, packedKeyValue, mask, heads, 0.25);
+                NDArray actual =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packedKeyValue, mask, heads, 0.25);
+
+                float tolerance =
+                        dataType == DataType.FLOAT32
+                                ? 2e-4f
+                                : dataType == DataType.FLOAT16 ? 3e-3f : 2e-2f;
+                assertClose(actual.toFloatArray(), expected.toFloatArray(), tolerance);
+            }
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionAllInvalidRowsMatchPortableDtypeBehavior() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            engine.setRandomSeed(20260914);
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                int heads = 2;
+                NDArray query = manager.randomNormal(new Shape(1, 2, 8), dataType);
+                NDArray packedKeyValue = manager.randomNormal(new Shape(1, 1, 3, 16), dataType);
+                NDArray mask = manager.zeros(new Shape(1, 1, 3), DataType.INT32);
+
+                NDArray expected =
+                        groupedPackedAttentionReference(query, packedKeyValue, mask, heads, 0.5);
+                NDArray actual =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packedKeyValue, mask, heads, 0.5);
+                float[] expectedValues = expected.toFloatArray();
+                float[] actualValues = actual.toFloatArray();
+
+                if (dataType == DataType.FLOAT16) {
+                    assertAllNaN(expectedValues);
+                    assertAllNaN(actualValues);
+                } else {
+                    assertClose(
+                            actualValues,
+                            expectedValues,
+                            dataType == DataType.FLOAT32 ? 2e-4f : 2e-2f);
+                }
+            }
+        }
+    }
+
+    private static void assertAllNaN(float[] values) {
+        for (float value : values) {
+            Assert.assertTrue(Float.isNaN(value), "expected NaN but found " + value);
+        }
+    }
+
+    @Test
     public void residualAddLayerNormUpdatesOwnedBuffer() {
         try (NDManager manager = NDManager.newBaseManager()) {
             NDArray residual = manager.create(new float[] {1f, 3f}, new Shape(1, 2));

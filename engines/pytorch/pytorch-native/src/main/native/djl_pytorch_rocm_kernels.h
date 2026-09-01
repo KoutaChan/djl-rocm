@@ -122,6 +122,12 @@ bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group,
     bool needs_shared_key_value_gradient);
 
+bool supports_grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads);
+
+torch::Tensor grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads, float scale);
+
 struct GroupedIndexedAttentionForwardResult {
   torch::Tensor output;
   torch::Tensor log_sum_exp;
