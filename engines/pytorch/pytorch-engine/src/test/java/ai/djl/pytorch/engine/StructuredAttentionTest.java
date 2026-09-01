@@ -169,11 +169,17 @@ public class StructuredAttentionTest {
                         NDArrays.groupedPackedScaledDotProductAttention(
                                 query, packedKeyValue, mask, heads, 0.25);
 
+                Assert.assertEquals(actual.getDataType(), dataType);
+                Assert.assertEquals(expected.getDataType(), dataType);
+
                 float tolerance =
                         dataType == DataType.FLOAT32
                                 ? 2e-4f
                                 : dataType == DataType.FLOAT16 ? 3e-3f : 2e-2f;
-                assertClose(actual.toFloatArray(), expected.toFloatArray(), tolerance);
+                assertClose(
+                        actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                        expected.toType(DataType.FLOAT32, false).toFloatArray(),
+                        tolerance);
             }
         }
     }
