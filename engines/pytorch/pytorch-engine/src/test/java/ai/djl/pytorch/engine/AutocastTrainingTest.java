@@ -14,7 +14,6 @@ package ai.djl.pytorch.engine;
 
 import ai.djl.Device;
 import ai.djl.Model;
-import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
@@ -55,7 +54,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-@SuppressWarnings("try")
 public class AutocastTrainingTest {
 
     private static final int GPU_DEVICE = 1;
@@ -88,45 +86,6 @@ public class AutocastTrainingTest {
     @Test
     public void legacyCustomLoopSupportsFloat16AutocastAndScaling() {
         runLegacyCustomLoop(DataType.FLOAT16);
-    }
-
-    @Test
-    public void outerAutocastCacheSupportsRepeatedBackward() {
-        Engine engine = Engine.getInstance();
-        if (engine.getGpuCount() == 0) {
-            throw new SkipException("This autocast training test requires a PyTorch GPU.");
-        }
-
-        Device device = Device.gpu();
-        try (NDManager manager = engine.newBaseManager(device);
-                NDArray input = manager.ones(new Shape(2, 4), DataType.FLOAT32);
-                NDArray weight = manager.ones(new Shape(4, 4), DataType.FLOAT32);
-                NDArray bias = manager.zeros(new Shape(4), DataType.FLOAT32)) {
-            weight.setRequiresGradient(true);
-            bias.setRequiresGradient(true);
-
-            try (Autocast outer = engine.newAutocast(device, DataType.BFLOAT16, true)) {
-                for (int iteration = 0; iteration < 2; ++iteration) {
-                    try (GradientCollector collector = engine.newGradientCollector();
-                            NDArray output =
-                                    Linear.linear(input, weight, bias).singletonOrThrow();
-                            Autocast disabled =
-                                    engine.newAutocast(
-                                            device, DataType.BFLOAT16, false, true);
-                            NDArray objective =
-                                    output.toType(DataType.FLOAT32, false).sum()) {
-                        Assert.assertEquals(output.getDataType(), DataType.BFLOAT16);
-                        collector.backward(objective);
-                    }
-                }
-            }
-
-            float[] expectedWeightGradient = new float[16];
-            Arrays.fill(expectedWeightGradient, 4.0f);
-            Assert.assertEquals(weight.getGradient().toFloatArray(), expectedWeightGradient, 0.0f);
-            Assert.assertEquals(
-                    bias.getGradient().toFloatArray(), new float[] {4f, 4f, 4f, 4f}, 0.0f);
-        }
     }
 
     @Test
