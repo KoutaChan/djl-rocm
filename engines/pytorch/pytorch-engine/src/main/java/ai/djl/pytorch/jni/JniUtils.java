@@ -1124,8 +1124,7 @@ public final class JniUtils {
     }
 
     /**
-     * Applies grouped packed attention while allowing the native backend to prepare matrix layouts
-     * around its batched matrix multiplications.
+     * Applies grouped packed attention with the native backend's differentiable execution plan.
      *
      * @param query token-major shared query projection
      * @param packedKeyValue token-major grouped key/value projection

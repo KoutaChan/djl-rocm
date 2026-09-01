@@ -1225,8 +1225,9 @@ public interface NDArrayEx {
      *
      * <p>Query uses {@code [batch, queryTokens, heads * keyFeatures]}. Packed memory uses {@code
      * [batch, groups, keyTokens, heads * (keyFeatures + valueFeatures)]}; all head keys precede all
-     * head values. The nonzero mask uses {@code [batch, groups, keyTokens]}. The default
-     * implementation is a differentiable decomposition and defines the portable fallback semantics.
+     * head values. The nonzero mask uses {@code [batch, groups, keyTokens]}; masked score entries
+     * do not contribute query or key gradients. The default implementation is a differentiable
+     * decomposition and defines the portable fallback semantics.
      *
      * @param packedKeyValue grouped packed key/value projection
      * @param mask nonzero valid-token mask
@@ -1287,13 +1288,11 @@ public interface NDArrayEx {
             NDArray valid =
                     mask.neq(0)
                             .reshape(batch, groups, 1, 1, keyTokens)
-                            .toType(query.getDataType(), false)
+                            .broadcast(batch, groups, heads, queryTokens, keyTokens)
                             .stopGradient();
+            NDArray scores = queries.matMul(keys.swapAxes(3, 4)).mul(scale);
             NDArray probabilities =
-                    queries.matMul(keys.swapAxes(3, 4))
-                            .mul(scale)
-                            .add(valid.neg().add(1.0f).mul(-1.0e30f))
-                            .softmax(4);
+                    NDArrays.where(valid, scores, scores.zerosLike().add(-1.0e30f)).softmax(4);
             NDArray result =
                     probabilities
                             .matMul(values)

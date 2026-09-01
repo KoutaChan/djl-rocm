@@ -513,7 +513,11 @@ public final class NDArrays {
      *
      * <p>The query is shared by every group in the same leading row. Packed memory stores all head
      * keys followed by all head values. Nonzero mask entries participate in the softmax. Engines
-     * may fuse this sequence directly; the portable implementation stays differentiable.
+     * may fuse the operation while preserving gradients for the query and packed key/value
+     * projections. Masked score entries do not contribute query or key gradients. Callers should
+     * provide at least one valid key per group; a fully masked group follows the engine and data
+     * type's softmax behavior. The mask, head count, and scale are not differentiable.
+     *
      * @param query shared query projection shaped {@code [..., queryTokens, queryWidth]}
      * @param packedKeyValue grouped packed projection shaped {@code [..., groups, keyTokens,
      *     packedWidth]}

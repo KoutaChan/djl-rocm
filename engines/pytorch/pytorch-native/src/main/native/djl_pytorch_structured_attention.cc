@@ -49,6 +49,41 @@ torch::Tensor indexed_relation_bias_reference(const torch::Tensor& relation_logi
   return relation_logits.gather(3, relation_indices).mul(scale).add(relation_bias);
 }
 
+torch::Tensor grouped_packed_attention_reference(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask,
+    int64_t heads, double scale) {
+  const int64_t batch = query.size(0);
+  const int64_t query_tokens = query.size(1);
+  const int64_t query_width = query.size(2);
+  const int64_t groups = packed_key_value.size(1);
+  const int64_t key_tokens = packed_key_value.size(2);
+  const int64_t packed_width = packed_key_value.size(3);
+  const int64_t key_features = query_width / heads;
+  const int64_t value_width = packed_width - query_width;
+  const int64_t value_features = value_width / heads;
+  auto queries = query.reshape({batch, query_tokens, heads, key_features})
+                     .transpose(1, 2)
+                     .unsqueeze(1)
+                     .expand({batch, groups, heads, query_tokens, key_features});
+  auto keys = packed_key_value.slice(3, 0, query_width)
+                  .reshape({batch, groups, key_tokens, heads, key_features})
+                  .transpose(2, 3);
+  auto values = packed_key_value.slice(3, query_width, packed_width)
+                    .reshape({batch, groups, key_tokens, heads, value_features})
+                    .transpose(2, 3);
+  auto valid = mask.ne(0).reshape({batch, groups, 1, 1, key_tokens});
+  auto scores = queries.matmul(keys.transpose(3, 4)).mul(scale);
+  const double masked_score = query.scalar_type() == torch::kFloat16
+      ? -std::numeric_limits<double>::infinity()
+      : -1.0e30;
+  auto probabilities = torch::where(
+      valid, scores, torch::full_like(scores, masked_score)).softmax(4);
+  return probabilities.matmul(values)
+      .transpose(2, 3)
+      .contiguous()
+      .view({batch, groups, query_tokens, value_width});
+}
+
 torch::Tensor grouped_indexed_attention_reference(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, int64_t queries_per_group,
@@ -153,6 +188,36 @@ class IndexedRelationBiasFunction : public torch::autograd::Function<IndexedRela
   }
 };
 
+class GroupedPackedAttentionFunction
+    : public torch::autograd::Function<GroupedPackedAttentionFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& query, const torch::Tensor& packed_key_value,
+      const torch::Tensor& mask, int64_t heads, double scale) {
+    auto result = rocm::grouped_packed_attention_forward(query, packed_key_value,
+        mask, heads, static_cast<float>(scale), true);
+    context->save_for_backward(
+        {query, packed_key_value, mask, result.probabilities});
+    context->saved_data["heads"] = heads;
+    context->saved_data["scale"] = scale;
+    return result.output;
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto heads = context->saved_data["heads"].toInt();
+    const auto scale = context->saved_data["scale"].toDouble();
+    auto gradients = rocm::grouped_packed_attention_backward(
+        saved.at(0), saved.at(1), saved.at(2), saved.at(3),
+        gradient_outputs.at(0), heads, static_cast<float>(scale),
+        context->needs_input_grad(0), context->needs_input_grad(1));
+    return {gradients.query, gradients.packed_key_value, torch::Tensor(),
+        torch::Tensor(), torch::Tensor()};
+  }
+};
+
 class GroupedIndexedAttentionFunction : public torch::autograd::Function<GroupedIndexedAttentionFunction> {
  public:
   static torch::Tensor forward(torch::autograd::AutogradContext* context, const torch::Tensor& query,
@@ -202,6 +267,28 @@ torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const 
   }
 #endif
   return indexed_relation_bias_reference(relation_logits, relation_bias, relation_ids, scale);
+}
+
+torch::Tensor grouped_packed_attention(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask,
+    int64_t heads, double scale) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  const bool needs_autograd = requires_autograd({&query, &packed_key_value});
+  if (rocm::supports_grouped_packed_attention_forward(
+          query, packed_key_value, mask, heads) &&
+      (!needs_autograd || rocm::supports_grouped_packed_attention_backward(
+          query, packed_key_value, mask, heads))) {
+    if (needs_autograd) {
+      return GroupedPackedAttentionFunction::apply(
+          query, packed_key_value, mask, heads, scale);
+    }
+    return rocm::grouped_packed_attention_forward(query, packed_key_value,
+        mask, heads, static_cast<float>(scale), false)
+        .output;
+  }
+#endif
+  return grouped_packed_attention_reference(
+      query, packed_key_value, mask, heads, scale);
 }
 
 torch::Tensor grouped_indexed_attention(const torch::Tensor& query, const torch::Tensor& shared_key_values,

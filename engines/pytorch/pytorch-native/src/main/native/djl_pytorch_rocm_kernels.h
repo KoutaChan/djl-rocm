@@ -122,11 +122,31 @@ bool supports_grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& indexed_shared_ids, int64_t queries_per_group,
     bool needs_shared_key_value_gradient);
 
-bool supports_grouped_packed_attention(const torch::Tensor& query,
+bool supports_grouped_packed_attention_forward(const torch::Tensor& query,
     const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads);
 
-torch::Tensor grouped_packed_attention(const torch::Tensor& query,
-    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads, float scale);
+bool supports_grouped_packed_attention_backward(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads);
+
+struct GroupedPackedAttentionForwardResult {
+  torch::Tensor output;
+  torch::Tensor probabilities;
+};
+
+GroupedPackedAttentionForwardResult grouped_packed_attention_forward(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads, float scale,
+    bool capture_probabilities);
+
+struct GroupedPackedAttentionGradients {
+  torch::Tensor query;
+  torch::Tensor packed_key_value;
+};
+
+GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask,
+    const torch::Tensor& probabilities, const torch::Tensor& gradient_output,
+    int64_t heads, float scale,
+    bool needs_query_gradient, bool needs_packed_key_value_gradient);
 
 struct GroupedIndexedAttentionForwardResult {
   torch::Tensor output;

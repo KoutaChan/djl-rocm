@@ -107,42 +107,6 @@ void add_bias_and_broadcast_residual_to_owned_and_silu_fallback(
   }
 }
 
-torch::Tensor grouped_packed_attention_fallback(const torch::Tensor& query,
-    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads,
-    double scale) {
-  const int64_t batch = query.size(0);
-  const int64_t query_tokens = query.size(1);
-  const int64_t query_width = query.size(2);
-  const int64_t groups = packed_key_value.size(1);
-  const int64_t key_tokens = packed_key_value.size(2);
-  const int64_t packed_width = packed_key_value.size(3);
-  const int64_t key_features = query_width / heads;
-  const int64_t value_width = packed_width - query_width;
-  const int64_t value_features = value_width / heads;
-  auto queries = query.reshape({batch, query_tokens, heads, key_features})
-                     .transpose(1, 2)
-                     .unsqueeze(1)
-                     .expand({batch, groups, heads, query_tokens, key_features});
-  auto keys = packed_key_value.slice(3, 0, query_width)
-                  .reshape({batch, groups, key_tokens, heads, key_features})
-                  .transpose(2, 3);
-  auto values = packed_key_value.slice(3, query_width, packed_width)
-                    .reshape({batch, groups, key_tokens, heads, value_features})
-                    .transpose(2, 3);
-  auto valid = mask.ne(0)
-                   .to(query.scalar_type())
-                   .reshape({batch, groups, 1, 1, key_tokens});
-  auto probabilities =
-      queries.matmul(keys.transpose(3, 4))
-          .mul(scale)
-          .add(valid.neg().add(1).mul(-1.0e30))
-          .softmax(4);
-  return probabilities.matmul(values)
-      .transpose(2, 3)
-      .contiguous()
-      .view({batch, groups, query_tokens, value_width});
-}
-
 }  // namespace
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPad(
@@ -274,19 +238,9 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGroupedPackedScaledDotProductAttenti
   TORCH_CHECK(query_ptr->scalar_type() == packed_key_value_ptr->scalar_type(),
       "grouped packed attention query and memory dtype must match");
 
-  torch::Tensor result;
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (!requires_autograd({query_ptr, packed_key_value_ptr, mask_ptr}) &&
-      djl::pytorch::rocm::supports_grouped_packed_attention(
-          *query_ptr, *packed_key_value_ptr, *mask_ptr, heads)) {
-    result = djl::pytorch::rocm::grouped_packed_attention(
-        *query_ptr, *packed_key_value_ptr, *mask_ptr, heads, static_cast<float>(jscale));
-  } else
-#endif
-  {
-    result = grouped_packed_attention_fallback(
-        *query_ptr, *packed_key_value_ptr, *mask_ptr, heads, static_cast<double>(jscale));
-  }
+  auto result = djl::pytorch::grouped_packed_attention(
+      *query_ptr, *packed_key_value_ptr, *mask_ptr, heads,
+      static_cast<double>(jscale));
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
