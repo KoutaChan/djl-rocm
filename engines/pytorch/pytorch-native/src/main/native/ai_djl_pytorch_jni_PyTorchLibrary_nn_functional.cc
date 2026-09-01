@@ -775,33 +775,12 @@ JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLayer
     bias = *reinterpret_cast<torch::Tensor*>(jbias);
   }
   const torch::ScalarType converted_type = utils::GetScalarTypeFromDType(jconverted_data_type);
-  torch::Tensor normalized;
-  torch::Tensor converted;
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (!at::GradMode::is_enabled() &&
-      at::autocast::is_autocast_enabled(at::DeviceType::CUDA) &&
-      djl::pytorch::rocm::supports_autocast_layer_norm_and_cast(
-          *tensor_ptr, weight, bias, normalized_shape_vec, converted_type)) {
-    auto outputs = djl::pytorch::rocm::autocast_layer_norm_and_cast(
-        *tensor_ptr, weight, bias, static_cast<float>(jeps), converted_type);
-    normalized = std::move(outputs.normalized);
-    converted = std::move(outputs.converted);
-  } else
-#endif
-  {
-    normalized = torch::nn::functional::layer_norm(*tensor_ptr,
-        torch::nn::functional::LayerNormFuncOptions(normalized_shape_vec)
-            .weight(weight)
-            .bias(bias)
-            .eps(jeps));
-    converted = normalized.scalar_type() == converted_type
-        ? normalized.clone()
-        : normalized.to(converted_type);
-  }
+  auto outputs = djl::pytorch::layer_norm_and_cast(
+      *tensor_ptr, normalized_shape_vec, weight, bias, jeps, converted_type);
   jlongArray jarray = env->NewLongArray(2);
   std::vector<jlong> jptrs(2);
-  jptrs[0] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(normalized)));
-  jptrs[1] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(converted)));
+  jptrs[0] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs.at(0))));
+  jptrs[1] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs.at(1))));
   env->SetLongArrayRegion(jarray, 0, 2, jptrs.data());
   return jarray;
 #endif

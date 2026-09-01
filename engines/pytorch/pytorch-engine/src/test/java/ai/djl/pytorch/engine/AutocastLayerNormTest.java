@@ -21,18 +21,20 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.norm.LayerNorm;
+import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.training.GradientCollector;
 
 import org.testng.Assert;
 import org.testng.SkipException;
 import org.testng.annotations.Test;
 
-/** Tests the ROCm inference specialization for ordinary autocast LayerNorm. */
+/** Tests the ROCm specialization for autocast LayerNorm. */
 @SuppressWarnings("try") // Autocast resources are used for their scope side effects.
 public class AutocastLayerNormTest {
 
     private static final float EPSILON = 1.0e-5f;
     private static final int[] ACTIVE_EXTENTS = {1, 384, 31, 256, 1};
+    private static final int[] WIDTHS = {1, 17, 64, 256, 257};
     private static final DataType[] FLOATING_DATA_TYPES = {
         DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16
     };
@@ -215,7 +217,7 @@ public class AutocastLayerNormTest {
     }
 
     @Test
-    public void float32AffineParametersUseFallback() {
+    public void float32AffineParametersRetainAutocastSemantics() {
         runOnGpuIfAvailable(
                 (engine, manager, device) -> {
                     Shape inputShape = new Shape(2, 9, 128);
@@ -293,47 +295,367 @@ public class AutocastLayerNormTest {
     }
 
     @Test
-    public void layerNormAndCastTrainingRemainsDifferentiable() {
-        runOnGpuIfAvailable(
-                (engine, manager, device) -> {
-                    Shape inputShape = new Shape(2, 5, 64);
-                    NDArray input =
-                            manager.create(sequence(inputShape.size(), 0.03125f), inputShape)
-                                    .toType(DataType.FLOAT16, false);
-                    NDArray weight = manager.ones(new Shape(64)).toType(DataType.FLOAT16, false);
-                    NDArray bias = manager.zeros(new Shape(64)).toType(DataType.FLOAT16, false);
-                    input.setRequiresGradient(true);
-                    weight.setRequiresGradient(true);
-                    bias.setRequiresGradient(true);
+    public void layerNormAndCastAutogradMatchesEagerAcrossWidths() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            for (int width : WIDTHS) {
+                TrainingResult reference =
+                        trainLayerNormAndCast(
+                                engine,
+                                manager,
+                                device,
+                                11,
+                                width,
+                                DataType.BFLOAT16,
+                                DataType.FLOAT32,
+                                DataType.BFLOAT16,
+                                OutputUse.BOTH,
+                                false);
+                TrainingResult fused =
+                        trainLayerNormAndCast(
+                                engine,
+                                manager,
+                                device,
+                                11,
+                                width,
+                                DataType.BFLOAT16,
+                                DataType.FLOAT32,
+                                DataType.BFLOAT16,
+                                OutputUse.BOTH,
+                                true);
+                assertTrainingResult(fused, reference, 2.0e-2f);
+            }
+        }
+    }
 
-                    try (GradientCollector collector = engine.newGradientCollector();
-                            Autocast ignored = engine.newAutocast(device, DataType.FLOAT16, true)) {
-                        NDList outputs =
-                                LayerNorm.layerNormAndCast(
-                                        input,
-                                        new Shape(64),
-                                        weight,
-                                        bias,
-                                        EPSILON,
-                                        DataType.FLOAT16);
-                        Assert.assertEquals(outputs.get(0).getDataType(), DataType.FLOAT32);
-                        Assert.assertEquals(outputs.get(1).getDataType(), DataType.FLOAT16);
-                        collector.backward(
-                                outputs.get(0)
-                                        .mean()
+    @Test
+    public void layerNormAndCastAutogradSupportsInputAndAffineDtypes() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            for (DataType inputType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                for (DataType parameterType :
+                        new DataType[] {DataType.FLOAT32, inputType}) {
+                    DataType convertedType =
+                            inputType == DataType.FLOAT16 ? DataType.BFLOAT16 : DataType.FLOAT16;
+                    TrainingResult reference =
+                            trainLayerNormAndCast(
+                                    engine,
+                                    manager,
+                                    device,
+                                    13,
+                                    64,
+                                    inputType,
+                                    parameterType,
+                                    convertedType,
+                                    OutputUse.BOTH,
+                                    false);
+                    TrainingResult fused =
+                            trainLayerNormAndCast(
+                                    engine,
+                                    manager,
+                                    device,
+                                    13,
+                                    64,
+                                    inputType,
+                                    parameterType,
+                                    convertedType,
+                                    OutputUse.BOTH,
+                                    true);
+                    assertTrainingResult(
+                            fused,
+                            reference,
+                            trainingTolerance(inputType, parameterType, convertedType));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void layerNormAndCastAutogradSupportsUndefinedAndSharedOutputGradients() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            for (OutputUse outputUse : OutputUse.values()) {
+                TrainingResult reference =
+                        trainLayerNormAndCast(
+                                engine,
+                                manager,
+                                device,
+                                17,
+                                256,
+                                DataType.BFLOAT16,
+                                DataType.BFLOAT16,
+                                DataType.BFLOAT16,
+                                outputUse,
+                                false);
+                TrainingResult fused =
+                        trainLayerNormAndCast(
+                                engine,
+                                manager,
+                                device,
+                                17,
+                                256,
+                                DataType.BFLOAT16,
+                                DataType.BFLOAT16,
+                                DataType.BFLOAT16,
+                                outputUse,
+                                true);
+                assertTrainingResult(fused, reference, 2.0e-2f);
+            }
+        }
+    }
+
+    @Test
+    public void layerNormAndCastAutogradSupportsZeroRows() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            TrainingResult reference =
+                    trainLayerNormAndCast(
+                            engine,
+                            manager,
+                            device,
+                            0,
+                            257,
+                            DataType.FLOAT16,
+                            DataType.FLOAT32,
+                            DataType.BFLOAT16,
+                            OutputUse.BOTH,
+                            false);
+            TrainingResult fused =
+                    trainLayerNormAndCast(
+                            engine,
+                            manager,
+                            device,
+                            0,
+                            257,
+                            DataType.FLOAT16,
+                            DataType.FLOAT32,
+                            DataType.BFLOAT16,
+                            OutputUse.BOTH,
+                            true);
+            assertTrainingResult(fused, reference, 0.0f);
+        }
+    }
+
+    @Test
+    public void layerNormAndCastCpuFallbackMatchesComposedOperations() {
+        Engine engine = Engine.getInstance();
+        try (NDManager manager = engine.newBaseManager(Device.cpu())) {
+            TrainingResult reference = trainLayerNormAndCastCpu(engine, manager, false);
+            TrainingResult actual = trainLayerNormAndCastCpu(engine, manager, true);
+            assertTrainingResult(actual, reference, 2.0e-5f);
+        }
+    }
+
+    private static TrainingResult trainLayerNormAndCast(
+            Engine engine,
+            NDManager manager,
+            Device device,
+            int rows,
+            int width,
+            DataType inputType,
+            DataType parameterType,
+            DataType convertedType,
+            OutputUse outputUse,
+            boolean fused) {
+        Shape shape = new Shape(rows, width);
+        try (NDManager scope = manager.newSubManager();
+                NDArray input =
+                        scope.create(sequence(shape.size(), 0.03125f, 0), shape)
+                                .toType(inputType, false);
+                NDArray weight =
+                        scope.create(sequence(width, 0.00390625f, 3))
+                                .add(1.0f)
+                                .toType(parameterType, false);
+                NDArray bias =
+                        scope.create(sequence(width, -0.001953125f, 11))
+                                .toType(parameterType, false);
+                NDArray normalizedLossWeight =
+                        scope.create(sequence(shape.size(), 0.001953125f, 5), shape);
+                NDArray convertedLossWeight =
+                        scope.create(sequence(shape.size(), -0.0009765625f, 13), shape)
+                                .toType(convertedType, false);
+                NDArray secondConvertedLossWeight =
+                        scope.create(sequence(shape.size(), 0.00048828125f, 19), shape)
+                                .toType(convertedType, false);
+                NDArray thirdConvertedLossWeight =
+                        scope.create(sequence(shape.size(), -0.000244140625f, 23), shape)
+                                .toType(convertedType, false)) {
+            input.setRequiresGradient(true);
+            weight.setRequiresGradient(true);
+            bias.setRequiresGradient(true);
+
+            try (GradientCollector collector = engine.newGradientCollector();
+                    Autocast ignored = engine.newAutocast(device, inputType, true)) {
+                NDList outputs = layerNormAndCast(input, weight, bias, width, convertedType, fused);
+                Assert.assertEquals(outputs.get(0).getDataType(), DataType.FLOAT32);
+                Assert.assertEquals(outputs.get(1).getDataType(), convertedType);
+                NDArray objective =
+                        trainingObjective(
+                                outputs,
+                                normalizedLossWeight,
+                                convertedLossWeight,
+                                secondConvertedLossWeight,
+                                thirdConvertedLossWeight,
+                                outputUse,
+                                fused);
+                collector.backward(objective);
+                return new TrainingResult(
+                        floatValues(outputs.get(0)),
+                        floatValues(outputs.get(1)),
+                        gradientValues(input),
+                        gradientValues(weight),
+                        gradientValues(bias));
+            }
+        }
+    }
+
+    private static TrainingResult trainLayerNormAndCastCpu(
+            Engine engine, NDManager manager, boolean fused) {
+        int rows = 5;
+        int width = 17;
+        Shape shape = new Shape(rows, width);
+        try (NDManager scope = manager.newSubManager();
+                NDArray input = scope.create(sequence(shape.size(), 0.03125f, 0), shape);
+                NDArray weight = scope.create(sequence(width, 0.00390625f, 3)).add(1.0f);
+                NDArray bias = scope.create(sequence(width, -0.001953125f, 11));
+                NDArray normalizedLossWeight =
+                        scope.create(sequence(shape.size(), 0.001953125f, 5), shape);
+                NDArray convertedLossWeight =
+                        scope.create(sequence(shape.size(), -0.0009765625f, 13), shape)
+                                .toType(DataType.FLOAT16, false);
+                NDArray secondConvertedLossWeight =
+                        scope.create(sequence(shape.size(), 0.00048828125f, 19), shape)
+                                .toType(DataType.FLOAT16, false);
+                NDArray thirdConvertedLossWeight =
+                        scope.create(sequence(shape.size(), -0.000244140625f, 23), shape)
+                                .toType(DataType.FLOAT16, false);
+                GradientCollector collector = engine.newGradientCollector()) {
+            input.setRequiresGradient(true);
+            weight.setRequiresGradient(true);
+            bias.setRequiresGradient(true);
+            NDList outputs = layerNormAndCast(input, weight, bias, width, DataType.FLOAT16, fused);
+            NDArray objective =
+                    trainingObjective(
+                            outputs,
+                            normalizedLossWeight,
+                            convertedLossWeight,
+                            secondConvertedLossWeight,
+                            thirdConvertedLossWeight,
+                            OutputUse.BOTH,
+                            fused);
+            collector.backward(objective);
+            return new TrainingResult(
+                    floatValues(outputs.get(0)),
+                    floatValues(outputs.get(1)),
+                    gradientValues(input),
+                    gradientValues(weight),
+                    gradientValues(bias));
+        }
+    }
+
+    private static NDList layerNormAndCast(
+            NDArray input,
+            NDArray weight,
+            NDArray bias,
+            int width,
+            DataType convertedType,
+            boolean fused) {
+        Shape normalizedShape = new Shape(width);
+        if (fused) {
+            return LayerNorm.layerNormAndCast(
+                    input, normalizedShape, weight, bias, EPSILON, convertedType);
+        }
+        NDArray normalized =
+                LayerNorm.layerNorm(input, normalizedShape, weight, bias, EPSILON)
+                        .singletonOrThrow();
+        return new NDList(normalized, normalized.toType(convertedType, false));
+    }
+
+    private static NDArray trainingObjective(
+            NDList outputs,
+            NDArray normalizedLossWeight,
+            NDArray convertedLossWeight,
+            NDArray secondConvertedLossWeight,
+            NDArray thirdConvertedLossWeight,
+            OutputUse outputUse,
+            boolean useReturnedOutputGraph) {
+        if (!useReturnedOutputGraph) {
+            return referenceTrainingObjective(
+                    outputs.get(0),
+                    normalizedLossWeight,
+                    convertedLossWeight,
+                    secondConvertedLossWeight,
+                    thirdConvertedLossWeight,
+                    outputUse);
+        }
+        switch (outputUse) {
+            case NORMALIZED:
+                return outputs.get(0).mul(normalizedLossWeight).sum();
+            case CONVERTED:
+                return outputs.get(1).mul(convertedLossWeight).sum();
+            case BOTH:
+                return outputs.get(0)
+                        .mul(normalizedLossWeight)
+                        .sum()
+                        .add(outputs.get(1).mul(convertedLossWeight).sum());
+            case CONVERTED_THREE_CONSUMERS:
+                return outputs.get(1)
+                        .mul(convertedLossWeight)
+                        .sum()
+                        .add(outputs.get(1).mul(secondConvertedLossWeight).sum())
+                        .add(outputs.get(1).mul(thirdConvertedLossWeight).sum());
+            default:
+                throw new AssertionError(outputUse);
+        }
+    }
+
+    private static NDArray referenceTrainingObjective(
+            NDArray normalized,
+            NDArray normalizedLossWeight,
+            NDArray convertedLossWeight,
+            NDArray secondConvertedLossWeight,
+            NDArray thirdConvertedLossWeight,
+            OutputUse outputUse) {
+        NDArray convertedGradient = convertedLossWeight.toType(DataType.FLOAT32, false);
+        switch (outputUse) {
+            case NORMALIZED:
+                return normalized.mul(normalizedLossWeight).sum();
+            case CONVERTED:
+                return normalized.mul(convertedGradient).sum();
+            case BOTH:
+                return normalized.mul(normalizedLossWeight.add(convertedGradient)).sum();
+            case CONVERTED_THREE_CONSUMERS:
+                return normalized
+                        .mul(
+                                convertedGradient
                                         .add(
-                                                outputs.get(1)
-                                                        .toType(DataType.FLOAT32, false)
-                                                        .mean()));
-                    }
+                                                secondConvertedLossWeight.toType(
+                                                        DataType.FLOAT32, false))
+                                        .add(
+                                                thirdConvertedLossWeight.toType(
+                                                        DataType.FLOAT32, false)))
+                        .sum();
+            default:
+                throw new AssertionError(outputUse);
+        }
+    }
 
-                    Assert.assertTrue(input.hasGradient());
-                    Assert.assertTrue(weight.hasGradient());
-                    Assert.assertTrue(bias.hasGradient());
-                    assertAllFinite(input.getGradient());
-                    assertAllFinite(weight.getGradient());
-                    assertAllFinite(bias.getGradient());
-                });
+    private static float trainingTolerance(
+            DataType inputType, DataType parameterType, DataType convertedType) {
+        if (inputType == DataType.BFLOAT16
+                || parameterType == DataType.BFLOAT16
+                || convertedType == DataType.BFLOAT16) {
+            return 2.0e-2f;
+        }
+        return 6.0e-3f;
     }
 
     private static void verifyLowPrecisionCombination(
@@ -376,11 +698,52 @@ public class AutocastLayerNormTest {
     }
 
     private static float[] sequence(long size, float scale) {
+        return sequence(size, scale, 0);
+    }
+
+    private static float[] sequence(long size, float scale, int offset) {
         float[] values = new float[Math.toIntExact(size)];
         for (int index = 0; index < values.length; index++) {
-            values[index] = (index % 31 - 15) * scale;
+            values[index] = ((index + offset) % 31 - 15) * scale;
         }
         return values;
+    }
+
+    private static float[] gradientValues(NDArray array) {
+        return array.hasGradient() ? floatValues(array.getGradient()) : null;
+    }
+
+    private static float[] floatValues(NDArray array) {
+        if (array.getDataType() == DataType.FLOAT32) {
+            return array.toFloatArray();
+        }
+        try (NDArray converted = array.toType(DataType.FLOAT32, false)) {
+            return converted.toFloatArray();
+        }
+    }
+
+    private static void assertTrainingResult(
+            TrainingResult actual, TrainingResult expected, float tolerance) {
+        assertClose(actual.normalized, expected.normalized, tolerance);
+        assertClose(actual.converted, expected.converted, tolerance);
+        assertNullableClose(actual.inputGradient, expected.inputGradient, tolerance);
+        assertNullableClose(actual.weightGradient, expected.weightGradient, tolerance);
+        assertNullableClose(actual.biasGradient, expected.biasGradient, tolerance);
+    }
+
+    private static void assertNullableClose(float[] actual, float[] expected, float tolerance) {
+        Assert.assertEquals(actual == null, expected == null);
+        if (actual != null) {
+            assertClose(actual, expected, tolerance);
+        }
+    }
+
+    private static void assertClose(float[] actual, float[] expected, float tolerance) {
+        Assert.assertEquals(actual.length, expected.length);
+        for (int index = 0; index < actual.length; index++) {
+            Assert.assertEquals(
+                    actual[index], expected[index], tolerance, "mismatch at index " + index);
+        }
     }
 
     private static void assertClose(NDArray actual, NDArray expected, float tolerance) {
@@ -410,6 +773,41 @@ public class AutocastLayerNormTest {
         Device device = Device.gpu();
         try (NDManager manager = engine.newBaseManager(device)) {
             body.run(engine, manager, device);
+        }
+    }
+
+    private static void requireRocm(Engine engine) {
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 2) {
+            throw new SkipException("This autocast LayerNorm test requires PyTorch ROCm.");
+        }
+    }
+
+    private enum OutputUse {
+        NORMALIZED,
+        CONVERTED,
+        BOTH,
+        CONVERTED_THREE_CONSUMERS
+    }
+
+    private static final class TrainingResult {
+
+        private final float[] normalized;
+        private final float[] converted;
+        private final float[] inputGradient;
+        private final float[] weightGradient;
+        private final float[] biasGradient;
+
+        private TrainingResult(
+                float[] normalized,
+                float[] converted,
+                float[] inputGradient,
+                float[] weightGradient,
+                float[] biasGradient) {
+            this.normalized = normalized;
+            this.converted = converted;
+            this.inputGradient = inputGradient;
+            this.weightGradient = weightGradient;
+            this.biasGradient = biasGradient;
         }
     }
 

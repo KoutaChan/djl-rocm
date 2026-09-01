@@ -309,6 +309,14 @@ torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
 struct AutocastLayerNormAndCastResult {
   torch::Tensor normalized;
   torch::Tensor converted;
+  torch::Tensor mean;
+  torch::Tensor reciprocal_standard_deviation;
+};
+
+struct AutocastLayerNormAndCastGradients {
+  torch::Tensor input;
+  torch::Tensor weight;
+  torch::Tensor bias;
 };
 
 bool supports_autocast_layer_norm_and_cast(const torch::Tensor& input, const torch::Tensor& weight,
@@ -316,7 +324,14 @@ bool supports_autocast_layer_norm_and_cast(const torch::Tensor& input, const tor
 
 AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
-    torch::ScalarType converted_type);
+    torch::ScalarType converted_type, bool capture_statistics);
+
+AutocastLayerNormAndCastGradients autocast_layer_norm_and_cast_backward(
+    const torch::Tensor& normalized_gradient, const torch::Tensor& converted_gradient,
+    const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor& mean, const torch::Tensor& reciprocal_standard_deviation,
+    torch::ScalarType converted_type, bool needs_input_gradient,
+    bool needs_weight_gradient, bool needs_bias_gradient);
 
 }  // namespace djl::pytorch::rocm
 

@@ -20,6 +20,11 @@
 
 namespace djl::pytorch {
 
+std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
+    at::IntArrayRef normalized_shape, const torch::Tensor& weight,
+    const torch::Tensor& bias, double epsilon,
+    torch::ScalarType converted_type);
+
 std::vector<torch::Tensor> residual_add_layer_norm(const torch::Tensor& residual,
     const torch::Tensor& update, at::IntArrayRef normalized_shape,
     const torch::Tensor& weight, const torch::Tensor& bias, double epsilon);

@@ -23,6 +23,21 @@
 namespace djl::pytorch {
 namespace {
 
+std::vector<torch::Tensor> layer_norm_and_cast_reference(const torch::Tensor& input,
+    at::IntArrayRef normalized_shape, const torch::Tensor& weight,
+    const torch::Tensor& bias, double epsilon,
+    torch::ScalarType converted_type) {
+  auto normalized = torch::nn::functional::layer_norm(input,
+      torch::nn::functional::LayerNormFuncOptions(normalized_shape.vec())
+          .weight(weight)
+          .bias(bias)
+          .eps(epsilon));
+  auto converted = normalized.scalar_type() == converted_type
+      ? normalized.clone()
+      : normalized.to(converted_type);
+  return {std::move(normalized), std::move(converted)};
+}
+
 std::vector<torch::Tensor> residual_add_layer_norm_reference(const torch::Tensor& residual,
     const torch::Tensor& update, at::IntArrayRef normalized_shape,
     const torch::Tensor& weight, const torch::Tensor& bias, double epsilon) {
@@ -36,6 +51,37 @@ std::vector<torch::Tensor> residual_add_layer_norm_reference(const torch::Tensor
 }
 
 #if defined(DJL_USE_ROCM_KERNELS)
+
+class LayerNormAndCastFunction
+    : public torch::autograd::Function<LayerNormAndCastFunction> {
+ public:
+  static torch::autograd::variable_list forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& input, const torch::Tensor& weight,
+      const torch::Tensor& bias, std::vector<int64_t> normalized_shape,
+      double epsilon, int64_t converted_type) {
+    auto result = rocm::autocast_layer_norm_and_cast(input, weight, bias,
+        static_cast<float>(epsilon), static_cast<torch::ScalarType>(converted_type), true);
+    context->save_for_backward(
+        {input, weight, result.mean, result.reciprocal_standard_deviation});
+    context->set_materialize_grads(false);
+    context->saved_data["converted_type"] = converted_type;
+    return {result.normalized, result.converted};
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto saved = context->get_saved_variables();
+    const auto converted_type = static_cast<torch::ScalarType>(
+        context->saved_data["converted_type"].toInt());
+    auto gradients = rocm::autocast_layer_norm_and_cast_backward(
+        gradient_outputs.at(0), gradient_outputs.at(1), saved.at(0), saved.at(1),
+        saved.at(2), saved.at(3), converted_type, context->needs_input_grad(0),
+        context->needs_input_grad(1), context->needs_input_grad(2));
+    return {gradients.input, gradients.weight, gradients.bias,
+        torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+};
 
 class ResidualAddLayerNormFunction
     : public torch::autograd::Function<ResidualAddLayerNormFunction> {
@@ -78,6 +124,30 @@ class ResidualAddLayerNormFunction
 #endif
 
 }  // namespace
+
+std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
+    at::IntArrayRef normalized_shape, const torch::Tensor& weight,
+    const torch::Tensor& bias, double epsilon,
+    torch::ScalarType converted_type) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (at::autocast::is_autocast_enabled(at::DeviceType::CUDA) &&
+      rocm::supports_autocast_layer_norm_and_cast(
+          input, weight, bias, normalized_shape, converted_type)) {
+    const bool needs_autograd = at::GradMode::is_enabled() &&
+        (input.requires_grad() || weight.requires_grad() || bias.requires_grad());
+    if (needs_autograd) {
+      auto outputs = LayerNormAndCastFunction::apply(input, weight, bias,
+          normalized_shape.vec(), epsilon, static_cast<int64_t>(converted_type));
+      return {outputs.at(0), outputs.at(1)};
+    }
+    auto result = rocm::autocast_layer_norm_and_cast(input, weight, bias,
+        static_cast<float>(epsilon), converted_type, false);
+    return {std::move(result.normalized), std::move(result.converted)};
+  }
+#endif
+  return layer_norm_and_cast_reference(
+      input, normalized_shape, weight, bias, epsilon, converted_type);
+}
 
 std::vector<torch::Tensor> residual_add_layer_norm(const torch::Tensor& residual,
     const torch::Tensor& update, at::IntArrayRef normalized_shape,

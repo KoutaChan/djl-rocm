@@ -2278,6 +2278,7 @@ template <int cached_values_per_lane, typename input_t, typename parameter_t,
     typename converted_t, bool write_converted>
 __global__ void autocast_layer_norm_kernel(const input_t* input, const parameter_t* weight,
     const parameter_t* bias, float* output, converted_t* converted_output,
+    float* mean_output, float* reciprocal_standard_deviation_output,
     int64_t row_count, int64_t width, float epsilon) {
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
@@ -2323,6 +2324,10 @@ __global__ void autocast_layer_norm_kernel(const input_t* input, const parameter
   mean = __shfl(mean, 0);
   const float inverse_standard_deviation =
       rsqrtf(__shfl(moment, 0) / static_cast<float>(width) + epsilon);
+  if (lane == 0 && mean_output != nullptr) {
+    mean_output[row] = mean;
+    reciprocal_standard_deviation_output[row] = inverse_standard_deviation;
+  }
 
 #pragma unroll
   for (int cached_index = 0; cached_index < cached_values_per_lane; cached_index++) {
@@ -2336,6 +2341,120 @@ __global__ void autocast_layer_norm_kernel(const input_t* input, const parameter
       if constexpr (write_converted) {
         converted_output[row_offset + feature] = static_cast<converted_t>(affine);
       }
+    }
+  }
+}
+
+template <int cached_values_per_lane, typename input_t, typename parameter_t,
+    typename converted_t>
+__global__ void autocast_layer_norm_and_cast_backward_kernel(
+    const float* normalized_gradient, const converted_t* converted_gradient,
+    const input_t* input, const parameter_t* weight, const float* mean,
+    const float* reciprocal_standard_deviation, input_t* input_gradient,
+    float* affine_partials, int64_t row_count, int64_t width) {
+  const int lane = threadIdx.x % warpSize;
+  const int wave = threadIdx.x / warpSize;
+  const int waves_per_block = blockDim.x / warpSize;
+  float cached_weight_gradient[cached_values_per_lane] = {};
+  float cached_bias_gradient[cached_values_per_lane] = {};
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
+       row < row_count;
+       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    float cached_standardized[cached_values_per_lane];
+    float cached_scaled_gradient[cached_values_per_lane];
+    float scaled_gradient_sum = 0.0f;
+    float scaled_standardized_gradient_sum = 0.0f;
+    const int64_t row_offset = row * width;
+    const float row_mean = mean[row];
+    const float row_reciprocal_standard_deviation =
+        reciprocal_standard_deviation[row];
+#pragma unroll
+    for (int cached_index = 0; cached_index < cached_values_per_lane;
+         cached_index++) {
+      const int64_t feature =
+          lane + static_cast<int64_t>(cached_index) * warpSize;
+      if (feature < width) {
+        const int64_t index = row_offset + feature;
+        const float standardized =
+            (static_cast<float>(input[index]) - row_mean) *
+            row_reciprocal_standard_deviation;
+        const float ordinary_gradient = normalized_gradient == nullptr
+            ? 0.0f
+            : normalized_gradient[index];
+        const float cast_gradient = converted_gradient == nullptr
+            ? 0.0f
+            : static_cast<float>(converted_gradient[index]);
+        const float gradient = ordinary_gradient + cast_gradient;
+        const float scaled_gradient =
+            gradient * static_cast<float>(weight[feature]);
+        cached_standardized[cached_index] = standardized;
+        cached_scaled_gradient[cached_index] = scaled_gradient;
+        cached_weight_gradient[cached_index] += gradient * standardized;
+        cached_bias_gradient[cached_index] += gradient;
+        scaled_gradient_sum += scaled_gradient;
+        scaled_standardized_gradient_sum += scaled_gradient * standardized;
+      }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      scaled_gradient_sum += __shfl_down(scaled_gradient_sum, offset);
+      scaled_standardized_gradient_sum +=
+          __shfl_down(scaled_standardized_gradient_sum, offset);
+    }
+    scaled_gradient_sum = __shfl(scaled_gradient_sum, 0);
+    scaled_standardized_gradient_sum =
+        __shfl(scaled_standardized_gradient_sum, 0);
+    const float inverse_width = 1.0f / static_cast<float>(width);
+
+#pragma unroll
+    for (int cached_index = 0; cached_index < cached_values_per_lane;
+         cached_index++) {
+      const int64_t feature =
+          lane + static_cast<int64_t>(cached_index) * warpSize;
+      if (feature < width && input_gradient != nullptr) {
+        const int64_t index = row_offset + feature;
+        const float gradient = row_reciprocal_standard_deviation *
+            (cached_scaled_gradient[cached_index] -
+                scaled_gradient_sum * inverse_width -
+                cached_standardized[cached_index] *
+                    scaled_standardized_gradient_sum * inverse_width);
+        input_gradient[index] = static_cast<input_t>(gradient);
+      }
+    }
+  }
+
+  if (affine_partials != nullptr) {
+    extern __shared__ float partial_sums[];
+    float* partial_weight = partial_sums;
+    float* partial_bias =
+        partial_sums + static_cast<int64_t>(waves_per_block) * width;
+#pragma unroll
+    for (int cached_index = 0; cached_index < cached_values_per_lane;
+         cached_index++) {
+      const int64_t feature =
+          lane + static_cast<int64_t>(cached_index) * warpSize;
+      if (feature < width) {
+        const int64_t shared_index =
+            static_cast<int64_t>(wave) * width + feature;
+        partial_weight[shared_index] = cached_weight_gradient[cached_index];
+        partial_bias[shared_index] = cached_bias_gradient[cached_index];
+      }
+    }
+    __syncthreads();
+    const int64_t output_offset =
+        static_cast<int64_t>(blockIdx.x) * 2 * width;
+    for (int64_t feature = threadIdx.x; feature < width;
+         feature += blockDim.x) {
+      float weight_sum = 0.0f;
+      float bias_sum = 0.0f;
+      for (int source_wave = 0; source_wave < waves_per_block; source_wave++) {
+        const int64_t shared_index =
+            static_cast<int64_t>(source_wave) * width + feature;
+        weight_sum += partial_weight[shared_index];
+        bias_sum += partial_bias[shared_index];
+      }
+      affine_partials[output_offset + feature] = weight_sum;
+      affine_partials[output_offset + width + feature] = bias_sum;
     }
   }
 }
@@ -2540,8 +2659,10 @@ __global__ void residual_add_layer_norm_input_gradient_kernel(
   }
 }
 
+template <typename parameter_t>
 __global__ void layer_norm_affine_partial_reduction_kernel(
-    const float* affine_partials, float* weight_gradient, float* bias_gradient,
+    const float* affine_partials, parameter_t* weight_gradient,
+    parameter_t* bias_gradient,
     int64_t partial_count, int64_t width) {
   const int64_t feature =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2556,10 +2677,10 @@ __global__ void layer_norm_affine_partial_reduction_kernel(
     bias_sum += affine_partials[offset + width + feature];
   }
   if (weight_gradient != nullptr) {
-    weight_gradient[feature] = weight_sum;
+    weight_gradient[feature] = static_cast<parameter_t>(weight_sum);
   }
   if (bias_gradient != nullptr) {
-    bias_gradient[feature] = bias_sum;
+    bias_gradient[feature] = static_cast<parameter_t>(bias_sum);
   }
 }
 
@@ -2949,16 +3070,172 @@ void dispatch_residual_add_layer_norm_input_gradient_types(
   }
 }
 
+template <int cached_values_per_lane, typename input_t, typename parameter_t,
+    typename converted_t>
+void launch_autocast_layer_norm_and_cast_backward_typed(
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& converted_gradient, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& input_gradient, torch::Tensor& affine_partials,
+    dim3 grid, dim3 block, size_t shared_memory_bytes, hipStream_t stream,
+    int64_t row_count, int64_t width) {
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(
+                         autocast_layer_norm_and_cast_backward_kernel<
+                             cached_values_per_lane, input_t, parameter_t,
+                             converted_t>),
+      grid, block, shared_memory_bytes, stream,
+      normalized_gradient.defined() ? normalized_gradient.data_ptr<float>() : nullptr,
+      converted_gradient.defined()
+          ? converted_gradient.data_ptr<converted_t>()
+          : nullptr,
+      input.data_ptr<input_t>(), weight.data_ptr<parameter_t>(),
+      mean.data_ptr<float>(), reciprocal_standard_deviation.data_ptr<float>(),
+      input_gradient.defined() ? input_gradient.data_ptr<input_t>() : nullptr,
+      affine_partials.defined() ? affine_partials.data_ptr<float>() : nullptr,
+      row_count, width);
+}
+
+template <int cached_values_per_lane, typename input_t, typename parameter_t>
+void dispatch_autocast_layer_norm_and_cast_backward_converted_type(
+    torch::ScalarType converted_type,
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& converted_gradient, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& input_gradient, torch::Tensor& affine_partials,
+    dim3 grid, dim3 block, size_t shared_memory_bytes, hipStream_t stream,
+    int64_t row_count, int64_t width) {
+  switch (converted_type) {
+    case torch::kFloat16:
+      launch_autocast_layer_norm_and_cast_backward_typed<
+          cached_values_per_lane, input_t, parameter_t, c10::Half>(
+          normalized_gradient, converted_gradient, input, weight, mean,
+          reciprocal_standard_deviation, input_gradient, affine_partials, grid,
+          block, shared_memory_bytes, stream, row_count, width);
+      break;
+    case torch::kBFloat16:
+      launch_autocast_layer_norm_and_cast_backward_typed<
+          cached_values_per_lane, input_t, parameter_t, c10::BFloat16>(
+          normalized_gradient, converted_gradient, input, weight, mean,
+          reciprocal_standard_deviation, input_gradient, affine_partials, grid,
+          block, shared_memory_bytes, stream, row_count, width);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported LayerNorm converted gradient data type");
+  }
+}
+
+template <int cached_values_per_lane, typename input_t>
+void dispatch_autocast_layer_norm_and_cast_backward_parameter_type(
+    torch::ScalarType parameter_type, torch::ScalarType converted_type,
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& converted_gradient, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& input_gradient, torch::Tensor& affine_partials,
+    dim3 grid, dim3 block, size_t shared_memory_bytes, hipStream_t stream,
+    int64_t row_count, int64_t width) {
+  switch (parameter_type) {
+    case torch::kFloat32:
+      dispatch_autocast_layer_norm_and_cast_backward_converted_type<
+          cached_values_per_lane, input_t, float>(converted_type,
+          normalized_gradient, converted_gradient, input, weight, mean,
+          reciprocal_standard_deviation, input_gradient, affine_partials, grid,
+          block, shared_memory_bytes, stream, row_count, width);
+      break;
+    case torch::kFloat16:
+      dispatch_autocast_layer_norm_and_cast_backward_converted_type<
+          cached_values_per_lane, input_t, c10::Half>(converted_type,
+          normalized_gradient, converted_gradient, input, weight, mean,
+          reciprocal_standard_deviation, input_gradient, affine_partials, grid,
+          block, shared_memory_bytes, stream, row_count, width);
+      break;
+    case torch::kBFloat16:
+      dispatch_autocast_layer_norm_and_cast_backward_converted_type<
+          cached_values_per_lane, input_t, c10::BFloat16>(converted_type,
+          normalized_gradient, converted_gradient, input, weight, mean,
+          reciprocal_standard_deviation, input_gradient, affine_partials, grid,
+          block, shared_memory_bytes, stream, row_count, width);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported LayerNorm parameter gradient data type");
+  }
+}
+
+template <int cached_values_per_lane>
+void dispatch_autocast_layer_norm_and_cast_backward_types(
+    torch::ScalarType input_type, torch::ScalarType parameter_type,
+    torch::ScalarType converted_type,
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& converted_gradient, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::Tensor& input_gradient, torch::Tensor& affine_partials,
+    dim3 grid, dim3 block, size_t shared_memory_bytes, hipStream_t stream,
+    int64_t row_count, int64_t width) {
+  switch (input_type) {
+    case torch::kFloat16:
+      dispatch_autocast_layer_norm_and_cast_backward_parameter_type<
+          cached_values_per_lane, c10::Half>(parameter_type, converted_type,
+          normalized_gradient, converted_gradient, input, weight, mean,
+          reciprocal_standard_deviation, input_gradient, affine_partials, grid,
+          block, shared_memory_bytes, stream, row_count, width);
+      break;
+    case torch::kBFloat16:
+      dispatch_autocast_layer_norm_and_cast_backward_parameter_type<
+          cached_values_per_lane, c10::BFloat16>(parameter_type,
+          converted_type, normalized_gradient, converted_gradient, input,
+          weight, mean, reciprocal_standard_deviation, input_gradient,
+          affine_partials, grid, block, shared_memory_bytes, stream, row_count,
+          width);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported autocast LayerNorm input gradient data type");
+  }
+}
+
+template <typename parameter_t>
+void launch_layer_norm_affine_partial_reduction_typed(
+    const torch::Tensor& affine_partials,
+    torch::Tensor& weight_gradient, torch::Tensor& bias_gradient,
+    dim3 grid, dim3 block, hipStream_t stream, int64_t partial_count,
+    int64_t width) {
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(
+                         layer_norm_affine_partial_reduction_kernel<parameter_t>),
+      grid, block, 0, stream, affine_partials.data_ptr<float>(),
+      weight_gradient.defined() ? weight_gradient.data_ptr<parameter_t>() : nullptr,
+      bias_gradient.defined() ? bias_gradient.data_ptr<parameter_t>() : nullptr,
+      partial_count, width);
+}
+
 void launch_layer_norm_affine_partial_reduction(
     const torch::Tensor& affine_partials,
     torch::Tensor& weight_gradient, torch::Tensor& bias_gradient,
     dim3 grid, dim3 block, hipStream_t stream, int64_t partial_count,
     int64_t width) {
-  hipLaunchKernelGGL(layer_norm_affine_partial_reduction_kernel, grid, block, 0,
-      stream, affine_partials.data_ptr<float>(),
-      weight_gradient.defined() ? weight_gradient.data_ptr<float>() : nullptr,
-      bias_gradient.defined() ? bias_gradient.data_ptr<float>() : nullptr,
-      partial_count, width);
+  const auto parameter_type = weight_gradient.defined()
+      ? weight_gradient.scalar_type()
+      : bias_gradient.scalar_type();
+  switch (parameter_type) {
+    case torch::kFloat32:
+      launch_layer_norm_affine_partial_reduction_typed<float>(affine_partials,
+          weight_gradient, bias_gradient, grid, block, stream, partial_count,
+          width);
+      break;
+    case torch::kFloat16:
+      launch_layer_norm_affine_partial_reduction_typed<c10::Half>(affine_partials,
+          weight_gradient, bias_gradient, grid, block, stream, partial_count,
+          width);
+      break;
+    case torch::kBFloat16:
+      launch_layer_norm_affine_partial_reduction_typed<c10::BFloat16>(
+          affine_partials, weight_gradient, bias_gradient, grid, block, stream,
+          partial_count, width);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported LayerNorm affine gradient data type");
+  }
 }
 
 struct IndexedRelationBiasLaunchPlan {
@@ -3499,8 +3776,11 @@ bool has_supported_masked_embedding_index_layout(
 
 AutocastLayerNormAndCastResult launch_autocast_layer_norm(
     const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias,
-    float epsilon, std::optional<torch::ScalarType> converted_type) {
+    float epsilon, std::optional<torch::ScalarType> converted_type,
+    bool capture_statistics) {
   c10::DeviceGuard device_guard(input.device());
+  const int64_t width = input.size(-1);
+  const int64_t row_count = input.numel() / width;
   torch::Tensor normalized = torch::empty(input.sizes(),
       input.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
   torch::Tensor converted;
@@ -3508,12 +3788,19 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
     converted = torch::empty(input.sizes(), input.options().dtype(*converted_type)
         .memory_format(torch::MemoryFormat::Contiguous));
   }
+  torch::Tensor mean;
+  torch::Tensor reciprocal_standard_deviation;
+  if (capture_statistics) {
+    const auto statistics_options = input.options().dtype(torch::kFloat32)
+        .memory_format(torch::MemoryFormat::Contiguous);
+    mean = torch::empty({row_count}, statistics_options);
+    reciprocal_standard_deviation = torch::empty({row_count}, statistics_options);
+  }
   if (input.numel() == 0) {
-    return {std::move(normalized), std::move(converted)};
+    return {std::move(normalized), std::move(converted), std::move(mean),
+        std::move(reciprocal_standard_deviation)};
   }
 
-  const int64_t width = input.size(-1);
-  const int64_t row_count = input.numel() / width;
   const auto& properties = device_properties(input.get_device());
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
@@ -3543,6 +3830,10 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
                                 grid, block, 0, stream, input.data_ptr<input_t>(),
                                 weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
                                 normalized.data_ptr<float>(), converted.data_ptr<converted_t>(),
+                                mean.defined() ? mean.data_ptr<float>() : nullptr,
+                                reciprocal_standard_deviation.defined()
+                                    ? reciprocal_standard_deviation.data_ptr<float>()
+                                    : nullptr,
                                 row_count, width, epsilon);
                           });
                     } else {
@@ -3551,15 +3842,20 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
                                              float, false>),
                           grid, block, 0, stream, input.data_ptr<input_t>(),
                           weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
-                          normalized.data_ptr<float>(), static_cast<float*>(nullptr), row_count,
-                          width, epsilon);
+                          normalized.data_ptr<float>(), static_cast<float*>(nullptr),
+                          mean.defined() ? mean.data_ptr<float>() : nullptr,
+                          reciprocal_standard_deviation.defined()
+                              ? reciprocal_standard_deviation.data_ptr<float>()
+                              : nullptr,
+                          row_count, width, epsilon);
                     }
                   });
             });
       });
   check_hip_kernel_launch(
       converted.defined() ? "autocast_layer_norm_and_cast" : "autocast_layer_norm");
-  return {std::move(normalized), std::move(converted)};
+  return {std::move(normalized), std::move(converted), std::move(mean),
+      std::move(reciprocal_standard_deviation)};
 }
 
 struct GroupedPackedAttentionLaunchPlan {
@@ -4385,7 +4681,7 @@ bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
       !weight.defined() || !bias.defined() || !weight.is_contiguous() || !bias.is_contiguous() ||
       weight.dim() != 1 || weight.size(0) != input.size(-1) || bias.sizes() != weight.sizes() ||
       (input.scalar_type() != torch::kFloat16 && input.scalar_type() != torch::kBFloat16) ||
-      (weight.scalar_type() != torch::kFloat16 && weight.scalar_type() != torch::kBFloat16) ||
+      !is_fused_floating(weight) ||
       bias.scalar_type() != weight.scalar_type() || weight.device() != input.device() ||
       bias.device() != input.device()) {
     return false;
@@ -6371,17 +6667,144 @@ torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
   const int64_t width = input.size(-1);
   TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, at::IntArrayRef(&width, 1)),
       "autocast LayerNorm received an unsupported ROCm tensor layout");
-  return launch_autocast_layer_norm(input, weight, bias, epsilon, std::nullopt).normalized;
+  return launch_autocast_layer_norm(
+      input, weight, bias, epsilon, std::nullopt, false).normalized;
 }
 
 AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
-    torch::ScalarType converted_type) {
+    torch::ScalarType converted_type, bool capture_statistics) {
   const int64_t width = input.size(-1);
   TORCH_CHECK(supports_autocast_layer_norm_and_cast(
                   input, weight, bias, at::IntArrayRef(&width, 1), converted_type),
       "autocast LayerNorm and cast received an unsupported ROCm tensor layout");
-  return launch_autocast_layer_norm(input, weight, bias, epsilon, converted_type);
+  return launch_autocast_layer_norm(
+      input, weight, bias, epsilon, converted_type, capture_statistics);
+}
+
+AutocastLayerNormAndCastGradients autocast_layer_norm_and_cast_backward(
+    const torch::Tensor& normalized_gradient,
+    const torch::Tensor& converted_gradient, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& mean,
+    const torch::Tensor& reciprocal_standard_deviation,
+    torch::ScalarType converted_type, bool needs_input_gradient,
+    bool needs_weight_gradient, bool needs_bias_gradient) {
+  TORCH_CHECK(input.is_cuda() && input.is_contiguous() && input.dim() >= 1 &&
+          input.size(-1) > 0 &&
+          (input.scalar_type() == torch::kFloat16 ||
+              input.scalar_type() == torch::kBFloat16),
+      "autocast LayerNorm backward input is incompatible");
+  TORCH_CHECK(weight.is_cuda() && weight.device() == input.device() &&
+          weight.is_contiguous() && weight.dim() == 1 &&
+          weight.size(0) == input.size(-1) && is_fused_floating(weight),
+      "autocast LayerNorm backward weight is incompatible");
+  const int64_t width = input.size(-1);
+  const int64_t row_count = input.numel() / width;
+  TORCH_CHECK(mean.is_cuda() && mean.device() == input.device() &&
+          mean.is_contiguous() && mean.scalar_type() == torch::kFloat32 &&
+          mean.dim() == 1 && mean.numel() == row_count &&
+          reciprocal_standard_deviation.is_cuda() &&
+          reciprocal_standard_deviation.device() == input.device() &&
+          reciprocal_standard_deviation.is_contiguous() &&
+          reciprocal_standard_deviation.scalar_type() == torch::kFloat32 &&
+          reciprocal_standard_deviation.sizes() == mean.sizes(),
+      "autocast LayerNorm backward statistics are incompatible");
+  TORCH_CHECK(converted_type == torch::kFloat16 ||
+          converted_type == torch::kBFloat16,
+      "autocast LayerNorm backward converted data type is unsupported");
+  TORCH_CHECK(!normalized_gradient.defined() ||
+          (normalized_gradient.is_cuda() &&
+              normalized_gradient.device() == input.device() &&
+              normalized_gradient.sizes() == input.sizes() &&
+              normalized_gradient.scalar_type() == torch::kFloat32),
+      "autocast LayerNorm normalized gradient is incompatible");
+  TORCH_CHECK(!converted_gradient.defined() ||
+          (converted_gradient.is_cuda() &&
+              converted_gradient.device() == input.device() &&
+              converted_gradient.sizes() == input.sizes() &&
+              converted_gradient.scalar_type() == converted_type),
+      "autocast LayerNorm converted gradient is incompatible");
+
+  const bool has_output_gradient =
+      normalized_gradient.defined() || converted_gradient.defined();
+  if (!has_output_gradient) {
+    return {};
+  }
+
+  c10::DeviceGuard device_guard(input.device());
+  const torch::Tensor contiguous_normalized_gradient =
+      normalized_gradient.defined() ? normalized_gradient.contiguous() : torch::Tensor();
+  const torch::Tensor contiguous_converted_gradient =
+      converted_gradient.defined() ? converted_gradient.contiguous() : torch::Tensor();
+  const auto input_gradient_options =
+      input.options().memory_format(torch::MemoryFormat::Contiguous);
+  torch::Tensor input_gradient = needs_input_gradient
+      ? torch::empty(input.sizes(), input_gradient_options)
+      : torch::Tensor();
+  torch::Tensor weight_gradient =
+      needs_weight_gradient ? torch::empty_like(weight) : torch::Tensor();
+  torch::Tensor bias_gradient =
+      needs_bias_gradient ? torch::empty_like(weight) : torch::Tensor();
+  if (row_count == 0) {
+    if (weight_gradient.defined()) {
+      weight_gradient.zero_();
+    }
+    if (bias_gradient.defined()) {
+      bias_gradient.zero_();
+    }
+    return {std::move(input_gradient), std::move(weight_gradient),
+        std::move(bias_gradient)};
+  }
+
+  const auto& properties = device_properties(input.get_device());
+  const int threads_per_block = configured_threads_per_block(properties,
+      rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
+      launch_environment::kResidualAddLayerNormThreadsPerBlock, true);
+  const int waves_per_block = threads_per_block / properties.warpSize;
+  const int cached_values_per_lane =
+      static_cast<int>((width + properties.warpSize - 1) / properties.warpSize);
+  const int64_t required_block_count =
+      (row_count + waves_per_block - 1) / waves_per_block;
+  const int64_t partial_count = std::min<int64_t>(required_block_count,
+      std::min<int64_t>(kLayerNormAffinePartialMaximumBlocks,
+          properties.maxGridSize[0]));
+  const bool needs_affine_gradient =
+      weight_gradient.defined() || bias_gradient.defined();
+  torch::Tensor affine_partials = needs_affine_gradient
+      ? torch::empty({partial_count, 2, width},
+            input.options().dtype(torch::kFloat32)
+                .memory_format(torch::MemoryFormat::Contiguous))
+      : torch::Tensor();
+  const size_t shared_memory_bytes = needs_affine_gradient
+      ? static_cast<size_t>(waves_per_block) * 2 * width * sizeof(float)
+      : 0;
+  const dim3 input_grid(partial_count);
+  const dim3 input_block(threads_per_block);
+  const hipStream_t stream =
+      c10::hip::getCurrentHIPStream(input.get_device()).stream();
+  dispatch_autocast_layer_norm_cached_values_per_lane(
+      cached_values_per_lane, [&](auto cached_values) {
+        constexpr int compiled_cached_values = decltype(cached_values)::value;
+        dispatch_autocast_layer_norm_and_cast_backward_types<
+            compiled_cached_values>(input.scalar_type(), weight.scalar_type(),
+            converted_type, contiguous_normalized_gradient,
+            contiguous_converted_gradient, input, weight, mean,
+            reciprocal_standard_deviation, input_gradient, affine_partials,
+            input_grid, input_block, shared_memory_bytes, stream, row_count,
+            width);
+      });
+  check_hip_kernel_launch("autocast LayerNorm and cast backward partials");
+  if (needs_affine_gradient) {
+    const dim3 affine_block(threads_per_block);
+    const dim3 affine_grid(
+        (width + threads_per_block - 1) / threads_per_block);
+    launch_layer_norm_affine_partial_reduction(affine_partials,
+        weight_gradient, bias_gradient, affine_grid, affine_block, stream,
+        partial_count, width);
+    check_hip_kernel_launch("autocast LayerNorm and cast affine gradient");
+  }
+  return {std::move(input_gradient), std::move(weight_gradient),
+      std::move(bias_gradient)};
 }
 
 }  // namespace djl::pytorch::rocm
