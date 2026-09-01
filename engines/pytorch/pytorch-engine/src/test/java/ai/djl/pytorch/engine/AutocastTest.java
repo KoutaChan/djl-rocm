@@ -93,6 +93,27 @@ public class AutocastTest {
     }
 
     @Test
+    public void disabledNestedScopeRestoresOuterState() {
+        Engine engine = Engine.getInstance();
+        try (Autocast outer = engine.newAutocast(Device.cpu(), DataType.BFLOAT16, true)) {
+            Assert.assertTrue(JniUtils.autocastIsEnabled(CPU_DEVICE));
+            Assert.assertTrue(JniUtils.autocastIsCacheEnabled());
+
+            try (Autocast disabled =
+                    engine.newAutocast(Device.cpu(), DataType.BFLOAT16, false, true)) {
+                Assert.assertFalse(JniUtils.autocastIsEnabled(CPU_DEVICE));
+                Assert.assertTrue(JniUtils.autocastIsCacheEnabled());
+            }
+
+            Assert.assertTrue(JniUtils.autocastIsEnabled(CPU_DEVICE));
+            Assert.assertEquals(
+                    JniUtils.autocastGetDataType(CPU_DEVICE), DataType.BFLOAT16.ordinal());
+            Assert.assertTrue(JniUtils.autocastIsCacheEnabled());
+        }
+        Assert.assertFalse(JniUtils.autocastIsEnabled(CPU_DEVICE));
+    }
+
+    @Test
     public void cacheEnabledFlagPropagates() {
         Engine engine = Engine.getInstance();
         boolean before = JniUtils.autocastIsCacheEnabled();

@@ -393,6 +393,34 @@ public abstract class Engine {
     }
 
     /**
+     * Opens an enabled or disabled autocast scope on the given {@link Device}.
+     *
+     * <p>A disabled nested scope is useful when a caller keeps an outer autocast scope open to
+     * reuse backend weight casts across several forward passes, but must execute a numerically
+     * sensitive loss in full precision. Closing the returned guard restores the previous state.
+     * Cached source tensors must not be modified until the outermost cached autocast scope has been
+     * closed. In particular, an optimizer step must run after that scope is closed. A disabled scope
+     * also does not convert existing low-precision tensors back to full precision.
+     *
+     * @param device the device whose thread-local autocast state is changed
+     * @param dataType the lower-precision data type used when {@code enabled} is {@code true}
+     * @param enabled whether autocast is enabled inside the scope
+     * @param cacheEnabled whether the backend autocast cache is enabled inside the scope
+     * @return an {@link Autocast} guard whose {@code close()} restores state
+     */
+    public Autocast newAutocast(
+            Device device, DataType dataType, boolean enabled, boolean cacheEnabled) {
+        if (enabled) {
+            return newAutocast(device, dataType, cacheEnabled);
+        }
+        if (supportsAutocast()) {
+            throw new UnsupportedOperationException(
+                    "This engine does not support disabled nested autocast scopes.");
+        }
+        return NoOpAutocast.INSTANCE;
+    }
+
+    /**
      * Opens an autocast scope with the backend cache enabled. Shortcut for {@link
      * #newAutocast(Device, DataType, boolean)} with {@code cacheEnabled = true}.
      *

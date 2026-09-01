@@ -330,7 +330,14 @@ public final class PtEngine extends Engine {
     /** {@inheritDoc} */
     @Override
     public Autocast newAutocast(Device device, DataType dataType, boolean cacheEnabled) {
-        return new PtAutocast(device, dataType, true, cacheEnabled);
+        return newAutocast(device, dataType, true, cacheEnabled);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Autocast newAutocast(
+            Device device, DataType dataType, boolean enabled, boolean cacheEnabled) {
+        return new PtAutocast(device, dataType, enabled, cacheEnabled);
     }
 
     /** {@inheritDoc} */
