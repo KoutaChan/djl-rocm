@@ -166,17 +166,13 @@ public class PtConcatToTypeTest {
             Assert.assertNotNull(currentDevice);
             NDArray first =
                     manager.create(new float[] {1.25f, -2.5f, 3.75f, -4.5f}, new Shape(2, 2));
-            NDArray second =
-                    manager.create(new float[] {5.5f, -6.25f}, new Shape(2, 1));
+            NDArray second = manager.create(new float[] {5.5f, -6.25f}, new Shape(2, 1));
 
-            NDArray actual =
-                    NDArrays.concatToType(
-                            new NDList(first, second), 1, DataType.FLOAT16);
+            NDArray actual = NDArrays.concatToType(new NDList(first, second), 1, DataType.FLOAT16);
 
             Assert.assertEquals(actual.getDevice(), inputDevice);
             Assert.assertEquals(
-                    actual.toFloatArray(),
-                    new float[] {1.25f, -2.5f, 5.5f, 3.75f, -4.5f, -6.25f});
+                    actual.toFloatArray(), new float[] {1.25f, -2.5f, 5.5f, 3.75f, -4.5f, -6.25f});
         }
     }
 

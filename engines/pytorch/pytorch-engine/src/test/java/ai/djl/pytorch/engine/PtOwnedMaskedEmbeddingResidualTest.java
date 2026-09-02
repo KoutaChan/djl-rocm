@@ -133,8 +133,7 @@ public class PtOwnedMaskedEmbeddingResidualTest {
             Assert.assertSame(convertedMask.getManager(), tokens.getManager());
             Assert.assertEquals(convertedMask.getDataType(), tokens.getDataType());
             Assert.assertEquals(convertedMask.getShape(), new Shape(BATCH, TOKENS));
-            Assert.assertEquals(
-                    tokens.toType(DataType.FLOAT32, false).toFloatArray(), expected);
+            Assert.assertEquals(tokens.toType(DataType.FLOAT32, false).toFloatArray(), expected);
             Assert.assertEquals(
                     convertedMask.toType(DataType.FLOAT32, false).toFloatArray(),
                     new float[] {1, 1, 0, 1, 1, 0});

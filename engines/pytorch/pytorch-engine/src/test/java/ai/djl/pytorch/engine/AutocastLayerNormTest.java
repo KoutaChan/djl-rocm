@@ -337,8 +337,7 @@ public class AutocastLayerNormTest {
         Device device = Device.gpu();
         try (NDManager manager = engine.newBaseManager(device)) {
             for (DataType inputType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
-                for (DataType parameterType :
-                        new DataType[] {DataType.FLOAT32, inputType}) {
+                for (DataType parameterType : new DataType[] {DataType.FLOAT32, inputType}) {
                     DataType convertedType =
                             inputType == DataType.FLOAT16 ? DataType.BFLOAT16 : DataType.FLOAT16;
                     TrainingResult reference =

@@ -141,10 +141,7 @@ public class SingleQueryAttentionTest {
             NDArray key = requiringGradient(random(manager, new Shape(2, 4, 7, 16)));
             NDArray value = requiringGradient(random(manager, new Shape(2, 4, 7, 16)));
             NDArray mask =
-                    manager.full(
-                            new Shape(2, 1, 1, 7),
-                            Float.NEGATIVE_INFINITY,
-                            DataType.BFLOAT16);
+                    manager.full(new Shape(2, 1, 1, 7), Float.NEGATIVE_INFINITY, DataType.BFLOAT16);
             NDArray output;
             try (GradientCollector collector = engine.newGradientCollector()) {
                 output =

@@ -45,8 +45,7 @@ public class EmbeddingWithOffsetsTest {
                     for (DataType tableType : tableTypes) {
                         verifyGpuParity(manager, rawType, offsetType, tableType);
                         verifyGpuFeaturePackParity(manager, rawType, offsetType, tableType);
-                        verifyGpuStridedFeaturePackParity(
-                                manager, rawType, offsetType, tableType);
+                        verifyGpuStridedFeaturePackParity(manager, rawType, offsetType, tableType);
                     }
                 }
             }
@@ -184,7 +183,7 @@ public class EmbeddingWithOffsetsTest {
                         expected.toType(DataType.FLOAT32, false).toFloatArray());
         System.out.printf(
                 "EMBEDDING_WITH_OFFSETS_PARITY rawDtype=%s offsetDtype=%s tableDtype=%s"
-                    + " maxAbs=%s%n",
+                        + " maxAbs=%s%n",
                 rawType, offsetType, tableType, maxAbs);
     }
 
@@ -215,17 +214,16 @@ public class EmbeddingWithOffsetsTest {
                         expected.toType(DataType.FLOAT32, false).toFloatArray());
         System.out.printf(
                 "EMBEDDING_FEATURE_PACK_PARITY rawDtype=%s offsetDtype=%s valueDtype=%s"
-                    + " maxAbs=%s%n",
+                        + " maxAbs=%s%n",
                 rawType, offsetType, tableType, maxAbs);
     }
 
     private static void verifyGpuStridedFeaturePackParity(
             NDManager manager, DataType rawType, DataType offsetType, DataType tableType) {
-        float maxAbs =
-                verifyStridedFeaturePackParity(manager, rawType, offsetType, tableType);
+        float maxAbs = verifyStridedFeaturePackParity(manager, rawType, offsetType, tableType);
         System.out.printf(
                 "EMBEDDING_FEATURE_PACK_STRIDED_PARITY rawDtype=%s offsetDtype=%s"
-                    + " valueDtype=%s maxAbs=%s%n",
+                        + " valueDtype=%s maxAbs=%s%n",
                 rawType, offsetType, tableType, maxAbs);
     }
 
