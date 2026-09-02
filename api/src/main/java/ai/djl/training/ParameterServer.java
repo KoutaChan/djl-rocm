@@ -69,6 +69,46 @@ public interface ParameterServer extends AutoCloseable {
     default void prepareForBackward(NDList outputs) {}
 
     /**
+     * Completes any parameter-server initialization required before a forward pass.
+     *
+     * <p>This hook is invoked after parameter mirrors have been materialized and immediately before
+     * the model reads them. Implementations must make repeated calls safe.
+     */
+    default void prepareForForward() {}
+
+    /** Finalizes asynchronous or distributed gradients before they are inspected or updated. */
+    default void finalizeGradients() {}
+
+    /**
+     * Returns whether this parameter server needs per-parameter gradient preparation before finite
+     * checks.
+     *
+     * @return {@code true} when {@link #prepareGradients(String, NDArray[])} must be called
+     */
+    default boolean requiresGradientPreparation() {
+        return false;
+    }
+
+    /**
+     * Prepares one parameter's gradients for finite checking and the optimizer step.
+     *
+     * <p>Parameter servers that reduce gradients during {@link #update(String, NDArray[],
+     * NDArray[])} must perform that reduction here as well, so mixed-precision overflow detection
+     * observes the exact gradient that the optimizer will consume.
+     *
+     * @param parameterId the key that identifies the parameter
+     * @param gradients the parameter gradients on each training device
+     */
+    default void prepareGradients(String parameterId, NDArray[] gradients) {}
+
+    /**
+     * Releases any state retained while preparing the current gradient step.
+     *
+     * <p>This method is called after an applied step, a skipped step, or a failed step.
+     */
+    default void finishGradientStep() {}
+
+    /**
      * Saves optimizer state.
      *
      * @param path the file to save optimizer state to

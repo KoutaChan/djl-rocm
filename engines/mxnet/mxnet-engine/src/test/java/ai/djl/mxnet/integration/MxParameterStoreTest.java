@@ -16,11 +16,14 @@ package ai.djl.mxnet.integration;
 import ai.djl.Device;
 import ai.djl.Model;
 import ai.djl.mxnet.engine.MxParameterServer;
+import ai.djl.mxnet.jna.JnaUtils;
 import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.testing.Assertions;
 import ai.djl.testing.TestRequirements;
+import ai.djl.training.GradScaler;
 import ai.djl.training.ParameterServer;
 import ai.djl.training.optimizer.Optimizer;
 import ai.djl.training.tracker.ParameterTracker;
@@ -30,6 +33,26 @@ import org.testng.Assert;
 import org.testng.annotations.Test;
 
 public class MxParameterStoreTest {
+
+    @Test
+    public void testInfiniteDetection() {
+        TestRequirements.notArm();
+
+        try (NDManager manager = NDManager.newBaseManager(Device.cpu());
+                NDArray values =
+                        manager.create(
+                                new float[] {
+                                    Float.NaN,
+                                    Float.POSITIVE_INFINITY,
+                                    Float.NEGATIVE_INFINITY,
+                                    Float.MAX_VALUE,
+                                    0f
+                                });
+                NDArray infinite = values.isInfinite()) {
+            Assert.assertEquals(
+                    infinite.toBooleanArray(), new boolean[] {false, true, true, false, false});
+        }
+    }
 
     @Test
     public void testParameterStore() {
@@ -91,6 +114,129 @@ public class MxParameterStoreTest {
                     Assert.assertEquals(optimizer.updateCount, numWeights * numUpdates);
                 }
             }
+        }
+    }
+
+    @Test
+    public void testPreparedGradientsAreNotAggregatedTwice() {
+        TestRequirements.notArm();
+
+        TestOptimizer optimizer =
+                TestOptimizer.builder().setLearningRateTracker(Tracker.fixed(1f)).build();
+        try (NDManager manager = NDManager.newBaseManager(Device.cpu());
+                NDArray firstWeight = manager.create(new float[] {10f});
+                NDArray secondWeight = manager.create(new float[] {10f});
+                NDArray firstGradient = manager.create(new float[] {1f});
+                NDArray secondGradient = manager.create(new float[] {2f});
+                ParameterServer parameterServer = new MxParameterServer(optimizer)) {
+            parameterServer.init("weight", new NDArray[] {firstWeight});
+            NDArray[] gradients = {firstGradient, secondGradient};
+
+            Assert.assertTrue(parameterServer.requiresGradientPreparation());
+            parameterServer.prepareGradients("weight", gradients);
+            Assert.assertEquals(firstGradient.getFloat(), 3f);
+            Assert.assertEquals(optimizer.updateCount, 0);
+
+            parameterServer.update("weight", gradients, new NDArray[] {firstWeight, secondWeight});
+            parameterServer.finishGradientStep();
+            Assert.assertEquals(firstWeight.getFloat(), 13f);
+            Assert.assertEquals(secondWeight.getFloat(), 13f);
+            Assert.assertEquals(optimizer.updateCount, 1);
+        }
+    }
+
+    @Test
+    public void testFinishGradientStepDiscardsPreparedState() {
+        TestRequirements.notArm();
+
+        TestOptimizer optimizer =
+                TestOptimizer.builder().setLearningRateTracker(Tracker.fixed(1f)).build();
+        try (NDManager manager = NDManager.newBaseManager(Device.cpu());
+                NDArray firstWeight = manager.create(new float[] {10f});
+                NDArray secondWeight = manager.create(new float[] {10f});
+                NDArray firstGradient = manager.create(new float[] {1f});
+                NDArray secondGradient = manager.create(new float[] {2f});
+                ParameterServer parameterServer = new MxParameterServer(optimizer)) {
+            parameterServer.init("weight", new NDArray[] {firstWeight});
+            NDArray[] gradients = {firstGradient, secondGradient};
+
+            parameterServer.prepareGradients("weight", gradients);
+            parameterServer.finishGradientStep();
+            firstGradient.fillI(1f);
+            parameterServer.update("weight", gradients, new NDArray[] {firstWeight, secondWeight});
+            parameterServer.finishGradientStep();
+
+            Assert.assertEquals(firstWeight.getFloat(), 13f);
+            Assert.assertEquals(secondWeight.getFloat(), 13f);
+            Assert.assertEquals(optimizer.updateCount, 1);
+        }
+    }
+
+    @Test
+    public void testReductionOverflowSkipsUpdateAndRecovers() {
+        TestRequirements.notArm();
+        int previousNumpyMode = JnaUtils.isNumpyMode();
+        JnaUtils.setNumpyMode(JnaUtils.NumpyMode.THREAD_LOCAL_ON);
+        try {
+            TestOptimizer optimizer =
+                    TestOptimizer.builder().setLearningRateTracker(Tracker.fixed(1f)).build();
+            GradScaler scaler = GradScaler.builder().optInitialScale(8f).build();
+            try (NDManager manager = NDManager.newBaseManager(Device.cpu());
+                    NDArray loss = manager.create(new float[] {1f});
+                    NDArray firstWeight = manager.create(new float[] {10f});
+                    NDArray secondWeight = manager.create(new float[] {10f});
+                    NDArray firstGradient = manager.create(new float[] {Float.MAX_VALUE});
+                    NDArray secondGradient = manager.create(new float[] {Float.MAX_VALUE});
+                    ParameterServer parameterServer = new MxParameterServer(optimizer)) {
+                parameterServer.init("weight", new NDArray[] {firstWeight});
+                NDArray[] gradients = {firstGradient, secondGradient};
+                NDArray[] weights = {firstWeight, secondWeight};
+
+                boolean finite;
+                try {
+                    try (NDArray scaledLoss = scaler.scale(loss)) {
+                        Assert.assertEquals(scaledLoss.getFloat(), 8f);
+                    }
+                    parameterServer.prepareGradients("weight", gradients);
+                    Assert.assertEquals(firstGradient.getFloat(), Float.POSITIVE_INFINITY);
+                    finite = scaler.unscale(new NDList(gradients));
+                    if (finite) {
+                        parameterServer.update("weight", gradients, weights);
+                    }
+                    scaler.update();
+                } finally {
+                    parameterServer.finishGradientStep();
+                }
+
+                Assert.assertFalse(finite);
+                Assert.assertEquals(firstWeight.getFloat(), 10f);
+                Assert.assertEquals(secondWeight.getFloat(), 10f);
+                Assert.assertEquals(optimizer.updateCount, 0);
+                Assert.assertEquals(scaler.getScale(), 4f);
+
+                firstGradient.fillI(4f);
+                secondGradient.fillI(8f);
+                try {
+                    try (NDArray scaledLoss = scaler.scale(loss)) {
+                        Assert.assertEquals(scaledLoss.getFloat(), 4f);
+                    }
+                    parameterServer.prepareGradients("weight", gradients);
+                    finite = scaler.unscale(new NDList(gradients));
+                    if (finite) {
+                        parameterServer.update("weight", gradients, weights);
+                    }
+                    scaler.update();
+                } finally {
+                    parameterServer.finishGradientStep();
+                }
+
+                Assert.assertTrue(finite);
+                Assert.assertEquals(firstWeight.getFloat(), 13f);
+                Assert.assertEquals(secondWeight.getFloat(), 13f);
+                Assert.assertEquals(optimizer.updateCount, 1);
+            }
+        } finally {
+            JnaUtils.setNumpyMode(JnaUtils.NumpyMode.values()[previousNumpyMode]);
         }
     }
 

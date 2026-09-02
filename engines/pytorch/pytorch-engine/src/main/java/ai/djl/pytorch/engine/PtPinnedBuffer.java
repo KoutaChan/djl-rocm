@@ -26,7 +26,8 @@ import java.nio.ByteOrder;
  * CUDA/ROCm accelerator. CPU-only builds fall back to regular CPU host memory so the same API can
  * still be used for CPU tensors. When this buffer is used with an asynchronous copy, the caller
  * must not overwrite or close it until the returned {@link PtCopyEvent} has been synchronized or
- * closed.
+ * closed. A buffer submitted through a {@link PtTransferBatch} must remain unchanged until its
+ * {@link PtTransferTicket} reports completion or has been synchronized.
  */
 public final class PtPinnedBuffer extends NativeResource<Long> {
 

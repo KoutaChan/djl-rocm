@@ -12,27 +12,32 @@
  */
 #include "djl_pytorch_accelerator.h"
 
-#if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(USE_ROCM)
 #include <ATen/hip/HIPGraph.h>
 #elif defined(DJL_USE_ACCELERATOR_GRAPH)
 #include <ATen/cuda/CUDAGraph.h>
 #endif
 
+#include <ATen/Context.h>
 #if __has_include(<ATen/DeviceAccelerator.h>)
 #include <ATen/DeviceAccelerator.h>
 #define DJL_HAS_DEVICE_ACCELERATOR 1
 #else
-#include <ATen/Context.h>
 #define DJL_HAS_DEVICE_ACCELERATOR 0
 #endif
 
+#include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
+#if defined(USE_ROCM)
+#include <c10/hip/HIPCachingAllocator.h>
+#endif
 
-#include <optional>
+#include <exception>
 #include <memory>
+#include <optional>
 
 namespace djl_pytorch {
 namespace accel {
@@ -48,12 +53,61 @@ struct CopyEvent {
   explicit CopyEvent(c10::DeviceType device_type) : event(device_type) {}
 };
 
+struct DeviceEvent {
+  c10::Device device;
+  c10::Event event;
+
+  explicit DeviceEvent(c10::Device device) : device(device), event(device.type()) {}
+};
+
+struct DeviceStream {
+  c10::Stream stream;
+
+  explicit DeviceStream(c10::Stream stream) : stream(stream) {}
+};
+
 struct StreamScope {
   c10::Stream stream;
   c10::StreamGuard guard;
 
   explicit StreamScope(c10::Stream stream) : stream(stream), guard(this->stream) {}
 };
+
+namespace {
+
+c10::Stream GetCurrentStream(c10::Device device) {
+  c10::DeviceGuard device_guard(device);
+  c10::impl::VirtualGuardImpl guard_impl(device.type());
+  return guard_impl.getStream(device);
+}
+
+void CheckBuffer(const torch::Tensor& tensor, const HostBuffer* buffer) {
+  TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
+  TORCH_CHECK(tensor.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
+  TORCH_CHECK(tensor.scalar_type() == buffer->storage.scalar_type(),
+      "tensor and host buffer data types must match");
+  TORCH_CHECK(tensor.numel() <= buffer->storage.numel(), "host buffer is smaller than the tensor");
+}
+
+void CopyFromBuffer(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
+  torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
+  target.copy_(source, non_blocking);
+}
+
+[[noreturn]] void DrainStreamAndRethrow(
+    const c10::Stream& stream, const std::exception_ptr& failure) {
+  try {
+    stream.synchronize();
+  } catch (...) {
+    // The original exception describes the operation that failed. If the
+    // accelerator cannot drain its stream, callers must treat the device as
+    // failed; replacing the original exception would not make the transfer
+    // recoverable.
+  }
+  std::rethrow_exception(failure);
+}
+
+}  // namespace
 
 #if defined(DJL_USE_ACCELERATOR_GRAPH)
 struct AcceleratorGraph {
@@ -87,6 +141,15 @@ bool IsAvailable() {
   return torch::cuda::is_available();
 #endif
 }
+
+namespace {
+
+void InitializeAccelerator() {
+  TORCH_CHECK(IsAvailable(), "accelerator is unavailable");
+  at::globalContext().lazyInitDevice(GetAcceleratorType().value());
+}
+
+}  // namespace
 
 bool IsAcceleratorDevice(c10::Device device) {
 #if DJL_HAS_DEVICE_ACCELERATOR
@@ -125,13 +188,41 @@ void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking) {
 }
 
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking) {
-  torch::Tensor source = buffer->storage.narrow(0, 0, target.numel()).view(target.sizes());
-  target.copy_(source, non_blocking);
+  CheckBuffer(target, buffer);
+  CopyFromBuffer(target, buffer, non_blocking);
+}
+
+void EnqueueCopyFrom(torch::Tensor& target, HostBuffer* buffer) {
+  CheckBuffer(target, buffer);
+  if (!IsAcceleratorDevice(target.device()) || !buffer->pinned) {
+    CopyFromBuffer(target, buffer, false);
+    return;
+  }
+
+  c10::Stream stream = GetCurrentStream(target.device());
+  CopyFromBuffer(target, buffer, true);
+  c10::impl::VirtualGuardImpl guard_impl(target.device().type());
+  guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
+}
+
+void EnqueueCopyTo(const torch::Tensor& source, HostBuffer* buffer) {
+  CheckBuffer(source, buffer);
+  torch::Tensor target = buffer->storage.narrow(0, 0, source.numel()).view(source.sizes());
+  if (!IsAcceleratorDevice(source.device()) || !buffer->pinned) {
+    target.copy_(source);
+    return;
+  }
+
+  c10::Stream stream = GetCurrentStream(source.device());
+  target.copy_(source, true);
+  c10::impl::VirtualGuardImpl guard_impl(source.device().type());
+  guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), stream);
 }
 
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
+  CheckBuffer(target, buffer);
   if (!IsAcceleratorDevice(target.device()) || !buffer->pinned) {
-    CopyFromHost(target, buffer);
+    CopyFromBuffer(target, buffer, false);
     return nullptr;
   }
   c10::DeviceGuard device_guard(target.device());
@@ -149,23 +240,25 @@ CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer) {
     dependency.block(stream);
   }
   c10::StreamGuard stream_guard(stream);
-  CopyFromHost(target, buffer, true);
-  guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
-  auto* event = new CopyEvent(target.device().type());
-  event->event.record(stream);
-  if (stream != alloc_stream) {
-    // The consumer continues on the allocation stream. Queue its dependency on
-    // the asynchronous host copy without synchronizing the CPU.
-    event->event.block(alloc_stream);
+  auto event = std::make_unique<CopyEvent>(target.device().type());
+  try {
+    CopyFromBuffer(target, buffer, true);
+    guard_impl.recordDataPtrOnStream(target.storage().data_ptr(), stream);
+    event->event.record(stream);
+    if (stream != alloc_stream) {
+      // The consumer continues on the allocation stream. Queue its dependency on
+      // the asynchronous host copy without synchronizing the CPU.
+      event->event.block(alloc_stream);
+    }
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    DrainStreamAndRethrow(stream, failure);
   }
-  return event;
+  return event.release();
 }
 
 CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer) {
-  TORCH_CHECK(source.scalar_type() == buffer->storage.scalar_type(),
-      "tensor and host buffer data types must match");
-  TORCH_CHECK(source.numel() <= buffer->storage.numel(),
-      "host buffer is smaller than the source tensor");
+  CheckBuffer(source, buffer);
   torch::Tensor target = buffer->storage.narrow(0, 0, source.numel()).view(source.sizes());
   if (!IsAcceleratorDevice(source.device()) || !buffer->pinned) {
     target.copy_(source);
@@ -182,11 +275,16 @@ CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer) {
     dependency.block(copy_stream);
   }
   c10::StreamGuard stream_guard(copy_stream);
-  target.copy_(source, true);
-  guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), copy_stream);
-  auto* event = new CopyEvent(source.device().type());
-  event->event.record(copy_stream);
-  return event;
+  auto event = std::make_unique<CopyEvent>(source.device().type());
+  try {
+    target.copy_(source, true);
+    guard_impl.recordDataPtrOnStream(source.storage().data_ptr(), copy_stream);
+    event->event.record(copy_stream);
+  } catch (...) {
+    const std::exception_ptr failure = std::current_exception();
+    DrainStreamAndRethrow(copy_stream, failure);
+  }
+  return event.release();
 }
 
 void SynchronizeCopyEvent(CopyEvent* event) {
@@ -197,7 +295,7 @@ void DeleteCopyEvent(CopyEvent* event) {
   delete event;
 }
 
-void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor) {
+void RecordStream(const torch::Tensor& tensor) {
   if (!tensor.defined() || tensor.numel() == 0 || tensor.layout() != c10::kStrided ||
       !IsAcceleratorDevice(tensor.device())) {
     return;
@@ -226,8 +324,63 @@ StreamScope* NewStreamScope(c10::Device device) {
   return new StreamScope(stream);
 }
 
+DeviceStream* NewDeviceStream(c10::Device device) {
+  if (!IsAcceleratorDevice(device)) {
+    return nullptr;
+  }
+  c10::impl::VirtualGuardImpl guard_impl(device.type());
+  return new DeviceStream(guard_impl.getStreamFromGlobalPool(device));
+}
+
+StreamScope* OpenDeviceStream(DeviceStream* stream) {
+  if (stream == nullptr) {
+    return nullptr;
+  }
+  return new StreamScope(stream->stream);
+}
+
+void DeleteDeviceStream(DeviceStream* stream) {
+  delete stream;
+}
+
 void DeleteStreamScope(StreamScope* scope) {
   delete scope;
+}
+
+DeviceEvent* NewDeviceEvent(c10::Device device) {
+  if (!IsAcceleratorDevice(device)) {
+    return nullptr;
+  }
+  return new DeviceEvent(device);
+}
+
+void RecordDeviceEvent(DeviceEvent* event) {
+  if (event == nullptr) {
+    return;
+  }
+  event->event.record(GetCurrentStream(event->device));
+}
+
+void WaitDeviceEvent(DeviceEvent* event) {
+  if (event == nullptr) {
+    return;
+  }
+  TORCH_CHECK(event->event.was_marked_for_recording(), "cannot wait for an event before it is recorded");
+  event->event.block(GetCurrentStream(event->device));
+}
+
+bool QueryDeviceEvent(DeviceEvent* event) {
+  return event == nullptr || event->event.query();
+}
+
+void SynchronizeDeviceEvent(DeviceEvent* event) {
+  if (event != nullptr && event->event.was_marked_for_recording()) {
+    event->event.synchronize();
+  }
+}
+
+void DeleteDeviceEvent(DeviceEvent* event) {
+  delete event;
 }
 
 AcceleratorGraph* NewAcceleratorGraph(c10::Device device) {
@@ -252,7 +405,7 @@ void BeginAcceleratorGraphCapture(AcceleratorGraph* graph) {
     ready.block(graph->stream);
   }
   graph->capture_guard = std::make_unique<c10::StreamGuard>(graph->stream);
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(USE_ROCM)
   graph->graph.capture_begin({0, 0}, hipStreamCaptureModeThreadLocal);
 #else
   graph->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
@@ -307,11 +460,41 @@ void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
 #endif
 }
 
+DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
+  InitializeAccelerator();
+  c10::CachingDeviceAllocator::DeviceStats stats;
+#if defined(USE_ROCM)
+  stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+#elif DJL_HAS_DEVICE_ACCELERATOR
+  stats = at::accelerator::getDeviceStats(device);
+#else
+  stats = at::getDeviceAllocator(c10::DeviceType::CUDA)->getDeviceStats(device);
+#endif
+  constexpr auto aggregate = static_cast<size_t>(c10::CachingAllocator::StatType::AGGREGATE);
+  const auto& allocated = stats.allocated_bytes[aggregate];
+  const auto& reserved = stats.reserved_bytes[aggregate];
+  const auto& active = stats.active_bytes[aggregate];
+  return {allocated.current, allocated.peak, reserved.current, reserved.peak, active.current, active.peak};
+}
+
+void ResetPeakMemoryStats(c10::DeviceIndex device) {
+  InitializeAccelerator();
+#if defined(USE_ROCM)
+  c10::cuda::CUDACachingAllocator::resetPeakStats(device);
+#elif DJL_HAS_DEVICE_ACCELERATOR
+  at::accelerator::resetPeakStats(device);
+#else
+  at::getDeviceAllocator(c10::DeviceType::CUDA)->resetPeakStats(device);
+#endif
+}
+
 void EmptyCache() {
   if (!IsAvailable()) {
     return;
   }
-#if DJL_HAS_DEVICE_ACCELERATOR
+#if defined(USE_ROCM)
+  c10::cuda::CUDACachingAllocator::emptyCache();
+#elif DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::emptyCache();
 #else
   at::getDeviceAllocator(c10::DeviceType::CUDA)->emptyCache();

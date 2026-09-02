@@ -1,7 +1,7 @@
 /*
  * Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
  * with the License. A copy of the License is located at
  *
  * http://aws.amazon.com/apache2.0/
@@ -84,9 +84,7 @@ public class MasterWeightOptimizerTest {
                 () -> optimizer.updateWithMasterWeight("master-dtype", bfloat16, int32, int32));
         Assert.assertThrows(
                 IllegalArgumentException.class,
-                () ->
-                        optimizer.updateWithMasterWeight(
-                                "gradient-dtype", bfloat16, float32, bfloat16));
+                () -> optimizer.updateWithMasterWeight("gradient-dtype", bfloat16, float32, int32));
         Assert.assertThrows(
                 IllegalArgumentException.class,
                 () ->

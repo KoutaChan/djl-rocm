@@ -44,18 +44,37 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_utils.h"
     "src/main/native/djl_pytorch_accelerator.h"
     "src/main/native/djl_pytorch_accelerator.cc"
+    "src/main/native/djl_pytorch_fusion.h"
+    "src/main/native/djl_pytorch_fusion.cc"
+    "src/main/native/djl_pytorch_fusion_backend.h"
+    "src/main/native/djl_pytorch_fusion_kernels.h"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
+    "src/main/native/djl_pytorch_attention.h"
+    "src/main/native/djl_pytorch_attention.cc"
+    "src/main/native/djl_pytorch_rocm_attention.h"
+    "src/main/native/djl_pytorch_rocm_attention.cc"
+    "src/main/native/djl_pytorch_single_query_attention.h"
     "src/main/native/djl_pytorch_masked_categorical.h"
     "src/main/native/djl_pytorch_masked_categorical.cc"
+    "src/main/native/djl_pytorch_routing_masks.h"
+    "src/main/native/djl_pytorch_routing_masks.cc"
     "src/main/native/djl_pytorch_row_ops.h"
     "src/main/native/djl_pytorch_row_ops.cc"
+    "src/main/native/djl_pytorch_layer_norm.h"
+    "src/main/native/djl_pytorch_layer_norm.cc"
+    "src/main/native/djl_pytorch_projected_residual_mlp.h"
+    "src/main/native/djl_pytorch_projected_residual_mlp.cc"
+    "src/main/native/djl_pytorch_flat_gradient.h"
+    "src/main/native/djl_pytorch_flat_gradient.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
+    "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_fusion.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_autocast.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_nn_functional.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_inference.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_ivalue.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_optim.cc"
+    "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_flat_gradient.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_distributed.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_torch_comparison.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_tensor.cc"
@@ -91,11 +110,24 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         set(CMAKE_HIP_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "HIP MinSizeRel flags" FORCE)
     endif()
     list(APPEND SOURCE_FILES
+        "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
+        "src/main/native/djl_pytorch_single_query_attention.hip"
         "src/main/native/djl_pytorch_rocm_launch_config.cc")
     set_source_files_properties(
+        "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
+        "src/main/native/djl_pytorch_single_query_attention.hip"
         PROPERTIES LANGUAGE HIP)
+endif()
+
+if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
+    enable_language(CUDA)
+    list(APPEND SOURCE_FILES
+        "src/main/native/djl_pytorch_fusion_kernels.cu")
+    set_source_files_properties(
+        "src/main/native/djl_pytorch_fusion_kernels.cu"
+        PROPERTIES LANGUAGE CUDA)
 endif()
 
 if(PT_VERSION)
@@ -157,8 +189,45 @@ if((USE_CUDA OR USE_ROCM) AND NOT BUILD_ANDROID)
     target_compile_definitions(djl_torch PRIVATE DJL_USE_ACCELERATOR_GRAPH)
 endif()
 if(USE_ROCM AND NOT BUILD_ANDROID)
-    target_compile_definitions(djl_torch PRIVATE DJL_USE_ROCM_KERNELS)
+    target_compile_definitions(djl_torch PRIVATE DJL_USE_FUSION_KERNELS DJL_USE_ROCM_KERNELS)
     set_property(TARGET djl_torch PROPERTY HIP_STANDARD 17)
+    find_path(HIPBLASLT_INCLUDE_DIR
+        NAMES hipblaslt/hipblaslt.h
+        HINTS $ENV{ROCM_PATH} /opt/rocm
+        PATH_SUFFIXES include
+        REQUIRED)
+    find_library(HIPBLASLT_LIBRARY
+        NAMES hipblaslt
+        HINTS $ENV{ROCM_PATH} /opt/rocm
+        PATH_SUFFIXES lib lib64
+        REQUIRED)
+    target_include_directories(djl_torch PRIVATE ${HIPBLASLT_INCLUDE_DIR})
+    target_link_libraries(djl_torch ${HIPBLASLT_LIBRARY})
+
+    # AOTriton is packaged with ROCm-enabled libtorch. Its device-property caches in
+    # releases up to 0.11.2 are initialized lazily without internal synchronization.
+    # Link its public utility API when available so DJL can initialize those caches
+    # before concurrent SDPA dispatch begins.
+    find_path(AOTRITON_INCLUDE_DIR
+        NAMES aotriton/util.h
+        PATHS "${TORCH_INSTALL_PREFIX}/include"
+        NO_DEFAULT_PATH)
+    find_library(AOTRITON_LIBRARY
+        NAMES aotriton_v2
+        PATHS "${TORCH_INSTALL_PREFIX}/lib" "${TORCH_INSTALL_PREFIX}/lib64"
+        NO_DEFAULT_PATH)
+    if(AOTRITON_INCLUDE_DIR AND AOTRITON_LIBRARY)
+        target_compile_definitions(djl_torch PRIVATE DJL_USE_AOTRITON)
+        target_include_directories(djl_torch PRIVATE ${AOTRITON_INCLUDE_DIR})
+        target_link_libraries(djl_torch ${AOTRITON_LIBRARY})
+        message(STATUS "AOTriton SDPA cache initialization enabled: ${AOTRITON_LIBRARY}")
+    else()
+        message(STATUS "AOTriton public utility API not found; SDPA cache initialization disabled")
+    endif()
+endif()
+if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
+    target_compile_definitions(djl_torch PRIVATE DJL_USE_FUSION_KERNELS DJL_USE_CUDA_FUSION_KERNELS)
+    set_property(TARGET djl_torch PROPERTY CUDA_STANDARD 17)
 endif()
 
 # build host
@@ -183,6 +252,9 @@ if(NOT BUILD_ANDROID)
     if(MSVC)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
         file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
+        # An override directory may already contain an older JNI build. Never copy it back over
+        # the target that was just linked.
+        list(FILTER TORCH_DLLS EXCLUDE REGEX "djl_torch\\.dll$")
         add_custom_command(TARGET djl_torch
                 POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -25,15 +25,21 @@ public final class PtGradientCollector implements GradientCollector {
 
     private final Thread ownerThread;
     private final boolean gradMode;
+    private final PtFlatGradientAccumulator flatGradientAccumulator;
     private boolean closed;
 
     /** Constructs a new {@code PtGradientCollector} instance. */
     public PtGradientCollector() {
+        this(null);
+    }
+
+    PtGradientCollector(PtFlatGradientAccumulator flatGradientAccumulator) {
         ownerThread = Thread.currentThread();
         if (ACTIVE.get() != null) {
             throw new IllegalStateException("Nested PtGradientCollectors are not supported.");
         }
 
+        this.flatGradientAccumulator = flatGradientAccumulator;
         gradMode = JniUtils.isGradMode();
         ACTIVE.set(this);
         JniUtils.setGradMode(true);
@@ -69,7 +75,11 @@ public final class PtGradientCollector implements GradientCollector {
      *     higher order derivative products. Defaults to false.
      */
     private void backward(NDArray target, NDArray grad, boolean keepGraph, boolean createGraph) {
-        JniUtils.backward((PtNDArray) target, (PtNDArray) grad, keepGraph, createGraph);
+        if (flatGradientAccumulator == null) {
+            JniUtils.backward((PtNDArray) target, (PtNDArray) grad, keepGraph, createGraph);
+        } else {
+            flatGradientAccumulator.backward((PtNDArray) target, (PtNDArray) grad);
+        }
     }
 
     /** {@inheritDoc} */
@@ -77,6 +87,10 @@ public final class PtGradientCollector implements GradientCollector {
     public void zeroGradients() {
         validateThread();
         validateOpen();
+        if (flatGradientAccumulator != null) {
+            flatGradientAccumulator.zeroGradients();
+            return;
+        }
         NDManager systemManager = PtNDManager.getSystemManager();
         for (NDArray array : systemManager.getManagedArrays()) {
             if (array.hasGradient()) {
@@ -103,6 +117,9 @@ public final class PtGradientCollector implements GradientCollector {
             JniUtils.setGradMode(gradMode);
         } finally {
             ACTIVE.remove();
+            if (flatGradientAccumulator != null) {
+                flatGradientAccumulator.collectorClosed();
+            }
         }
         // TODO: do some clean up if necessary
     }

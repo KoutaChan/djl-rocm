@@ -17,8 +17,46 @@
 
 namespace djl::pytorch {
 
+torch::Tensor embedding_with_offsets(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table);
+
+torch::Tensor embedding_feature_pack(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features);
+
 torch::Tensor scatter_rows(
     const torch::Tensor& rows, const torch::Tensor& row_indices, int64_t row_count);
+
+torch::Tensor segmented_lookup_sum(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
+
+/**
+ * Returns packed float32 weighted mean, minimum, and maximum values for each row.
+ * This diagnostic reduction is not differentiable.
+ */
+torch::Tensor weighted_row_statistics(
+    const torch::Tensor& values, const torch::Tensor& weights);
+
+/**
+ * Selects one-based rows from each batch while mapping padding and out-of-range indices to zero.
+ * Repeated selections accumulate into the source gradient.
+ */
+torch::Tensor padded_batch_gather(
+    const torch::Tensor& source, const torch::Tensor& stored_indices);
+
+/**
+ * Selects one-based outer and inner rows while mapping invalid index pairs to zero.
+ * Repeated selections accumulate into the source gradient.
+ */
+torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
+    const torch::Tensor& outer_stored_indices, const torch::Tensor& inner_stored_indices);
+
+/**
+ * Selects one-based rows from explicit zero-based batches while mapping invalid pairs to zero.
+ * Repeated selections accumulate into the source gradient.
+ */
+torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
+    const torch::Tensor& batch_indices, const torch::Tensor& stored_indices);
 
 }  // namespace djl::pytorch
 

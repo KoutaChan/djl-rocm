@@ -18,6 +18,9 @@ import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
 import ai.djl.engine.InferenceMode;
+import ai.djl.engine.fusion.FusionCompiler;
+import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
@@ -38,7 +41,12 @@ import java.io.FileNotFoundException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The {@code PtEngine} is an implementation of the {@link Engine} based on the <a
@@ -140,6 +148,39 @@ public final class PtEngine extends Engine {
         return JniUtils.getGpuCount();
     }
 
+    /**
+     * Returns PyTorch caching allocator memory statistics for a GPU device.
+     *
+     * <p>The returned values describe memory managed by the PyTorch allocator, not total process or
+     * device memory.
+     *
+     * @param device the GPU device
+     * @return an immutable snapshot of allocator memory statistics
+     * @throws IllegalArgumentException if the device is not a GPU device
+     */
+    public PtMemoryStats getMemoryStats(Device device) {
+        if (!device.isGpu()) {
+            throw new IllegalArgumentException("Memory statistics require a GPU device.");
+        }
+        return new PtMemoryStats(JniUtils.getMemoryStats(device.getDeviceId()));
+    }
+
+    /**
+     * Resets PyTorch caching allocator peak memory statistics for a GPU device.
+     *
+     * <p>Each peak is reset to the corresponding current value. This method does not synchronize
+     * the device or release cached memory.
+     *
+     * @param device the GPU device
+     * @throws IllegalArgumentException if the device is not a GPU device
+     */
+    public void resetPeakMemoryStats(Device device) {
+        if (!device.isGpu()) {
+            throw new IllegalArgumentException("Memory statistics require a GPU device.");
+        }
+        JniUtils.resetPeakMemoryStats(device.getDeviceId());
+    }
+
     /** {@inheritDoc} */
     @Override
     public SymbolBlock newSymbolBlock(NDManager manager) {
@@ -170,6 +211,42 @@ public final class PtEngine extends Engine {
         return new PtGradientCollector();
     }
 
+    /**
+     * Creates an accumulator that writes gradients directly into a caller-owned flat tensor.
+     *
+     * <p>The parameter order defines the non-overlapping slices of {@code gradient}. Parameters and
+     * the destination must be same-device, same-type PyTorch tensors and remain owned by the
+     * caller. On an accelerator, one accumulator is confined to the stream of its first operation.
+     *
+     * @param parameters ordered leaf parameters whose gradients are collected
+     * @param gradient contiguous rank-1 destination tensor
+     * @return a reusable flat gradient accumulator
+     */
+    public PtFlatGradientAccumulator newFlatGradientAccumulator(
+            NDList parameters, NDArray gradient) {
+        return new PtFlatGradientAccumulator(parameters, gradient);
+    }
+
+    /**
+     * Creates a reusable plan that packs leaf gradients into a caller-owned flat tensor.
+     *
+     * <p>The parameter order defines the non-overlapping slices of {@code destination}. The
+     * parameters and destination must be same-device PyTorch tensors. The destination must be a
+     * contiguous, floating-point rank-1 tensor whose element count equals the total parameter
+     * element count. Its data type may differ from the parameter data types.
+     *
+     * <p>On an accelerator, the first operation binds the packer to the current device stream. All
+     * later operations must use that stream. The parameter arrays and destination remain
+     * caller-owned and must outlive the packer.
+     *
+     * @param parameters ordered parameters whose leaf gradients are packed
+     * @param destination contiguous rank-1 destination tensor
+     * @return a reusable flat gradient packer
+     */
+    public PtFlatGradientPacker newFlatGradientPacker(NDList parameters, NDArray destination) {
+        return new PtFlatGradientPacker(parameters, destination);
+    }
+
     /** {@inheritDoc} */
     @Override
     public GradientCollectorMode getGradientCollectorMode() {
@@ -193,6 +270,26 @@ public final class PtEngine extends Engine {
     }
 
     /**
+     * Creates a reusable device stream selected from PyTorch's stream pool.
+     *
+     * @param device device on which work is enqueued
+     * @return a reusable device stream
+     */
+    public PtStream newStream(Device device) {
+        return new PtStream(device);
+    }
+
+    /**
+     * Creates a reusable device event.
+     *
+     * @param device device on which the event is recorded
+     * @return a reusable device event
+     */
+    public PtEvent newEvent(Device device) {
+        return new PtEvent(device);
+    }
+
+    /**
      * Creates a reusable accelerator graph for a fixed-shape workload.
      *
      * @param device accelerator device on which capture and replay execute
@@ -200,6 +297,12 @@ public final class PtEngine extends Engine {
      */
     public PtAcceleratorGraph newAcceleratorGraph(Device device) {
         return new PtAcceleratorGraph(device);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public FusionCompiler newFusionCompiler(Device device) {
+        return new PtFusionCompiler(device);
     }
 
     /** {@inheritDoc} */
@@ -226,8 +329,46 @@ public final class PtEngine extends Engine {
 
     /** {@inheritDoc} */
     @Override
-    public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
-        return new PtAutocast(device, dtype, true, cacheEnabled);
+    public Autocast newAutocast(Device device, DataType dataType, boolean cacheEnabled) {
+        return new PtAutocast(device, dataType, true, cacheEnabled);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean unscaleGradients(NDList gradients, float inverseScale) {
+        if (inverseScale <= 0f || !Float.isFinite(inverseScale)) {
+            throw new IllegalArgumentException("inverseScale must be positive and finite.");
+        }
+
+        Map<Device, Map<DataType, List<PtNDArray>>> grouped = new ConcurrentHashMap<>();
+        for (NDArray gradient : gradients) {
+            if (!(gradient instanceof PtNDArray)) {
+                throw new IllegalArgumentException(
+                        "PyTorch GradScaler requires PyTorch gradient arrays.");
+            }
+            switch (gradient.getDataType()) {
+                case FLOAT16:
+                case BFLOAT16:
+                case FLOAT32:
+                case FLOAT64:
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "GradScaler gradients must use a real floating data type.");
+            }
+            grouped.computeIfAbsent(gradient.getDevice(), key -> new EnumMap<>(DataType.class))
+                    .computeIfAbsent(gradient.getDataType(), key -> new ArrayList<>())
+                    .add((PtNDArray) gradient);
+        }
+
+        boolean gradientsFinite = true;
+        for (Map<DataType, List<PtNDArray>> byDataType : grouped.values()) {
+            for (List<PtNDArray> group : byDataType.values()) {
+                boolean groupFinite = JniUtils.unscaleGradients(group, inverseScale);
+                gradientsFinite &= groupFinite;
+            }
+        }
+        return gradientsFinite;
     }
 
     /** {@inheritDoc} */

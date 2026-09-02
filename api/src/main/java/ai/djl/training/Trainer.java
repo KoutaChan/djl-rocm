@@ -14,11 +14,12 @@ package ai.djl.training;
 
 import ai.djl.Device;
 import ai.djl.Model;
+import ai.djl.engine.Autocast;
 import ai.djl.metric.Metrics;
 import ai.djl.ndarray.NDArray;
-import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.Parameter;
 import ai.djl.nn.UninitializedParameterException;
@@ -65,6 +66,7 @@ import java.util.function.Consumer;
  * @see <a href="https://docs.djl.ai/master/docs/development/memory_management.html">The guide on
  *     memory management</a>
  */
+@SuppressWarnings("try") // Autocast resources are used for their scope side effects.
 public class Trainer implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(Trainer.class);
@@ -78,6 +80,11 @@ public class Trainer implements AutoCloseable {
     private List<Evaluator> evaluators;
     private Loss loss;
     private ExecutorService executorService;
+    private DataType autocastDataType;
+    private boolean autocastCacheEnabled;
+    private GradScaler gradScaler;
+    private final ThreadLocal<MixedPrecisionGradientCollector> activeMixedPrecisionCollector =
+            new ThreadLocal<>();
 
     private boolean gradientsChecked;
 
@@ -99,6 +106,18 @@ public class Trainer implements AutoCloseable {
         evaluators = new ArrayList<>(trainingConfig.getEvaluators());
         evaluators.add(loss); // track loss as an evaluator by default
         executorService = trainingConfig.getExecutorService();
+        autocastDataType = trainingConfig.getAutocastDataType().orElse(null);
+        if (autocastDataType != null
+                && autocastDataType != DataType.FLOAT16
+                && autocastDataType != DataType.BFLOAT16) {
+            throw new IllegalArgumentException(
+                    "Training autocast data type must be FLOAT16 or BFLOAT16.");
+        }
+        autocastCacheEnabled = trainingConfig.isAutocastCacheEnabled();
+        gradScaler = trainingConfig.getGradScaler().orElse(null);
+        if (autocastDataType == DataType.FLOAT16 && gradScaler == null) {
+            gradScaler = GradScaler.builder().build();
+        }
 
         ParameterServer parameterServer =
                 manager.getEngine()
@@ -178,7 +197,27 @@ public class Trainer implements AutoCloseable {
      * @return a new instance of {@link GradientCollector}
      */
     public GradientCollector newGradientCollector() {
-        return manager.getEngine().newGradientCollector();
+        GradientCollector collector = manager.getEngine().newGradientCollector();
+        if (autocastDataType == null && gradScaler == null) {
+            return collector;
+        }
+        return new MixedPrecisionGradientCollector(collector);
+    }
+
+    /**
+     * Opens this trainer's configured autocast scope for a device.
+     *
+     * <p>When autocast is disabled, the returned guard is a no-op. The guard must be opened on the
+     * thread that executes the operations because backend autocast state is thread-local.
+     *
+     * @param device the device on which operations will execute
+     * @return the configured autocast guard
+     */
+    public Autocast newAutocast(Device device) {
+        if (autocastDataType == null) {
+            return NoOpAutocast.INSTANCE;
+        }
+        return manager.getEngine().newAutocast(device, autocastDataType, autocastCacheEnabled);
     }
 
     /**
@@ -190,9 +229,12 @@ public class Trainer implements AutoCloseable {
     public NDList forward(NDList input) {
         long begin = System.nanoTime();
         try {
-            NDList output = model.getBlock().forward(parameterStore, input, true);
-            parameterStore.prepareForBackward(output);
-            return output;
+            parameterStore.prepareForForward();
+            try (Autocast ignored = newAutocast(executionDevice(input))) {
+                NDList output = model.getBlock().forward(parameterStore, input, true);
+                parameterStore.prepareForBackward(output);
+                return output;
+            }
         } finally {
             addMetric("forward", begin);
         }
@@ -208,9 +250,12 @@ public class Trainer implements AutoCloseable {
     public NDList forward(NDList data, NDList labels) {
         long begin = System.nanoTime();
         try {
-            NDList output = model.getBlock().forward(parameterStore, data, labels, null);
-            parameterStore.prepareForBackward(output);
-            return output;
+            parameterStore.prepareForForward();
+            try (Autocast ignored = newAutocast(executionDevice(data))) {
+                NDList output = model.getBlock().forward(parameterStore, data, labels, null);
+                parameterStore.prepareForBackward(output);
+                return output;
+            }
         } finally {
             addMetric("forward", begin);
         }
@@ -223,18 +268,89 @@ public class Trainer implements AutoCloseable {
      * @return the output of the predict function
      */
     public NDList evaluate(NDList input) {
-        return model.getBlock().forward(parameterStore, input, false, null);
+        parameterStore.prepareForForward();
+        try (Autocast ignored = newAutocast(executionDevice(input))) {
+            return model.getBlock().forward(parameterStore, input, false, null);
+        }
     }
 
     /** Updates all of the parameters of the model once. */
     public void step() {
-        if (!gradientsChecked) {
-            checkGradients();
+        MixedPrecisionGradientCollector collector = activeMixedPrecisionCollector.get();
+        if (collector == null) {
+            stepInternal();
+            return;
         }
 
-        long begin = System.nanoTime();
-        parameterStore.updateAllParameters();
-        addMetric("step", begin);
+        collector.closeAutocastScopes();
+        try {
+            stepInternal();
+        } catch (RuntimeException | Error e) {
+            try {
+                collector.openAutocastScopes();
+            } catch (RuntimeException | Error openException) {
+                e.addSuppressed(openException);
+            }
+            throw e;
+        }
+        collector.openAutocastScopes();
+    }
+
+    private void stepInternal() {
+        parameterStore.finalizeGradients(gradScaler != null);
+        if (gradScaler == null) {
+            try {
+                if (!gradientsChecked) {
+                    checkGradients();
+                }
+                long begin = System.nanoTime();
+                parameterStore.updateAllParameters();
+                addMetric("step", begin);
+            } finally {
+                parameterStore.releaseGradientStep();
+            }
+            return;
+        }
+
+        try (NDList gradients = parameterStore.getGradients()) {
+            try {
+                if (!gradientsChecked) {
+                    checkGradients(gradients);
+                }
+                long begin = System.nanoTime();
+                boolean gradientsFinite = gradScaler.unscale(gradients);
+                if (!gradientsFinite) {
+                    for (NDArray gradient : gradients) {
+                        gradient.fillI(0);
+                    }
+                }
+                if (gradientsFinite) {
+                    parameterStore.updateAllParameters();
+                }
+                gradScaler.update();
+                addMetric("step", begin);
+            } finally {
+                parameterStore.releaseGradientStep();
+            }
+        }
+    }
+
+    /**
+     * Returns the configured autocast data type.
+     *
+     * @return the configured autocast data type, or empty if autocast is disabled
+     */
+    public Optional<DataType> getAutocastDataType() {
+        return Optional.ofNullable(autocastDataType);
+    }
+
+    /**
+     * Returns this trainer's gradient scaler.
+     *
+     * @return the configured gradient scaler, or empty if gradient scaling is disabled
+     */
+    public Optional<GradScaler> getGradScaler() {
+        return Optional.ofNullable(gradScaler);
     }
 
     /**
@@ -255,6 +371,28 @@ public class Trainer implements AutoCloseable {
      */
     public void loadOptimizerState(Path path) throws IOException {
         parameterStore.loadOptimizerState(path);
+    }
+
+    /**
+     * Saves the configured {@link GradScaler} state.
+     *
+     * @param path the file to save scaler state to
+     * @throws IllegalStateException if this trainer does not use a scaler or a step is active
+     * @throws IOException if the state cannot be written
+     */
+    public void saveGradScalerState(Path path) throws IOException {
+        requireGradScaler().saveState(path);
+    }
+
+    /**
+     * Restores the configured {@link GradScaler} state.
+     *
+     * @param path the scaler state file to load
+     * @throws IllegalStateException if this trainer does not use a scaler or a step is active
+     * @throws IOException if the state is invalid, incompatible, or cannot be read
+     */
+    public void loadGradScalerState(Path path) throws IOException {
+        requireGradScaler().loadState(path);
     }
 
     /**
@@ -401,18 +539,56 @@ public class Trainer implements AutoCloseable {
                                                 .getGradient()));
 
         try (NDManager scoped = manager.newSubManager()) {
-            scoped.tempAttachAll(new NDList(grads));
-            NDList list = new NDList(grads.stream().map(NDArray::sum).toArray(NDArray[]::new));
-            float gradSum = NDArrays.stack(list).sum().getFloat();
-
-            if (gradSum == 0f) {
-                throw new IllegalStateException(
-                        "Gradient values are all zeros, please call gradientCollector.backward() on"
-                                + "your target NDArray (usually loss), before calling step() ");
-            }
-
-            gradientsChecked = true;
+            NDList gradients = new NDList(grads);
+            scoped.tempAttachAll(gradients);
+            checkGradients(gradients);
         }
+    }
+
+    private void checkGradients(NDList gradients) {
+        boolean hasNonZeroGradient = false;
+        for (NDArray gradient : gradients) {
+            if (hasNonZeroGradient(gradient)) {
+                hasNonZeroGradient = true;
+                break;
+            }
+        }
+
+        if (!hasNonZeroGradient) {
+            throw new IllegalStateException(
+                    "Gradient values are all zeros, please call gradientCollector.backward() on"
+                            + "your target NDArray (usually loss), before calling step() ");
+        }
+
+        gradientsChecked = true;
+    }
+
+    private boolean hasNonZeroGradient(NDArray gradient) {
+        if (gradient.isSparse()) {
+            try (NDArray absoluteGradient = gradient.abs();
+                    NDArray absoluteSum = absoluteGradient.sum()) {
+                return absoluteSum.getFloat() != 0f;
+            }
+        }
+
+        try (NDArray nonZero = gradient.neq(0);
+                NDArray anyNonZero = nonZero.any()) {
+            return anyNonZero.getBoolean();
+        }
+    }
+
+    private Device executionDevice(NDList input) {
+        if (input.isEmpty()) {
+            return devices[0];
+        }
+        return input.head().getDevice();
+    }
+
+    private GradScaler requireGradScaler() {
+        if (gradScaler == null) {
+            throw new IllegalStateException("This trainer does not use a GradScaler.");
+        }
+        return gradScaler;
     }
 
     /**
@@ -425,5 +601,159 @@ public class Trainer implements AutoCloseable {
         if (metrics != null && begin > 0L) {
             metrics.addMetric(metricName, System.nanoTime() - begin);
         }
+    }
+
+    private final class MixedPrecisionGradientCollector implements GradientCollector {
+
+        private final GradientCollector delegate;
+        private final Thread ownerThread;
+        private final List<Autocast> autocastScopes;
+        private boolean closed;
+
+        private MixedPrecisionGradientCollector(GradientCollector delegate) {
+            this.delegate = delegate;
+            ownerThread = Thread.currentThread();
+            autocastScopes = new ArrayList<>();
+            try {
+                openAutocastScopes();
+            } catch (RuntimeException | Error e) {
+                try {
+                    delegate.close();
+                } catch (RuntimeException | Error closeException) {
+                    e.addSuppressed(closeException);
+                }
+                throw e;
+            }
+            if (activeMixedPrecisionCollector.get() != null) {
+                closeAutocastScopes();
+                delegate.close();
+                throw new IllegalStateException(
+                        "Nested mixed-precision GradientCollectors are not supported.");
+            }
+            activeMixedPrecisionCollector.set(this);
+        }
+
+        @Override
+        public void backward(NDArray target) {
+            validateThread();
+            validateOpen();
+            closeAutocastScopes();
+            try {
+                DataType dataType = target.getDataType();
+                NDArray converted =
+                        dataType == DataType.FLOAT16 || dataType == DataType.BFLOAT16
+                                ? target.toType(DataType.FLOAT32, false)
+                                : null;
+                try (NDArray convertedTarget = converted) {
+                    NDArray backwardTarget = convertedTarget == null ? target : convertedTarget;
+                    NDArray scaled = gradScaler == null ? null : gradScaler.scale(backwardTarget);
+                    try (NDArray scaledTarget = scaled) {
+                        delegate.backward(scaledTarget == null ? backwardTarget : scaledTarget);
+                    }
+                }
+            } catch (RuntimeException | Error e) {
+                try {
+                    openAutocastScopes();
+                } catch (RuntimeException | Error openException) {
+                    e.addSuppressed(openException);
+                }
+                throw e;
+            }
+            openAutocastScopes();
+        }
+
+        @Override
+        public void zeroGradients() {
+            validateThread();
+            validateOpen();
+            delegate.zeroGradients();
+        }
+
+        @Override
+        public void close() {
+            validateThread();
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                closeAutocastScopes();
+            } finally {
+                try {
+                    delegate.close();
+                } finally {
+                    if (activeMixedPrecisionCollector.get() == this) {
+                        activeMixedPrecisionCollector.remove();
+                    }
+                }
+            }
+        }
+
+        private void openAutocastScopes() {
+            if (autocastDataType == null || closed || !autocastScopes.isEmpty()) {
+                return;
+            }
+
+            List<String> deviceTypes = new ArrayList<>();
+            try {
+                for (Device device : devices) {
+                    if (!deviceTypes.contains(device.getDeviceType())) {
+                        autocastScopes.add(newAutocast(device));
+                        deviceTypes.add(device.getDeviceType());
+                    }
+                }
+            } catch (RuntimeException | Error e) {
+                closeAutocastScopes(e);
+                throw e;
+            }
+        }
+
+        private void closeAutocastScopes() {
+            Throwable failure = closeAutocastScopes(null);
+            if (failure instanceof RuntimeException) {
+                throw (RuntimeException) failure;
+            }
+            if (failure != null) {
+                throw (Error) failure;
+            }
+        }
+
+        private Throwable closeAutocastScopes(Throwable failure) {
+            for (int i = autocastScopes.size() - 1; i >= 0; --i) {
+                try {
+                    autocastScopes.get(i).close();
+                } catch (RuntimeException | Error e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            autocastScopes.clear();
+            return failure;
+        }
+
+        private void validateThread() {
+            if (Thread.currentThread() != ownerThread) {
+                throw new IllegalStateException(
+                        "Mixed-precision GradientCollector can only be used from the thread that"
+                                + " created it.");
+            }
+        }
+
+        private void validateOpen() {
+            if (closed) {
+                throw new IllegalStateException(
+                        "Mixed-precision GradientCollector has already been closed.");
+            }
+        }
+    }
+
+    private enum NoOpAutocast implements Autocast {
+        INSTANCE;
+
+        @Override
+        public void close() {}
     }
 }

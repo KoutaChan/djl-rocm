@@ -14,6 +14,7 @@ package ai.djl.pytorch.jni;
 
 import ai.djl.Device;
 import ai.djl.ndarray.NDList;
+import ai.djl.ndarray.NDScope;
 import ai.djl.ndarray.index.NDIndex;
 import ai.djl.ndarray.index.dim.NDIndexAll;
 import ai.djl.ndarray.index.dim.NDIndexBooleans;
@@ -25,6 +26,7 @@ import ai.djl.ndarray.index.dim.NDIndexSlice;
 import ai.djl.ndarray.index.dim.NDIndexTake;
 import ai.djl.ndarray.index.full.NDIndexFullPick;
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.recurrent.RNN;
@@ -118,6 +120,44 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchCloseStreamScope(handle);
     }
 
+    public static long createDeviceStream(Device device) {
+        return PyTorchLibrary.LIB.torchCreateDeviceStream(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+    }
+
+    public static long openDeviceStream(long handle) {
+        return PyTorchLibrary.LIB.torchOpenDeviceStream(handle);
+    }
+
+    public static void deleteDeviceStream(long handle) {
+        PyTorchLibrary.LIB.torchDeleteDeviceStream(handle);
+    }
+
+    public static long createDeviceEvent(Device device) {
+        return PyTorchLibrary.LIB.torchCreateDeviceEvent(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
+    }
+
+    public static void recordDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchRecordDeviceEvent(handle);
+    }
+
+    public static void waitDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchWaitDeviceEvent(handle);
+    }
+
+    public static boolean queryDeviceEvent(long handle) {
+        return PyTorchLibrary.LIB.torchQueryDeviceEvent(handle);
+    }
+
+    public static void synchronizeDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchSynchronizeDeviceEvent(handle);
+    }
+
+    public static void deleteDeviceEvent(long handle) {
+        PyTorchLibrary.LIB.torchDeleteDeviceEvent(handle);
+    }
+
     public static long createAcceleratorGraph(Device device) {
         return PyTorchLibrary.LIB.torchCreateAcceleratorGraph(
                 new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()});
@@ -139,13 +179,61 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchDeleteAcceleratorGraph(handle);
     }
 
-    // ------------------------------------------------------------------
-    // Autocast (at::autocast) thread-local flags. deviceType uses the same
-    // integer encoding as PtDeviceType.toDeviceType (0=CPU, 1=CUDA/GPU).
-    // ROCm libtorch built with PYTORCH_HIP_AS_CUDA=1 registers autocast
-    // under CUDA, so both NVIDIA and AMD GPUs pass deviceType=1. dtype
-    // uses DataType.ordinal() (0=FLOAT32, 11=BFLOAT16, ...).
-    // ------------------------------------------------------------------
+    public static long prepareFusionPlan(Device device, ByteBuffer descriptor) {
+        return PyTorchLibrary.LIB.torchPrepareFusionPlan(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}, descriptor);
+    }
+
+    /**
+     * Returns the fusion backend compiled into the loaded native library.
+     *
+     * @return {@code 0} when unavailable, {@code 1} for CUDA, or {@code 2} for ROCm
+     */
+    public static int getFusionBackend() {
+        return PyTorchLibrary.LIB.torchGetFusionBackend();
+    }
+
+    public static long bindFusionPlan(long planHandle, ByteBuffer constantHandles) {
+        return PyTorchLibrary.LIB.torchBindFusionPlan(planHandle, constantHandles);
+    }
+
+    public static long createFusionSession(long executableHandle, int bufferCount) {
+        return PyTorchLibrary.LIB.torchCreateFusionSession(executableHandle, bufferCount);
+    }
+
+    public static PtNDArray getFusionSessionOutput(
+            PtNDManager manager, long sessionHandle, int bufferIndex, int outputIndex) {
+        long outputHandle =
+                PyTorchLibrary.LIB.torchGetFusionSessionOutput(
+                        sessionHandle, bufferIndex, outputIndex);
+        PtNDArray output = new PtNDArray(manager, outputHandle);
+        NDScope.unregister(output);
+        return output;
+    }
+
+    public static void submitFusion(
+            long sessionHandle, int bufferIndex, ByteBuffer inputHandles, ByteBuffer dimensions) {
+        PyTorchLibrary.LIB.torchSubmitFusion(sessionHandle, bufferIndex, inputHandles, dimensions);
+    }
+
+    public static void synchronizeFusionOutput(long sessionHandle, int bufferIndex) {
+        PyTorchLibrary.LIB.torchSynchronizeFusionOutput(sessionHandle, bufferIndex);
+    }
+
+    public static void deleteFusionPlan(long handle) {
+        PyTorchLibrary.LIB.torchDeleteFusionPlan(handle);
+    }
+
+    public static void deleteFusionExecutable(long handle) {
+        PyTorchLibrary.LIB.torchDeleteFusionExecutable(handle);
+    }
+
+    public static void deleteFusionSession(long handle) {
+        PyTorchLibrary.LIB.torchDeleteFusionSession(handle);
+    }
+
+    // Autocast state is thread-local. deviceType follows PtDeviceType and dataType uses
+    // DataType.ordinal(). ROCm registers autocast under the CUDA device type.
 
     public static boolean autocastIsEnabled(int deviceType) {
         return PyTorchLibrary.LIB.torchAutocastIsEnabled(deviceType);
@@ -155,12 +243,36 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchAutocastSetEnabled(deviceType, enabled);
     }
 
-    public static int autocastGetDtype(int deviceType) {
+    public static int autocastGetDataType(int deviceType) {
         return PyTorchLibrary.LIB.torchAutocastGetDtype(deviceType);
     }
 
-    public static void autocastSetDtype(int deviceType, int dtype) {
-        PyTorchLibrary.LIB.torchAutocastSetDtype(deviceType, dtype);
+    public static void autocastSetDataType(int deviceType, int dataType) {
+        PyTorchLibrary.LIB.torchAutocastSetDtype(deviceType, dataType);
+    }
+
+    /**
+     * Returns the autocast data type.
+     *
+     * @param deviceType the PyTorch device type
+     * @return the {@link DataType} ordinal
+     * @deprecated Use {@link #autocastGetDataType(int)}.
+     */
+    @Deprecated
+    public static int autocastGetDtype(int deviceType) {
+        return autocastGetDataType(deviceType);
+    }
+
+    /**
+     * Sets the autocast data type.
+     *
+     * @param deviceType the PyTorch device type
+     * @param dataType the {@link DataType} ordinal
+     * @deprecated Use {@link #autocastSetDataType(int, int)}.
+     */
+    @Deprecated
+    public static void autocastSetDtype(int deviceType, int dataType) {
+        autocastSetDataType(deviceType, dataType);
     }
 
     public static boolean autocastIsCacheEnabled() {
@@ -215,6 +327,14 @@ public final class JniUtils {
 
     public static int getGpuCount() {
         return PyTorchLibrary.LIB.torchGetGpuCount();
+    }
+
+    public static long[] getMemoryStats(int deviceId) {
+        return PyTorchLibrary.LIB.torchGetMemoryStats(deviceId);
+    }
+
+    public static void resetPeakMemoryStats(int deviceId) {
+        PyTorchLibrary.LIB.torchResetPeakMemoryStats(deviceId);
     }
 
     public static void setSeed(long seed) {
@@ -422,6 +542,14 @@ public final class JniUtils {
                         ndArray.getHandle(),
                         dataType.ordinal(),
                         new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}));
+    }
+
+    /** Converts a floating-point array without detaching it from the autograd graph. */
+    public static PtNDArray differentiableCast(PtNDArray ndArray, DataType dataType) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchDifferentiableCast(
+                        ndArray.getHandle(), dataType.ordinal()));
     }
 
     public static PtNDArray toSparse(PtNDArray ndArray) {
@@ -639,9 +767,21 @@ public final class JniUtils {
                 self.getHandle(), pinnedBufferHandle);
     }
 
+    public static void enqueueCopyFrom(PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchEnqueueCopyFrom(self.getHandle(), pinnedBufferHandle);
+    }
+
     public static long copyToPinnedBufferAsync(PtNDArray self, long pinnedBufferHandle) {
         return PyTorchLibrary.LIB.torchCopyToPinnedBufferAsync(
                 self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static void enqueueCopyTo(PtNDArray self, long pinnedBufferHandle) {
+        PyTorchLibrary.LIB.torchEnqueueCopyTo(self.getHandle(), pinnedBufferHandle);
+    }
+
+    public static void copyTo(PtNDArray source, PtNDArray target) {
+        PyTorchLibrary.LIB.torchCopyTo(source.getHandle(), target.getHandle());
     }
 
     public static void synchronizeCopyEvent(long handle) {
@@ -652,8 +792,8 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchDeleteCopyEvent(handle);
     }
 
-    public static void copyTo(PtNDArray source, PtNDArray target) {
-        PyTorchLibrary.LIB.torchCopyTo(source.getHandle(), target.getHandle());
+    public static void recordStream(PtNDArray self) {
+        PyTorchLibrary.LIB.torchRecordStream(self.getHandle());
     }
 
     public static PtNDArray gather(PtNDArray ndArray, PtNDArray index, long dim) {
@@ -693,6 +833,27 @@ public final class JniUtils {
                         ndArray.getHandle(), index.getHandle(), value.getHandle(), axis));
     }
 
+    /** Adds namespace offsets to integer IDs and performs a dense embedding lookup. */
+    public static PtNDArray embeddingWithOffsets(
+            PtNDArray rawIds, PtNDArray offsets, PtNDArray table) {
+        return new PtNDArray(
+                rawIds.getManager(),
+                PyTorchLibrary.LIB.torchEmbeddingWithOffsets(
+                        rawIds.getHandle(), offsets.getHandle(), table.getHandle()));
+    }
+
+    /** Packs flattened offset embedding fields followed by dense features. */
+    public static PtNDArray embeddingFeaturePack(
+            PtNDArray rawIds, PtNDArray offsets, PtNDArray table, PtNDArray features) {
+        return new PtNDArray(
+                rawIds.getManager(),
+                PyTorchLibrary.LIB.torchEmbeddingFeaturePack(
+                        rawIds.getHandle(),
+                        offsets.getHandle(),
+                        table.getHandle(),
+                        features.getHandle()));
+    }
+
     /** Selects leading-axis rows with a one-dimensional index tensor. */
     public static PtNDArray gatherRows(PtNDArray rows, PtNDArray rowIndices) {
         if (rowIndices.getDataType() != DataType.INT64) {
@@ -712,6 +873,72 @@ public final class JniUtils {
                 rows.getManager(),
                 PyTorchLibrary.LIB.torchScatterRows(
                         rows.getHandle(), rowIndices.getHandle(), rowCount));
+    }
+
+    /** Builds masked categorical membership indicators. */
+    public static PtNDArray categoricalMasks(
+            PtNDArray categories, PtNDArray mask, int[] fieldIndices, long[] categorySets) {
+        return new PtNDArray(
+                categories.getManager(),
+                PyTorchLibrary.LIB.torchCategoricalMasks(
+                        categories.getHandle(), mask.getHandle(), fieldIndices, categorySets));
+    }
+
+    /** Builds the four masks associated with a routed binary choice. */
+    public static PtNDArray binaryChoiceMasks(
+            PtNDArray routes,
+            PtNDArray firstMask,
+            PtNDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        return new PtNDArray(
+                routes.getManager(),
+                PyTorchLibrary.LIB.torchBinaryChoiceMasks(
+                        routes.getHandle(),
+                        firstMask.getHandle(),
+                        secondMask.getHandle(),
+                        representativeField,
+                        firstRouteField,
+                        secondRouteField,
+                        paddingValue));
+    }
+
+    /** Sums one lookup row from each contiguous table segment. */
+    public static PtNDArray segmentedLookupSum(PtNDArray lookupTable, PtNDArray storedIndices) {
+        return new PtNDArray(
+                lookupTable.getManager(),
+                PyTorchLibrary.LIB.torchSegmentedLookupSum(
+                        lookupTable.getHandle(), storedIndices.getHandle()));
+    }
+
+    /** Selects one-based entries from an independent table in each batch. */
+    public static PtNDArray paddedBatchGather(PtNDArray source, PtNDArray storedIndices) {
+        return new PtNDArray(
+                source.getManager(),
+                PyTorchLibrary.LIB.torchPaddedBatchGather(
+                        source.getHandle(), storedIndices.getHandle()));
+    }
+
+    /** Selects one-based entries from two independent table dimensions in each batch. */
+    public static PtNDArray paddedBatchGather(
+            PtNDArray source, PtNDArray outerStoredIndices, PtNDArray innerStoredIndices) {
+        return new PtNDArray(
+                source.getManager(),
+                PyTorchLibrary.LIB.torchPaddedBatchGather2d(
+                        source.getHandle(),
+                        outerStoredIndices.getHandle(),
+                        innerStoredIndices.getHandle()));
+    }
+
+    /** Selects one-based table entries from explicit zero-based batch rows. */
+    public static PtNDArray paddedBatchGatherByBatchIndices(
+            PtNDArray source, PtNDArray batchIndices, PtNDArray storedIndices) {
+        return new PtNDArray(
+                source.getManager(),
+                PyTorchLibrary.LIB.torchPaddedBatchGatherByBatchIndices(
+                        source.getHandle(), batchIndices.getHandle(), storedIndices.getHandle()));
     }
 
     /** Returns {@code ndArray.index_add(axis, index, value)} without mutating the input tensor. */
@@ -813,6 +1040,14 @@ public final class JniUtils {
         return new PtNDArray(arrays[0].getManager(), PyTorchLibrary.LIB.torchCat(pointers, dim));
     }
 
+    /** Converts floating-point arrays while concatenating them along an existing axis. */
+    public static PtNDArray concatToType(PtNDArray[] arrays, long dim, DataType dataType) {
+        long[] pointers = Arrays.stream(arrays).mapToLong(PtNDArray::getHandle).toArray();
+        return new PtNDArray(
+                arrays[0].getManager(),
+                PyTorchLibrary.LIB.torchConcatToType(pointers, dim, dataType.ordinal()));
+    }
+
     public static PtNDArray tile(PtNDArray ndArray, long[] repeats) {
         return new PtNDArray(
                 ndArray.getManager(), PyTorchLibrary.LIB.torchRepeat(ndArray.getHandle(), repeats));
@@ -835,6 +1070,32 @@ public final class JniUtils {
         return new PtNDArray(
                 logits.getManager(),
                 PyTorchLibrary.LIB.torchMaskedSoftmax(logits.getHandle(), mask.getHandle(), axis));
+    }
+
+    /** Returns packed float32 weighted mean, minimum, and maximum values for each row. */
+    public static PtNDArray weightedRowStatistics(PtNDArray values, PtNDArray weights) {
+        return new PtNDArray(
+                values.getManager(),
+                PyTorchLibrary.LIB.torchWeightedRowStatistics(
+                        values.getHandle(), weights.getHandle()));
+    }
+
+    /** Pools values with independently masked softmax weights for several groups. */
+    public static PtNDArray groupedMaskedSoftmaxPool(
+            PtNDArray logits, PtNDArray mask, PtNDArray values) {
+        return new PtNDArray(
+                logits.getManager(),
+                PyTorchLibrary.LIB.torchGroupedMaskedSoftmaxPool(
+                        logits.getHandle(), mask.getHandle(), values.getHandle()));
+    }
+
+    /** Pools selected values with masked softmax weights without materializing the subset. */
+    public static PtNDArray indexedMaskedSoftmaxPool(
+            PtNDArray logits, PtNDArray mask, PtNDArray values, int[] choiceIndices) {
+        return new PtNDArray(
+                logits.getManager(),
+                PyTorchLibrary.LIB.torchIndexedMaskedSoftmaxPool(
+                        logits.getHandle(), mask.getHandle(), values.getHandle(), choiceIndices));
     }
 
     /** Returns the float32 log normalizer over legal mask entries. */
@@ -879,6 +1140,28 @@ public final class JniUtils {
     }
 
     /**
+     * Applies grouped packed attention with the native backend's differentiable execution plan.
+     *
+     * @param query token-major shared query projection
+     * @param packedKeyValue token-major grouped key/value projection
+     * @param mask nonzero valid-token mask
+     * @param heads number of attention heads
+     * @param scale query-key score scale
+     * @return grouped attended values in token-major packed-head layout
+     */
+    public static PtNDArray groupedPackedScaledDotProductAttention(
+            PtNDArray query, PtNDArray packedKeyValue, PtNDArray mask, long heads, float scale) {
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchGroupedPackedScaledDotProductAttention(
+                        query.getHandle(),
+                        packedKeyValue.getHandle(),
+                        mask.getHandle(),
+                        heads,
+                        scale));
+    }
+
+    /**
      * Applies grouped indexed attention without materializing a complete key/value table per query.
      *
      * <p>Packed key/value tensors store all head keys followed by all head values. Positive indexed
@@ -914,6 +1197,42 @@ public final class JniUtils {
     }
 
     /**
+     * Applies differentiable grouped indexed attention through explicit group and shared-delta
+     * lookup mappings.
+     *
+     * @param query queries shaped {@code [query,heads,keyFeatures]}
+     * @param sharedKeyValues packed shared data shaped {@code [groups,sharedTokens,packedWidth]}
+     * @param sharedGroupIndices zero-based group indices
+     * @param sharedDeltaTable packed shared-token delta lookup table
+     * @param sharedDeltaIndices zero-based delta indices
+     * @param indexedDeltas query-specific auxiliary deltas
+     * @param indexedSharedIds one-based shared-token IDs; zero denotes padding
+     * @param scale attention score scale
+     * @return attended values shaped {@code [query,heads,valueFeatures]}
+     */
+    public static PtNDArray mappedGroupedIndexedScaledDotProductAttention(
+            PtNDArray query,
+            PtNDArray sharedKeyValues,
+            PtNDArray sharedGroupIndices,
+            PtNDArray sharedDeltaTable,
+            PtNDArray sharedDeltaIndices,
+            PtNDArray indexedDeltas,
+            PtNDArray indexedSharedIds,
+            float scale) {
+        return new PtNDArray(
+                query.getManager(),
+                PyTorchLibrary.LIB.torchMappedGroupedIndexedScaledDotProductAttention(
+                        query.getHandle(),
+                        sharedKeyValues.getHandle(),
+                        sharedGroupIndices.getHandle(),
+                        sharedDeltaTable.getHandle(),
+                        sharedDeltaIndices.getHandle(),
+                        indexedDeltas.getHandle(),
+                        indexedSharedIds.getHandle(),
+                        scale));
+    }
+
+    /**
      * Adds an inference residual in place and returns its affine LayerNorm.
      *
      * <p>The residual remains the unnormalized sum so the following residual branch observes the
@@ -929,6 +1248,60 @@ public final class JniUtils {
                         weight.getHandle(),
                         bias.getHandle(),
                         epsilon));
+    }
+
+    /** Adds masked embedding rows to an owned token buffer and returns its converted mask. */
+    public static PtNDArray addMaskedEmbeddingResidualToOwnedTokens(
+            PtNDArray tokens,
+            NDList storedIndices,
+            PtNDArray embeddingTable,
+            PtNDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        long[] indexHandles = new long[storedIndices.size()];
+        PtNDManager manager = tokens.getManager();
+        for (int index = 0; index < indexHandles.length; ++index) {
+            indexHandles[index] = manager.from(storedIndices.get(index)).getHandle();
+        }
+        int reductionValue;
+        switch (reduction) {
+            case SUM:
+                reductionValue = 0;
+                break;
+            case MEAN_VALID:
+                reductionValue = 1;
+                break;
+            default:
+                throw new AssertionError("Unsupported embedding reduction: " + reduction);
+        }
+        return new PtNDArray(
+                manager,
+                PyTorchLibrary.LIB.torchAddMaskedEmbeddingResidualToOwnedTokens(
+                        tokens.getHandle(),
+                        indexHandles,
+                        embeddingTable.getHandle(),
+                        validMask.getHandle(),
+                        paddingIndex,
+                        reductionValue));
+    }
+
+    /** Adds a broadcast residual to caller-owned values and applies SiLU and an optional mask. */
+    public static PtNDArray addBroadcastResidualToOwnedAndSilu(
+            PtNDArray values, PtNDArray residual, PtNDArray mask) {
+        PyTorchLibrary.LIB.torchAddBroadcastResidualToOwnedAndSilu(
+                values.getHandle(), residual.getHandle(), mask == null ? 0L : mask.getHandle());
+        return values;
+    }
+
+    /** Adds a bias and broadcast residual to caller-owned values before SiLU. */
+    public static PtNDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            PtNDArray values, PtNDArray bias, PtNDArray residual, PtNDArray mask) {
+        PyTorchLibrary.LIB.torchAddBiasAndBroadcastResidualToOwnedAndSilu(
+                values.getHandle(),
+                bias.getHandle(),
+                residual.getHandle(),
+                mask == null ? 0L : mask.getHandle());
+        return values;
     }
 
     public static PtNDArray rmsNorm(
@@ -1909,6 +2282,20 @@ public final class JniUtils {
                         bias == null ? NULL_PTR : bias.getHandle()));
     }
 
+    public static PtNDArray projectedResidualMlp(
+            PtNDArray input,
+            PtNDArray combinedWeight,
+            PtNDArray combinedBias,
+            PtNDArray outputWeight) {
+        return new PtNDArray(
+                input.getManager(),
+                PyTorchLibrary.LIB.torchNNProjectedResidualMlp(
+                        input.getHandle(),
+                        combinedWeight.getHandle(),
+                        combinedBias.getHandle(),
+                        outputWeight.getHandle()));
+    }
+
     public static PtNDArray embedding(PtNDArray input, PtNDArray weight, boolean sparse) {
         return new PtNDArray(
                 input.getManager(),
@@ -2003,6 +2390,46 @@ public final class JniUtils {
                         gamma.getHandle(),
                         beta.getHandle(),
                         eps));
+    }
+
+    /** Adds a residual update and returns the normalized output followed by the sum. */
+    public static NDList residualAddLayerNorm(
+            PtNDArray residual,
+            PtNDArray update,
+            Shape normalizedShape,
+            PtNDArray gamma,
+            PtNDArray beta,
+            double eps) {
+        long[] handles =
+                PyTorchLibrary.LIB.torchNNResidualAddLayerNorm(
+                        residual.getHandle(),
+                        update.getHandle(),
+                        normalizedShape.getShape(),
+                        gamma.getHandle(),
+                        beta.getHandle(),
+                        eps);
+        PtNDManager manager = residual.getManager();
+        return new NDList(new PtNDArray(manager, handles[0]), new PtNDArray(manager, handles[1]));
+    }
+
+    /** Applies LayerNorm and returns its ordinary output together with a converted copy. */
+    public static NDList layerNormAndCast(
+            PtNDArray ndArray,
+            Shape normalizedShape,
+            PtNDArray gamma,
+            PtNDArray beta,
+            double eps,
+            DataType convertedDataType) {
+        long[] handles =
+                PyTorchLibrary.LIB.torchNNLayerNormAndCast(
+                        ndArray.getHandle(),
+                        normalizedShape.getShape(),
+                        gamma.getHandle(),
+                        beta.getHandle(),
+                        eps,
+                        convertedDataType.ordinal());
+        PtNDManager manager = ndArray.getManager();
+        return new NDList(new PtNDArray(manager, handles[0]), new PtNDArray(manager, handles[1]));
     }
 
     public static PtNDArray normalize(PtNDArray ndArray, double p, long dim, double eps) {
@@ -2201,6 +2628,10 @@ public final class JniUtils {
         return new Shape(PyTorchLibrary.LIB.torchSizes(ndArray.getHandle()));
     }
 
+    public static boolean isContiguous(PtNDArray ndArray) {
+        return PyTorchLibrary.LIB.torchIsContiguous(ndArray.getHandle());
+    }
+
     public static ByteBuffer getByteBuffer(PtNDArray ndArray, boolean tryDirect) {
         if (ndArray.getDevice().equals(Device.cpu())) {
             if (tryDirect
@@ -2263,6 +2694,57 @@ public final class JniUtils {
             PtNDArray ndArray, PtNDArray gradNd, boolean keepGraph, boolean createGraph) {
         PyTorchLibrary.LIB.torchBackward(
                 ndArray.getHandle(), gradNd.getHandle(), keepGraph, createGraph);
+    }
+
+    public static long createFlatGradientAccumulator(PtNDArray[] parameters, PtNDArray gradient) {
+        long[] parameterHandles =
+                Arrays.stream(parameters).mapToLong(PtNDArray::getHandle).toArray();
+        return PyTorchLibrary.LIB.torchCreateFlatGradientAccumulator(
+                parameterHandles, gradient.getHandle());
+    }
+
+    public static void backwardFlatGradientAccumulator(
+            long accumulatorHandle, PtNDArray target, PtNDArray targetGradient) {
+        PyTorchLibrary.LIB.torchFlatGradientAccumulatorBackward(
+                accumulatorHandle, target.getHandle(), targetGradient.getHandle());
+    }
+
+    public static void zeroFlatGradientAccumulator(long accumulatorHandle) {
+        PyTorchLibrary.LIB.torchZeroFlatGradientAccumulator(accumulatorHandle);
+    }
+
+    public static void deleteFlatGradientAccumulator(long accumulatorHandle) {
+        PyTorchLibrary.LIB.torchDeleteFlatGradientAccumulator(accumulatorHandle);
+    }
+
+    public static long createFlatGradientPacker(PtNDArray[] parameters, PtNDArray destination) {
+        long[] parameterHandles =
+                Arrays.stream(parameters).mapToLong(PtNDArray::getHandle).toArray();
+        return PyTorchLibrary.LIB.torchCreateFlatGradientPacker(
+                parameterHandles, destination.getHandle());
+    }
+
+    public static void packAndClearFlatGradientPacker(
+            long packerHandle, boolean zeroMissingGradients) {
+        PyTorchLibrary.LIB.torchFlatGradientPackerPackAndClear(packerHandle, zeroMissingGradients);
+    }
+
+    public static void accumulateAndClearFlatGradientPacker(
+            long packerHandle, boolean zeroMissingGradients) {
+        PyTorchLibrary.LIB.torchFlatGradientPackerAccumulateAndClear(
+                packerHandle, zeroMissingGradients);
+    }
+
+    public static void zeroFlatGradientPackerDestination(long packerHandle) {
+        PyTorchLibrary.LIB.torchZeroFlatGradientPackerDestination(packerHandle);
+    }
+
+    public static void clearFlatGradientPackerParameterGradients(long packerHandle) {
+        PyTorchLibrary.LIB.torchClearFlatGradientPackerParameterGradients(packerHandle);
+    }
+
+    public static void deleteFlatGradientPacker(long packerHandle) {
+        PyTorchLibrary.LIB.torchDeleteFlatGradientPacker(packerHandle);
     }
 
     public static long distributedCreateReducer(
@@ -2393,6 +2875,12 @@ public final class JniUtils {
 
     public static void zeroGrad(PtNDArray weight) {
         PyTorchLibrary.LIB.zeroGrad(weight.getHandle());
+    }
+
+    public static boolean unscaleGradients(List<PtNDArray> gradients, float inverseScale) {
+        long[] handles = gradients.stream().mapToLong(PtNDArray::getHandle).toArray();
+        // The native name is retained for JNI binary compatibility.
+        return PyTorchLibrary.LIB.torchUnscaleGradientsAndCheckFinite(handles, inverseScale);
     }
 
     public static void adamUpdate(

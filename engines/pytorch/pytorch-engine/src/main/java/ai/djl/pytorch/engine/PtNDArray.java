@@ -66,8 +66,25 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         super(handle);
         this.manager = manager;
         this.ptNDArrayEx = new PtNDArrayEx(this);
-        manager.attachInternal(getUid(), this);
-        NDScope.register(this);
+        boolean attached = false;
+        try {
+            manager.attachInternal(getUid(), this);
+            attached = true;
+            NDScope.register(this);
+        } catch (RuntimeException | Error failure) {
+            if (attached) {
+                manager.detachInternal(getUid());
+            }
+            Long pointer = this.handle.getAndSet(null);
+            if (pointer != null && pointer != -1) {
+                try {
+                    JniUtils.deleteNDArray(pointer);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw failure;
+        }
     }
 
     /**
@@ -278,7 +295,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @param buffer the source direct byte buffer
      */
     public void copyFromDirectBuffer(ByteBuffer buffer) {
-        JniUtils.copyFromDirectBuffer(this, validateDirectCopyBuffer(buffer));
+        JniUtils.copyFromDirectBuffer(this, validateBuffer(buffer));
     }
 
     /**
@@ -290,7 +307,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @param buffer the source host transfer buffer
      */
     public void copyFromPinnedBuffer(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
+        validateBuffer(buffer);
         JniUtils.copyFromPinnedBuffer(this, buffer.getHandle());
     }
 
@@ -305,9 +322,24 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @return an event that completes when the copy is visible to this array
      */
     public PtCopyEvent copyFromPinnedBufferAsync(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
+        validateBuffer(buffer);
         long event = JniUtils.copyFromPinnedBufferAsync(this, buffer.getHandle());
         return new PtCopyEvent(manager, event, buffer);
+    }
+
+    /**
+     * Enqueues a copy from a host transfer buffer on the current PyTorch stream.
+     *
+     * <p>No completion event is created. The caller must record a {@link PtEvent} after this method
+     * before reusing or closing the source buffer. The caller must also order any earlier use of
+     * this array on another stream before the current stream. CPU arrays perform the copy
+     * synchronously.
+     *
+     * @param buffer the source host transfer buffer
+     */
+    public void enqueueCopyFrom(PtPinnedBuffer buffer) {
+        validateBuffer(buffer);
+        JniUtils.enqueueCopyFrom(this, buffer.getHandle());
     }
 
     /**
@@ -322,12 +354,51 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
      * @return an event that completes when this array has been copied into the buffer
      */
     public PtCopyEvent copyToPinnedBufferAsync(PtPinnedBuffer buffer) {
-        validatePinnedCopyBuffer(buffer);
+        validateBuffer(buffer);
         long event = JniUtils.copyToPinnedBufferAsync(this, buffer.getHandle());
         return new PtCopyEvent(buffer.getManager(), event, buffer);
     }
 
-    private ByteBuffer validateDirectCopyBuffer(ByteBuffer buffer) {
+    /**
+     * Enqueues a copy from this array into a host transfer buffer on the current PyTorch stream.
+     *
+     * <p>No completion event is created. The caller must record and synchronize a {@link PtEvent}
+     * before reading or closing the destination buffer. The caller must also order any earlier
+     * write to this array on another stream before the current stream. CPU arrays perform the copy
+     * synchronously.
+     *
+     * @param buffer the destination host transfer buffer
+     */
+    public void enqueueCopyTo(PtPinnedBuffer buffer) {
+        validateBuffer(buffer);
+        JniUtils.enqueueCopyTo(this, buffer.getHandle());
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void copyTo(NDArray array) {
+        if (array instanceof PtNDArray) {
+            PtNDArray target = (PtNDArray) array;
+            if (getShape().equals(target.getShape()) && !isSparse() && !target.isSparse()) {
+                JniUtils.copyTo(this, target);
+                return;
+            }
+        }
+        NDArray.super.copyTo(array);
+    }
+
+    /**
+     * Records this array's storage as used by the current PyTorch stream.
+     *
+     * <p>This method does not enqueue a synchronization. It informs PyTorch's caching allocator
+     * that the storage must not be reused until work already enqueued on the current stream has
+     * completed.
+     */
+    void recordStream() {
+        JniUtils.recordStream(this);
+    }
+
+    private ByteBuffer validateBuffer(ByteBuffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         if (!buffer.isDirect()) {
             throw new IllegalArgumentException("buffer must be direct.");
@@ -337,7 +408,7 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         return view;
     }
 
-    private void validatePinnedCopyBuffer(PtPinnedBuffer buffer) {
+    private void validateBuffer(PtPinnedBuffer buffer) {
         Objects.requireNonNull(buffer, "buffer");
         buffer.getHandle();
         DataType arrayDataType = getDataType();
@@ -356,19 +427,6 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
                             + " elements, but transfer buffer size is: "
                             + buffer.size());
         }
-    }
-
-    /** {@inheritDoc} */
-    @Override
-    public void copyTo(NDArray array) {
-        if (array instanceof PtNDArray) {
-            PtNDArray target = (PtNDArray) array;
-            if (getShape().equals(target.getShape()) && !isSparse() && !target.isSparse()) {
-                JniUtils.copyTo(this, target);
-                return;
-            }
-        }
-        NDArray.super.copyTo(array);
     }
 
     /** {@inheritDoc} */

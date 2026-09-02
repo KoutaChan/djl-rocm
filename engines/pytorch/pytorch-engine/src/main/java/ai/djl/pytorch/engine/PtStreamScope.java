@@ -19,11 +19,20 @@ import ai.djl.pytorch.jni.JniUtils;
 public final class PtStreamScope implements AutoCloseable {
 
     private final Thread ownerThread;
+    private final PtStream stream;
     private long handle;
+    private boolean closed;
 
     PtStreamScope(Device device) {
         ownerThread = Thread.currentThread();
+        stream = null;
         handle = JniUtils.openStreamScope(device);
+    }
+
+    PtStreamScope(PtStream stream) {
+        ownerThread = Thread.currentThread();
+        this.stream = stream;
+        handle = JniUtils.openDeviceStream(stream.getHandle());
     }
 
     /** Restores the stream that was current when this scope was opened. */
@@ -33,10 +42,18 @@ public final class PtStreamScope implements AutoCloseable {
             throw new IllegalStateException(
                     "PtStreamScope must be closed by the thread that opened it.");
         }
-        long nativeHandle = handle;
-        if (nativeHandle != 0) {
-            handle = 0;
-            JniUtils.closeStreamScope(nativeHandle);
+        if (!closed) {
+            closed = true;
+            try {
+                if (handle != 0) {
+                    JniUtils.closeStreamScope(handle);
+                }
+            } finally {
+                handle = 0;
+                if (stream != null) {
+                    stream.closeScope();
+                }
+            }
         }
     }
 }

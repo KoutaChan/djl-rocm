@@ -14,9 +14,22 @@
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_jni_exception.h"
+#include "djl_pytorch_row_ops.h"
 #include "djl_pytorch_utils.h"
 
 // The file is the implementation for PyTorch tensor reduction ops
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchWeightedRowStatistics(
+    JNIEnv* env, jobject jthis, jlong jvalues, jlong jweights) {
+  API_BEGIN()
+  const auto& values = *reinterpret_cast<torch::Tensor*>(jvalues);
+  const auto& weights = *reinterpret_cast<torch::Tensor*>(jweights);
+  const auto* result =
+      new torch::Tensor(djl::pytorch::weighted_row_statistics(values, weights));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchArgMax__J(
     JNIEnv* env, jobject jthis, jlong jhandle) {

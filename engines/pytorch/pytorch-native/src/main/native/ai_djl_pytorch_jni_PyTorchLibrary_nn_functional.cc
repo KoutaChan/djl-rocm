@@ -10,16 +10,23 @@
  * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
  * and limitations under the License.
  */
+#include <ATen/autocast_mode.h>
 #include <djl/utils.h>
 #include <torch/torch.h>
 
 #include <cmath>
+#include <cstdint>
 #include <initializer_list>
+#include <vector>
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
+#include "djl_pytorch_attention.h"
 #include "djl_pytorch_jni_exception.h"
+#include "djl_pytorch_layer_norm.h"
+#include "djl_pytorch_projected_residual_mlp.h"
 #include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
+#include "djl_pytorch_routing_masks.h"
 #include "djl_pytorch_structured_attention.h"
 #include "djl_pytorch_utils.h"
 
@@ -39,17 +46,55 @@ bool requires_autograd(std::initializer_list<const torch::Tensor*> tensors) {
   return false;
 }
 
-torch::Tensor scaled_dot_product_attention_preserving_mask_autograd(const torch::Tensor& query,
-    const torch::Tensor& key, const torch::Tensor& value, const std::optional<torch::Tensor>& mask,
-    double dropout, bool causal, const std::optional<double>& scale) {
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (at::GradMode::is_enabled() && mask.has_value() && mask->requires_grad() && !query.requires_grad() &&
-      !key.requires_grad() && !value.requires_grad()) {
-    return std::get<0>(
-        at::_scaled_dot_product_attention_math(query, key, value, mask, dropout, causal, std::nullopt, scale, false));
+torch::Tensor add_masked_embedding_residual_to_owned_tokens_fallback(torch::Tensor& tokens,
+    const std::vector<torch::Tensor>& stored_indices, const torch::Tensor& embedding_table,
+    const torch::Tensor& valid_mask, int64_t padding_index, bool mean_valid) {
+  torch::NoGradGuard no_grad;
+  torch::Tensor converted_valid_mask = valid_mask.to(tokens.scalar_type()).contiguous();
+  torch::Tensor identity;
+  torch::Tensor valid_count;
+  for (const torch::Tensor& stored_index : stored_indices) {
+    const torch::Tensor present = stored_index.ne(padding_index).to(tokens.scalar_type());
+    const torch::Tensor embedding_index =
+        stored_index.scalar_type() == torch::kInt32 || stored_index.scalar_type() == torch::kInt64
+        ? stored_index
+        : stored_index.to(torch::kInt64);
+    const torch::Tensor embedded = torch::nn::functional::embedding(
+        embedding_index, embedding_table, torch::nn::functional::EmbeddingFuncOptions());
+    const torch::Tensor masked = embedded.mul(present.unsqueeze(-1));
+    identity = identity.defined() ? identity.add(masked) : masked;
+    if (mean_valid) {
+      valid_count = valid_count.defined() ? valid_count.add(present) : present;
+    }
   }
-#endif
-  return at::scaled_dot_product_attention(query, key, value, mask, dropout, causal, scale);
+  if (mean_valid) {
+    identity = identity.div(valid_count.clamp_min(1).unsqueeze(-1));
+  }
+  tokens.add_(identity);
+  tokens.mul_(converted_valid_mask.unsqueeze(-1));
+  return converted_valid_mask;
+}
+
+void add_broadcast_residual_to_owned_and_silu_fallback(
+    torch::Tensor& values, const torch::Tensor& residual, const torch::Tensor* mask) {
+  torch::NoGradGuard no_grad;
+  values.add_(residual);
+  values.mul_(torch::sigmoid(values));
+  if (mask != nullptr) {
+    values.mul_(mask->unsqueeze(-1));
+  }
+}
+
+void add_bias_and_broadcast_residual_to_owned_and_silu_fallback(
+    torch::Tensor& values, const torch::Tensor& bias,
+    const torch::Tensor& residual, const torch::Tensor* mask) {
+  torch::NoGradGuard no_grad;
+  values.add_(bias);
+  values.add_(residual);
+  values.mul_(torch::sigmoid(values));
+  if (mask != nullptr) {
+    values.mul_(mask->unsqueeze(-1));
+  }
 }
 
 }  // namespace
@@ -129,7 +174,7 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScaledDotPro
   }
   const std::optional<double> scale_opt =
       std::isnan(jscale) ? std::nullopt : std::optional<double>(static_cast<double>(jscale));
-  auto result = scaled_dot_product_attention_preserving_mask_autograd(
+  auto result = djl::pytorch::scaled_dot_product_attention(
       *q_ptr, *k_ptr, *v_ptr, mask_opt, static_cast<double>(jdropout), jcausal == JNI_TRUE, scale_opt);
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
@@ -144,6 +189,48 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchI
   const auto* relation_ids_ptr = reinterpret_cast<torch::Tensor*>(jrelation_ids);
   auto result = djl::pytorch::indexed_relation_bias(
       *relation_logits_ptr, *relation_bias_ptr, *relation_ids_ptr, static_cast<double>(jscale));
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGroupedPackedScaledDotProductAttention(
+    JNIEnv* env, jobject jthis, jlong jquery, jlong jpacked_key_value, jlong jmask,
+    jlong jheads, jfloat jscale) {
+  API_BEGIN()
+  const auto* query_ptr = reinterpret_cast<torch::Tensor*>(jquery);
+  const auto* packed_key_value_ptr = reinterpret_cast<torch::Tensor*>(jpacked_key_value);
+  const auto* mask_ptr = reinterpret_cast<torch::Tensor*>(jmask);
+  const int64_t heads = static_cast<int64_t>(jheads);
+  TORCH_CHECK(query_ptr->dim() == 3,
+      "grouped packed attention query must have shape [batch, query tokens, query width]");
+  TORCH_CHECK(packed_key_value_ptr->dim() == 4,
+      "grouped packed attention memory must have shape [batch, groups, key tokens, packed width]");
+  TORCH_CHECK(mask_ptr->dim() == 3,
+      "grouped packed attention mask must have shape [batch, groups, key tokens]");
+  TORCH_CHECK(query_ptr->size(0) == packed_key_value_ptr->size(0) &&
+          mask_ptr->size(0) == packed_key_value_ptr->size(0) &&
+          mask_ptr->size(1) == packed_key_value_ptr->size(1) &&
+          mask_ptr->size(2) == packed_key_value_ptr->size(2),
+      "grouped packed attention batch, group, or key-token dimensions do not match");
+  TORCH_CHECK(heads > 0 && query_ptr->size(1) > 0 && query_ptr->size(2) > 0 &&
+          query_ptr->size(2) % heads == 0 && packed_key_value_ptr->size(1) > 0 &&
+          packed_key_value_ptr->size(2) > 0 &&
+          packed_key_value_ptr->size(3) > query_ptr->size(2) &&
+          (packed_key_value_ptr->size(3) - query_ptr->size(2)) % heads == 0,
+      "grouped packed attention feature dimensions are incompatible");
+  TORCH_CHECK(std::isfinite(static_cast<double>(jscale)),
+      "grouped packed attention scale must be finite");
+  TORCH_CHECK(query_ptr->device() == packed_key_value_ptr->device() &&
+          query_ptr->device() == mask_ptr->device(),
+      "grouped packed attention inputs must be on the same device");
+  TORCH_CHECK(query_ptr->scalar_type() == packed_key_value_ptr->scalar_type(),
+      "grouped packed attention query and memory dtype must match");
+
+  auto result = djl::pytorch::grouped_packed_attention(
+      *query_ptr, *packed_key_value_ptr, *mask_ptr, heads,
+      static_cast<double>(jscale));
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
@@ -192,6 +279,61 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchG
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMappedGroupedIndexedScaledDotProductAttention(
+    JNIEnv* env, jobject jthis, jlong jquery, jlong jshared_key_values,
+    jlong jshared_group_indices, jlong jshared_delta_table, jlong jshared_delta_indices,
+    jlong jindexed_deltas, jlong jindexed_shared_ids, jfloat jscale) {
+  API_BEGIN()
+  const auto* query_ptr = reinterpret_cast<torch::Tensor*>(jquery);
+  const auto* shared_key_values_ptr = reinterpret_cast<torch::Tensor*>(jshared_key_values);
+  const auto* shared_group_indices_ptr = reinterpret_cast<torch::Tensor*>(jshared_group_indices);
+  const auto* shared_delta_table_ptr = reinterpret_cast<torch::Tensor*>(jshared_delta_table);
+  const auto* shared_delta_indices_ptr = reinterpret_cast<torch::Tensor*>(jshared_delta_indices);
+  const auto* indexed_deltas_ptr = reinterpret_cast<torch::Tensor*>(jindexed_deltas);
+  const auto* indexed_shared_ids_ptr = reinterpret_cast<torch::Tensor*>(jindexed_shared_ids);
+
+  TORCH_CHECK(query_ptr->dim() == 3, "query must have shape [queries, heads, key features]");
+  TORCH_CHECK(shared_key_values_ptr->dim() == 3,
+      "shared key/value storage must have shape [groups, shared tokens, packed features]");
+  TORCH_CHECK(shared_group_indices_ptr->dim() == 1,
+      "shared group indices must have shape [queries]");
+  TORCH_CHECK(shared_delta_table_ptr->dim() == 2,
+      "shared delta table must have shape [deltas, packed features]");
+  TORCH_CHECK(shared_delta_indices_ptr->dim() == 2,
+      "shared delta indices must have shape [queries, shared tokens]");
+  TORCH_CHECK(indexed_deltas_ptr->dim() == 3 && indexed_shared_ids_ptr->dim() == 2,
+      "indexed deltas and IDs must describe query-local auxiliary tokens");
+  const auto query_count = query_ptr->size(0);
+  const auto heads = query_ptr->size(1);
+  const auto key_width = heads * query_ptr->size(2);
+  const auto shared_tokens = shared_key_values_ptr->size(1);
+  const auto packed_width = shared_key_values_ptr->size(2);
+  TORCH_CHECK(heads > 0 && query_ptr->size(2) > 0 && shared_key_values_ptr->size(0) > 0 &&
+          shared_tokens > 0 && shared_delta_table_ptr->size(0) > 0,
+      "mapped grouped attention dimensions must be positive");
+  TORCH_CHECK(packed_width > key_width && (packed_width - key_width) % heads == 0,
+      "packed shared features must contain per-head keys followed by per-head values");
+  TORCH_CHECK(shared_group_indices_ptr->size(0) == query_count &&
+          shared_delta_indices_ptr->size(0) == query_count &&
+          shared_delta_indices_ptr->size(1) == shared_tokens &&
+          shared_delta_table_ptr->size(1) == packed_width,
+      "shared table mappings must describe every query and shared token");
+  TORCH_CHECK(indexed_deltas_ptr->size(0) == query_count &&
+          indexed_deltas_ptr->size(2) == packed_width &&
+          indexed_shared_ids_ptr->size(0) == query_count &&
+          indexed_shared_ids_ptr->size(1) == indexed_deltas_ptr->size(1),
+      "indexed deltas and IDs must describe the same query-token pairs");
+
+  auto result = djl::pytorch::mapped_grouped_indexed_attention(*query_ptr,
+      *shared_key_values_ptr, *shared_group_indices_ptr, *shared_delta_table_ptr,
+      *shared_delta_indices_ptr, *indexed_deltas_ptr, *indexed_shared_ids_ptr,
+      static_cast<double>(jscale));
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedSoftmax(
     JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
   API_BEGIN()
@@ -202,12 +344,86 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchM
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGroupedMaskedSoftmaxPool(
+    JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jvalues) {
+  API_BEGIN()
+  const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto& values = *reinterpret_cast<torch::Tensor*>(jvalues);
+  const auto* result =
+      new torch::Tensor(djl::pytorch::grouped_masked_softmax_pool(logits, mask, values));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchIndexedMaskedSoftmaxPool(
+    JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jvalues,
+    jintArray jchoice_indices) {
+  API_BEGIN()
+  const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto& values = *reinterpret_cast<torch::Tensor*>(jvalues);
+  const jsize choice_count = env->GetArrayLength(jchoice_indices);
+  std::vector<jint> raw_indices(static_cast<size_t>(choice_count));
+  env->GetIntArrayRegion(jchoice_indices, 0, choice_count, raw_indices.data());
+  std::vector<int64_t> choice_indices;
+  choice_indices.reserve(static_cast<size_t>(choice_count));
+  for (jint choice : raw_indices) {
+    choice_indices.push_back(static_cast<int64_t>(choice));
+  }
+  const auto* result = new torch::Tensor(
+      djl::pytorch::indexed_masked_softmax_pool(logits, mask, values, choice_indices));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMaskedLogSumExp(
     JNIEnv* env, jobject jthis, jlong jlogits, jlong jmask, jlong jaxis) {
   API_BEGIN()
   const auto& logits = *reinterpret_cast<torch::Tensor*>(jlogits);
   const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
   const auto* result = new torch::Tensor(djl::pytorch::masked_log_sum_exp(logits, mask, jaxis));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCategoricalMasks(
+    JNIEnv* env, jobject jthis, jlong jcategories, jlong jmask, jintArray jfield_indices,
+    jlongArray jcategory_sets) {
+  API_BEGIN()
+  const auto field_count = env->GetArrayLength(jfield_indices);
+  TORCH_CHECK(field_count > 0 && field_count == env->GetArrayLength(jcategory_sets),
+      "categorical rules must have matching non-empty arrays");
+  std::vector<int64_t> field_indices(field_count);
+  std::vector<uint64_t> category_sets(field_count);
+  jint* fields = env->GetIntArrayElements(jfield_indices, JNI_FALSE);
+  jlong* sets = env->GetLongArrayElements(jcategory_sets, JNI_FALSE);
+  for (jsize index = 0; index < field_count; ++index) {
+    field_indices[index] = static_cast<int64_t>(fields[index]);
+    category_sets[index] = static_cast<uint64_t>(sets[index]);
+  }
+  env->ReleaseIntArrayElements(jfield_indices, fields, JNI_ABORT);
+  env->ReleaseLongArrayElements(jcategory_sets, sets, JNI_ABORT);
+  const auto& categories = *reinterpret_cast<torch::Tensor*>(jcategories);
+  const auto& mask = *reinterpret_cast<torch::Tensor*>(jmask);
+  const auto* result =
+      new torch::Tensor(djl::pytorch::categorical_masks(categories, mask, field_indices, category_sets));
+  return reinterpret_cast<uintptr_t>(result);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBinaryChoiceMasks(
+    JNIEnv* env, jobject jthis, jlong jroutes, jlong jfirst_mask, jlong jsecond_mask,
+    jint jrepresentative_field, jint jfirst_route_field, jint jsecond_route_field,
+    jlong jpadding_value) {
+  API_BEGIN()
+  const auto& routes = *reinterpret_cast<torch::Tensor*>(jroutes);
+  const auto& first_mask = *reinterpret_cast<torch::Tensor*>(jfirst_mask);
+  const auto& second_mask = *reinterpret_cast<torch::Tensor*>(jsecond_mask);
+  const auto* result = new torch::Tensor(djl::pytorch::binary_choice_masks(routes, first_mask,
+      second_mask, static_cast<int64_t>(jrepresentative_field),
+      static_cast<int64_t>(jfirst_route_field), static_cast<int64_t>(jsecond_route_field),
+      static_cast<int64_t>(jpadding_value)));
   return reinterpret_cast<uintptr_t>(result);
   API_END_RETURN()
 }
@@ -247,6 +463,162 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchA
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddMaskedEmbeddingResidualToOwnedTokens(JNIEnv* env,
+    jobject jthis, jlong jtokens, jlongArray jstored_indices, jlong jembedding_table,
+    jlong jvalid_mask, jlong jpadding_index, jint jreduction) {
+  API_BEGIN()
+  auto* tokens_ptr = reinterpret_cast<torch::Tensor*>(jtokens);
+  const auto* embedding_table_ptr = reinterpret_cast<torch::Tensor*>(jembedding_table);
+  const auto* valid_mask_ptr = reinterpret_cast<torch::Tensor*>(jvalid_mask);
+  const auto index_handles = djl::utils::jni::GetVecFromJLongArray(env, jstored_indices);
+  TORCH_CHECK(index_handles.size() >= 1 && index_handles.size() <= 2,
+      "masked embedding residual requires one or two index arrays");
+  std::vector<torch::Tensor> stored_indices;
+  stored_indices.reserve(index_handles.size());
+  for (int64_t handle : index_handles) {
+    TORCH_CHECK(handle != 0, "masked embedding residual index handle is null");
+    stored_indices.emplace_back(*reinterpret_cast<torch::Tensor*>(handle));
+  }
+  TORCH_CHECK(jreduction == 0 || jreduction == 1, "masked embedding residual reduction is unsupported");
+  TORCH_CHECK(!requires_autograd({tokens_ptr, embedding_table_ptr}),
+      "owned masked embedding residual is an inference operation and does not support automatic differentiation");
+  TORCH_CHECK(tokens_ptr->dim() == 3 && tokens_ptr->size(2) > 0,
+      "tokens must have shape [batch, tokens, features]");
+  TORCH_CHECK(tokens_ptr->is_floating_point(), "tokens must use a floating-point data type");
+  TORCH_CHECK(embedding_table_ptr->dim() == 2 && embedding_table_ptr->size(1) == tokens_ptr->size(2),
+      "embedding table width must match the token width");
+  TORCH_CHECK(embedding_table_ptr->scalar_type() == tokens_ptr->scalar_type(),
+      "embedding table and tokens must have the same data type");
+  TORCH_CHECK(valid_mask_ptr->dim() == 2 && valid_mask_ptr->size(0) == tokens_ptr->size(0) &&
+          valid_mask_ptr->size(1) == tokens_ptr->size(1),
+      "valid mask must match the leading token dimensions");
+  TORCH_CHECK(jpadding_index >= 0 && jpadding_index < embedding_table_ptr->size(0),
+      "padding index must identify an embedding-table row");
+  TORCH_CHECK(embedding_table_ptr->device() == tokens_ptr->device() &&
+          valid_mask_ptr->device() == tokens_ptr->device(),
+      "masked embedding residual inputs must be on the same device");
+  for (const torch::Tensor& stored_index : stored_indices) {
+    TORCH_CHECK(stored_index.dim() == 2 && stored_index.size(0) == tokens_ptr->size(0) &&
+            stored_index.size(1) == tokens_ptr->size(1),
+        "stored indices must match the leading token dimensions");
+    TORCH_CHECK(stored_index.device() == tokens_ptr->device(),
+        "masked embedding residual inputs must be on the same device");
+  }
+
+  torch::Tensor converted_valid_mask;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (djl::pytorch::rocm::supports_masked_embedding_residual_to_owned_tokens(
+          *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr)) {
+    converted_valid_mask = djl::pytorch::rocm::add_masked_embedding_residual_to_owned_tokens(
+        *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr,
+        static_cast<int64_t>(jpadding_index), jreduction == 1);
+  } else
+#endif
+  {
+    converted_valid_mask = add_masked_embedding_residual_to_owned_tokens_fallback(
+        *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr,
+        static_cast<int64_t>(jpadding_index), jreduction == 1);
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(converted_valid_mask));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddBroadcastResidualToOwnedAndSilu(
+    JNIEnv* env, jobject jthis, jlong jvalues, jlong jresidual, jlong jmask) {
+  API_BEGIN()
+  auto* values_ptr = reinterpret_cast<torch::Tensor*>(jvalues);
+  const auto* residual_ptr = reinterpret_cast<torch::Tensor*>(jresidual);
+  const auto* mask_ptr = jmask == djl::utils::jni::NULL_PTR
+      ? nullptr
+      : reinterpret_cast<torch::Tensor*>(jmask);
+  TORCH_CHECK(!requires_autograd({values_ptr, residual_ptr, mask_ptr}),
+      "owned broadcast residual SiLU is an inference operation and does not support automatic differentiation");
+  TORCH_CHECK(values_ptr->dim() == 3 && values_ptr->size(2) > 0,
+      "values must have shape [batch, items, features]");
+  TORCH_CHECK(residual_ptr->dim() == 3 && residual_ptr->size(0) == values_ptr->size(0) &&
+          residual_ptr->size(1) == 1 && residual_ptr->size(2) == values_ptr->size(2),
+      "residual must have shape [batch, 1, features]");
+  TORCH_CHECK(values_ptr->is_floating_point() &&
+          residual_ptr->scalar_type() == values_ptr->scalar_type(),
+      "values and residual must use the same floating-point data type");
+  TORCH_CHECK(residual_ptr->device() == values_ptr->device(),
+      "values and residual must be on the same device");
+  if (mask_ptr != nullptr) {
+    TORCH_CHECK(mask_ptr->dim() == 2 && mask_ptr->size(0) == values_ptr->size(0) &&
+            mask_ptr->size(1) == values_ptr->size(1),
+        "mask must have shape [batch, items]");
+    TORCH_CHECK(mask_ptr->scalar_type() == values_ptr->scalar_type() &&
+            mask_ptr->device() == values_ptr->device(),
+        "mask must use the values data type and device");
+  }
+
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (djl::pytorch::rocm::supports_broadcast_residual_to_owned_silu(
+          *values_ptr, *residual_ptr, mask_ptr)) {
+    djl::pytorch::rocm::add_broadcast_residual_to_owned_and_silu(
+        *values_ptr, *residual_ptr, mask_ptr);
+  } else
+#endif
+  {
+    add_broadcast_residual_to_owned_and_silu_fallback(
+        *values_ptr, *residual_ptr, mask_ptr);
+  }
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddBiasAndBroadcastResidualToOwnedAndSilu(
+    JNIEnv* env, jobject jthis, jlong jvalues, jlong jbias,
+    jlong jresidual, jlong jmask) {
+  API_BEGIN()
+  auto* values_ptr = reinterpret_cast<torch::Tensor*>(jvalues);
+  const auto* bias_ptr = reinterpret_cast<torch::Tensor*>(jbias);
+  const auto* residual_ptr = reinterpret_cast<torch::Tensor*>(jresidual);
+  const auto* mask_ptr = jmask == djl::utils::jni::NULL_PTR
+      ? nullptr
+      : reinterpret_cast<torch::Tensor*>(jmask);
+  TORCH_CHECK(!requires_autograd({values_ptr, bias_ptr, residual_ptr, mask_ptr}),
+      "owned bias and broadcast residual SiLU is an inference operation and does not support automatic differentiation");
+  TORCH_CHECK(values_ptr->dim() == 3 && values_ptr->size(2) > 0,
+      "values must have shape [batch, items, features]");
+  TORCH_CHECK(bias_ptr->dim() == 1 && bias_ptr->size(0) == values_ptr->size(2),
+      "bias must have shape [features]");
+  TORCH_CHECK(residual_ptr->dim() == 3 && residual_ptr->size(0) == values_ptr->size(0) &&
+          residual_ptr->size(1) == 1 && residual_ptr->size(2) == values_ptr->size(2),
+      "residual must have shape [batch, 1, features]");
+  TORCH_CHECK(values_ptr->is_floating_point() &&
+          bias_ptr->scalar_type() == values_ptr->scalar_type() &&
+          residual_ptr->scalar_type() == values_ptr->scalar_type(),
+      "values, bias, and residual must use the same floating-point data type");
+  TORCH_CHECK(bias_ptr->device() == values_ptr->device() &&
+          residual_ptr->device() == values_ptr->device(),
+      "values, bias, and residual must be on the same device");
+  if (mask_ptr != nullptr) {
+    TORCH_CHECK(mask_ptr->dim() == 2 && mask_ptr->size(0) == values_ptr->size(0) &&
+            mask_ptr->size(1) == values_ptr->size(1),
+        "mask must have shape [batch, items]");
+    TORCH_CHECK(mask_ptr->scalar_type() == values_ptr->scalar_type() &&
+            mask_ptr->device() == values_ptr->device(),
+        "mask must use the values data type and device");
+  }
+
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (djl::pytorch::rocm::supports_bias_and_broadcast_residual_to_owned_silu(
+          *values_ptr, *bias_ptr, *residual_ptr, mask_ptr)) {
+    djl::pytorch::rocm::add_bias_and_broadcast_residual_to_owned_and_silu(
+        *values_ptr, *bias_ptr, *residual_ptr, mask_ptr);
+  } else
+#endif
+  {
+    add_bias_and_broadcast_residual_to_owned_and_silu_fallback(
+        *values_ptr, *bias_ptr, *residual_ptr, mask_ptr);
+  }
+  API_END()
 }
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNInterpolate(
@@ -292,6 +664,20 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLinear(
   }
   const auto* result_ptr = new torch::Tensor(torch::nn::functional::linear(*input_ptr, *weight_ptr, bias));
   return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNProjectedResidualMlp(
+    JNIEnv* env, jobject jthis, jlong jinput, jlong jcombined_weight,
+    jlong jcombined_bias, jlong joutput_weight) {
+  API_BEGIN()
+  const auto* input = reinterpret_cast<torch::Tensor*>(jinput);
+  const auto* combined_weight = reinterpret_cast<torch::Tensor*>(jcombined_weight);
+  const auto* combined_bias = reinterpret_cast<torch::Tensor*>(jcombined_bias);
+  const auto* output_weight = reinterpret_cast<torch::Tensor*>(joutput_weight);
+  const auto* result = new torch::Tensor(djl::pytorch::projected_residual_mlp(
+      *input, *combined_weight, *combined_bias, *output_weight));
+  return reinterpret_cast<uintptr_t>(result);
   API_END_RETURN()
 }
 
@@ -364,9 +750,86 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLayerNorm(
   if (jbias != djl::utils::jni::NULL_PTR) {
     bias = *reinterpret_cast<torch::Tensor*>(jbias);
   }
-  const auto* result_ptr = new torch::Tensor(torch::nn::functional::layer_norm(*tensor_ptr,
-      torch::nn::functional::LayerNormFuncOptions(normalized_shape_vec).weight(weight).bias(bias).eps(jeps)));
+  torch::Tensor result;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() &&
+      at::autocast::is_autocast_enabled(at::DeviceType::CUDA) &&
+      djl::pytorch::rocm::supports_autocast_layer_norm(
+          *tensor_ptr, weight, bias, normalized_shape_vec)) {
+    result = djl::pytorch::rocm::autocast_layer_norm(
+        *tensor_ptr, weight, bias, static_cast<float>(jeps));
+  } else
+#endif
+  {
+    result = torch::nn::functional::layer_norm(*tensor_ptr,
+        torch::nn::functional::LayerNormFuncOptions(normalized_shape_vec).weight(weight).bias(bias).eps(jeps));
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
+#endif
+  API_END_RETURN()
+}
+
+JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLayerNormAndCast(
+    JNIEnv* env, jobject jthis, jlong jinput, jlongArray jnormalizedshape, jlong jweight,
+    jlong jbias, jdouble jeps, jint jconverted_data_type) {
+  API_BEGIN()
+#if defined(__ANDROID__)
+  env->ThrowNew(ENGINE_EXCEPTION_CLASS, "layerNorm is not supported on Android.");
+  return nullptr;
+#else
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jinput);
+  const auto normalized_shape_vec =
+      djl::utils::jni::GetVecFromJLongArray(env, jnormalizedshape);
+  torch::Tensor weight = {};
+  torch::Tensor bias = {};
+  if (jweight != djl::utils::jni::NULL_PTR) {
+    weight = *reinterpret_cast<torch::Tensor*>(jweight);
+  }
+  if (jbias != djl::utils::jni::NULL_PTR) {
+    bias = *reinterpret_cast<torch::Tensor*>(jbias);
+  }
+  const torch::ScalarType converted_type = utils::GetScalarTypeFromDType(jconverted_data_type);
+  auto outputs = djl::pytorch::layer_norm_and_cast(
+      *tensor_ptr, normalized_shape_vec, weight, bias, jeps, converted_type);
+  jlongArray jarray = env->NewLongArray(2);
+  std::vector<jlong> jptrs(2);
+  jptrs[0] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs.at(0))));
+  jptrs[1] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs.at(1))));
+  env->SetLongArrayRegion(jarray, 0, 2, jptrs.data());
+  return jarray;
+#endif
+  API_END_RETURN()
+}
+
+JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNResidualAddLayerNorm(
+    JNIEnv* env, jobject jthis, jlong jresidual, jlong jupdate,
+    jlongArray jnormalizedshape, jlong jweight, jlong jbias, jdouble jeps) {
+  API_BEGIN()
+#if defined(__ANDROID__)
+  env->ThrowNew(ENGINE_EXCEPTION_CLASS, "residualAddLayerNorm is not supported on Android.");
+  return nullptr;
+#else
+  const auto* residual_ptr = reinterpret_cast<torch::Tensor*>(jresidual);
+  const auto* update_ptr = reinterpret_cast<torch::Tensor*>(jupdate);
+  const auto normalized_shape_vec =
+      djl::utils::jni::GetVecFromJLongArray(env, jnormalizedshape);
+  torch::Tensor weight = {};
+  torch::Tensor bias = {};
+  if (jweight != djl::utils::jni::NULL_PTR) {
+    weight = *reinterpret_cast<torch::Tensor*>(jweight);
+  }
+  if (jbias != djl::utils::jni::NULL_PTR) {
+    bias = *reinterpret_cast<torch::Tensor*>(jbias);
+  }
+  auto outputs = djl::pytorch::residual_add_layer_norm(
+      *residual_ptr, *update_ptr, normalized_shape_vec, weight, bias, jeps);
+  jlongArray jarray = env->NewLongArray(2);
+  std::vector<jlong> jptrs(2);
+  jptrs[0] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs[0])));
+  jptrs[1] = reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(outputs[1])));
+  env->SetLongArrayRegion(jarray, 0, 2, jptrs.data());
+  return jarray;
 #endif
   API_END_RETURN()
 }

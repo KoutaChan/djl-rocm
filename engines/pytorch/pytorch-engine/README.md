@@ -23,6 +23,102 @@ You can also build the latest javadocs locally using the following command:
 
 The javadocs output is built in the `build/doc/javadoc` folder.
 
+## Automatic mixed-precision training
+
+Training autocast is opt-in through `DefaultTrainingConfig`. BF16 is the recommended starting
+point because it has a wider exponent range and normally does not require loss scaling:
+
+```java
+DefaultTrainingConfig config =
+        new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                .optAutocast(DataType.BFLOAT16);
+```
+
+`Trainer.forward`, `Trainer.evaluate`, and the loss calculation in `EasyTrain` run inside the
+configured autocast scope. The standard training and validation evaluators use the same scope.
+Autocast does not change the stored parameter data type, and optimizer updates run outside autocast;
+with the default model data type, both remain FP32. `Trainer.newGradientCollector()` keeps the
+configured scope active around the conventional custom-loop sequence of forward, loss, and backward,
+while temporarily leaving autocast for backward and for `Trainer.step()` if it is called before the
+collector closes. This lets existing loops that create the collector before forward use mixed
+precision without source changes. Operations performed outside the collector lifetime should be
+wrapped with `Trainer.newAutocast(device)`.
+
+Selecting FP16 automatically installs a dynamic `GradScaler`; FP16 training cannot accidentally
+run through `Trainer` without scaling. The scaler unscales and checks every gradient before the
+optimizer, skips the complete update if any gradient is non-finite, and adjusts its scale for the
+next step. FP16 training requires `pytorch-engine` and `pytorch-jni` from the same release because
+the fused GradScaler JNI entry point is mandatory; it does not fall back to a generic unscale
+implementation:
+
+```java
+DefaultTrainingConfig config =
+        new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                .optAutocast(DataType.FLOAT16);
+```
+
+A custom scaler can be supplied when different growth behavior is needed:
+
+```java
+GradScaler scaler =
+        GradScaler.builder()
+                .optInitialScale(32768f)
+                .optGrowthInterval(1000)
+                .build();
+DefaultTrainingConfig config =
+        new DefaultTrainingConfig(Loss.softmaxCrossEntropyLoss())
+                .optAutocast(DataType.FLOAT16)
+                .optGradScaler(scaler);
+```
+
+For exact FP16 training continuation, save scaler state after `Trainer.step()` beside the model and
+optimizer checkpoint with `Trainer.saveGradScalerState(path)` and restore it with
+`Trainer.loadGradScalerState(path)`. The versioned scaler state includes its growth configuration
+and rejects a mismatched restore. Engines that do not implement autocast return a no-op guard,
+preserving compatibility with existing `TrainingConfig` and training code.
+
+## Fusion Plan accelerator backends
+
+PyTorch Fusion Plan uses the same `FusionRecipe`, compilation report, executable, session,
+invocation, and output-lease API on NVIDIA CUDA and AMD ROCm. The loaded PyTorch native library
+selects the matching backend; application code does not select CUDA or ROCm separately. A prepared
+plan can contain output packs, segmented packs, branch blends, affine and indexed-affine groups,
+transformer encoder stacks, indexed local transformers, single-query readouts, and mapped grouped
+masked-softmax pools.
+
+Preparation is accelerator-only and fail-fast. It requires a CUDA or ROCm device and a matching
+PyTorch native library built with Fusion kernels. A CPU device, an unsupported native library, a
+malformed recipe, unsupported data type, invalid shape, or incompatible constant binding raises an
+exception instead of switching to a reference or eager implementation. `FusionCompilationReport`
+reports `PyTorch CUDA AOT` or `PyTorch ROCm AOT`; `isNativeOnly()` remains true because every recipe
+value is lowered into the prepared native plan. The optional ROCm hipBLASLt bias-SiLU epilogue is a
+backend optimization: when it is unavailable, the command still executes inside the native plan
+using ordinary PyTorch operators, rather than replaying the whole plan through a fallback path.
+
+An executable owns bound constants and precomputed values. Each session owns a configurable ring of
+persistent output and workspace slots; the default `bufferCount` is one. Invocations and output
+leases are generation-checked, single-use handles. Closing an output lease permits its slot to be
+reused but does not synchronize the device, so cross-stream consumers and asynchronous host copies
+must complete first. Submission validates every input, runtime extent, empty case, mask, and shape
+before launching any command. A preflight failure therefore leaves the session reusable. If a later
+failure occurs after work may have been enqueued, the native backend retains referenced inputs and
+establishes completion before returning the failure. If completion cannot be established, the
+session remains poisoned, rejects further submissions, and must be closed; close may retry the
+drain and can itself fail without releasing resources.
+
+The compilation report exposes logical payload sizes for capacity planning. For `n` session slots,
+backend-owned tensor payload is:
+
+```text
+getExecutableStorageBytes() + n * getPersistentStorageBytes()
+```
+
+`getWorkspaceBytes()` is already included in per-slot persistent storage and must not be added
+again. The estimate excludes allocator alignment and rounding, tensor metadata, streams and events,
+backend-library scratch storage, caller-owned inputs, and caller-owned constant tensors. Actual VRAM
+can therefore be higher; measure allocator usage on the target CUDA or ROCm device for deployment
+headroom.
+
 ## Installation
 
 You can pull the PyTorch engine from the central Maven repository by including the following dependency:

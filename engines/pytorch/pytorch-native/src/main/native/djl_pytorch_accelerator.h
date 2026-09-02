@@ -21,9 +21,20 @@ namespace djl_pytorch {
 namespace accel {
 
 struct CopyEvent;
+struct DeviceEvent;
+struct DeviceStream;
 struct HostBuffer;
 struct AcceleratorGraph;
 struct StreamScope;
+
+struct DeviceMemoryStats {
+  int64_t allocated_bytes;
+  int64_t peak_allocated_bytes;
+  int64_t reserved_bytes;
+  int64_t peak_reserved_bytes;
+  int64_t active_bytes;
+  int64_t peak_active_bytes;
+};
 
 bool IsAvailable();
 
@@ -35,15 +46,27 @@ void DeleteHostBuffer(HostBuffer* buffer);
 
 void CopyFromHost(torch::Tensor& target, void* data, bool non_blocking = false);
 void CopyFromHost(torch::Tensor& target, HostBuffer* buffer, bool non_blocking = false);
+void EnqueueCopyFrom(torch::Tensor& target, HostBuffer* buffer);
+void EnqueueCopyTo(const torch::Tensor& source, HostBuffer* buffer);
 CopyEvent* CopyFromHostAsync(torch::Tensor& target, HostBuffer* buffer);
 CopyEvent* CopyToHostAsync(const torch::Tensor& source, HostBuffer* buffer);
 void SynchronizeCopyEvent(CopyEvent* event);
 void DeleteCopyEvent(CopyEvent* event);
-void RecordTensorUseOnCurrentStream(const torch::Tensor& tensor);
+void RecordStream(const torch::Tensor& tensor);
 
 StreamScope* NewStreamScope();
 StreamScope* NewStreamScope(c10::Device device);
+DeviceStream* NewDeviceStream(c10::Device device);
+StreamScope* OpenDeviceStream(DeviceStream* stream);
+void DeleteDeviceStream(DeviceStream* stream);
 void DeleteStreamScope(StreamScope* scope);
+
+DeviceEvent* NewDeviceEvent(c10::Device device);
+void RecordDeviceEvent(DeviceEvent* event);
+void WaitDeviceEvent(DeviceEvent* event);
+bool QueryDeviceEvent(DeviceEvent* event);
+void SynchronizeDeviceEvent(DeviceEvent* event);
+void DeleteDeviceEvent(DeviceEvent* event);
 
 AcceleratorGraph* NewAcceleratorGraph(c10::Device device);
 void BeginAcceleratorGraphCapture(AcceleratorGraph* graph);
@@ -51,6 +74,8 @@ void EndAcceleratorGraphCapture(AcceleratorGraph* graph);
 void ReplayAcceleratorGraph(AcceleratorGraph* graph);
 void DeleteAcceleratorGraph(AcceleratorGraph* graph);
 
+DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device);
+void ResetPeakMemoryStats(c10::DeviceIndex device);
 void EmptyCache();
 
 }  // namespace accel

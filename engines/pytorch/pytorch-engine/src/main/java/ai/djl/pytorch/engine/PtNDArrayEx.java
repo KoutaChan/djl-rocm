@@ -21,6 +21,7 @@ import ai.djl.ndarray.NDUtils;
 import ai.djl.ndarray.index.NDArrayIndexer;
 import ai.djl.ndarray.internal.NDArrayEx;
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.recurrent.RNN;
@@ -46,6 +47,46 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray embeddingWithOffsets(NDArray offsets, NDArray table) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.embeddingWithOffsets(array, manager.from(offsets), manager.from(table));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray embeddingFeaturePack(NDArray offsets, NDArray table, NDArray features) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.embeddingFeaturePack(
+                array, manager.from(offsets), manager.from(table), manager.from(features));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray concatToType(NDList arrays, int axis, DataType dataType) {
+        PtNDManager manager = array.getManager();
+        PtNDArray[] inputs = new PtNDArray[arrays.size() + 1];
+        inputs[0] = array;
+        for (int index = 0; index < arrays.size(); ++index) {
+            inputs[index + 1] = manager.from(arrays.get(index));
+        }
+        return JniUtils.concatToType(inputs, axis, dataType);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray differentiableCast(DataType dataType) {
+        if (!array.getDataType().isFloating() || !dataType.isFloating()) {
+            throw new IllegalArgumentException(
+                    "Differentiable casts require floating-point types.");
+        }
+        if (array.getDataType() == dataType) {
+            return array;
+        }
+        return JniUtils.differentiableCast(array, dataType);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray gatherRows(NDArray rowIndices) {
         PtNDManager manager = array.getManager();
         return JniUtils.gatherRows(array, manager.from(rowIndices));
@@ -60,9 +101,125 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray categoricalMasks(NDArray mask, int[] fieldIndices, long[] categorySets) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.categoricalMasks(mask, fieldIndices, categorySets);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.categoricalMasks(array, manager.from(mask), fieldIndices, categorySets);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray binaryChoiceMasks(
+            NDArray firstMask,
+            NDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.binaryChoiceMasks(
+                    firstMask,
+                    secondMask,
+                    representativeField,
+                    firstRouteField,
+                    secondRouteField,
+                    paddingValue);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.binaryChoiceMasks(
+                array,
+                manager.from(firstMask),
+                manager.from(secondMask),
+                representativeField,
+                firstRouteField,
+                secondRouteField,
+                paddingValue);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray segmentedLookupSum(NDArray storedIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.segmentedLookupSum(storedIndices);
+        }
+        DataType indexType = storedIndices.getDataType();
+        if (indexType != DataType.INT16
+                && indexType != DataType.INT32
+                && indexType != DataType.INT64) {
+            throw new IllegalArgumentException(
+                    "segmented lookup indices must be INT16, INT32, or INT64: " + indexType);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.segmentedLookupSum(array, manager.from(storedIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray paddedBatchGather(NDArray storedIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.paddedBatchGather(storedIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.paddedBatchGather(array, manager.from(storedIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray paddedBatchGather(NDArray outerStoredIndices, NDArray innerStoredIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.paddedBatchGather(outerStoredIndices, innerStoredIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.paddedBatchGather(
+                array, manager.from(outerStoredIndices), manager.from(innerStoredIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray paddedBatchGatherByBatchIndices(NDArray batchIndices, NDArray storedIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.paddedBatchGatherByBatchIndices(batchIndices, storedIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.paddedBatchGatherByBatchIndices(
+                array, manager.from(batchIndices), manager.from(storedIndices));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray maskedSoftmax(NDArray mask, int axis) {
         PtNDManager manager = array.getManager();
         return JniUtils.maskedSoftmax(array, manager.from(mask), axis);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray weightedRowStatistics(NDArray weights) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.weightedRowStatistics(weights);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.weightedRowStatistics(array, manager.from(weights));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray groupedMaskedSoftmaxPool(NDArray mask, NDArray values) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.groupedMaskedSoftmaxPool(array, manager.from(mask), manager.from(values));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray indexedMaskedSoftmaxPool(NDArray mask, NDArray values, int[] choiceIndices) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.indexedMaskedSoftmaxPool(mask, values, choiceIndices);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.indexedMaskedSoftmaxPool(
+                array, manager.from(mask), manager.from(values), choiceIndices);
     }
 
     /** {@inheritDoc} */
@@ -371,6 +528,21 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray projectedResidualMlp(
+            NDArray combinedWeight, NDArray combinedBias, NDArray outputWeight) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.projectedResidualMlp(combinedWeight, combinedBias, outputWeight);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.projectedResidualMlp(
+                array,
+                manager.from(combinedWeight),
+                manager.from(combinedBias),
+                manager.from(outputWeight));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDList embedding(NDArray input, NDArray weight, SparseFormat sparseFormat) {
         if (!sparseFormat.equals(SparseFormat.DENSE) && !sparseFormat.equals(SparseFormat.COO)) {
             throw new IllegalArgumentException("PyTorch only supports COO");
@@ -408,6 +580,44 @@ public class PtNDArrayEx implements NDArrayEx {
                         manager.from(gamma),
                         manager.from(beta),
                         eps));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDList residualAddLayerNorm(
+            NDArray residual,
+            NDArray update,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.residualAddLayerNorm(
+                manager.from(residual),
+                manager.from(update),
+                normalizedShape,
+                manager.from(gamma),
+                manager.from(beta),
+                eps);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDList layerNormAndCast(
+            NDArray input,
+            Shape normalizedShape,
+            NDArray gamma,
+            NDArray beta,
+            float eps,
+            DataType convertedDataType) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.layerNormAndCast(
+                manager.from(input),
+                normalizedShape,
+                manager.from(gamma),
+                manager.from(beta),
+                eps,
+                convertedDataType);
     }
 
     /** {@inheritDoc} */
@@ -926,6 +1136,19 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray canonicalGroupedPackedScaledDotProductAttention(
+            NDArray packedKeyValue, NDArray mask, long heads, double scale) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.canonicalGroupedPackedScaledDotProductAttention(
+                    packedKeyValue, mask, heads, scale);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.groupedPackedScaledDotProductAttention(
+                array, manager.from(packedKeyValue), manager.from(mask), heads, (float) scale);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray canonicalGroupedIndexedScaledDotProductAttention(
             NDArray sharedKeyValues,
             NDArray sharedDeltas,
@@ -946,11 +1169,77 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray canonicalMappedGroupedIndexedScaledDotProductAttention(
+            NDArray sharedKeyValues,
+            NDArray sharedGroupIndices,
+            NDArray sharedDeltaTable,
+            NDArray sharedDeltaIndices,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            double scale) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.mappedGroupedIndexedScaledDotProductAttention(
+                array,
+                manager.from(sharedKeyValues),
+                manager.from(sharedGroupIndices),
+                manager.from(sharedDeltaTable),
+                manager.from(sharedDeltaIndices),
+                manager.from(indexedDeltas),
+                manager.from(indexedSharedIds),
+                (float) scale);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDArray addToOwnedResidualAndLayerNorm(
             NDArray update, NDArray weight, NDArray bias, float eps) {
         PtNDManager manager = array.getManager();
         return JniUtils.addToOwnedResidualAndLayerNorm(
                 array, manager.from(update), manager.from(weight), manager.from(bias), eps);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray addMaskedEmbeddingResidualToOwnedTokens(
+            NDList storedIndices,
+            NDArray embeddingTable,
+            NDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        PtNDManager manager = array.getManager();
+        return JniUtils.addMaskedEmbeddingResidualToOwnedTokens(
+                array,
+                storedIndices,
+                manager.from(embeddingTable),
+                manager.from(validMask),
+                paddingIndex,
+                reduction);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray addBroadcastResidualToOwnedAndSilu(NDArray residual, NDArray mask) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.addBroadcastResidualToOwnedAndSilu(residual, mask);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.addBroadcastResidualToOwnedAndSilu(
+                array, manager.from(residual), mask == null ? null : manager.from(mask));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray bias, NDArray residual, NDArray mask) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.addBiasAndBroadcastResidualToOwnedAndSilu(bias, residual, mask);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.addBiasAndBroadcastResidualToOwnedAndSilu(
+                array,
+                manager.from(bias),
+                manager.from(residual),
+                mask == null ? null : manager.from(mask));
     }
 
     /** {@inheritDoc} */

@@ -1,7 +1,7 @@
 /*
  * Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
  * with the License. A copy of the License is located at
  *
  * http://aws.amazon.com/apache2.0/
@@ -18,6 +18,7 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.training.GradientCollector;
 import ai.djl.training.optimizer.Optimizer;
 import ai.djl.training.tracker.Tracker;
 
@@ -42,8 +43,7 @@ public class AdamWMasterWeightTest {
                 NDArray masterWeight = manager.ones(new Shape(4), DataType.FLOAT32);
                 NDArray gradient = manager.ones(new Shape(4), DataType.FLOAT32);
                 NDArray wrongShape = manager.ones(new Shape(3), DataType.FLOAT32);
-                NDArray integerWeight = manager.ones(new Shape(4), DataType.INT32);
-                NDArray lowPrecisionGradient = manager.ones(new Shape(4), DataType.BFLOAT16)) {
+                NDArray integerWeight = manager.ones(new Shape(4), DataType.INT32)) {
             Optimizer optimizer = optimizer();
 
             Assert.assertThrows(
@@ -70,10 +70,16 @@ public class AdamWMasterWeightTest {
                     IllegalArgumentException.class,
                     () ->
                             optimizer.updateWithMasterWeight(
-                                    "gradient-dtype",
-                                    modelWeight,
-                                    masterWeight,
-                                    lowPrecisionGradient));
+                                    "gradient-dtype", modelWeight, masterWeight, integerWeight));
+        }
+    }
+
+    @Test
+    public void acceptsModelPrecisionAutogradGradient() {
+        Engine engine = Engine.getInstance();
+        verifyAutogradMasterWeightUpdate(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyAutogradMasterWeightUpdate(engine, Device.gpu());
         }
     }
 
@@ -125,6 +131,37 @@ public class AdamWMasterWeightTest {
             assertClose(masterWeight.toFloatArray(), referenceWeight.toFloatArray(), 2e-6f);
             try (NDArray restored = modelWeight.toType(DataType.FLOAT32, false)) {
                 assertClose(restored.toFloatArray(), masterWeight.toFloatArray(), 2e-2f);
+            }
+        }
+    }
+
+    private static void verifyAutogradMasterWeightUpdate(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray masterWeight = manager.create(new float[] {1.0f, -2.0f, 0.5f, 3.0f});
+                NDArray referenceWeight = masterWeight.duplicate();
+                NDArray modelWeight = masterWeight.toType(DataType.BFLOAT16, false);
+                NDArray multiplier =
+                        manager.create(new float[] {0.2f, -0.4f, 0.8f, -0.1f})
+                                .toType(DataType.BFLOAT16, false)) {
+            modelWeight.setRequiresGradient(true);
+            try (GradientCollector collector = engine.newGradientCollector();
+                    NDArray loss = modelWeight.mul(multiplier).sum()) {
+                collector.backward(loss);
+            }
+
+            try (NDArray modelGradient = modelWeight.getGradient();
+                    NDArray referenceGradient = modelGradient.toType(DataType.FLOAT32, false)) {
+                Assert.assertEquals(modelGradient.getDataType(), DataType.BFLOAT16);
+                Optimizer reference = optimizer();
+                Optimizer mixedPrecision = optimizer();
+                reference.update("weight", referenceWeight, referenceGradient);
+                mixedPrecision.updateWithMasterWeight(
+                        "weight", modelWeight, masterWeight, modelGradient);
+
+                assertClose(masterWeight.toFloatArray(), referenceWeight.toFloatArray(), 2e-6f);
+                try (NDArray clearedGradient = modelGradient.toType(DataType.FLOAT32, false)) {
+                    assertClose(clearedGradient.toFloatArray(), new float[4], 0f);
+                }
             }
         }
     }

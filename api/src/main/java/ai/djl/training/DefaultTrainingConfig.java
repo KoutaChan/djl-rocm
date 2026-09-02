@@ -14,6 +14,7 @@ package ai.djl.training;
 
 import ai.djl.Device;
 import ai.djl.engine.Engine;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.Parameter;
 import ai.djl.training.evaluator.Evaluator;
 import ai.djl.training.initializer.Initializer;
@@ -27,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
@@ -37,6 +39,10 @@ public class DefaultTrainingConfig implements TrainingConfig {
 
     private PairList<Initializer, Predicate<Parameter>> initializers = new PairList<>();
     private Optimizer optimizer;
+    private DataType autocastDataType;
+    private boolean autocastCacheEnabled = true;
+    private GradScaler gradScaler;
+    private boolean automaticGradScaler;
     private Device[] devices;
     private Loss loss;
     private ExecutorService executorService;
@@ -117,6 +123,60 @@ public class DefaultTrainingConfig implements TrainingConfig {
      */
     public DefaultTrainingConfig optOptimizer(Optimizer optimizer) {
         this.optimizer = optimizer;
+        return this;
+    }
+
+    /**
+     * Enables training autocast with the backend cache enabled.
+     *
+     * <p>{@link DataType#FLOAT16} automatically installs a default {@link GradScaler}. {@link
+     * DataType#BFLOAT16} autocast does not require gradient scaling by default.
+     *
+     * @param dataType the autocast data type, either FLOAT16 or BFLOAT16
+     * @return this {@code DefaultTrainingConfig}
+     */
+    public DefaultTrainingConfig optAutocast(DataType dataType) {
+        return optAutocast(dataType, true);
+    }
+
+    /**
+     * Enables training autocast.
+     *
+     * <p>{@link DataType#FLOAT16} automatically installs a default {@link GradScaler}. {@link
+     * DataType#BFLOAT16} autocast does not require gradient scaling by default.
+     *
+     * @param dataType the autocast data type, either FLOAT16 or BFLOAT16
+     * @param cacheEnabled whether the backend autocast cache is enabled
+     * @return this {@code DefaultTrainingConfig}
+     */
+    public DefaultTrainingConfig optAutocast(DataType dataType, boolean cacheEnabled) {
+        Objects.requireNonNull(dataType, "Autocast data type must not be null");
+        if (dataType != DataType.FLOAT16 && dataType != DataType.BFLOAT16) {
+            throw new IllegalArgumentException("Autocast data type must be FLOAT16 or BFLOAT16.");
+        }
+        autocastDataType = dataType;
+        autocastCacheEnabled = cacheEnabled;
+        if (dataType == DataType.FLOAT16) {
+            if (gradScaler == null) {
+                gradScaler = GradScaler.builder().build();
+                automaticGradScaler = true;
+            }
+        } else if (automaticGradScaler) {
+            gradScaler = null;
+            automaticGradScaler = false;
+        }
+        return this;
+    }
+
+    /**
+     * Sets a custom gradient scaler.
+     *
+     * @param gradScaler the gradient scaler
+     * @return this {@code DefaultTrainingConfig}
+     */
+    public DefaultTrainingConfig optGradScaler(GradScaler gradScaler) {
+        this.gradScaler = Objects.requireNonNull(gradScaler, "GradScaler must not be null");
+        automaticGradScaler = false;
         return this;
     }
 
@@ -205,6 +265,24 @@ public class DefaultTrainingConfig implements TrainingConfig {
     @Override
     public Optimizer getOptimizer() {
         return optimizer;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Optional<DataType> getAutocastDataType() {
+        return Optional.ofNullable(autocastDataType);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean isAutocastCacheEnabled() {
+        return autocastCacheEnabled;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Optional<GradScaler> getGradScaler() {
+        return Optional.ofNullable(gradScaler);
     }
 
     /** {@inheritDoc} */

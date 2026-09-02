@@ -13,6 +13,7 @@
 package ai.djl.training.listener;
 
 import ai.djl.Device;
+import ai.djl.engine.Autocast;
 import ai.djl.metric.Metrics;
 import ai.djl.ndarray.NDList;
 import ai.djl.training.Trainer;
@@ -40,6 +41,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@link EvaluatorTrainingListener#metricName(Evaluator, String)}. The validation evaluators are
  * also saved as model properties with the evaluator name.
  */
+@SuppressWarnings("try") // Autocast resources are used for their scope side effects.
 public class EvaluatorTrainingListener extends TrainingListenerAdapter {
 
     public static final String TRAIN_EPOCH = "train/epoch";
@@ -140,11 +142,13 @@ public class EvaluatorTrainingListener extends TrainingListenerAdapter {
     }
 
     private void updateEvaluators(Trainer trainer, BatchData batchData, String[] accumulators) {
-        for (Evaluator evaluator : trainer.getEvaluators()) {
-            for (Device device : batchData.getLabels().keySet()) {
+        for (Device device : batchData.getLabels().keySet()) {
+            try (Autocast ignored = trainer.newAutocast(device)) {
                 NDList labels = batchData.getLabels().get(device);
                 NDList predictions = batchData.getPredictions().get(device);
-                evaluator.updateAccumulators(accumulators, labels, predictions);
+                for (Evaluator evaluator : trainer.getEvaluators()) {
+                    evaluator.updateAccumulators(accumulators, labels, predictions);
+                }
             }
         }
     }

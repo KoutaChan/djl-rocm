@@ -26,13 +26,17 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -122,6 +126,7 @@ public final class LibUtils {
         // flavor "cpu" contains "cu", so contains("cu") gives false positives
         boolean isCuda = libTorch.flavor.startsWith("cu");
         boolean isRocm = libTorch.flavor.startsWith("rocm");
+        boolean isWindowsRocm = isRocm && libTorch.classifier.startsWith("win");
         List<String> deferred =
                 Arrays.asList(
                         System.mapLibraryName("fbgemm"),
@@ -135,6 +140,13 @@ public final class LibUtils {
                         System.mapLibraryName("torch"));
 
         Set<String> loadLater = new HashSet<>(deferred);
+        List<Path> windowsRocmLibraries = Collections.emptyList();
+        if (isWindowsRocm) {
+            windowsRocmLibraries = getWindowsRocmLoadOrder(libDir);
+            for (Path path : windowsRocmLibraries) {
+                loadLater.add(path.toFile().getName());
+            }
+        }
         try (Stream<Path> paths = Files.walk(libDir)) {
             Map<Path, Integer> rank = new ConcurrentHashMap<>();
             paths.filter(
@@ -155,7 +167,8 @@ public final class LibUtils {
                                 } else if (name.startsWith("libarm_compute_")) {
                                     rank.put(path, 3);
                                     return true;
-                                } else if (!loadLater.contains(name)
+                                } else if (!isWindowsRocm
+                                        && !loadLater.contains(name)
                                         && Files.isRegularFile(path)
                                         && !name.endsWith(JNI_LIB_NAME)
                                         && !name.contains("torch_")
@@ -182,7 +195,14 @@ public final class LibUtils {
                 loadNativeLibrary(libDir.resolve("cudnn64_7.dll").toString());
             }
 
-            if (isRocm) {
+            if (!windowsRocmLibraries.isEmpty()) {
+                // Windows does not reliably resolve sibling ROCm DLL dependencies for an
+                // absolute System.load(). Load the dependency graph explicitly.
+                for (Path path : windowsRocmLibraries) {
+                    loadNativeLibrary(path.toString());
+                }
+                deferred = Collections.emptyList();
+            } else if (isRocm) {
                 // ROCm libtorch ships the hipified libs as libtorch_hip.so / libc10_hip.so;
                 // some releases keep the libtorch_cuda.so naming, so try both.
                 deferred =
@@ -210,6 +230,69 @@ public final class LibUtils {
             }
         } catch (IOException e) {
             throw new EngineException("Folder not exist! " + libDir, e);
+        }
+    }
+
+    private static List<Path> getWindowsRocmLoadOrder(Path libDir) {
+        List<Path> libraries = new ArrayList<>();
+        addFirstMatching(libraries, libDir, "amd_comgr");
+        addFirstMatching(libraries, libDir, "amdhip64");
+        addFirstMatching(libraries, libDir, "hiprtc-builtins");
+        addFirstMatching(libraries, libDir, "hiprtc", "hiprtc-builtins");
+        addIfExists(libraries, libDir, System.mapLibraryName("caffe2_nvrtc"));
+        addIfExists(libraries, libDir, System.mapLibraryName("c10"));
+        addIfExists(libraries, libDir, System.mapLibraryName("hipblaslt"));
+        addIfExists(libraries, libDir, System.mapLibraryName("rocblas"));
+        addIfExists(libraries, libDir, System.mapLibraryName("hipblas"));
+        addIfExists(libraries, libDir, System.mapLibraryName("rocfft"));
+        addIfExists(libraries, libDir, System.mapLibraryName("hipfft"));
+        addIfExists(libraries, libDir, System.mapLibraryName("rocrand"));
+        addIfExists(libraries, libDir, System.mapLibraryName("hiprand"));
+        addIfExists(libraries, libDir, System.mapLibraryName("rocsparse"));
+        addIfExists(libraries, libDir, System.mapLibraryName("hipsparse"));
+        addIfExists(libraries, libDir, System.mapLibraryName("rocsolver"));
+        addIfExists(libraries, libDir, System.mapLibraryName("hipsolver"));
+        addIfExists(libraries, libDir, System.mapLibraryName("MIOpen"));
+        addIfExists(libraries, libDir, System.mapLibraryName("c10_hip"));
+        addIfExists(libraries, libDir, System.mapLibraryName("fbgemm"));
+        addIfExists(libraries, libDir, System.mapLibraryName("torch_cpu"));
+        addIfExists(libraries, libDir, System.mapLibraryName("shm"));
+        addIfExists(libraries, libDir, System.mapLibraryName("torch_hip"));
+        addIfExists(libraries, libDir, System.mapLibraryName("torch"));
+        return libraries;
+    }
+
+    private static void addIfExists(List<Path> libraries, Path libDir, String name) {
+        Path path = libDir.resolve(name);
+        if (Files.isRegularFile(path)) {
+            libraries.add(path);
+        }
+    }
+
+    private static void addFirstMatching(
+            List<Path> libraries, Path libDir, String prefix, String... excludedPrefixes) {
+        try (Stream<Path> paths = Files.list(libDir)) {
+            paths.filter(Files::isRegularFile)
+                    .filter(
+                            path -> {
+                                String name =
+                                        path.getFileName().toString().toLowerCase(Locale.ROOT);
+                                if (!name.endsWith(".dll")
+                                        || !name.startsWith(prefix.toLowerCase(Locale.ROOT))) {
+                                    return false;
+                                }
+                                for (String excluded : excludedPrefixes) {
+                                    if (name.startsWith(excluded.toLowerCase(Locale.ROOT))) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            })
+                    .sorted()
+                    .findFirst()
+                    .ifPresent(libraries::add);
+        } catch (IOException e) {
+            throw new EngineException("Failed to inspect ROCm libraries in: " + libDir, e);
         }
     }
 
@@ -571,6 +654,14 @@ public final class LibUtils {
             }
         }
 
+        LibTorch(Path dir, Platform platform, String flavor) {
+            this.dir = dir;
+            this.version = platform.getVersion();
+            this.apiVersion = platform.getApiVersion();
+            this.classifier = platform.getClassifier();
+            this.flavor = flavor;
+        }
+
         /**
          * Detect a ROCm installation under /opt/rocm* and return a flavor string (e.g. "rocm6.3"),
          * or {@code null} if none is found. Override with the {@code DJL_ROCM_VERSION} env var
@@ -591,7 +682,11 @@ public final class LibUtils {
             File versionFile = new File(rocmRoot, ".info/version");
             if (versionFile.exists()) {
                 try {
-                    String version = new String(Files.readAllBytes(versionFile.toPath())).trim();
+                    String version =
+                            new String(
+                                            Files.readAllBytes(versionFile.toPath()),
+                                            StandardCharsets.UTF_8)
+                                    .trim();
                     Matcher m = Pattern.compile("(\\d+\\.\\d+)").matcher(version);
                     if (m.find()) {
                         return "rocm" + m.group(1);
@@ -611,14 +706,6 @@ public final class LibUtils {
                 }
             }
             return null;
-        }
-
-        LibTorch(Path dir, Platform platform, String flavor) {
-            this.dir = dir;
-            this.version = platform.getVersion();
-            this.apiVersion = platform.getApiVersion();
-            this.classifier = platform.getClassifier();
-            this.flavor = flavor;
         }
     }
 }

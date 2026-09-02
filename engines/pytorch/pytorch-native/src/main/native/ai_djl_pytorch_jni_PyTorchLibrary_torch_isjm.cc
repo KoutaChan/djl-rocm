@@ -11,13 +11,28 @@
  * and limitations under the License.
  */
 #include <ATen/ops/unique_dim.h>
+#include <c10/core/DeviceGuard.h>
 #include <djl/utils.h>
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
+#include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
 
 // The file is the implementation for PyTorch tensor indexing, slicing, joining, mutating ops
+
+#if defined(DJL_USE_ROCM_KERNELS)
+namespace {
+
+void record_concat_to_type_stream(const torch::Tensor& tensor) {
+  c10::DeviceGuard device_guard(tensor.device());
+  c10::impl::VirtualGuardImpl guard_impl(tensor.device().type());
+  guard_impl.recordDataPtrOnStream(
+      tensor.storage().data_ptr(), guard_impl.getStream(tensor.device()));
+}
+
+}  // namespace
+#endif
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchReshape(
     JNIEnv* env, jobject jthis, jlong jhandle, jlongArray jshape) {
@@ -90,6 +105,81 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCat(
   API_BEGIN()
   const std::vector<torch::Tensor> tensor_vec = djl::utils::jni::GetObjectVecFromJHandles<torch::Tensor>(env, jhandles);
   const torch::Tensor* result_ptr = new torch::Tensor(torch::cat(tensor_vec, jdim));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchConcatToType(
+    JNIEnv* env, jobject jthis, jlongArray jhandles, jlong jdim,
+    jint jdata_type) {
+  API_BEGIN()
+  const std::vector<torch::Tensor> tensors =
+      djl::utils::jni::GetObjectVecFromJHandles<torch::Tensor>(env, jhandles);
+  TORCH_CHECK(!tensors.empty(), "concat-to-type requires at least one tensor");
+  const torch::ScalarType output_type =
+      utils::GetScalarTypeFromDType(jdata_type);
+  const int64_t rank = tensors.front().dim();
+  const int64_t dimension = jdim < 0 ? jdim + rank : jdim;
+  TORCH_CHECK(dimension >= 0 && dimension < rank,
+      "concat-to-type dimension is outside the input rank");
+
+#if defined(DJL_USE_ROCM_KERNELS)
+  bool native = dimension == rank - 1 && tensors.size() <=
+      static_cast<size_t>(djl::pytorch::fusion::kMaximumOutputPackSources) &&
+      (output_type == torch::kFloat16 || output_type == torch::kBFloat16 ||
+       output_type == torch::kFloat32);
+  int64_t output_width = 0;
+  std::vector<int64_t> output_sizes(tensors.front().sizes().begin(),
+      tensors.front().sizes().end());
+  const auto device = tensors.front().device();
+  for (const torch::Tensor& tensor : tensors) {
+    native = native && tensor.dim() == rank && tensor.is_cuda() &&
+        tensor.is_contiguous() && tensor.device() == device &&
+        !tensor.requires_grad() &&
+        (tensor.scalar_type() == torch::kFloat16 ||
+         tensor.scalar_type() == torch::kBFloat16 ||
+         tensor.scalar_type() == torch::kFloat32);
+    if (tensor.dim() == rank) {
+      for (int64_t axis = 0; axis < rank - 1; ++axis) {
+        native = native && tensor.size(axis) == output_sizes[axis];
+      }
+      output_width += tensor.size(rank - 1);
+    }
+  }
+  if (native) {
+    c10::DeviceGuard device_guard(device);
+    output_sizes[rank - 1] = output_width;
+    torch::Tensor output = torch::empty(
+        output_sizes, tensors.front().options().dtype(output_type));
+    const int64_t row_count = output_width == 0
+        ? 0
+        : output.numel() / output_width;
+    std::vector<djl::pytorch::fusion::OutputPackSource> sources;
+    sources.reserve(tensors.size());
+    int64_t destination_offset = 0;
+    for (const torch::Tensor& tensor : tensors) {
+      record_concat_to_type_stream(tensor);
+      sources.push_back(djl::pytorch::fusion::OutputPackSource{
+          tensor.data_ptr(), tensor.scalar_type(), tensor.size(rank - 1),
+          destination_offset});
+      destination_offset += tensor.size(rank - 1);
+    }
+    record_concat_to_type_stream(output);
+    djl::pytorch::fusion::LaunchOutputPack(
+        sources.data(), static_cast<int32_t>(sources.size()), output,
+        row_count, output_width);
+    const auto* result_ptr = new torch::Tensor(std::move(output));
+    return reinterpret_cast<uintptr_t>(result_ptr);
+  }
+#endif
+
+  std::vector<torch::Tensor> converted;
+  converted.reserve(tensors.size());
+  for (const torch::Tensor& tensor : tensors) {
+    converted.push_back(tensor.to(output_type));
+  }
+  const auto* result_ptr =
+      new torch::Tensor(torch::cat(converted, dimension));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }

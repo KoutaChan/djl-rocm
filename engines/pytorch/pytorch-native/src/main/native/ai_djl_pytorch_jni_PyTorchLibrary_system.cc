@@ -197,6 +197,87 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCloseStreamScope(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateDeviceStream(
+    JNIEnv* env, jobject jthis, jintArray jdevice) {
+  API_BEGIN()
+  const torch::Device device = utils::GetDeviceFromJDevice(env, jdevice);
+  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::NewDeviceStream(device));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchOpenDeviceStream(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  auto* stream = reinterpret_cast<djl_pytorch::accel::DeviceStream*>(jhandle);
+  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::OpenDeviceStream(stream));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteDeviceStream(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::DeleteDeviceStream(
+      reinterpret_cast<djl_pytorch::accel::DeviceStream*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateDeviceEvent(
+    JNIEnv* env, jobject jthis, jintArray jdevice) {
+  API_BEGIN()
+  const torch::Device device = utils::GetDeviceFromJDevice(env, jdevice);
+  return reinterpret_cast<uintptr_t>(djl_pytorch::accel::NewDeviceEvent(device));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRecordDeviceEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::RecordDeviceEvent(
+      reinterpret_cast<djl_pytorch::accel::DeviceEvent*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchWaitDeviceEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::WaitDeviceEvent(
+      reinterpret_cast<djl_pytorch::accel::DeviceEvent*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchQueryDeviceEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  return djl_pytorch::accel::QueryDeviceEvent(
+      reinterpret_cast<djl_pytorch::accel::DeviceEvent*>(jhandle));
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSynchronizeDeviceEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::SynchronizeDeviceEvent(
+      reinterpret_cast<djl_pytorch::accel::DeviceEvent*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteDeviceEvent(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  djl_pytorch::accel::DeleteDeviceEvent(
+      reinterpret_cast<djl_pytorch::accel::DeviceEvent*>(jhandle));
+  API_END()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
 Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateAcceleratorGraph(
     JNIEnv* env, jobject jthis, jintArray jdevice) {
   API_BEGIN()
@@ -437,5 +518,27 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchStopProfile(
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCudaEmptyCache(JNIEnv* env, jobject jthis) {
   API_BEGIN()
   djl_pytorch::accel::EmptyCache();
+  API_END()
+}
+
+JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetMemoryStats(
+    JNIEnv* env, jobject jthis, jint jdevice_id) {
+  API_BEGIN()
+  const auto stats =
+      djl_pytorch::accel::GetMemoryStats(static_cast<c10::DeviceIndex>(jdevice_id));
+  const jlong values[] = {static_cast<jlong>(stats.allocated_bytes),
+      static_cast<jlong>(stats.peak_allocated_bytes), static_cast<jlong>(stats.reserved_bytes),
+      static_cast<jlong>(stats.peak_reserved_bytes), static_cast<jlong>(stats.active_bytes),
+      static_cast<jlong>(stats.peak_active_bytes)};
+  jlongArray result = env->NewLongArray(6);
+  env->SetLongArrayRegion(result, 0, 6, values);
+  return result;
+  API_END_RETURN()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchResetPeakMemoryStats(
+    JNIEnv* env, jobject jthis, jint jdevice_id) {
+  API_BEGIN()
+  djl_pytorch::accel::ResetPeakMemoryStats(static_cast<c10::DeviceIndex>(jdevice_id));
   API_END()
 }

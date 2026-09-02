@@ -36,6 +36,24 @@ final class PyTorchLibrary {
 
     native void torchCloseStreamScope(long handle);
 
+    native long torchCreateDeviceStream(int[] device);
+
+    native long torchOpenDeviceStream(long handle);
+
+    native void torchDeleteDeviceStream(long handle);
+
+    native long torchCreateDeviceEvent(int[] device);
+
+    native void torchRecordDeviceEvent(long handle);
+
+    native void torchWaitDeviceEvent(long handle);
+
+    native boolean torchQueryDeviceEvent(long handle);
+
+    native void torchSynchronizeDeviceEvent(long handle);
+
+    native void torchDeleteDeviceEvent(long handle);
+
     native long torchCreateAcceleratorGraph(int[] device);
 
     native void torchBeginAcceleratorGraphCapture(long handle);
@@ -45,6 +63,27 @@ final class PyTorchLibrary {
     native void torchReplayAcceleratorGraph(long handle);
 
     native void torchDeleteAcceleratorGraph(long handle);
+
+    native int torchGetFusionBackend();
+
+    native long torchPrepareFusionPlan(int[] device, ByteBuffer descriptor);
+
+    native long torchBindFusionPlan(long planHandle, ByteBuffer constantHandles);
+
+    native long torchCreateFusionSession(long executableHandle, int bufferCount);
+
+    native long torchGetFusionSessionOutput(long sessionHandle, int bufferIndex, int outputIndex);
+
+    native void torchSubmitFusion(
+            long sessionHandle, int bufferIndex, ByteBuffer inputHandles, ByteBuffer dimensions);
+
+    native void torchSynchronizeFusionOutput(long sessionHandle, int bufferIndex);
+
+    native void torchDeleteFusionPlan(long handle);
+
+    native void torchDeleteFusionExecutable(long handle);
+
+    native void torchDeleteFusionSession(long handle);
 
     native boolean torchAutocastIsEnabled(int deviceType);
 
@@ -80,6 +119,10 @@ final class PyTorchLibrary {
 
     native int torchGetGpuCount();
 
+    native long[] torchGetMemoryStats(int deviceId);
+
+    native void torchResetPeakMemoryStats(int deviceId);
+
     native void torchStartProfile(boolean useCuda, boolean recordShape, boolean profileMemory);
 
     native void torchStopProfile(String outputFile);
@@ -101,6 +144,8 @@ final class PyTorchLibrary {
     native int torchLayout(long handle);
 
     native long torchTo(long handle, int dType, int[] device);
+
+    native long torchDifferentiableCast(long handle, int dataType);
 
     native long torchGetItem(long handle, long index);
 
@@ -251,7 +296,26 @@ final class PyTorchLibrary {
 
     native long torchMaskedSoftmax(long logits, long mask, long axis);
 
+    native long torchWeightedRowStatistics(long values, long weights);
+
+    native long torchGroupedMaskedSoftmaxPool(long logits, long mask, long values);
+
+    native long torchIndexedMaskedSoftmaxPool(
+            long logits, long mask, long values, int[] choiceIndices);
+
     native long torchMaskedLogSumExp(long logits, long mask, long axis);
+
+    native long torchCategoricalMasks(
+            long categories, long mask, int[] fieldIndices, long[] categorySets);
+
+    native long torchBinaryChoiceMasks(
+            long routes,
+            long firstMask,
+            long secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue);
 
     native long torchScaledDotProductAttention(
             long query,
@@ -265,6 +329,9 @@ final class PyTorchLibrary {
     native long torchIndexedRelationBias(
             long relationLogits, long relationBias, long relationIds, float scale);
 
+    native long torchGroupedPackedScaledDotProductAttention(
+            long query, long packedKeyValue, long mask, long heads, float scale);
+
     native long torchGroupedIndexedScaledDotProductAttention(
             long query,
             long sharedKeyValues,
@@ -274,8 +341,31 @@ final class PyTorchLibrary {
             long queriesPerGroup,
             float scale);
 
+    native long torchMappedGroupedIndexedScaledDotProductAttention(
+            long query,
+            long sharedKeyValues,
+            long sharedGroupIndices,
+            long sharedDeltaTable,
+            long sharedDeltaIndices,
+            long indexedDeltas,
+            long indexedSharedIds,
+            float scale);
+
     native long torchAddToOwnedResidualAndLayerNorm(
             long residual, long update, long weight, long bias, float epsilon);
+
+    native long torchAddMaskedEmbeddingResidualToOwnedTokens(
+            long tokens,
+            long[] storedIndices,
+            long embeddingTable,
+            long validMask,
+            long paddingIndex,
+            int reduction);
+
+    native void torchAddBroadcastResidualToOwnedAndSilu(long values, long residual, long mask);
+
+    native void torchAddBiasAndBroadcastResidualToOwnedAndSilu(
+            long values, long bias, long residual, long mask);
 
     native long torchRmsNorm(long input, long[] normalizedShape, long weight, double eps);
 
@@ -336,11 +426,17 @@ final class PyTorchLibrary {
 
     native long torchCopyFromPinnedBufferAsync(long handle, long pinnedBufferHandle);
 
+    native void torchEnqueueCopyFrom(long handle, long pinnedBufferHandle);
+
     native long torchCopyToPinnedBufferAsync(long handle, long pinnedBufferHandle);
+
+    native void torchEnqueueCopyTo(long handle, long pinnedBufferHandle);
 
     native void torchSynchronizeCopyEvent(long handle);
 
     native void torchDeleteCopyEvent(long handle);
+
+    native void torchRecordStream(long handle);
 
     native void torchCopyTo(long sourceHandle, long targetHandle);
 
@@ -354,9 +450,23 @@ final class PyTorchLibrary {
 
     native long torchScatter(long handle, long index, long value, int axis);
 
+    native long torchEmbeddingWithOffsets(long rawIds, long offsets, long table);
+
+    native long torchEmbeddingFeaturePack(long rawIds, long offsets, long table, long features);
+
     native long torchGatherRows(long handle, long index);
 
     native long torchScatterRows(long handle, long index, long rowCount);
+
+    native long torchSegmentedLookupSum(long handle, long storedIndices);
+
+    native long torchPaddedBatchGather(long handle, long storedIndices);
+
+    native long torchPaddedBatchGather2d(
+            long handle, long outerStoredIndices, long innerStoredIndices);
+
+    native long torchPaddedBatchGatherByBatchIndices(
+            long handle, long batchIndices, long storedIndices);
 
     native long torchIndexAdd(long handle, long index, long value, int axis);
 
@@ -457,6 +567,8 @@ final class PyTorchLibrary {
     native long torchStack(long[] handles, long dim);
 
     native long torchCat(long[] handles, long dim);
+
+    native long torchConcatToType(long[] handles, long dim, int dataType);
 
     native long torchRepeat(long handle, long[] repeats);
 
@@ -598,6 +710,12 @@ final class PyTorchLibrary {
 
     native long torchNNLinear(long handle, long weightHandle, long biasHandle);
 
+    native long torchNNProjectedResidualMlp(
+            long inputHandle,
+            long combinedWeightHandle,
+            long combinedBiasHandle,
+            long outputWeightHandle);
+
     native long torchNNEmbedding(long handle, long weightHandle, boolean sparse);
 
     native long torchNNRelu(long handle);
@@ -633,6 +751,22 @@ final class PyTorchLibrary {
             long weigthHandle,
             long biasHandle,
             double eps);
+
+    native long[] torchNNResidualAddLayerNorm(
+            long residualHandle,
+            long updateHandle,
+            long[] normalizedShape,
+            long weightHandle,
+            long biasHandle,
+            double eps);
+
+    native long[] torchNNLayerNormAndCast(
+            long inputHandle,
+            long[] normalizedShape,
+            long weightHandle,
+            long biasHandle,
+            double eps,
+            int convertedDataType);
 
     native long torchNNBatchNorm(
             long inputHandle,
@@ -710,6 +844,29 @@ final class PyTorchLibrary {
 
     native void torchBackward(
             long inputHandle, long gradHandle, boolean keepGraph, boolean createGraph);
+
+    native long torchCreateFlatGradientAccumulator(long[] parameterHandles, long gradientHandle);
+
+    native void torchFlatGradientAccumulatorBackward(
+            long accumulatorHandle, long targetHandle, long targetGradientHandle);
+
+    native void torchZeroFlatGradientAccumulator(long accumulatorHandle);
+
+    native void torchDeleteFlatGradientAccumulator(long accumulatorHandle);
+
+    native long torchCreateFlatGradientPacker(long[] parameterHandles, long destinationHandle);
+
+    native void torchFlatGradientPackerPackAndClear(
+            long packerHandle, boolean zeroMissingGradients);
+
+    native void torchFlatGradientPackerAccumulateAndClear(
+            long packerHandle, boolean zeroMissingGradients);
+
+    native void torchZeroFlatGradientPackerDestination(long packerHandle);
+
+    native void torchClearFlatGradientPackerParameterGradients(long packerHandle);
+
+    native void torchDeleteFlatGradientPacker(long packerHandle);
 
     native long distributedCreateReducer(
             long[] parameterHandles,
@@ -838,6 +995,8 @@ final class PyTorchLibrary {
     native boolean iValueIsMap(long iValueHandle);
 
     native void zeroGrad(long handle);
+
+    native boolean torchUnscaleGradientsAndCheckFinite(long[] gradientHandles, float inverseScale);
 
     native void adamUpdate(
             long weight,

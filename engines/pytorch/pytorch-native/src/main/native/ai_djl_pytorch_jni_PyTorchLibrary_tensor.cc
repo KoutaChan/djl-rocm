@@ -89,6 +89,16 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTo(
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDifferentiableCast(
+    JNIEnv* env, jobject jthis, jlong jhandle, jint jdtype) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* result_ptr = new torch::Tensor(
+      tensor_ptr->to(utils::GetScalarTypeFromDType(jdtype)));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetItem__JJ(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex) {
   API_BEGIN()
@@ -308,6 +318,26 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyFromPinn
   API_END_RETURN()
 }
 
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEnqueueCopyFrom(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  auto* target_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
+  djl_pytorch::accel::EnqueueCopyFrom(*target_ptr, buffer);
+  API_END()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEnqueueCopyTo(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
+  API_BEGIN()
+  torch::NoGradGuard guard;
+  const auto* source_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  auto* buffer = reinterpret_cast<djl_pytorch::accel::HostBuffer*>(jpinned_buffer_handle);
+  djl_pytorch::accel::EnqueueCopyTo(*source_ptr, buffer);
+  API_END()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCopyToPinnedBufferAsync(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jpinned_buffer_handle) {
   API_BEGIN()
@@ -402,6 +432,37 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchScatter(
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEmbeddingWithOffsets(
+    JNIEnv* env, jobject jthis, jlong jraw_ids_handle, jlong joffsets_handle,
+    jlong jtable_handle) {
+  API_BEGIN()
+  const auto* raw_ids_ptr = reinterpret_cast<torch::Tensor*>(jraw_ids_handle);
+  const auto* offsets_ptr = reinterpret_cast<torch::Tensor*>(joffsets_handle);
+  const auto* table_ptr = reinterpret_cast<torch::Tensor*>(jtable_handle);
+  auto result = djl::pytorch::embedding_with_offsets(
+      *raw_ids_ptr, *offsets_ptr, *table_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchEmbeddingFeaturePack(
+    JNIEnv* env, jobject jthis, jlong jraw_ids_handle, jlong joffsets_handle,
+    jlong jtable_handle, jlong jfeatures_handle) {
+  API_BEGIN()
+  const auto* raw_ids_ptr = reinterpret_cast<torch::Tensor*>(jraw_ids_handle);
+  const auto* offsets_ptr = reinterpret_cast<torch::Tensor*>(joffsets_handle);
+  const auto* table_ptr = reinterpret_cast<torch::Tensor*>(jtable_handle);
+  const auto* features_ptr = reinterpret_cast<torch::Tensor*>(jfeatures_handle);
+  auto result = djl::pytorch::embedding_feature_pack(
+      *raw_ids_ptr, *offsets_ptr, *table_ptr, *features_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGatherRows(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex_handle) {
   API_BEGIN()
@@ -418,6 +479,63 @@ extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchS
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
   const auto* index_ptr = reinterpret_cast<torch::Tensor*>(jindex_handle);
   auto result = djl::pytorch::scatter_rows(*tensor_ptr, *index_ptr, jrow_count);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSegmentedLookupSum(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jstored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jstored_indices_handle);
+  auto result = djl::pytorch::segmented_lookup_sum(*tensor_ptr, *stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGather(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jstored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jstored_indices_handle);
+  auto result = djl::pytorch::padded_batch_gather(*tensor_ptr, *stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGather2d(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jouter_stored_indices_handle,
+    jlong jinner_stored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* outer_stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jouter_stored_indices_handle);
+  const auto* inner_stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jinner_stored_indices_handle);
+  auto result = djl::pytorch::padded_batch_gather_2d(
+      *tensor_ptr, *outer_stored_indices_ptr, *inner_stored_indices_ptr);
+  const auto* result_ptr = new torch::Tensor(std::move(result));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPaddedBatchGatherByBatchIndices(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jbatch_indices_handle,
+    jlong jstored_indices_handle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* batch_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jbatch_indices_handle);
+  const auto* stored_indices_ptr =
+      reinterpret_cast<torch::Tensor*>(jstored_indices_handle);
+  auto result = djl::pytorch::padded_batch_gather_by_batch_indices(
+      *tensor_ptr, *batch_indices_ptr, *stored_indices_ptr);
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
@@ -519,11 +637,20 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchToContiguous
   API_END_RETURN()
 }
 
+JNIEXPORT void JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchRecordStream(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  djl_pytorch::accel::RecordStream(*tensor_ptr);
+  API_END()
+}
+
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteTensor(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
   const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
-  djl_pytorch::accel::RecordTensorUseOnCurrentStream(*tensor_ptr);
+  djl_pytorch::accel::RecordStream(*tensor_ptr);
   delete tensor_ptr;
   API_END()
 }

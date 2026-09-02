@@ -13,6 +13,7 @@
 package ai.djl.ndarray;
 
 import ai.djl.ndarray.types.DataType;
+import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.util.Preconditions;
 
@@ -22,6 +23,98 @@ import java.util.Arrays;
 public final class NDArrays {
 
     private NDArrays() {}
+
+    /**
+     * Adds namespace offsets to integer IDs and looks up their dense embeddings.
+     *
+     * <p>{@code offsets} must be broadcastable to {@code rawIds}. The result has the shape of the
+     * broadcast IDs followed by the embedding width, and its data type is the data type of {@code
+     * table}. Engines may fuse the offset addition and lookup while retaining the same dense
+     * embedding gradient semantics as the portable implementation.
+     *
+     * @param rawIds unoffset integer IDs
+     * @param offsets integer namespace offsets broadcastable to {@code rawIds}
+     * @param table dense embedding table shaped {@code [entries, embeddingSize]}
+     * @return embeddings selected by {@code rawIds + offsets}
+     */
+    public static NDArray embeddingWithOffsets(NDArray rawIds, NDArray offsets, NDArray table) {
+        validateEmbeddingWithOffsets(rawIds, offsets, table);
+        return rawIds.getNDArrayInternal().embeddingWithOffsets(offsets, table);
+    }
+
+    /**
+     * Packs offset embedding fields and trailing dense features without intermediate tensors.
+     *
+     * <p>{@code rawIds} is shaped {@code [..., fields]}, {@code offsets} is broadcastable to that
+     * shape, {@code table} is shaped {@code [entries, embeddingSize]}, and {@code features} is
+     * shaped {@code [..., featureSize]} with the same leading dimensions as {@code rawIds}. The
+     * result is {@code [..., fields * embeddingSize + featureSize]} and uses the common
+     * floating-point data type of {@code table} and {@code features}. Engines may fuse offset
+     * addition, embedding lookup, flattening, and concatenation; the portable path remains
+     * differentiable. Strided leading dimensions are supported.
+     *
+     * @param rawIds unoffset integer IDs shaped {@code [..., fields]}
+     * @param offsets integer namespace offsets broadcastable to {@code rawIds}
+     * @param table dense embedding table shaped {@code [entries, embeddingSize]}
+     * @param features dense trailing features shaped {@code [..., featureSize]}
+     * @return packed embedded fields followed by the dense features
+     */
+    public static NDArray embeddingFeaturePack(
+            NDArray rawIds, NDArray offsets, NDArray table, NDArray features) {
+        validateEmbeddingWithOffsets(rawIds, offsets, table);
+        Shape rawShape = rawIds.getShape();
+        Shape featureShape = features.getShape();
+        int dimensions = rawShape.dimension();
+        if (dimensions < 2
+                || featureShape.dimension() != dimensions
+                || featureShape.get(dimensions - 1) <= 0
+                || !rawShape.slice(0, dimensions - 1)
+                        .equals(featureShape.slice(0, dimensions - 1))) {
+            throw new IllegalArgumentException(
+                    "embedding feature pack requires IDs [..., fields] and features [..., width]"
+                            + " with identical leading dimensions");
+        }
+        if (!features.getDataType().isFloating() || features.getDataType() != table.getDataType()) {
+            throw new IllegalArgumentException(
+                    "embedding table and features must use one floating-point data type");
+        }
+        return rawIds.getNDArrayInternal().embeddingFeaturePack(offsets, table, features);
+    }
+
+    private static void validateEmbeddingWithOffsets(
+            NDArray rawIds, NDArray offsets, NDArray table) {
+        DataType rawType = rawIds.getDataType();
+        DataType offsetType = offsets.getDataType();
+        if (!isEmbeddingIndexType(rawType) || !isEmbeddingIndexType(offsetType)) {
+            throw new IllegalArgumentException(
+                    "raw IDs and offsets must use int16, int32, or int64");
+        }
+        if (rawType == DataType.INT16 && offsetType == DataType.INT16) {
+            throw new IllegalArgumentException("raw IDs and offsets cannot both use int16");
+        }
+        Shape rawShape = rawIds.getShape();
+        Shape offsetShape = offsets.getShape();
+        if (offsetShape.dimension() > rawShape.dimension()) {
+            throw new IllegalArgumentException("offsets must be broadcastable to raw IDs");
+        }
+        for (int axis = 1; axis <= offsetShape.dimension(); ++axis) {
+            long offsetDimension = offsetShape.get(offsetShape.dimension() - axis);
+            long rawDimension = rawShape.get(rawShape.dimension() - axis);
+            if (offsetDimension != 1 && offsetDimension != rawDimension) {
+                throw new IllegalArgumentException("offsets must be broadcastable to raw IDs");
+            }
+        }
+        if (table.getShape().dimension() != 2 || !table.getDataType().isFloating()) {
+            throw new IllegalArgumentException(
+                    "embedding table must be a rank-two floating-point tensor");
+        }
+    }
+
+    private static boolean isEmbeddingIndexType(DataType dataType) {
+        return dataType == DataType.INT16
+                || dataType == DataType.INT32
+                || dataType == DataType.INT64;
+    }
 
     /**
      * Selects rows from the leading axis without expanding the row indices across trailing axes.
@@ -53,6 +146,184 @@ public final class NDArrays {
     }
 
     /**
+     * Builds masked categorical membership indicators.
+     *
+     * <p>{@code categories} stores categorical fields on its last axis. Each output channel is
+     * described by the field at the same position in {@code fieldIndices} and the bit set at the
+     * same position in {@code categorySets}. Bit {@code n} selects encoded category {@code n}.
+     * Matching positions receive the corresponding value from {@code mask}; every other position
+     * receives zero. The returned tensor appends the rule count to the leading shape of {@code
+     * categories} and uses the data type of {@code mask}.
+     *
+     * <p>This operation is intended for non-differentiable routing metadata. Engines may evaluate
+     * all rules with a single kernel.
+     *
+     * @param categories integral categories shaped {@code [..., fields]}
+     * @param mask floating-point mask shaped like the leading category dimensions
+     * @param fieldIndices source field for every output rule
+     * @param categorySets category membership bit set for every output rule
+     * @return indicators shaped {@code [..., rules]}
+     */
+    public static NDArray categoricalMasks(
+            NDArray categories, NDArray mask, int[] fieldIndices, long[] categorySets) {
+        Shape categoryShape = categories.getShape();
+        int dimensions = categoryShape.dimension();
+        if (dimensions == 0 || !mask.getShape().equals(categoryShape.slice(0, dimensions - 1))) {
+            throw new IllegalArgumentException(
+                    "mask shape must match the leading categorical dimensions");
+        }
+        if (!categories.getDataType().isInteger() || !mask.getDataType().isFloating()) {
+            throw new IllegalArgumentException(
+                    "categories must be integral and mask must be floating point");
+        }
+        if (fieldIndices.length == 0 || fieldIndices.length != categorySets.length) {
+            throw new IllegalArgumentException(
+                    "field indices and category sets must have the same non-zero length");
+        }
+        long fields = categoryShape.get(dimensions - 1);
+        for (int fieldIndex : fieldIndices) {
+            if (fieldIndex < 0 || fieldIndex >= fields) {
+                throw new IllegalArgumentException("categorical field index is out of range");
+            }
+        }
+        return categories.getNDArrayInternal().categoricalMasks(mask, fieldIndices, categorySets);
+    }
+
+    /**
+     * Builds routing masks for two mutually exclusive choices.
+     *
+     * <p>The returned trailing channels are, in order, the union of {@code firstMask} and {@code
+     * secondMask}, that union gated by the presence of the first route, the union gated by the
+     * presence of the second route, and the union gated by the representative marker. A route is
+     * present when its encoded value differs from {@code paddingValue}.
+     *
+     * <p>This operation is intended for non-differentiable routing metadata. Engines may compute
+     * all four output channels with a single kernel.
+     *
+     * @param routes integral routing metadata shaped {@code [..., fields]}
+     * @param firstMask mask for the first choice shaped like the leading route dimensions
+     * @param secondMask mask for the second choice shaped like the leading route dimensions
+     * @param representativeField field containing the representative marker
+     * @param firstRouteField field containing the first route
+     * @param secondRouteField field containing the second route
+     * @param paddingValue encoded value denoting an absent route
+     * @return routing masks shaped {@code [..., 4]}
+     */
+    public static NDArray binaryChoiceMasks(
+            NDArray routes,
+            NDArray firstMask,
+            NDArray secondMask,
+            int representativeField,
+            int firstRouteField,
+            int secondRouteField,
+            long paddingValue) {
+        Shape routeShape = routes.getShape();
+        int dimensions = routeShape.dimension();
+        Shape leadingShape = dimensions == 0 ? routeShape : routeShape.slice(0, dimensions - 1);
+        if (dimensions == 0
+                || !firstMask.getShape().equals(leadingShape)
+                || !secondMask.getShape().equals(leadingShape)) {
+            throw new IllegalArgumentException(
+                    "choice masks must match the leading routing dimensions");
+        }
+        if (!routes.getDataType().isInteger()
+                || !firstMask.getDataType().isFloating()
+                || firstMask.getDataType() != secondMask.getDataType()) {
+            throw new IllegalArgumentException(
+                    "routes must be integral and choice masks must share a floating data type");
+        }
+        long fields = routeShape.get(dimensions - 1);
+        if (representativeField < 0
+                || representativeField >= fields
+                || firstRouteField < 0
+                || firstRouteField >= fields
+                || secondRouteField < 0
+                || secondRouteField >= fields) {
+            throw new IllegalArgumentException("routing field index is out of range");
+        }
+        return routes.getNDArrayInternal()
+                .binaryChoiceMasks(
+                        firstMask,
+                        secondMask,
+                        representativeField,
+                        firstRouteField,
+                        secondRouteField,
+                        paddingValue);
+    }
+
+    /**
+     * Sums one lookup row from each contiguous table segment.
+     *
+     * <p>The lookup table is shaped {@code [segments * entriesPerSegment, ...]}. Stored indices are
+     * one-based {@code INT16}, {@code INT32}, or {@code INT64} values shaped {@code [...,
+     * segments]}; values are clamped to the segment range, so zero selects the first row of its
+     * segment. The returned shape removes the trailing segment axis and appends every lookup-table
+     * dimension after its leading row axis. Engines may fuse index normalization, lookup, and
+     * reduction while retaining a differentiable eager fallback.
+     *
+     * @param lookupTable contiguous row segments followed by value dimensions
+     * @param storedIndices one-based row indices for every segment
+     * @return sum of one selected row from every segment
+     */
+    public static NDArray segmentedLookupSum(NDArray lookupTable, NDArray storedIndices) {
+        return lookupTable.getNDArrayInternal().segmentedLookupSum(storedIndices);
+    }
+
+    /**
+     * Selects entries from a separate table in every batch while preserving padding.
+     *
+     * <p>The source must be shaped {@code [batch, entries, ...]}. Stored indices are one-based and
+     * shaped {@code [batch, ...]}; zero identifies padding and produces an all-zero result. The
+     * returned shape appends every source dimension after {@code entries} to the stored-index
+     * shape.
+     *
+     * @param source batched source tables
+     * @param storedIndices one-based table indices, with zero reserved for padding
+     * @return selected entries with padding replaced by zero
+     */
+    public static NDArray paddedBatchGather(NDArray source, NDArray storedIndices) {
+        return source.getNDArrayInternal().paddedBatchGather(storedIndices);
+    }
+
+    /**
+     * Selects entries from two table dimensions in every batch while preserving padding.
+     *
+     * <p>The source must be shaped {@code [batch, outerEntries, innerEntries, ...]}. Both stored
+     * index tensors are one-based, have the same shape {@code [batch, ...]}, and reserve zero for
+     * padding. An output entry is zero when either stored index is zero. The returned shape appends
+     * every source dimension after {@code innerEntries} to the stored-index shape.
+     *
+     * @param source batched two-dimensional source tables
+     * @param outerStoredIndices one-based indices for the outer table dimension
+     * @param innerStoredIndices one-based indices for the inner table dimension
+     * @return selected entries with padding replaced by zero
+     */
+    public static NDArray paddedBatchGather(
+            NDArray source, NDArray outerStoredIndices, NDArray innerStoredIndices) {
+        return source.getNDArrayInternal()
+                .paddedBatchGather(outerStoredIndices, innerStoredIndices);
+    }
+
+    /**
+     * Selects entries from explicitly identified batch rows while preserving padding.
+     *
+     * <p>The source must be shaped {@code [batch, entries, ...]}. Batch indices are zero-based,
+     * stored indices are one-based, and both index tensors must have the same shape. A zero stored
+     * index identifies padding and produces an all-zero result. The returned shape appends every
+     * source dimension after {@code entries} to the stored-index shape.
+     *
+     * @param source batched source tables
+     * @param batchIndices zero-based source batch indices
+     * @param storedIndices one-based table indices, with zero reserved for padding
+     * @return selected entries with padding replaced by zero
+     */
+    public static NDArray paddedBatchGatherByBatchIndices(
+            NDArray source, NDArray batchIndices, NDArray storedIndices) {
+        return source.getNDArrayInternal()
+                .paddedBatchGatherByBatchIndices(batchIndices, storedIndices);
+    }
+
+    /**
      * Normalizes logits over legal elements while returning zero for masked elements.
      *
      * <p>Computation and output use {@link DataType#FLOAT32}. A row with no legal element returns
@@ -65,6 +336,74 @@ public final class NDArrays {
      */
     public static NDArray maskedSoftmax(NDArray logits, NDArray mask, int axis) {
         return logits.getNDArrayInternal().maskedSoftmax(mask, axis);
+    }
+
+    /**
+     * Summarizes each row with a weighted mean and the active minimum and maximum.
+     *
+     * <p>{@code values} must have shape {@code [rows, columns]} and {@code weights} must have shape
+     * {@code [columns]}. A column participates when its weight is greater than zero. The returned
+     * float32 tensor has shape {@code [3, rows]}, with weighted means in row zero, minima in row
+     * one, and maxima in row two. All three statistics are zero when every weight is zero.
+     *
+     * <p>Weights must be finite and nonnegative. A non-finite or negative weight makes every output
+     * statistic NaN. A non-finite value makes the three statistics for its row NaN only when the
+     * corresponding weight is positive. Values in zero-weight columns are ignored. This diagnostic
+     * operation stops gradients. Engines may fuse the complete reduction while retaining these
+     * semantics.
+     *
+     * @param values values shaped {@code [rows, columns]}
+     * @param weights nonnegative weights shaped {@code [columns]}
+     * @return packed float32 row statistics shaped {@code [3, rows]}
+     */
+    public static NDArray weightedRowStatistics(NDArray values, NDArray weights) {
+        return values.getNDArrayInternal().weightedRowStatistics(weights);
+    }
+
+    /**
+     * Pools values with independently masked softmax weights for several groups.
+     *
+     * <p>The logits are shaped {@code [..., choices]}, the mask is shaped {@code [..., choices,
+     * groups]}, and the values are shaped {@code [..., choices, features]}. The returned tensor is
+     * group-major with shape {@code [groups, ..., features]}. Each group normalizes the shared
+     * logits over its nonzero mask entries. A group with no selected choice returns zeros. The
+     * group-major layout keeps each independently consumed group contiguous.
+     *
+     * <p>Softmax evaluation, accumulation, and output use {@link DataType#FLOAT32}. Engines may
+     * fuse normalization and pooling while retaining a differentiable fallback with identical
+     * semantics.
+     *
+     * @param logits unnormalized scores shared by all groups
+     * @param mask nonzero entries identify the choices in each group
+     * @param values values pooled along the choice axis
+     * @return independently pooled group values
+     */
+    public static NDArray groupedMaskedSoftmaxPool(NDArray logits, NDArray mask, NDArray values) {
+        return logits.getNDArrayInternal().groupedMaskedSoftmaxPool(mask, values);
+    }
+
+    /**
+     * Pools a selected subset of choices with masked softmax weights.
+     *
+     * <p>The logits and mask are shaped {@code [..., choices]}, and the values are shaped {@code
+     * [..., choices, features]}. {@code choiceIndices} selects the choices that participate in the
+     * softmax, in reduction order. The returned tensor has shape {@code [..., features]}. A row
+     * with no selected legal choice returns zeros.
+     *
+     * <p>Softmax evaluation, accumulation, and output use {@link DataType#FLOAT32}. Engines may
+     * read the host-side indices directly in a fused kernel while retaining a differentiable
+     * fallback with identical semantics. Indices must be non-empty, unique, and in range.
+     *
+     * @param logits unnormalized scores for all choices
+     * @param mask nonzero entries identify legal choices
+     * @param values values for all choices
+     * @param choiceIndices choices included in the masked softmax pool
+     * @return the pooled selected-choice values
+     */
+    public static NDArray indexedMaskedSoftmaxPool(
+            NDArray logits, NDArray mask, NDArray values, int... choiceIndices) {
+        return logits.getNDArrayInternal()
+                .indexedMaskedSoftmaxPool(mask, values, choiceIndices.clone());
     }
 
     /**
@@ -192,6 +531,90 @@ public final class NDArrays {
     }
 
     /**
+     * Applies grouped attention to packed token-major key/value projections.
+     *
+     * <p>The query is shared by every group in the same leading row. Packed memory stores all head
+     * keys followed by all head values. Only nonzero mask entries participate in the softmax and
+     * value pooling. Engines may fuse the operation while preserving gradients for the query and
+     * packed key/value projections. Masked entries do not contribute query, key, or value
+     * gradients, and a fully masked group returns zero. The mask, head count, and scale are not
+     * differentiable.
+     *
+     * @param query shared query projection shaped {@code [..., queryTokens, queryWidth]}
+     * @param packedKeyValue grouped packed projection shaped {@code [..., groups, keyTokens,
+     *     packedWidth]}
+     * @param mask nonzero valid-token mask shaped {@code [..., groups, keyTokens]}
+     * @param heads number of attention heads
+     * @param scale query-key score scale
+     * @return grouped attended values in token-major packed-head layout
+     */
+    public static NDArray groupedPackedScaledDotProductAttention(
+            NDArray query, NDArray packedKeyValue, NDArray mask, long heads, double scale) {
+        Shape queryShape = query.getShape();
+        Shape packedShape = packedKeyValue.getShape();
+        Shape maskShape = mask.getShape();
+        int queryRank = queryShape.dimension();
+        if (queryRank < 2
+                || packedShape.dimension() != queryRank + 1
+                || maskShape.dimension() != queryRank) {
+            throw new IllegalArgumentException(
+                    "grouped packed attention requires query [...,Q,F], memory [...,G,K,P], "
+                            + "and mask [...,G,K]");
+        }
+
+        long[] leadingDimensions = leadingDimensions(queryShape, 2);
+        if (!Arrays.equals(leadingDimensions, leadingDimensions(packedShape, 3))
+                || !Arrays.equals(leadingDimensions, leadingDimensions(maskShape, 2))) {
+            throw new IllegalArgumentException(
+                    "query, packed memory, and mask must preserve the same leading dimensions");
+        }
+        long queryTokens = queryShape.get(queryRank - 2);
+        long queryWidth = queryShape.get(queryRank - 1);
+        long groups = packedShape.get(queryRank - 2);
+        long keyTokens = packedShape.get(queryRank - 1);
+        long packedWidth = packedShape.get(queryRank);
+        if (maskShape.get(queryRank - 2) != groups
+                || maskShape.get(queryRank - 1) != keyTokens
+                || heads <= 0
+                || queryTokens <= 0
+                || groups <= 0
+                || keyTokens <= 0
+                || queryWidth <= 0
+                || queryWidth % heads != 0
+                || packedWidth <= queryWidth
+                || (packedWidth - queryWidth) % heads != 0
+                || !Double.isFinite(scale)) {
+            throw new IllegalArgumentException("grouped packed attention shapes are incompatible");
+        }
+        long valueWidth = packedWidth - queryWidth;
+        long batch = elementCount(leadingDimensions);
+
+        if (queryRank == 3) {
+            return query.getNDArrayInternal()
+                    .canonicalGroupedPackedScaledDotProductAttention(
+                            packedKeyValue, mask, heads, scale);
+        }
+
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(query, packedKeyValue, mask);
+            NDArray canonicalResult =
+                    query.reshape(batch, queryTokens, queryWidth)
+                            .getNDArrayInternal()
+                            .canonicalGroupedPackedScaledDotProductAttention(
+                                    packedKeyValue.reshape(batch, groups, keyTokens, packedWidth),
+                                    mask.reshape(batch, groups, keyTokens),
+                                    heads,
+                                    scale);
+            NDArray result =
+                    canonicalResult.reshape(
+                            shapeWithTrailing(leadingDimensions, groups, queryTokens, valueWidth));
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Applies grouped attention with shared tokens and indexed auxiliary tokens.
      *
      * <p>Packed key/value tensors store all head keys followed by all head values in the last
@@ -302,6 +725,117 @@ public final class NDArrays {
     }
 
     /**
+     * Applies grouped indexed attention through explicit group and delta-table mappings.
+     *
+     * <p>Each query selects one packed shared key/value table with a zero-based group index. Each
+     * shared token independently selects one packed delta row with a zero-based delta index.
+     * Auxiliary tokens use the same one-based shared-token indices and zero padding as {@link
+     * #groupedIndexedScaledDotProductAttention(NDArray, NDArray, NDArray, NDArray, NDArray, long,
+     * double)}. This form lets engines read immutable base tables directly instead of materializing
+     * query-local shared key/value and delta tensors.
+     *
+     * <p>The query leading dimensions are preserved. Group indices have exactly those leading
+     * dimensions, shared-delta indices append the shared-token dimension, and auxiliary tensors
+     * append their indexed-token dimension. All group and delta indices must be in range. Engines
+     * may load both mapped tables directly and provide a fused differentiable implementation; the
+     * portable implementation remains differentiable for unsupported layouts.
+     *
+     * @param query query tensor shaped {@code [queryDimensions..., heads, keyFeatures]}
+     * @param sharedKeyValues packed shared data shaped {@code [groups, sharedTokens, packedWidth]}
+     * @param sharedGroupIndices zero-based group index shaped {@code [queryDimensions...]}
+     * @param sharedDeltaTable packed delta rows shaped {@code [deltas, packedWidth]}
+     * @param sharedDeltaIndices zero-based delta indices shaped {@code [queryDimensions...,
+     *     sharedTokens]}
+     * @param indexedDeltas auxiliary-token deltas shaped {@code [queryDimensions..., indexedTokens,
+     *     packedWidth]}
+     * @param indexedSharedIds one-based shared-token indices shaped {@code [queryDimensions...,
+     *     indexedTokens]}; zero denotes padding
+     * @param scale score scale
+     * @return attended values shaped {@code [queryDimensions..., heads, valueFeatures]}
+     */
+    public static NDArray mappedGroupedIndexedScaledDotProductAttention(
+            NDArray query,
+            NDArray sharedKeyValues,
+            NDArray sharedGroupIndices,
+            NDArray sharedDeltaTable,
+            NDArray sharedDeltaIndices,
+            NDArray indexedDeltas,
+            NDArray indexedSharedIds,
+            double scale) {
+        Shape queryShape = query.getShape();
+        Shape sharedShape = sharedKeyValues.getShape();
+        if (queryShape.dimension() < 3
+                || sharedShape.dimension() != 3
+                || sharedDeltaTable.getShape().dimension() != 2) {
+            throw new IllegalArgumentException(
+                    "mapped grouped attention requires query rank >= 3 and rank-three shared data");
+        }
+
+        long[] queryDimensions = leadingDimensions(queryShape, 2);
+        long queryCount = elementCount(queryDimensions);
+        long heads = queryShape.get(queryShape.dimension() - 2);
+        long keyFeatures = queryShape.get(queryShape.dimension() - 1);
+        long sharedTokens = sharedShape.get(1);
+        long packedWidth = sharedShape.get(2);
+        Shape groupIndexShape = sharedGroupIndices.getShape();
+        Shape sharedDeltaIndexShape = sharedDeltaIndices.getShape();
+        Shape indexedDeltaShape = indexedDeltas.getShape();
+        Shape indexedIdShape = indexedSharedIds.getShape();
+        if (!Arrays.equals(queryDimensions, groupIndexShape.getShape())
+                || !sharedDeltaIndexShape.equals(shapeWithTrailing(queryDimensions, sharedTokens))
+                || indexedDeltaShape.dimension() != queryDimensions.length + 2
+                || indexedIdShape.dimension() != queryDimensions.length + 1
+                || !Arrays.equals(queryDimensions, leadingDimensions(indexedDeltaShape, 2))
+                || !Arrays.equals(queryDimensions, leadingDimensions(indexedIdShape, 1))) {
+            throw new IllegalArgumentException(
+                    "mapped grouped attention indices must preserve query leading dimensions");
+        }
+        long indexedTokens = indexedDeltaShape.get(indexedDeltaShape.dimension() - 2);
+        if (sharedShape.get(0) <= 0
+                || sharedTokens <= 0
+                || sharedDeltaTable.getShape().get(0) <= 0
+                || sharedDeltaTable.getShape().get(1) != packedWidth
+                || indexedDeltaShape.get(indexedDeltaShape.dimension() - 1) != packedWidth
+                || indexedIdShape.get(indexedIdShape.dimension() - 1) != indexedTokens) {
+            throw new IllegalArgumentException("mapped grouped attention shapes are incompatible");
+        }
+        long keyWidth = heads * keyFeatures;
+        if (heads <= 0 || packedWidth <= keyWidth || (packedWidth - keyWidth) % heads != 0) {
+            throw new IllegalArgumentException(
+                    "packed shared features must contain per-head keys followed by values");
+        }
+        long valueFeatures = (packedWidth - keyWidth) / heads;
+
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(
+                    query,
+                    sharedKeyValues,
+                    sharedGroupIndices,
+                    sharedDeltaTable,
+                    sharedDeltaIndices,
+                    indexedDeltas,
+                    indexedSharedIds);
+            NDArray canonicalResult =
+                    query.reshape(queryCount, heads, keyFeatures)
+                            .getNDArrayInternal()
+                            .canonicalMappedGroupedIndexedScaledDotProductAttention(
+                                    sharedKeyValues,
+                                    sharedGroupIndices.reshape(queryCount),
+                                    sharedDeltaTable,
+                                    sharedDeltaIndices.reshape(queryCount, sharedTokens),
+                                    indexedDeltas.reshape(queryCount, indexedTokens, packedWidth),
+                                    indexedSharedIds.reshape(queryCount, indexedTokens),
+                                    scale);
+            NDArray result =
+                    canonicalResult.reshape(
+                            shapeWithTrailing(queryDimensions, heads, valueFeatures));
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Adds an inference residual in place and returns its affine LayerNorm.
      *
      * <p>The residual buffer is left as the unnormalized sum. This operation is intended for
@@ -318,6 +852,139 @@ public final class NDArrays {
             NDArray residual, NDArray update, NDArray weight, NDArray bias, float eps) {
         return residual.getNDArrayInternal()
                 .addToOwnedResidualAndLayerNorm(update, weight, bias, eps);
+    }
+
+    /**
+     * Adds masked embedding rows to an owned token buffer and applies its token mask in place.
+     *
+     * <p>The token buffer must be shaped {@code [batch, tokens, features]}, the embedding table
+     * {@code [vocabulary, features]}, and every index and the valid mask {@code [batch, tokens]}.
+     * One or two index arrays are accepted. For every token, this operation computes {@code (tokens
+     * + reduce(table[index], index != paddingIndex)) * cast(validMask)[..., None]}. The valid mask
+     * must contain integer zero or one values. The embedding table and token buffer must use the
+     * same floating-point data type. The returned mask is contiguous and cast to that data type.
+     *
+     * <p>This operation mutates {@code tokens}. It is intended for inference graphs where the
+     * caller exclusively owns that buffer and does not support automatic differentiation.
+     *
+     * @param tokens owned token buffer to update
+     * @param storedIndices one or two stored-index arrays
+     * @param embeddingTable embedding lookup table
+     * @param validMask token-validity mask containing zero or one
+     * @param paddingIndex index excluded from the embedding reduction
+     * @param reduction reduction applied to valid embedding rows
+     * @return the valid mask cast to the token data type
+     */
+    public static NDArray addMaskedEmbeddingResidualToOwnedTokens(
+            NDArray tokens,
+            NDList storedIndices,
+            NDArray embeddingTable,
+            NDArray validMask,
+            long paddingIndex,
+            EmbeddingReduction reduction) {
+        Preconditions.checkArgument(
+                !storedIndices.isEmpty() && storedIndices.size() <= 2,
+                "storedIndices must contain one or two arrays");
+        return tokens.getNDArrayInternal()
+                .addMaskedEmbeddingResidualToOwnedTokens(
+                        storedIndices, embeddingTable, validMask, paddingIndex, reduction);
+    }
+
+    /**
+     * Adds a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * <p>The values must be shaped {@code [batch, items, features]} and the residual {@code [batch,
+     * 1, features]}. If present, the mask must be shaped {@code [batch, items]} and is applied
+     * after SiLU. All arrays must use the same floating-point data type. This operation is intended
+     * for inference graphs where the caller exclusively owns {@code values}; it does not support
+     * automatic differentiation.
+     *
+     * @param values owned values to update
+     * @param residual residual broadcast across the item dimension
+     * @param mask optional item mask, or {@code null}
+     * @return {@code values}, updated in place
+     */
+    public static NDArray addBroadcastResidualToOwnedAndSilu(
+            NDArray values, NDArray residual, NDArray mask) {
+        return values.getNDArrayInternal().addBroadcastResidualToOwnedAndSilu(residual, mask);
+    }
+
+    /**
+     * Adds a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * @param values owned values to update
+     * @param residual residual broadcast across the item dimension
+     * @return {@code values}, updated in place
+     * @see #addBroadcastResidualToOwnedAndSilu(NDArray, NDArray, NDArray)
+     */
+    public static NDArray addBroadcastResidualToOwnedAndSilu(NDArray values, NDArray residual) {
+        return addBroadcastResidualToOwnedAndSilu(values, residual, null);
+    }
+
+    /**
+     * Adds a bias and a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * <p>The values must be shaped {@code [batch, items, features]}, the bias {@code [features]},
+     * and the residual {@code [batch, 1, features]}. If present, the mask must be shaped {@code
+     * [batch, items]} and is applied after SiLU. All arrays must use the same floating-point data
+     * type. Low-precision implementations preserve the staged rounding of {@code values += bias}
+     * followed by {@code values += residual}. This operation is intended for inference graphs where
+     * the caller exclusively owns {@code values}; it does not support automatic differentiation.
+     *
+     * @param values owned values to update
+     * @param bias feature bias added before the residual
+     * @param residual residual broadcast across the item dimension
+     * @param mask optional item mask, or {@code null}
+     * @return {@code values}, updated in place
+     */
+    public static NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray values, NDArray bias, NDArray residual, NDArray mask) {
+        return values.getNDArrayInternal()
+                .addBiasAndBroadcastResidualToOwnedAndSilu(bias, residual, mask);
+    }
+
+    /**
+     * Adds a bias and a broadcast residual to an owned tensor and applies SiLU in place.
+     *
+     * @param values owned values to update
+     * @param bias feature bias added before the residual
+     * @param residual residual broadcast across the item dimension
+     * @return {@code values}, updated in place
+     * @see #addBiasAndBroadcastResidualToOwnedAndSilu(NDArray, NDArray, NDArray, NDArray)
+     */
+    public static NDArray addBiasAndBroadcastResidualToOwnedAndSilu(
+            NDArray values, NDArray bias, NDArray residual) {
+        return addBiasAndBroadcastResidualToOwnedAndSilu(values, bias, residual, null);
+    }
+
+    /**
+     * Applies a projected-residual multilayer perceptron.
+     *
+     * <p>This operation computes the following, where {@code O} is the number of rows in {@code
+     * outputWeight}:
+     *
+     * <pre>{@code
+     * z = linear(input, combinedWeight, combinedBias)
+     * output = z[..., 0:O] + linear(silu(z[..., O:]), outputWeight, null)
+     * }</pre>
+     *
+     * <p>The input may have any number of leading dimensions. The combined weight is shaped {@code
+     * [O + H, I]}, the combined bias {@code [O + H]}, and the output weight {@code [O, H]}. All
+     * arrays must reside on one device and use one of FLOAT16, BFLOAT16, or FLOAT32. An engine may
+     * accept floating-point parameter arrays in a different type while autocast is active. The
+     * operation is differentiable. Engines may select equivalent projection and residual epilogues;
+     * results follow the engine's floating-point execution semantics.
+     *
+     * @param input input shaped {@code [..., I]}
+     * @param combinedWeight combined projection weight shaped {@code [O + H, I]}
+     * @param combinedBias combined projection bias shaped {@code [O + H]}
+     * @param outputWeight bias-free output projection weight shaped {@code [O, H]}
+     * @return output shaped {@code [..., O]}
+     */
+    public static NDArray projectedResidualMlp(
+            NDArray input, NDArray combinedWeight, NDArray combinedBias, NDArray outputWeight) {
+        return input.getNDArrayInternal()
+                .projectedResidualMlp(combinedWeight, combinedBias, outputWeight);
     }
 
     private static NDArray canonicalRelationKeys(
@@ -2287,6 +2954,29 @@ public final class NDArrays {
         }
         NDArray array = arrays.head();
         return array.getNDArrayInternal().concat(arrays.subNDList(1), axis);
+    }
+
+    /**
+     * Converts floating-point arrays to one data type while concatenating them.
+     *
+     * <p>The result is equivalent to converting each input to {@code dataType} and concatenating
+     * the converted arrays along {@code axis}. Engines may combine the conversions and
+     * concatenation into one operation. The portable implementation remains differentiable.
+     *
+     * @param arrays arrays with matching dimensions except along {@code axis}
+     * @param axis axis along which the arrays are joined
+     * @param dataType floating-point data type of the result
+     * @return converted and concatenated array
+     */
+    public static NDArray concatToType(NDList arrays, int axis, DataType dataType) {
+        Preconditions.checkArgument(!arrays.isEmpty(), "need at least one array to concatenate");
+        Preconditions.checkArgument(dataType.isFloating(), "output data type must be floating");
+        for (NDArray array : arrays) {
+            Preconditions.checkArgument(
+                    array.getDataType().isFloating(), "all arrays must be floating-point");
+        }
+        NDArray array = arrays.head();
+        return array.getNDArrayInternal().concatToType(arrays.subNDList(1), axis, dataType);
     }
 
     /**

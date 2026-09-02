@@ -14,6 +14,9 @@ package ai.djl.engine;
 
 import ai.djl.Device;
 import ai.djl.Model;
+import ai.djl.engine.fusion.FusionCompiler;
+import ai.djl.ndarray.NDArray;
+import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.nn.SymbolBlock;
@@ -288,6 +291,20 @@ public abstract class Engine {
     }
 
     /**
+     * Returns a compiler for bounded fusion recipes on the specified device.
+     *
+     * <p>Fusion is an optional engine capability. The default implementation rejects the request so
+     * existing engines remain source and binary compatible.
+     *
+     * @param device the device targeted by prepared fusion plans
+     * @return a new fusion compiler
+     * @throws UnsupportedOperationException if this engine does not support fusion
+     */
+    public FusionCompiler newFusionCompiler(Device device) {
+        throw new UnsupportedOperationException("Fusion is not supported.");
+    }
+
+    /**
      * Constructs a new model.
      *
      * @param name the model name
@@ -356,39 +373,96 @@ public abstract class Engine {
     }
 
     /**
-     * Opens an autocast scope on the given {@link Device}. Heavy matmul / conv / attention ops
-     * inside the scope are cast to {@code dtype}; numerically sensitive ops stay in FP32. The
-     * previous autocast state (enabled flag, dtype, cache flag) is saved on entry and restored on
-     * {@link Autocast#close()}, so scopes nest safely.
+     * Opens an autocast scope on the given {@link Device}. Matrix multiplication, convolution, and
+     * attention operations inside the scope can use {@code dataType}, while numerically sensitive
+     * operations remain in {@link DataType#FLOAT32}. Closing the scope restores the previous
+     * autocast state, so scopes can be nested.
      *
      * <p>The default implementation is a no-op guard, which lets callers write engine-agnostic code
      * ({@code try (Autocast ac = engine.newAutocast(...)) { ... }}). Engines that implement
      * autocast must override this method.
      *
      * @param device the device to autocast on (typically a GPU)
-     * @param dtype the lower-precision dtype ({@link DataType#BFLOAT16} or {@link
+     * @param dataType the lower-precision data type ({@link DataType#BFLOAT16} or {@link
      *     DataType#FLOAT16})
-     * @param cacheEnabled whether to enable the op-result cache inside the scope (matches PyTorch's
-     *     {@code cache_enabled} flag)
+     * @param cacheEnabled whether to enable the backend autocast cache inside the scope
      * @return an {@link Autocast} guard whose {@code close()} restores state
      */
-    public Autocast newAutocast(Device device, DataType dtype, boolean cacheEnabled) {
-        throw new UnsupportedOperationException("Not supported.");
+    public Autocast newAutocast(Device device, DataType dataType, boolean cacheEnabled) {
+        return NoOpAutocast.INSTANCE;
     }
 
     /**
-     * Opens an autocast scope with the op-result cache enabled. Shortcut for {@link
+     * Opens an autocast scope with the backend cache enabled. Shortcut for {@link
      * #newAutocast(Device, DataType, boolean)} with {@code cacheEnabled = true}.
      *
      * @param device the device to autocast on
-     * @param dtype the lower-precision dtype
+     * @param dataType the lower-precision data type
      * @return an {@link Autocast} guard
      */
-    public Autocast newAutocast(Device device, DataType dtype) {
-        return newAutocast(device, dtype, true);
+    public Autocast newAutocast(Device device, DataType dataType) {
+        return newAutocast(device, dataType, true);
+    }
+
+    /**
+     * Unscales gradients in place and checks whether all values are finite.
+     *
+     * <p>The default implementation is engine-agnostic. Engines may override it with a fused
+     * backend implementation to avoid per-gradient host synchronization.
+     *
+     * @param gradients the gradients to unscale
+     * @param inverseScale the reciprocal of the loss scale
+     * @return {@code true} if every unscaled gradient value is finite
+     */
+    public boolean unscaleGradients(NDList gradients, float inverseScale) {
+        if (inverseScale <= 0f || !Float.isFinite(inverseScale)) {
+            throw new IllegalArgumentException("inverseScale must be positive and finite.");
+        }
+
+        for (NDArray gradient : gradients) {
+            if (gradient.getManager().getEngine() != this) {
+                throw new IllegalArgumentException(
+                        "All gradients must belong to the engine performing the unscale.");
+            }
+            if (gradient.isSparse()) {
+                throw new UnsupportedOperationException(
+                        "Sparse GradScaler gradients require an engine-specific implementation.");
+            }
+            switch (gradient.getDataType()) {
+                case FLOAT16:
+                case BFLOAT16:
+                case FLOAT32:
+                case FLOAT64:
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "GradScaler gradients must use a real floating data type.");
+            }
+        }
+
+        boolean gradientsFinite = true;
+        for (NDArray gradient : gradients) {
+            gradient.muli(inverseScale);
+            try (NDArray nan = gradient.isNaN();
+                    NDArray infinite = gradient.isInfinite();
+                    NDArray nonFinite = nan.logicalOr(infinite);
+                    NDArray anyNonFinite = nonFinite.any()) {
+                if (anyNonFinite.getBoolean()) {
+                    gradientsFinite = false;
+                }
+            }
+        }
+        return gradientsFinite;
     }
 
     private enum NoOpInferenceMode implements InferenceMode {
+        INSTANCE;
+
+        @Override
+        public void close() {}
+    }
+
+    private enum NoOpAutocast implements Autocast {
         INSTANCE;
 
         @Override
