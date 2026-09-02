@@ -200,4 +200,20 @@ public class FusionRoutingFunctionsTest {
                     0);
         }
     }
+
+    @Test
+    public void mappedGroupedMaskedSoftmaxPoolKeepsLegalNonFiniteValuesObservable() {
+        try (NDManager manager = NDManager.newBaseManager(Device.cpu())) {
+            NDArray scores = manager.create(new float[] {0, -1000}, new Shape(1, 2));
+            NDArray masks = manager.ones(new Shape(1, 2, 1));
+            NDArray values = manager.create(new float[] {1, Float.NaN}, new Shape(1, 2, 1));
+
+            MappedGroupedMaskedSoftmaxPoolResult output =
+                    FusionFunctions.mappedGroupedMaskedSoftmaxPool(
+                            scores, masks, values, new NDList(manager.create(new int[] {0})));
+
+            Assert.assertTrue(Float.isNaN(output.getContexts().singletonOrThrow().getFloat()));
+            Assert.assertEquals(output.getPresence().singletonOrThrow().getFloat(), 1f);
+        }
+    }
 }

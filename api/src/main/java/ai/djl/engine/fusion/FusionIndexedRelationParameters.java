@@ -29,7 +29,7 @@ public final class FusionIndexedRelationParameters {
      * borrows the arrays and does not close, attach, or copy them. Relation IDs are discrete
      * metadata. Automatic differentiation applies only to the floating-point key and bias arrays.
      *
-     * @param relationIds zero-based relation IDs
+     * @param relationIds zero-based INT16, INT32, or INT64 relation IDs
      * @param relationKeys relation-key table
      * @param relationBias per-relation, per-head bias table
      */

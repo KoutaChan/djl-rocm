@@ -70,6 +70,7 @@ public final class FusionFunctions {
     public static NDArray segmentedOutputPack(
             NDList sources, long[] tokenOffsets, long[] tokenCounts, DataType outputDataType) {
         validatePackDataTypes(sources, outputDataType);
+        validateSegmentedPack(sources, tokenOffsets, tokenCounts);
         return first(sources)
                 .getNDArrayInternal()
                 .segmentedOutputPack(
@@ -234,6 +235,7 @@ public final class FusionFunctions {
         for (FusionTransformerBlockParameters block : blocks) {
             transformerAttentionWidth(block, attentionHeads);
         }
+        NDArray result;
         try (NDScope scope = new NDScope()) {
             scope.suppressNotUsedWarning();
             NDArray state = input;
@@ -292,8 +294,10 @@ public final class FusionFunctions {
                 }
             }
             NDScope.unregister(state);
-            return state;
+            result = state;
         }
+        NDScope.register(result);
+        return result;
     }
 
     /**
@@ -327,6 +331,7 @@ public final class FusionFunctions {
             throw new IllegalArgumentException(
                     "Indexed local transformer attention does not use relation parameters.");
         }
+        NDArray result;
         try (NDScope scope = new NDScope()) {
             scope.suppressNotUsedWarning();
             NDArray input =
@@ -377,7 +382,19 @@ public final class FusionFunctions {
             NDArray validMask =
                     NDArrays.scatterRows(validRows, routingIndices, denseRows)
                             .reshape(batch * groups, 1, 1, tokens);
-            NDArray attentionBias = validMask.neg().add(1f).mul(-1.0e9f);
+            NDArray groupHasValid =
+                    validMask
+                            .sum(new int[] {3}, true)
+                            .gt(0)
+                            .broadcast(validMask.getShape())
+                            .stopGradient();
+            NDArray attentionValid =
+                    NDArrays.where(groupHasValid, validMask.neq(0), validMask.onesLike().neq(0));
+            NDArray attentionBias =
+                    NDArrays.where(
+                            attentionValid,
+                            validMask.zerosLike(),
+                            validMask.zerosLike().add(Float.NEGATIVE_INFINITY));
             NDArray context =
                     queries.getNDArrayInternal()
                             .scaledDotProductAttention(keys, values, attentionBias, 0.0, false)
@@ -421,8 +438,10 @@ public final class FusionFunctions {
                                     denseRows)
                             .reshape(inputShape);
             NDScope.unregister(output);
-            return output;
+            result = output;
         }
+        NDScope.register(result);
+        return result;
     }
 
     /**
@@ -440,7 +459,8 @@ public final class FusionFunctions {
      * @param queryIndex selected query token, or zero for a two-dimensional source
      * @param attentionHeads attention head count
      * @param epsilon LayerNorm epsilon
-     * @param readouts readout parameter sets in output order
+     * @param readouts readout parameter sets in output order; every query-seed weight must use the
+     *     same projection data type
      * @return readout states in declaration order
      */
     public static NDList singleQueryCrossAttentionReadoutGroup(
@@ -463,16 +483,39 @@ public final class FusionFunctions {
                         && (queryIndex < 0 || queryIndex >= querySource.getShape().get(1)))) {
             throw new IllegalArgumentException("Query index is outside the query source.");
         }
+        Shape memoryShape = memory.getShape();
+        if (memoryShape.dimension() != 3 || memoryShape.get(1) <= 0) {
+            throw new IllegalArgumentException(
+                    "Readout memory must have shape [batch, positive tokens, hiddenWidth].");
+        }
+        long batch = memoryShape.get(0);
+        long tokens = memoryShape.get(1);
+        long hiddenWidth = memoryShape.get(2);
+        Shape queryShape = querySource.getShape();
+        if (queryShape.get(0) != batch || queryShape.get(queryRank - 1) != hiddenWidth) {
+            throw new IllegalArgumentException(
+                    "Query source must match the memory batch and hidden width.");
+        }
+        if (!validMask.getShape().equals(new Shape(batch, tokens))) {
+            throw new IllegalArgumentException(
+                    "Readout valid mask must match the memory batch and token count.");
+        }
+        NDList result;
         try (NDScope scope = new NDScope()) {
             scope.suppressNotUsedWarning();
-            Shape memoryShape = memory.getShape();
-            long batch = memoryShape.get(0);
-            long tokens = memoryShape.get(1);
-            NDArray floatMask = validMask.neq(0).toType(DataType.FLOAT32, false);
+            NDArray validTokens = validMask.neq(0).stopGradient();
+            NDArray floatMask = validTokens.toType(DataType.FLOAT32, false);
             NDArray validCount = floatMask.sum(new int[] {1}, true);
+            NDArray hasValid = validCount.gt(0).stopGradient();
+            NDArray attentionValidTokens =
+                    validTokens.logicalOr(hasValid.logicalNot().broadcast(validTokens.getShape()));
+            NDArray selectedMemory =
+                    NDArrays.where(
+                            validTokens.expandDims(2).broadcast(memoryShape),
+                            memory,
+                            memory.zerosLike());
             NDArray mean =
-                    differentiableCast(memory, DataType.FLOAT32)
-                            .mul(floatMask.expandDims(2))
+                    differentiableCast(selectedMemory, DataType.FLOAT32)
                             .sum(new int[] {1})
                             .div(validCount.maximum(1f));
             NDArray querySeed =
@@ -480,14 +523,20 @@ public final class FusionFunctions {
                             ? querySource
                             : querySource.get(":,{}", queryIndex);
             DataType projectionDataType = readouts.get(0).getQuerySeedWeight().getDataType();
+            for (FusionSingleQueryReadoutParameters readout : readouts) {
+                if (readout.getQuerySeedWeight().getDataType() != projectionDataType) {
+                    throw new IllegalArgumentException(
+                            "All readouts in a group must use one projection data type.");
+                }
+            }
             NDArray seedInput =
                     NDArrays.concat(
                             new NDList(
                                     differentiableCast(querySeed, projectionDataType),
                                     differentiableCast(mean, projectionDataType)),
                             1);
-            NDArray projectionMemory = differentiableCast(memory, projectionDataType);
-            NDArray presence = validCount.gt(0).reshape(batch, 1, 1, 1);
+            NDArray projectionMemory = differentiableCast(selectedMemory, projectionDataType);
+            NDArray presence = hasValid.reshape(batch, 1, 1, 1);
             NDList outputs = new NDList(readouts.size());
             for (FusionSingleQueryReadoutParameters readout : readouts) {
                 NDArray seedState =
@@ -501,6 +550,11 @@ public final class FusionFunctions {
                 }
                 NDArray keyValue = linear(projectionMemory, readout.getKeyValueWeight(), null);
                 NDArray queries = query.reshape(batch, attentionHeads, 1, headWidth);
+                NDArray selectedQueries =
+                        NDArrays.where(
+                                presence.broadcast(queries.getShape()),
+                                queries,
+                                queries.zerosLike());
                 NDArray keys =
                         keyValue.get("...,0:{}", attentionWidth)
                                 .reshape(batch, tokens, attentionHeads, headWidth)
@@ -509,16 +563,20 @@ public final class FusionFunctions {
                         keyValue.get("...,{}:{}", attentionWidth, 2 * attentionWidth)
                                 .reshape(batch, tokens, attentionHeads, headWidth)
                                 .swapAxes(1, 2);
+                NDArray attentionBiasValues =
+                        attentionValidTokens.toType(query.getDataType(), false);
                 NDArray attentionBias =
-                        validMask
-                                .eq(0)
-                                .toType(query.getDataType(), false)
-                                .mul(-1.0e9f)
+                        NDArrays.where(
+                                        attentionValidTokens,
+                                        attentionBiasValues.zerosLike(),
+                                        attentionBiasValues
+                                                .zerosLike()
+                                                .add(Float.NEGATIVE_INFINITY))
                                 .reshape(batch, 1, 1, tokens);
                 NDArray context =
-                        queries.getNDArrayInternal()
+                        selectedQueries
+                                .getNDArrayInternal()
                                 .scaledDotProductAttention(keys, values, attentionBias, 0.0, false)
-                                .mul(presence.toType(query.getDataType(), false))
                                 .swapAxes(1, 2)
                                 .reshape(batch, attentionWidth);
                 NDArray attentionUpdate =
@@ -559,8 +617,10 @@ public final class FusionFunctions {
                 outputs.add(output);
             }
             NDScope.unregister(outputs);
-            return outputs;
+            result = outputs;
         }
+        result.forEach(NDScope::register);
+        return result;
     }
 
     /**
@@ -743,10 +803,42 @@ public final class FusionFunctions {
 
     private static void validateRelationIds(NDArray relationIds, long tokens) {
         DataType dataType = relationIds.getDataType();
-        if ((dataType != DataType.INT32 && dataType != DataType.INT64)
+        if ((dataType != DataType.INT16 && dataType != DataType.INT32 && dataType != DataType.INT64)
                 || !relationIds.getShape().equals(new Shape(tokens, tokens))) {
             throw new IllegalArgumentException(
-                    "Relation IDs must be a square INT32 or INT64 token matrix.");
+                    "Relation IDs must be a square INT16, INT32, or INT64 token matrix.");
+        }
+    }
+
+    private static void validateSegmentedPack(
+            NDList sources, long[] tokenOffsets, long[] tokenCounts) {
+        if (tokenOffsets.length != sources.size() || tokenCounts.length != sources.size()) {
+            throw new IllegalArgumentException("Segment metadata must match the source count.");
+        }
+        Shape firstShape = first(sources).getShape();
+        if (firstShape.dimension() < 3) {
+            throw new IllegalArgumentException(
+                    "A segmented output-pack source must have batch, token, and width axes.");
+        }
+        long batch = firstShape.get(0);
+        long hiddenWidth = firstShape.get(firstShape.dimension() - 1);
+        for (int index = 0; index < sources.size(); ++index) {
+            Shape shape = sources.get(index).getShape();
+            if (shape.dimension() < 3) {
+                throw new IllegalArgumentException(
+                        "A segmented output-pack source must have batch, token, and width axes.");
+            }
+            if (shape.get(0) != batch || shape.get(shape.dimension() - 1) != hiddenWidth) {
+                throw new IllegalArgumentException(
+                        "Segmented output-pack sources must share the batch and hidden width.");
+            }
+            long availableTokens = shape.get(shape.dimension() - 2);
+            long offset = tokenOffsets[index];
+            long count = tokenCounts[index];
+            if (offset < 0 || count <= 0 || offset > availableTokens - count) {
+                throw new IllegalArgumentException(
+                        "The segmented output-pack token slice is outside the source range.");
+            }
         }
     }
 

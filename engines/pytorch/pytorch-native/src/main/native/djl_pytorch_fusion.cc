@@ -3696,9 +3696,11 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan,
         expansion_plans.resize(transformer_command->blocks.size());
         for (std::size_t block_index = 0;
              block_index < transformer_command->blocks.size(); ++block_index) {
+#if defined(DJL_USE_FUSION_KERNELS)
           if (transformer_command->relation_ids_value_index >= 0) {
             expansion_plans[block_index] = CreateLinearBiasSiluPlan();
           }
+#endif
           const auto& block = transformer_command->blocks[block_index];
           const std::array<int32_t, 4> binding_indices{
               block.query_key_value_weight_binding_index,

@@ -141,11 +141,10 @@ public class PtWeightedRowStatisticsTest {
             throw new SkipException("GPU is unavailable");
         }
         try (NDManager manager = engine.newBaseManager(Device.gpu())) {
-            NDArray values = manager.arange(60).reshape(10, 6).transpose();
-            NDArray weights = manager.arange(10).add(1f);
+            NDArray values = manager.arange(60f).reshape(10, 6).transpose();
+            NDArray weights = manager.arange(10f).add(1f);
             NDArray actual = NDArrays.weightedRowStatistics(values, weights);
-            NDArray contiguous =
-                    manager.create(values.toFloatArray(), new Shape(6, 10));
+            NDArray contiguous = manager.create(values.toFloatArray(), new Shape(6, 10));
             NDArray expected = NDArrays.weightedRowStatistics(contiguous, weights);
 
             Assert.assertEquals(actual.getShape(), new Shape(3, 6));

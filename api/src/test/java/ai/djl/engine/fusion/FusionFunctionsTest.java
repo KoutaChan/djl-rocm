@@ -48,17 +48,20 @@ public class FusionFunctionsTest {
             }
 
             Assert.assertEquals(output.getShape(), new Shape(2, 1));
-            assertFiniteGradient(input);
-            assertFiniteGradient(combinedWeight);
-            assertFiniteGradient(combinedBias);
-            assertFiniteGradient(outputWeight);
+            assertFiniteNonZeroGradient(input);
+            assertFiniteNonZeroGradient(combinedWeight);
+            assertFiniteNonZeroGradient(combinedBias);
+            assertFiniteNonZeroGradient(outputWeight);
         }
     }
 
-    private static void assertFiniteGradient(NDArray array) {
+    private static void assertFiniteNonZeroGradient(NDArray array) {
         Assert.assertTrue(array.hasGradient());
+        boolean hasNonZero = false;
         for (float value : array.getGradient().toFloatArray()) {
             Assert.assertTrue(Float.isFinite(value));
+            hasNonZero |= value != 0f;
         }
+        Assert.assertTrue(hasNonZero, "Expected a nonzero gradient.");
     }
 }

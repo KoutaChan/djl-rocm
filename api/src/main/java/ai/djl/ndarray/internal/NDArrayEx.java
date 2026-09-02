@@ -145,12 +145,27 @@ public interface NDArrayEx {
                     baselinePresence.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
             NDArray selectedMask =
                     selectedPresence.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
-            NDArray selectedProbability = Activation.sigmoid(logit);
             NDArray jointPresence = baselineMask.mul(selectedMask);
+            NDArray participatingLogit =
+                    NDArrays.where(jointPresence.neq(0), logit, logit.zerosLike());
+            NDArray selectedProbability = Activation.sigmoid(participatingLogit);
             NDArray baselineWeight = baselineMask.sub(jointPresence.mul(selectedProbability));
             NDArray selectedWeight =
                     selectedMask.sub(jointPresence).add(jointPresence.mul(selectedProbability));
-            NDArray result = baseline.mul(baselineWeight).add(selected.mul(selectedWeight));
+            NDArray participatingBaseline =
+                    NDArrays.where(
+                            baselineMask.neq(0).broadcast(baseline.getShape()),
+                            baseline,
+                            baseline.zerosLike());
+            NDArray participatingSelected =
+                    NDArrays.where(
+                            selectedMask.neq(0).broadcast(selected.getShape()),
+                            selected,
+                            selected.zerosLike());
+            NDArray result =
+                    participatingBaseline
+                            .mul(baselineWeight)
+                            .add(participatingSelected.mul(selectedWeight));
             outputManager.attachAll(result);
             return result;
         }
@@ -534,13 +549,36 @@ public interface NDArrayEx {
     /** Returns float32 probabilities normalized over nonzero mask entries. */
     default NDArray maskedSoftmax(NDArray mask, int axis) {
         NDArray logits = differentiableCast(DataType.FLOAT32);
+        int normalizedAxis = axis < 0 ? axis + logits.getShape().dimension() : axis;
+        long[] reducedShape = logits.getShape().getShape().clone();
+        reducedShape[normalizedAxis] = 1;
         NDArray floatMask =
                 mask.neq(0)
                         .toType(DataType.FLOAT32, false)
                         .broadcast(logits.getShape())
                         .stopGradient();
-        NDArray masked = logits.add(floatMask.neg().add(1.0f).mul(-1.0e30f));
-        return NDArrays.where(floatMask, masked.softmax(axis), logits.zerosLike());
+        NDArray selectedLogits = NDArrays.where(floatMask, logits, logits.zerosLike());
+        NDArray maskedForMaximum =
+                NDArrays.where(
+                        floatMask, selectedLogits, logits.zerosLike().add(Float.NEGATIVE_INFINITY));
+        NDArray maximum =
+                maskedForMaximum.max(new int[] {normalizedAxis}).reshape(new Shape(reducedShape));
+        NDArray present =
+                floatMask
+                        .sum(new int[] {normalizedAxis})
+                        .reshape(new Shape(reducedShape))
+                        .gt(0.5f)
+                        .stopGradient();
+        NDArray safeMaximum = NDArrays.where(present, maximum, maximum.zerosLike());
+        NDArray shifted =
+                NDArrays.where(floatMask, selectedLogits.sub(safeMaximum), logits.zerosLike());
+        NDArray exponentials = NDArrays.where(floatMask, shifted.exp(), logits.zerosLike());
+        NDArray denominator =
+                exponentials
+                        .sum(new int[] {normalizedAxis})
+                        .reshape(new Shape(reducedShape))
+                        .maximum(1.0e-30f);
+        return NDArrays.where(floatMask, exponentials.div(denominator), logits.zerosLike());
     }
 
     /** Summarizes rows with a weighted mean and active extrema using portable operations. */
@@ -664,7 +702,10 @@ public interface NDArrayEx {
                         .expandDims(-2)
                         .broadcast(pooledShape);
         NDArray selectedValues =
-                NDArrays.where(expandedWeights.neq(0), expandedValues, expandedValues.zerosLike());
+                NDArrays.where(
+                        mask.neq(0).expandDims(-1).broadcast(pooledShape),
+                        expandedValues,
+                        expandedValues.zerosLike());
         NDArray pooled = expandedWeights.mul(selectedValues).sum(new int[] {choiceAxis});
         NDArray present = mask.neq(0).sum(new int[] {choiceAxis}).gt(0).expandDims(-1);
         NDArray masked = NDArrays.where(present, pooled, pooled.zerosLike());
@@ -728,12 +769,15 @@ public interface NDArrayEx {
         NDArray selectedMaskArray = NDArrays.concat(selectedMasks, -1);
         NDArray selectedValueArray = NDArrays.concat(selectedValues, -2);
         NDArray weights = NDArrays.maskedSoftmax(selectedLogitArray, selectedMaskArray, -1);
-        NDArray pooled =
-                selectedValueArray
-                        .getNDArrayInternal()
-                        .differentiableCast(DataType.FLOAT32)
-                        .mul(weights.expandDims(-1))
-                        .sum(new int[] {logitRank - 1});
+        NDArray expandedWeights = weights.expandDims(-1);
+        NDArray floatValues =
+                selectedValueArray.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+        NDArray participatingValues =
+                NDArrays.where(
+                        selectedMaskArray.neq(0).expandDims(-1).broadcast(floatValues.getShape()),
+                        floatValues,
+                        floatValues.zerosLike());
+        NDArray pooled = participatingValues.mul(expandedWeights).sum(new int[] {logitRank - 1});
         NDArray present =
                 selectedMaskArray
                         .neq(0)
@@ -776,23 +820,28 @@ public interface NDArrayEx {
                         .toType(DataType.FLOAT32, false)
                         .broadcast(logits.getShape())
                         .stopGradient();
-        NDArray masked = logits.add(floatMask.neg().add(1.0f).mul(-1.0e30f));
-        NDArray maximum = masked.max(new int[] {normalizedAxis}).reshape(new Shape(reducedShape));
-        NDArray sum =
-                masked.sub(maximum)
-                        .exp()
-                        .mul(floatMask)
-                        .sum(new int[] {normalizedAxis})
-                        .reshape(new Shape(reducedShape))
-                        .maximum(1.0e-30f);
+        NDArray selectedLogits = NDArrays.where(floatMask, logits, logits.zerosLike());
+        NDArray maskedForMaximum =
+                NDArrays.where(
+                        floatMask, selectedLogits, logits.zerosLike().add(Float.NEGATIVE_INFINITY));
+        NDArray maximum =
+                maskedForMaximum.max(new int[] {normalizedAxis}).reshape(new Shape(reducedShape));
         NDArray present =
                 floatMask
                         .sum(new int[] {normalizedAxis})
                         .reshape(new Shape(reducedShape))
                         .gt(0.5f)
-                        .toType(DataType.FLOAT32, false)
                         .stopGradient();
-        return sum.log().add(maximum).mul(present);
+        NDArray safeMaximum = NDArrays.where(present, maximum, maximum.zerosLike());
+        NDArray shifted =
+                NDArrays.where(floatMask, selectedLogits.sub(safeMaximum), logits.zerosLike());
+        NDArray sum =
+                NDArrays.where(floatMask, shifted.exp(), logits.zerosLike())
+                        .sum(new int[] {normalizedAxis})
+                        .reshape(new Shape(reducedShape))
+                        .maximum(1.0e-30f);
+        NDArray normalizer = sum.log().add(safeMaximum);
+        return NDArrays.where(present, normalizer, normalizer.zerosLike());
     }
 
     /**
@@ -1698,9 +1747,9 @@ public interface NDArrayEx {
      *
      * <p>Query uses {@code [batch, queryTokens, heads * keyFeatures]}. Packed memory uses {@code
      * [batch, groups, keyTokens, heads * (keyFeatures + valueFeatures)]}; all head keys precede all
-     * head values. The nonzero mask uses {@code [batch, groups, keyTokens]}; masked score entries
-     * do not contribute query or key gradients. The default implementation is a differentiable
-     * decomposition and defines the portable fallback semantics.
+     * head values. The nonzero mask uses {@code [batch, groups, keyTokens]}; masked entries do not
+     * contribute query, key, or value gradients, and a fully masked group returns zero. The default
+     * implementation is a differentiable decomposition and defines the portable fallback semantics.
      *
      * @param packedKeyValue grouped packed key/value projection
      * @param mask nonzero valid-token mask
@@ -1758,14 +1807,28 @@ public interface NDArrayEx {
                             .get("...,{}:{}", queryWidth, packedWidth)
                             .reshape(batch, groups, keyTokens, heads, valueFeatures)
                             .swapAxes(2, 3);
+            NDArray tokenValid = mask.neq(0).reshape(batch, groups, 1, keyTokens, 1).stopGradient();
+            keys = NDArrays.where(tokenValid.broadcast(keys.getShape()), keys, keys.zerosLike());
+            values =
+                    NDArrays.where(
+                            tokenValid.broadcast(values.getShape()), values, values.zerosLike());
             NDArray valid =
-                    mask.neq(0)
+                    tokenValid
                             .reshape(batch, groups, 1, 1, keyTokens)
                             .broadcast(batch, groups, heads, queryTokens, keyTokens)
                             .stopGradient();
             NDArray scores = queries.matMul(keys.swapAxes(3, 4)).mul(scale);
+            NDArray safeScores = NDArrays.where(valid, scores, scores.zerosLike());
+            NDArray present =
+                    valid.sum(new int[] {4}, true).gt(0).broadcast(valid.getShape()).stopGradient();
+            NDArray attentionValid = NDArrays.where(present, valid, valid.onesLike());
+            NDArray maskedScores =
+                    NDArrays.where(
+                            attentionValid,
+                            safeScores,
+                            scores.zerosLike().add(Float.NEGATIVE_INFINITY));
             NDArray probabilities =
-                    NDArrays.where(valid, scores, scores.zerosLike().add(-1.0e30f)).softmax(4);
+                    NDArrays.where(valid, maskedScores.softmax(4), scores.zerosLike());
             NDArray result =
                     probabilities
                             .matMul(values)
@@ -1966,21 +2029,29 @@ public interface NDArrayEx {
                             .get("...,0:" + keyWidth)
                             .reshape(queryCount, indexedTokens, heads, keyFeatures)
                             .swapAxes(1, 2);
-            NDArray keys =
-                    sharedKeys.add(sharedDeltaKeys).concat(indexedKeys.add(indexedDeltaKeys), 2);
-            NDArray scores = query.expandDims(2).mul(keys).sum(new int[] {3}).mul(scale);
-            NDArray indexedMask =
+            NDArray indexedPresent =
                     storedIds
                             .neq(0)
-                            .toType(scores.getDataType(), false)
                             .expandDims(1)
                             .broadcast(queryCount, heads, indexedTokens)
-                            .neg()
-                            .add(1)
-                            .mul(-1.0e9f);
+                            .stopGradient();
+            NDArray combinedIndexedKeys = indexedKeys.add(indexedDeltaKeys);
+            NDArray participatingIndexedKeys =
+                    NDArrays.where(
+                            indexedPresent.expandDims(3).broadcast(combinedIndexedKeys.getShape()),
+                            combinedIndexedKeys,
+                            combinedIndexedKeys.zerosLike());
+            NDArray keys = sharedKeys.add(sharedDeltaKeys).concat(participatingIndexedKeys, 2);
+            NDArray scores = query.expandDims(2).mul(keys).sum(new int[] {3}).mul(scale);
+            NDArray indexedScores = scores.get("...," + sharedTokens + ":");
             scores =
                     scores.get("...,0:" + sharedTokens)
-                            .concat(scores.get("...," + sharedTokens + ":").add(indexedMask), 2);
+                            .concat(
+                                    NDArrays.where(
+                                            indexedPresent,
+                                            indexedScores,
+                                            indexedScores.zerosLike().add(Float.NEGATIVE_INFINITY)),
+                                    2);
             NDArray weights = scores.softmax(2);
 
             NDArray sharedValues =
@@ -2003,10 +2074,16 @@ public interface NDArrayEx {
                             .get("...," + keyWidth + ":")
                             .reshape(queryCount, indexedTokens, heads, valueFeatures)
                             .swapAxes(1, 2);
+            NDArray combinedIndexedValues = indexedValues.add(indexedDeltaValues);
+            NDArray participatingIndexedValues =
+                    NDArrays.where(
+                            indexedPresent
+                                    .expandDims(3)
+                                    .broadcast(combinedIndexedValues.getShape()),
+                            combinedIndexedValues,
+                            combinedIndexedValues.zerosLike());
             NDArray values =
-                    sharedValues
-                            .add(sharedDeltaValues)
-                            .concat(indexedValues.add(indexedDeltaValues), 2);
+                    sharedValues.add(sharedDeltaValues).concat(participatingIndexedValues, 2);
             NDArray result = weights.expandDims(3).mul(values).sum(new int[] {2});
             outputManager.attachAll(result);
             return result;

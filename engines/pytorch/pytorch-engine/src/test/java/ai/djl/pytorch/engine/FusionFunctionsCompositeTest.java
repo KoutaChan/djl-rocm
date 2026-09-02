@@ -23,6 +23,7 @@ import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.NDScope;
+import ai.djl.ndarray.index.NDIndex;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.Activation;
@@ -127,6 +128,44 @@ public class FusionFunctionsCompositeTest {
     }
 
     @Test
+    public void singleQueryReadoutDoesNotReadMaskedNonFiniteMemory() {
+        Engine engine = Engine.getInstance();
+        verifySingleQueryNonFiniteIsolation(Device.cpu(), DataType.FLOAT32);
+        if (engine.getGpuCount() > 0) {
+            verifySingleQueryNonFiniteIsolation(Device.gpu(), DataType.FLOAT16);
+            verifySingleQueryNonFiniteIsolation(Device.gpu(), DataType.BFLOAT16);
+        }
+    }
+
+    @Test
+    public void singleQueryReadoutResultFollowsCallingScope() {
+        Engine engine = Engine.getInstance();
+        try (NDManager manager = engine.newBaseManager(Device.cpu())) {
+            NDArray memory = patterned(manager, new Shape(1, 2, 4), 3, 0.037f);
+            NDArray querySource = patterned(manager, new Shape(1, 4), 5, 0.031f);
+            NDArray mask = manager.ones(new Shape(1, 2));
+            FusionSingleQueryReadoutParameters readout =
+                    typedReadout(manager, DataType.FLOAT32, 4, 4, 6);
+            NDArray output;
+            try (NDScope scope = new NDScope()) {
+                scope.suppressNotUsedWarning();
+                output =
+                        FusionFunctions.singleQueryCrossAttentionReadoutGroup(
+                                        memory,
+                                        querySource,
+                                        mask,
+                                        0,
+                                        2,
+                                        EPSILON,
+                                        Collections.singletonList(readout))
+                                .singletonOrThrow();
+                Assert.assertFalse(output.isReleased());
+            }
+            Assert.assertTrue(output.isReleased());
+        }
+    }
+
+    @Test
     public void gpuSingleQueryReadoutConvertsMixedInputToProjectionType() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -170,6 +209,57 @@ public class FusionFunctionsCompositeTest {
                         }) {
                     Assert.assertTrue(differentiable.hasGradient());
                     assertFinite(differentiable.getGradient());
+                }
+            }
+        }
+    }
+
+    private static void verifySingleQueryNonFiniteIsolation(
+            Device device, DataType projectionType) {
+        Engine engine = Engine.getInstance();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray memory = patterned(manager, new Shape(2, 4, 4), 3, 0.037f);
+            memory.set(new NDIndex("0,1,:"), Float.NaN);
+            memory.set(new NDIndex("0,3,:"), Float.POSITIVE_INFINITY);
+            memory.set(new NDIndex("1,:,:"), Float.NaN);
+            NDArray querySource = patterned(manager, new Shape(2, 2, 4), 5, 0.031f);
+            NDArray mask = manager.create(new int[] {1, 0, 1, 0, 0, 0, 0, 0}, new Shape(2, 4));
+            memory.setRequiresGradient(true);
+            querySource.setRequiresGradient(true);
+            FusionSingleQueryReadoutParameters readout =
+                    typedReadout(manager, projectionType, 4, 4, 6);
+            readout.getQuerySeedWeight().setRequiresGradient(true);
+            readout.getKeyValueWeight().setRequiresGradient(true);
+            NDArray output;
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                output =
+                        FusionFunctions.singleQueryCrossAttentionReadoutGroup(
+                                        memory,
+                                        querySource,
+                                        mask,
+                                        1,
+                                        2,
+                                        EPSILON,
+                                        Collections.singletonList(readout))
+                                .singletonOrThrow();
+                collector.backward(output.sum());
+            }
+
+            assertFinite(output);
+            assertFinite(memory.getGradient());
+            assertFinite(querySource.getGradient());
+            assertFinite(readout.getQuerySeedWeight().getGradient());
+            assertFinite(readout.getKeyValueWeight().getGradient());
+            float[] memoryGradient =
+                    memory.getGradient().toType(DataType.FLOAT32, false).toFloatArray();
+            for (int batch = 0; batch < 2; ++batch) {
+                for (int token = 0; token < 4; ++token) {
+                    if (mask.getInt(batch, token) == 0) {
+                        for (int hidden = 0; hidden < 4; ++hidden) {
+                            int index = (batch * 4 + token) * 4 + hidden;
+                            Assert.assertEquals(memoryGradient[index], 0f);
+                        }
+                    }
                 }
             }
         }
@@ -400,12 +490,17 @@ public class FusionFunctionsCompositeTest {
                             .ones(
                                     new Shape(local.indices.getShape().size(), 1),
                                     input.getDataType());
-            attentionBias =
+            NDArray valid =
                     NDArrays.scatterRows(validRows, local.indices, denseRows)
-                            .reshape(batch, 1, 1, tokens)
-                            .neg()
-                            .add(1f)
-                            .mul(-1.0e9f);
+                            .reshape(batch, 1, 1, tokens);
+            NDArray hasValid = valid.sum(new int[] {3}, true).gt(0).broadcast(valid.getShape());
+            NDArray attentionValid =
+                    NDArrays.where(hasValid, valid.neq(0), valid.onesLike().neq(0));
+            attentionBias =
+                    NDArrays.where(
+                            attentionValid,
+                            valid.zerosLike(),
+                            valid.zerosLike().add(Float.NEGATIVE_INFINITY));
         }
         NDArray queries =
                 queryKeyValue
@@ -474,11 +569,17 @@ public class FusionFunctionsCompositeTest {
             scope.suppressNotUsedWarning();
             long batch = memory.getShape().get(0);
             long tokens = memory.getShape().get(1);
-            NDArray floatMask = validMask.neq(0).toType(DataType.FLOAT32, false);
+            NDArray validTokens = validMask.neq(0);
+            NDArray floatMask = validTokens.toType(DataType.FLOAT32, false);
             NDArray counts = floatMask.sum(new int[] {1}, true);
+            NDArray selectedMemory =
+                    NDArrays.where(
+                            validTokens.expandDims(2).broadcast(memory.getShape()),
+                            memory,
+                            memory.zerosLike());
             NDArray mean =
-                    memory.toType(DataType.FLOAT32, false)
-                            .mul(floatMask.expandDims(2))
+                    selectedMemory
+                            .toType(DataType.FLOAT32, false)
                             .sum(new int[] {1})
                             .div(counts.maximum(1f))
                             .toType(memory.getDataType(), false);
@@ -491,7 +592,7 @@ public class FusionFunctionsCompositeTest {
                     referenceLinear(state, readout.getQueryWeight(), readout.getQueryBias());
             long attentionWidth = query.getShape().get(1);
             long headWidth = attentionWidth / attentionHeads;
-            NDArray keyValue = referenceLinear(memory, readout.getKeyValueWeight(), null);
+            NDArray keyValue = referenceLinear(selectedMemory, readout.getKeyValueWeight(), null);
             NDArray queries = query.reshape(batch, attentionHeads, 1, headWidth);
             NDArray keys =
                     keyValue.get("...,0:{}", attentionWidth)
@@ -502,14 +603,17 @@ public class FusionFunctionsCompositeTest {
                             .reshape(batch, tokens, attentionHeads, headWidth)
                             .swapAxes(1, 2);
             NDArray scores = queries.matMul(keys.swapAxes(2, 3)).mul(1.0 / Math.sqrt(headWidth));
-            NDArray attentionBias =
-                    validMask
-                            .eq(0)
-                            .toType(query.getDataType(), false)
-                            .mul(-1.0e9f)
-                            .reshape(batch, 1, 1, tokens);
             NDArray presence =
                     counts.gt(0).toType(query.getDataType(), false).reshape(batch, 1, 1, 1);
+            NDArray attentionValidTokens =
+                    validTokens.logicalOr(counts.eq(0).broadcast(validTokens.getShape()));
+            NDArray attentionBiasValues = attentionValidTokens.toType(query.getDataType(), false);
+            NDArray attentionBias =
+                    NDArrays.where(
+                                    attentionValidTokens,
+                                    attentionBiasValues.zerosLike(),
+                                    attentionBiasValues.zerosLike().add(Float.NEGATIVE_INFINITY))
+                            .reshape(batch, 1, 1, tokens);
             NDArray context =
                     scores.add(attentionBias)
                             .softmax(3)
@@ -744,8 +848,8 @@ public class FusionFunctionsCompositeTest {
         private RelationPair createRelation(
                 int tokens, int relationCount, int attentionWidth, int attentionHeads) {
             NDArray relationIds =
-                    manager.create(
-                            new long[] {0, 1, 2, 2, 0, 1, 1, 2, 0}, new Shape(tokens, tokens));
+                    manager.create(new int[] {0, 1, 2, 2, 0, 1, 1, 2, 0}, new Shape(tokens, tokens))
+                            .toType(DataType.INT16, false);
             ArrayPair relationKeys = create(new Shape(relationCount, attentionWidth));
             ArrayPair relationBias = create(new Shape(relationCount, attentionHeads));
             return new RelationPair(

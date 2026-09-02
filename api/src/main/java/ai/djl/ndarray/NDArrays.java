@@ -534,11 +534,11 @@ public final class NDArrays {
      * Applies grouped attention to packed token-major key/value projections.
      *
      * <p>The query is shared by every group in the same leading row. Packed memory stores all head
-     * keys followed by all head values. Nonzero mask entries participate in the softmax. Engines
-     * may fuse the operation while preserving gradients for the query and packed key/value
-     * projections. Masked score entries do not contribute query or key gradients. Callers should
-     * provide at least one valid key per group; a fully masked group follows the engine and data
-     * type's softmax behavior. The mask, head count, and scale are not differentiable.
+     * keys followed by all head values. Only nonzero mask entries participate in the softmax and
+     * value pooling. Engines may fuse the operation while preserving gradients for the query and
+     * packed key/value projections. Masked entries do not contribute query, key, or value
+     * gradients, and a fully masked group returns zero. The mask, head count, and scale are not
+     * differentiable.
      *
      * @param query shared query projection shaped {@code [..., queryTokens, queryWidth]}
      * @param packedKeyValue grouped packed projection shaped {@code [..., groups, keyTokens,

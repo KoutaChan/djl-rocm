@@ -69,6 +69,65 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void groupedAttentionStrictlyExcludesPaddedIndexedTokens() {
+        Engine engine = Engine.getInstance();
+        verifyGroupedAttentionStrictPadding(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyGroupedAttentionStrictPadding(engine, Device.gpu());
+        }
+    }
+
+    @Test
+    public void groupedAttentionKeepsLegalUnderflowValueObservable() {
+        Engine engine = Engine.getInstance();
+        verifyGroupedAttentionLegalUnderflowValue(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyGroupedAttentionLegalUnderflowValue(engine, Device.gpu());
+        }
+    }
+
+    private static void verifyGroupedAttentionStrictPadding(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray query = requiringGradient(manager.create(new float[] {1f}, new Shape(1, 1, 1)));
+            NDArray shared =
+                    requiringGradient(
+                            manager.create(new float[] {-Float.MAX_VALUE, 2f}, new Shape(1, 1, 2)));
+            NDArray sharedDeltas = requiringGradient(manager.zeros(new Shape(1, 1, 2)));
+            NDArray indexedDeltas =
+                    requiringGradient(
+                            manager.create(
+                                    new float[] {Float.MAX_VALUE, Float.NaN}, new Shape(1, 1, 2)));
+            NDArray indexedIds = manager.zeros(new Shape(1, 1), DataType.INT32);
+            NDArray output;
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                output =
+                        NDArrays.groupedIndexedScaledDotProductAttention(
+                                query, shared, sharedDeltas, indexedDeltas, indexedIds, 1, 1.0);
+                collector.backward(output.sum());
+            }
+
+            assertClose(output.toFloatArray(), new float[] {2f}, 0f);
+            assertClose(query.getGradient().toFloatArray(), new float[] {0f}, 0f);
+            assertClose(indexedDeltas.getGradient().toFloatArray(), new float[] {0f, 0f}, 0f);
+        }
+    }
+
+    private static void verifyGroupedAttentionLegalUnderflowValue(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray query = manager.create(new float[] {1f}, new Shape(1, 1, 1));
+            NDArray shared = manager.create(new float[] {0f, 1f}, new Shape(1, 1, 2));
+            NDArray sharedDeltas = manager.zeros(new Shape(1, 1, 2));
+            NDArray indexedDeltas =
+                    manager.create(new float[] {-1000f, Float.NaN}, new Shape(1, 1, 2));
+            NDArray indexedIds = manager.ones(new Shape(1, 1), DataType.INT32);
+            NDArray output =
+                    NDArrays.groupedIndexedScaledDotProductAttention(
+                            query, shared, sharedDeltas, indexedDeltas, indexedIds, 1, 1.0);
+            Assert.assertTrue(Float.isNaN(output.getFloat()));
+        }
+    }
+
+    @Test
     public void mappedGroupedAttentionReadsSharedAndDeltaTables() {
         try (NDManager manager = NDManager.newBaseManager()) {
             NDArray query = manager.zeros(new Shape(2, 1, 1));
@@ -282,6 +341,42 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void groupedPackedAttentionElementwiseBackwardMasksNonFiniteToken() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        engine.setRandomSeed(20260922);
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            int keyTokens = 32;
+            int keyFeatures = 32;
+            int valueFeatures = 64;
+            NDArray query = requiringGradient(manager.randomNormal(new Shape(1, 1, keyFeatures)));
+            NDArray packedValues =
+                    manager.randomNormal(new Shape(1, 1, keyTokens, keyFeatures + valueFeatures));
+            packedValues.set(new ai.djl.ndarray.index.NDIndex("..., -1, :"), Float.NaN);
+            NDArray packed = requiringGradient(packedValues);
+            NDArray mask = manager.ones(new Shape(1, 1, keyTokens), DataType.INT32);
+            mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+            NDArray output;
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                output =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packed, mask, 1, 1.0 / Math.sqrt(keyFeatures));
+                collector.backward(output.sum());
+            }
+
+            for (float value : output.toFloatArray()) {
+                Assert.assertTrue(Float.isFinite(value));
+            }
+            assertFiniteNonzeroGradient(query);
+            try (NDArray maskedGradient = packed.getGradient().get("..., -1, :")) {
+                assertAllZero(maskedGradient.toFloatArray());
+            }
+        }
+    }
+
+    @Test
     public void groupedPackedAttentionNativeBackwardSupportsEveryMaskDtype() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -302,7 +397,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
-    public void groupedPackedAttentionAllInvalidRowsMatchPortableDtypeBehavior() {
+    public void groupedPackedAttentionAllInvalidRowsReturnZeroAcrossDtypes() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             return;
@@ -328,15 +423,8 @@ public class StructuredAttentionTest {
                 float[] expectedValues = expected.toType(DataType.FLOAT32, false).toFloatArray();
                 float[] actualValues = actual.toType(DataType.FLOAT32, false).toFloatArray();
 
-                if (dataType == DataType.FLOAT16) {
-                    assertAllNaN(expectedValues);
-                    assertAllNaN(actualValues);
-                } else {
-                    assertClose(
-                            actualValues,
-                            expectedValues,
-                            dataType == DataType.FLOAT32 ? 2e-4f : 2e-2f);
-                }
+                assertAllZero(expectedValues);
+                assertAllZero(actualValues);
             }
         }
     }
@@ -365,6 +453,7 @@ public class StructuredAttentionTest {
                             .swapAxes(2, 3);
             NDArray mask = manager.ones(new Shape(batch, groups, keyTokens), DataType.INT32);
             mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+            packedKeyValue.set(new ai.djl.ndarray.index.NDIndex("..., -1, :"), Float.NaN);
 
             NDArray expected =
                     groupedPackedAttentionReference(query, packedKeyValue, mask, heads, 0.5);
@@ -377,7 +466,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
-    public void groupedPackedAttentionFloat16FallbackAcceptsFullyMaskedRows() {
+    public void groupedPackedAttentionFloat16FallbackReturnsZeroForFullyMaskedRows() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             return;
@@ -393,13 +482,7 @@ public class StructuredAttentionTest {
                     NDArrays.groupedPackedScaledDotProductAttention(
                             query, packedKeyValue, mask, 1, 0.5);
 
-            assertAllNaN(output.toType(DataType.FLOAT32, false).toFloatArray());
-        }
-    }
-
-    private static void assertAllNaN(float[] values) {
-        for (float value : values) {
-            Assert.assertTrue(Float.isNaN(value), "expected NaN but found " + value);
+            assertAllZero(output.toType(DataType.FLOAT32, false).toFloatArray());
         }
     }
 
@@ -929,13 +1012,28 @@ public class StructuredAttentionTest {
                         .get("...,{}:{}", queryWidth, packedShape.get(3))
                         .reshape(batch, groups, keyTokens, heads, valueFeatures)
                         .swapAxes(2, 3);
+        NDArray tokenValid = mask.neq(0).reshape(batch, groups, 1, keyTokens, 1);
+        keys = NDArrays.where(tokenValid.broadcast(keys.getShape()), keys, keys.zerosLike());
+        values =
+                NDArrays.where(tokenValid.broadcast(values.getShape()), values, values.zerosLike());
         NDArray valid =
-                mask.neq(0)
+                tokenValid
                         .reshape(batch, groups, 1, 1, keyTokens)
                         .broadcast(batch, groups, heads, queryTokens, keyTokens);
         NDArray scores = queries.matMul(keys.swapAxes(3, 4)).mul(scale);
-        return NDArrays.where(valid, scores, scores.zerosLike().add(-1.0e30f))
-                .softmax(4)
+        NDArray safeScores = NDArrays.where(valid, scores, scores.zerosLike());
+        NDArray present = valid.sum(new int[] {4}, true).gt(0).broadcast(valid.getShape());
+        NDArray attentionValid = NDArrays.where(present, valid, valid.onesLike());
+        NDArray probabilities =
+                NDArrays.where(
+                        valid,
+                        NDArrays.where(
+                                        attentionValid,
+                                        safeScores,
+                                        scores.zerosLike().add(Float.NEGATIVE_INFINITY))
+                                .softmax(4),
+                        scores.zerosLike());
+        return probabilities
                 .matMul(values)
                 .swapAxes(2, 3)
                 .reshape(batch, groups, queryTokens, valueWidth);
@@ -1210,30 +1308,59 @@ public class StructuredAttentionTest {
     }
 
     @Test
-    public void groupedPackedAttentionMaskedProbabilityContributesToSoftmaxJacobian() {
+    public void groupedPackedAttentionStrictlyExcludesMaskedTokens() {
         Engine engine = Engine.getInstance();
-        if (engine.getGpuCount() == 0) {
-            return;
+        verifyGroupedPackedAttentionStrictMask(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyGroupedPackedAttentionStrictMask(engine, Device.gpu());
         }
-        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+    }
+
+    @Test
+    public void groupedPackedAttentionKeepsLegalUnderflowValueObservable() {
+        Engine engine = Engine.getInstance();
+        verifyGroupedPackedAttentionLegalUnderflowValue(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyGroupedPackedAttentionLegalUnderflowValue(engine, Device.gpu());
+        }
+    }
+
+    private static void verifyGroupedPackedAttentionStrictMask(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device)) {
             NDArray query = requiringGradient(manager.create(new float[] {1f}, new Shape(1, 1, 1)));
             NDArray packed =
                     requiringGradient(
                             manager.create(
-                                    new float[] {-1.0e30f, 1f, 0f, 3f}, new Shape(1, 1, 2, 2)));
+                                    new float[] {-Float.MAX_VALUE, 1f, 0f, Float.NaN},
+                                    new Shape(1, 1, 2, 2)));
             NDArray mask = manager.create(new int[] {1, 0}, new Shape(1, 1, 2));
+            NDArray output;
             try (GradientCollector collector = engine.newGradientCollector()) {
-                collector.backward(
-                        NDArrays.groupedPackedScaledDotProductAttention(query, packed, mask, 1, 1.0)
-                                .sum());
+                output =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packed, mask, 1, 1.0);
+                collector.backward(output.sum());
             }
 
             try (NDArray queryGradient = query.getGradient();
                     NDArray packedGradient = packed.getGradient()) {
-                Assert.assertTrue(queryGradient.toFloatArray()[0] > 4.0e29f);
-                assertClose(
-                        packedGradient.toFloatArray(), new float[] {-0.5f, 0.5f, 0f, 0.5f}, 1e-6f);
+                assertClose(output.toFloatArray(), new float[] {1f}, 0f);
+                assertClose(queryGradient.toFloatArray(), new float[] {0f}, 0f);
+                assertClose(packedGradient.toFloatArray(), new float[] {0f, 1f, 0f, 0f}, 0f);
             }
+        }
+    }
+
+    private static void verifyGroupedPackedAttentionLegalUnderflowValue(
+            Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray query = manager.create(new float[] {1f}, new Shape(1, 1, 1));
+            NDArray packed =
+                    manager.create(new float[] {0f, 1f, -1000f, Float.NaN}, new Shape(1, 1, 2, 2));
+            NDArray mask = manager.ones(new Shape(1, 1, 2), DataType.INT32);
+            NDArray output =
+                    NDArrays.groupedPackedScaledDotProductAttention(query, packed, mask, 1, 1.0);
+            Assert.assertTrue(Float.isNaN(output.getFloat()));
         }
     }
 
@@ -1362,22 +1489,33 @@ public class StructuredAttentionTest {
             Engine engine, Device device, DataType dataType) {
         try (NDManager manager = engine.newBaseManager(device)) {
             NDArray query = requiringGradient(manager.ones(new Shape(1, 1, 2), dataType));
-            NDArray packed = requiringGradient(manager.ones(new Shape(1, 1, 2, 4), dataType));
+            NDArray packed =
+                    requiringGradient(
+                            manager.create(
+                                            new float[] {
+                                                Float.NaN, Float.NaN, Float.NaN, Float.NaN,
+                                                Float.NaN, Float.NaN, Float.NaN, Float.NaN
+                                            },
+                                            new Shape(1, 1, 2, 4))
+                                    .toType(dataType, false));
             NDArray mask = manager.zeros(new Shape(1, 1, 2), DataType.INT32);
+            NDArray output;
             try (GradientCollector collector = engine.newGradientCollector()) {
-                collector.backward(
-                        NDArrays.groupedPackedScaledDotProductAttention(query, packed, mask, 1, 1.0)
-                                .sum());
+                output =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packed, mask, 1, 1.0);
+                collector.backward(output.sum());
             }
 
             try (NDArray queryGradient = query.getGradient();
                     NDArray packedGradient = packed.getGradient();
                     NDArray queryGradientValues = queryGradient.toType(DataType.FLOAT32, false);
                     NDArray packedGradientValues = packedGradient.toType(DataType.FLOAT32, false)) {
+                assertAllZero(output.toType(DataType.FLOAT32, false).toFloatArray());
                 assertClose(queryGradientValues.toFloatArray(), new float[] {0f, 0f}, 0f);
                 assertClose(
                         packedGradientValues.toFloatArray(),
-                        new float[] {0f, 0f, 0.5f, 0.5f, 0f, 0f, 0.5f, 0.5f},
+                        new float[] {0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f},
                         0f);
             }
         }
@@ -1427,7 +1565,7 @@ public class StructuredAttentionTest {
             }
 
             assertFiniteNonzeroGradient(query, key, value, relationKeys, relationBias);
-            float tolerance = gradientTolerance(dataType);
+            float tolerance = structuredAttentionGradientTolerance(dataType);
             assertGradientClose(query, referenceQuery, tolerance);
             assertGradientClose(key, referenceKey, tolerance);
             assertGradientClose(value, referenceValue, tolerance);
@@ -1480,7 +1618,7 @@ public class StructuredAttentionTest {
             }
 
             assertFiniteNonzeroGradient(query, shared, sharedDeltas, indexedDeltas);
-            float tolerance = gradientTolerance(dataType);
+            float tolerance = structuredAttentionGradientTolerance(dataType);
             assertGradientClose(query, referenceQuery, tolerance);
             assertGradientClose(shared, referenceShared, tolerance);
             assertGradientClose(sharedDeltas, referenceSharedDeltas, tolerance);
@@ -1560,7 +1698,7 @@ public class StructuredAttentionTest {
             }
 
             assertFiniteNonzeroGradient(query, shared, deltaTable, indexedDeltas);
-            float tolerance = gradientTolerance(dataType);
+            float tolerance = structuredAttentionGradientTolerance(dataType);
             assertGradientClose(query, referenceQuery, tolerance);
             assertGradientClose(shared, referenceShared, tolerance);
             assertGradientClose(deltaTable, referenceDeltaTable, tolerance);
@@ -1583,16 +1721,13 @@ public class StructuredAttentionTest {
             NDArray queryValues =
                     manager.randomNormal(new Shape(queries, heads, keyFeatures), dataType);
             NDArray sharedValues =
-                    manager.randomNormal(
-                            new Shape(groups, sharedTokens, packedWidth), dataType);
+                    manager.randomNormal(new Shape(groups, sharedTokens, packedWidth), dataType);
             NDArray deltaTableValues =
                     manager.randomNormal(new Shape(deltaRows, packedWidth), dataType);
             NDArray indexedDeltaValues =
-                    manager.randomNormal(
-                            new Shape(queries, indexedTokens, packedWidth), dataType);
+                    manager.randomNormal(new Shape(queries, indexedTokens, packedWidth), dataType);
             NDArray outputGradientValues =
-                    manager.randomNormal(
-                            new Shape(queries, heads, valueFeatures), dataType);
+                    manager.randomNormal(new Shape(queries, heads, valueFeatures), dataType);
             int[] groupIds = new int[queries];
             int[] deltaIds = new int[queries * sharedTokens];
             int[] indexedIds = new int[queries * indexedTokens];
@@ -1603,12 +1738,10 @@ public class StructuredAttentionTest {
                 deltaIds[index] = (index * 5 + 3) % deltaRows;
             }
             for (int index = 0; index < indexedIds.length; index++) {
-                indexedIds[index] =
-                        index % 5 == 0 ? 0 : (index * 7 + 3) % sharedTokens + 1;
+                indexedIds[index] = index % 5 == 0 ? 0 : (index * 7 + 3) % sharedTokens + 1;
             }
             NDArray groupIndices = manager.create(groupIds);
-            NDArray deltaIndices =
-                    manager.create(deltaIds, new Shape(queries, sharedTokens));
+            NDArray deltaIndices = manager.create(deltaIds, new Shape(queries, sharedTokens));
             NDArray storedIndexedIds =
                     manager.create(indexedIds, new Shape(queries, indexedTokens));
 
@@ -1656,8 +1789,7 @@ public class StructuredAttentionTest {
                         if (indexedIds[queryIndex * indexedTokens + token] != 0) {
                             continue;
                         }
-                        int offset =
-                                (queryIndex * indexedTokens + token) * packedWidth;
+                        int offset = (queryIndex * indexedTokens + token) * packedWidth;
                         for (int feature = 0; feature < packedWidth; feature++) {
                             Assert.assertEquals(
                                     gradients[offset + feature],
@@ -1693,6 +1825,10 @@ public class StructuredAttentionTest {
             default:
                 throw new IllegalArgumentException("Unsupported gradient data type: " + dataType);
         }
+    }
+
+    private static float structuredAttentionGradientTolerance(DataType dataType) {
+        return dataType == DataType.BFLOAT16 ? 8e-2f : gradientTolerance(dataType);
     }
 
     private static void runStructuredStep(
@@ -2049,20 +2185,25 @@ public class StructuredAttentionTest {
                         .get("...,0:{}", keyWidth)
                         .reshape(queryCount, indexedTokens, heads, keyFeatures)
                         .swapAxes(1, 2);
-        NDArray keys = sharedKeys.add(sharedDeltaKeys).concat(indexedKeys.add(indexedDeltaKeys), 2);
+        NDArray indexedPresent =
+                storedIds.neq(0).expandDims(1).broadcast(queryCount, heads, indexedTokens);
+        NDArray combinedIndexedKeys = indexedKeys.add(indexedDeltaKeys);
+        NDArray participatingIndexedKeys =
+                NDArrays.where(
+                        indexedPresent.expandDims(3).broadcast(combinedIndexedKeys.getShape()),
+                        combinedIndexedKeys,
+                        combinedIndexedKeys.zerosLike());
+        NDArray keys = sharedKeys.add(sharedDeltaKeys).concat(participatingIndexedKeys, 2);
         NDArray scores = query.expandDims(2).mul(keys).sum(new int[] {3}).mul(scale);
-        NDArray indexedMask =
-                storedIds
-                        .neq(0)
-                        .toType(scores.getDataType(), false)
-                        .expandDims(1)
-                        .broadcast(queryCount, heads, indexedTokens)
-                        .neg()
-                        .add(1)
-                        .mul(-1.0e9f);
+        NDArray indexedScores = scores.get("...,{}:", sharedTokens);
         scores =
                 scores.get("...,0:{}", sharedTokens)
-                        .concat(scores.get("...,{}:", sharedTokens).add(indexedMask), 2);
+                        .concat(
+                                NDArrays.where(
+                                        indexedPresent,
+                                        indexedScores,
+                                        indexedScores.zerosLike().add(Float.NEGATIVE_INFINITY)),
+                                2);
         NDArray weights = scores.softmax(2);
 
         NDArray sharedValues =
@@ -2085,10 +2226,13 @@ public class StructuredAttentionTest {
                         .get("...,{}:", keyWidth)
                         .reshape(queryCount, indexedTokens, heads, valueFeatures)
                         .swapAxes(1, 2);
-        NDArray values =
-                sharedValues
-                        .add(sharedDeltaValues)
-                        .concat(indexedValues.add(indexedDeltaValues), 2);
+        NDArray combinedIndexedValues = indexedValues.add(indexedDeltaValues);
+        NDArray participatingIndexedValues =
+                NDArrays.where(
+                        indexedPresent.expandDims(3).broadcast(combinedIndexedValues.getShape()),
+                        combinedIndexedValues,
+                        combinedIndexedValues.zerosLike());
+        NDArray values = sharedValues.add(sharedDeltaValues).concat(participatingIndexedValues, 2);
         return weights.expandDims(3).mul(values).sum(new int[] {2});
     }
 

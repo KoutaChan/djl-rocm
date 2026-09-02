@@ -15,6 +15,7 @@
 
 #include <torch/csrc/autograd/custom_function.h>
 
+#include <limits>
 #include <vector>
 
 #if defined(DJL_USE_ROCM_KERNELS)
@@ -46,21 +47,30 @@ MaskedReduction masked_reduction(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
   auto values = logits.to(torch::kFloat32);
   auto boolean_mask = expanded_boolean_mask(values, mask);
-  auto masked_values = torch::where(boolean_mask, values, torch::full_like(values, -1.0e30));
+  auto masked_values = torch::where(
+      boolean_mask, values,
+      torch::full_like(values, -std::numeric_limits<float>::infinity()));
   auto maximum = std::get<0>(masked_values.max(axis, true));
-  auto shifted =
-      torch::where(boolean_mask, values.sub(maximum), torch::full_like(values, -1.0e30));
-  auto exponentials = shifted.exp();
-  auto denominator = exponentials.sum(axis, true);
   auto has_choice = boolean_mask.any(axis, true);
-  return {exponentials, denominator, maximum, has_choice};
+  auto safe_maximum = torch::where(has_choice, maximum, torch::zeros_like(maximum));
+  auto selected_values =
+      torch::where(boolean_mask, values, torch::zeros_like(values));
+  auto shifted_values = torch::where(
+      boolean_mask, selected_values.sub(safe_maximum), torch::zeros_like(values));
+  auto exponentials = torch::where(
+      boolean_mask, shifted_values.exp(),
+      torch::zeros_like(values));
+  auto denominator = exponentials.sum(axis, true);
+  return {exponentials, denominator, safe_maximum, has_choice};
 }
 
 torch::Tensor masked_softmax_reference(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
   auto reduction = masked_reduction(logits, mask, axis);
   auto probabilities = reduction.exponentials.div(reduction.denominator.clamp_min(1.0e-30));
-  return torch::where(mask, probabilities, torch::zeros_like(probabilities));
+  return torch::where(
+      expanded_boolean_mask(probabilities, mask), probabilities,
+      torch::zeros_like(probabilities));
 }
 
 torch::Tensor masked_log_sum_exp_reference(
@@ -129,8 +139,12 @@ torch::Tensor grouped_masked_softmax_pool_reference(
   auto boolean_mask = mask.to(torch::kBool);
   auto expanded_logits = float_logits.unsqueeze(-1).expand_as(boolean_mask);
   auto weights = masked_softmax_reference(expanded_logits, boolean_mask, choice_axis);
-  auto pooled =
-      weights.unsqueeze(-1).mul(values.to(torch::kFloat32).unsqueeze(-2)).sum(choice_axis);
+  auto expanded_weights = weights.unsqueeze(-1);
+  auto expanded_values = values.to(torch::kFloat32).unsqueeze(-2);
+  auto selected_values = torch::where(
+      boolean_mask.unsqueeze(-1), expanded_values,
+      torch::zeros_like(expanded_values));
+  auto pooled = expanded_weights.mul(selected_values).sum(choice_axis);
   auto present = boolean_mask.any(choice_axis).unsqueeze(-1);
   return torch::where(present, pooled, torch::zeros_like(pooled))
       .movedim(choice_axis, 0)
@@ -146,8 +160,12 @@ torch::Tensor indexed_masked_softmax_pool_reference(const torch::Tensor& logits,
   auto selected_mask = mask.to(torch::kBool).index_select(-1, index);
   auto selected_values = values.index_select(-2, index);
   auto weights = masked_softmax_reference(selected_logits, selected_mask, -1);
-  auto pooled =
-      selected_values.to(torch::kFloat32).mul(weights.unsqueeze(-1)).sum(-2);
+  auto expanded_weights = weights.unsqueeze(-1);
+  auto float_values = selected_values.to(torch::kFloat32);
+  auto participating_values = torch::where(
+      selected_mask.unsqueeze(-1), float_values,
+      torch::zeros_like(float_values));
+  auto pooled = participating_values.mul(expanded_weights).sum(-2);
   auto present = selected_mask.any(-1).unsqueeze(-1);
   return torch::where(present, pooled, torch::zeros_like(pooled));
 }

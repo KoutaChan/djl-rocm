@@ -383,8 +383,11 @@ __global__ void grouped_masked_softmax_pool_kernel(const logit_t* logits, const 
       float pooled = 0.0f;
       if (has_choice) {
         for (int64_t choice = 0; choice < choice_count; ++choice) {
-          pooled += probabilities[choice] * static_cast<float>(
-              values[(row * choice_count + choice) * feature_count + feature]);
+          const float probability = probabilities[choice];
+          if (mask[(row * choice_count + choice) * group_count + group]) {
+            pooled += probability * static_cast<float>(
+                values[(row * choice_count + choice) * feature_count + feature]);
+          }
         }
       }
       output[output_offset + feature] = pooled;
@@ -442,9 +445,13 @@ __global__ void indexed_masked_softmax_pool_kernel(const logit_t* logits,
       float pooled = 0.0f;
       if (has_choice) {
         for (int index = 0; index < selected.count; ++index) {
-          const int64_t value_offset =
-              (row * choice_count + selected.columns[index]) * feature_count + feature;
-          pooled += probabilities[index] * static_cast<float>(values[value_offset]);
+          const float probability = probabilities[index];
+          const int64_t choice_offset =
+              row * choice_count + selected.columns[index];
+          if (static_cast<float>(mask[choice_offset]) != 0.0f) {
+            const int64_t value_offset = choice_offset * feature_count + feature;
+            pooled += probability * static_cast<float>(values[value_offset]);
+          }
         }
       }
       output[output_offset + feature] = pooled;
@@ -500,9 +507,11 @@ __global__ void grouped_masked_softmax_pool_value_backward_kernel(
       const int64_t feature = index - choice * feature_count;
       float gradient = 0.0f;
       for (int64_t group = 0; group < group_count; ++group) {
-        gradient += probabilities[group * choice_count + choice] *
-            gradient_output[(group * row_count + row) * feature_count +
-                feature];
+        if (mask[(row * choice_count + choice) * group_count + group]) {
+          gradient += probabilities[group * choice_count + choice] *
+              gradient_output[(group * row_count + row) * feature_count +
+                  feature];
+        }
       }
       gradient_values[value_row_offset + index] =
           static_cast<value_t>(gradient);
@@ -566,11 +575,12 @@ __global__ void indexed_masked_softmax_pool_value_backward_kernel(
       const int64_t feature = index - selected_index * feature_count;
       const int64_t choice = selected.columns[selected_index];
       const float probability = probabilities[selected_index];
+      const bool legal =
+          static_cast<float>(mask[row * choice_count + choice]) != 0.0f;
       gradient_values[value_row_offset + choice * feature_count + feature] =
-          probability == 0.0f
-              ? static_cast<value_t>(0.0f)
-              : static_cast<value_t>(probability *
-                    gradient_output[row * feature_count + feature]);
+          legal ? static_cast<value_t>(probability *
+                      gradient_output[row * feature_count + feature])
+                : static_cast<value_t>(0.0f);
     }
     __syncthreads();
   }
@@ -734,7 +744,10 @@ __global__ void masked_softmax_backward_kernel(const float* gradient_output,
     const int64_t row_offset = row * width;
     float local_dot = 0.0f;
     for (int64_t column = lane; column < width; column += warpSize) {
-      local_dot += gradient_output[row_offset + column] * probabilities[row_offset + column];
+      const int64_t index = row_offset + column;
+      if (mask[index]) {
+        local_dot += gradient_output[index] * probabilities[index];
+      }
     }
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {
       local_dot += __shfl_down(local_dot, offset);
@@ -3914,11 +3927,6 @@ __device__ __forceinline__ bool grouped_attention_mask_present(mask_t value) {
   return static_cast<float>(value) != 0.0f;
 }
 
-template <typename scalar_t>
-__device__ __forceinline__ float grouped_attention_masked_score() {
-  return round_grouped_attention_boundary<scalar_t>(-1.0e30f);
-}
-
 template <int query_group_width, typename scalar_t, typename mask_t>
 __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     const scalar_t* packed_key_value, const mask_t* mask, scalar_t* output,
@@ -3949,8 +3957,10 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     const int feature = index - key_token * key_features;
     const int64_t source_offset =
         (matrix * key_tokens + key_token) * packed_width + head * key_features + feature;
-    shared_keys[feature * key_tokens + key_token] =
-        static_cast<float>(packed_key_value[source_offset]);
+    shared_keys[feature * key_tokens + key_token] = grouped_attention_mask_present(
+            mask[matrix * key_tokens + key_token])
+        ? static_cast<float>(packed_key_value[source_offset])
+        : 0.0f;
   }
   for (int index = threadIdx.x; index < value_elements; index += blockDim.x) {
     const int key_token = index / value_features;
@@ -3958,8 +3968,10 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     const int64_t source_offset =
         (matrix * key_tokens + key_token) * packed_width + query_width +
         head * value_features + feature;
-    shared_values[key_token * value_features + feature] =
-        static_cast<float>(packed_key_value[source_offset]);
+    shared_values[key_token * value_features + feature] = grouped_attention_mask_present(
+            mask[matrix * key_tokens + key_token])
+        ? static_cast<float>(packed_key_value[source_offset])
+        : 0.0f;
   }
   for (int key_token = threadIdx.x; key_token < key_tokens;
        key_token += blockDim.x) {
@@ -3979,7 +3991,6 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     float score = -std::numeric_limits<float>::infinity();
     if (lane < key_tokens) {
       const bool present = shared_mask[lane] != 0;
-      score = grouped_attention_masked_score<scalar_t>();
       if (present) {
         score = 0.0f;
         for (int feature = 0; feature < key_features; ++feature) {
@@ -3998,13 +4009,15 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     }
     const float maximum = __shfl(local_maximum, 0, query_group_width);
 
-    const float weight = lane < key_tokens ? expf(score - maximum) : 0.0f;
+    const bool present = lane < key_tokens && shared_mask[lane] != 0;
+    const float weight = present ? expf(score - maximum) : 0.0f;
     float local_sum = weight;
     for (int offset = query_group_width / 2; offset > 0; offset /= 2) {
       local_sum += __shfl_down(local_sum, offset, query_group_width);
     }
-    const float inverse_sum = 1.0f / __shfl(local_sum, 0, query_group_width);
-    const float probability = lane < key_tokens
+    const float sum = __shfl(local_sum, 0, query_group_width);
+    const float inverse_sum = sum == 0.0f ? 0.0f : 1.0f / sum;
+    const float probability = present
         ? round_grouped_attention_boundary<scalar_t>(weight * inverse_sum)
         : 0.0f;
     if (probabilities != nullptr && lane < key_tokens) {
@@ -4022,7 +4035,7 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
       for (int key_token = 0; key_token < key_tokens; ++key_token) {
         const float token_probability =
             __shfl(probability, key_token, query_group_width);
-        if (feature < value_features) {
+        if (feature < value_features && shared_mask[key_token] != 0) {
           context += token_probability *
               shared_values[key_token * value_features + feature];
         }
@@ -4034,9 +4047,9 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
   }
 }
 
-template <int query_group_width, typename scalar_t, typename mask_t>
+template <int query_group_width, typename scalar_t>
 __global__ void grouped_packed_attention_score_gradient_kernel(
-    const scalar_t* packed_key_value, const mask_t* mask,
+    const scalar_t* packed_key_value, const bool* mask,
     const scalar_t* probabilities, const scalar_t* gradient_output,
     float* score_gradient,
     int query_tokens, int groups, int key_tokens, int heads,
@@ -4059,7 +4072,9 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
     const int64_t value_offset =
         (matrix * key_tokens + key_token) * packed_width + query_width +
         head * value_features + feature;
-    shared_values[element] = static_cast<float>(packed_key_value[value_offset]);
+    shared_values[element] = mask[matrix * key_tokens + key_token]
+        ? static_cast<float>(packed_key_value[value_offset])
+        : 0.0f;
   }
   __syncthreads();
 
@@ -4069,13 +4084,13 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
         ((matrix * query_tokens + query_token) * heads + head) * key_tokens;
     const int64_t output_offset =
         ((matrix * query_tokens + query_token) * heads + head) * value_features;
-    const bool present = lane < key_tokens && grouped_attention_mask_present(
-        mask[matrix * key_tokens + lane]);
+    const bool present =
+        lane < key_tokens && mask[matrix * key_tokens + lane];
     const float probability = lane < key_tokens
         ? static_cast<float>(probabilities[probability_offset + lane])
         : 0.0f;
     float probability_gradient = 0.0f;
-    if (lane < key_tokens) {
+    if (present) {
       for (int feature = 0; feature < value_features; ++feature) {
         probability_gradient +=
             static_cast<float>(gradient_output[output_offset + feature]) *
@@ -4098,7 +4113,7 @@ __global__ void grouped_packed_attention_score_gradient_kernel(
 
 template <int query_group_width, typename scalar_t>
 __global__ void grouped_packed_attention_query_gradient_kernel(
-    const scalar_t* packed_key_value,
+    const scalar_t* packed_key_value, const bool* mask,
     const float* score_gradient, scalar_t* query_gradient,
     int query_tokens, int groups, int key_tokens,
     int heads, int key_features, int packed_width, float scale) {
@@ -4120,7 +4135,7 @@ __global__ void grouped_packed_attention_query_gradient_kernel(
       for (int key_token = 0; key_token < key_tokens; ++key_token) {
         const float token_score_gradient =
             __shfl(lane_score_gradient, key_token, query_group_width);
-        if (lane < key_features) {
+        if (lane < key_features && mask[matrix * key_tokens + key_token]) {
           const int64_t key_offset =
               (matrix * key_tokens + key_token) * packed_width +
               head * key_features + lane;
@@ -4140,7 +4155,7 @@ __global__ void grouped_packed_attention_query_gradient_kernel(
 
 template <typename scalar_t>
 __global__ void grouped_packed_attention_key_value_gradient_elementwise_kernel(
-    const scalar_t* query, const scalar_t* probabilities,
+    const scalar_t* query, const bool* mask, const scalar_t* probabilities,
     const float* score_gradient, const scalar_t* gradient_output,
     scalar_t* packed_key_value_gradient, int64_t element_count,
     int query_tokens, int groups, int key_tokens, int heads,
@@ -4161,6 +4176,10 @@ __global__ void grouped_packed_attention_key_value_gradient_elementwise_kernel(
     const int head = key ? local_feature / key_features : local_feature / value_features;
     const int feature = key ? local_feature % key_features : local_feature % value_features;
     const int64_t matrix = batch * groups + group;
+    if (!mask[matrix * key_tokens + key_token]) {
+      packed_key_value_gradient[element] = static_cast<scalar_t>(0.0f);
+      continue;
+    }
     float gradient = 0.0f;
     for (int query_token = 0; query_token < query_tokens; ++query_token) {
       const int64_t score_offset =
@@ -4187,7 +4206,7 @@ __global__ void grouped_packed_attention_key_value_gradient_elementwise_kernel(
 
 template <int maximum_elements_per_thread, int query_tile, typename scalar_t>
 __global__ void grouped_packed_attention_key_value_gradient_tiled_kernel(
-    const scalar_t* query, const scalar_t* probabilities,
+    const scalar_t* query, const bool* mask, const scalar_t* probabilities,
     const float* score_gradient, const scalar_t* gradient_output,
     scalar_t* packed_key_value_gradient, int query_tokens, int groups,
     int key_tokens, int heads, int key_features, int value_features,
@@ -4262,14 +4281,16 @@ __global__ void grouped_packed_attention_key_value_gradient_tiled_kernel(
       const bool key = feature_in_token < key_features;
       const int feature = key ? feature_in_token : feature_in_token - key_features;
       float gradient = gradients[element_in_thread];
-      for (int query_in_tile = 0; query_in_tile < tile_queries; ++query_in_tile) {
-        const int score_offset = query_in_tile * key_tokens + key_token;
-        if (key) {
-          gradient += shared_score_gradient[score_offset] *
-              shared_query[query_in_tile * key_features + feature];
-        } else {
-          gradient += shared_probabilities[score_offset] *
-              shared_gradient_output[query_in_tile * value_features + feature];
+      if (mask[matrix * key_tokens + key_token]) {
+        for (int query_in_tile = 0; query_in_tile < tile_queries; ++query_in_tile) {
+          const int score_offset = query_in_tile * key_tokens + key_token;
+          if (key) {
+            gradient += shared_score_gradient[score_offset] *
+                shared_query[query_in_tile * key_features + feature];
+          } else {
+            gradient += shared_probabilities[score_offset] *
+                shared_gradient_output[query_in_tile * value_features + feature];
+          }
         }
       }
       gradients[element_in_thread] = gradient;
@@ -5831,6 +5852,8 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
   TORCH_CHECK(mask.device() == query.device() && probabilities.device() == query.device() &&
           gradient_output.device() == query.device(),
       "grouped packed attention backward inputs must be on the same device");
+  TORCH_CHECK(mask.scalar_type() == torch::kBool && mask.is_contiguous(),
+      "grouped packed attention backward mask must be contiguous boolean");
 
   c10::DeviceGuard device_guard(query.device());
   const auto gradient_options =
@@ -5888,42 +5911,19 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
       torch::kHalf, torch::kBFloat16, query.scalar_type(),
       "grouped_packed_attention_backward", [&] {
         constexpr int kQueryGroupWidth = 32;
-        const auto launch_score_gradient = [&](auto mask_tag) {
-          using mask_t = decltype(mask_tag);
-          hipLaunchKernelGGL(HIP_KERNEL_NAME(
-              grouped_packed_attention_score_gradient_kernel<
-                  kQueryGroupWidth, scalar_t, mask_t>),
-              dim3(static_cast<unsigned int>(heads), static_cast<unsigned int>(groups),
-                  static_cast<unsigned int>(batch)),
-              dim3(launch_plan->block_threads), score_gradient_shared_memory_bytes, stream,
-              packed_key_value.data_ptr<scalar_t>(), mask.data_ptr<mask_t>(),
-              probabilities.data_ptr<scalar_t>(),
-              contiguous_gradient_output.data_ptr<scalar_t>(),
-              score_gradient.data_ptr<float>(), static_cast<int>(query_tokens),
-              static_cast<int>(groups), static_cast<int>(key_tokens),
-              static_cast<int>(heads), static_cast<int>(query_width),
-              static_cast<int>(value_features));
-        };
-        switch (mask.scalar_type()) {
-          case torch::kBool:
-            launch_score_gradient(bool{});
-            break;
-          case torch::kInt32:
-            launch_score_gradient(int32_t{});
-            break;
-          case torch::kFloat32:
-            launch_score_gradient(float{});
-            break;
-          case torch::kFloat16:
-            launch_score_gradient(c10::Half{});
-            break;
-          case torch::kBFloat16:
-            launch_score_gradient(c10::BFloat16{});
-            break;
-          default:
-            TORCH_CHECK(false,
-                "unsupported grouped packed attention backward mask dtype");
-        }
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(
+            grouped_packed_attention_score_gradient_kernel<
+                kQueryGroupWidth, scalar_t>),
+            dim3(static_cast<unsigned int>(heads), static_cast<unsigned int>(groups),
+                static_cast<unsigned int>(batch)),
+            dim3(launch_plan->block_threads), score_gradient_shared_memory_bytes, stream,
+            packed_key_value.data_ptr<scalar_t>(), mask.data_ptr<bool>(),
+            probabilities.data_ptr<scalar_t>(),
+            contiguous_gradient_output.data_ptr<scalar_t>(),
+            score_gradient.data_ptr<float>(), static_cast<int>(query_tokens),
+            static_cast<int>(groups), static_cast<int>(key_tokens),
+            static_cast<int>(heads), static_cast<int>(query_width),
+            static_cast<int>(value_features));
         if (needs_query_gradient) {
           hipLaunchKernelGGL(HIP_KERNEL_NAME(
               grouped_packed_attention_query_gradient_kernel<
@@ -5931,7 +5931,7 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
               dim3(static_cast<unsigned int>(heads), 1,
                   static_cast<unsigned int>(batch)),
               dim3(launch_plan->block_threads), 0, stream,
-              packed_key_value.data_ptr<scalar_t>(),
+              packed_key_value.data_ptr<scalar_t>(), mask.data_ptr<bool>(),
               score_gradient.data_ptr<float>(), query_gradient.data_ptr<scalar_t>(),
               static_cast<int>(query_tokens), static_cast<int>(groups),
               static_cast<int>(key_tokens), static_cast<int>(heads),
@@ -5951,7 +5951,8 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
                           static_cast<unsigned int>(groups),
                           static_cast<unsigned int>(batch)),
                       dim3(element_threads), key_value_shared_memory_bytes, stream,
-                      query.data_ptr<scalar_t>(), probabilities.data_ptr<scalar_t>(),
+                      query.data_ptr<scalar_t>(), mask.data_ptr<bool>(),
+                      probabilities.data_ptr<scalar_t>(),
                       score_gradient.data_ptr<float>(),
                       contiguous_gradient_output.data_ptr<scalar_t>(),
                       packed_key_value_gradient.data_ptr<scalar_t>(),
@@ -5964,7 +5965,8 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
             hipLaunchKernelGGL(HIP_KERNEL_NAME(
                 grouped_packed_attention_key_value_gradient_elementwise_kernel<scalar_t>),
                 dim3(grid_size(packed_key_value.numel())), dim3(element_threads), 0,
-                stream, query.data_ptr<scalar_t>(), probabilities.data_ptr<scalar_t>(),
+                stream, query.data_ptr<scalar_t>(), mask.data_ptr<bool>(),
+                probabilities.data_ptr<scalar_t>(),
                 score_gradient.data_ptr<float>(),
                 contiguous_gradient_output.data_ptr<scalar_t>(),
                 packed_key_value_gradient.data_ptr<scalar_t>(),

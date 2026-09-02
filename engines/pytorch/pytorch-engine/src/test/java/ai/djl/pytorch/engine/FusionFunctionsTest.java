@@ -52,6 +52,11 @@ public class FusionFunctionsTest {
     }
 
     @Test
+    public void binaryBranchBlendDoesNotReadAbsentInputs() {
+        forEachDevice(this::verifyBinaryBranchBlendNonFiniteIsolation);
+    }
+
+    @Test
     public void affineSumMatchesComposedForwardAndBackward() {
         forEachDevice(this::verifyAffineSum);
     }
@@ -72,6 +77,44 @@ public class FusionFunctionsTest {
                                     new long[] {0},
                                     new long[] {1},
                                     DataType.FLOAT32));
+        }
+    }
+
+    @Test
+    public void segmentedOutputPackRejectsInvalidMetadata() {
+        try (NDManager manager = Engine.getInstance().newBaseManager(Device.cpu())) {
+            NDArray valid = manager.ones(new Shape(2, 3, 4));
+            NDArray rankTwo = manager.ones(new Shape(2, 4));
+            NDArray wrongBatch = manager.ones(new Shape(1, 3, 4));
+            NDArray wrongWidth = manager.ones(new Shape(2, 3, 5));
+            Assert.expectThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            FusionFunctions.segmentedOutputPack(
+                                    new NDList(valid),
+                                    new long[0],
+                                    new long[] {1},
+                                    DataType.FLOAT32));
+            for (long[] slice : new long[][] {{-1, 1}, {0, 0}, {2, 2}, {Long.MAX_VALUE, 1}}) {
+                Assert.expectThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                FusionFunctions.segmentedOutputPack(
+                                        new NDList(valid),
+                                        new long[] {slice[0]},
+                                        new long[] {slice[1]},
+                                        DataType.FLOAT32));
+            }
+            for (NDArray incompatible : new NDArray[] {rankTwo, wrongBatch, wrongWidth}) {
+                Assert.expectThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                FusionFunctions.segmentedOutputPack(
+                                        new NDList(valid, incompatible),
+                                        new long[] {0, 0},
+                                        new long[] {1, 1},
+                                        DataType.FLOAT32));
+            }
         }
     }
 
@@ -176,6 +219,70 @@ public class FusionFunctionsTest {
             TrainingResult actual = trainBinary(source, lossWeight, true);
             TrainingResult expected = trainBinary(source, lossWeight, false);
             assertResult(actual, expected, 2e-5f);
+        }
+    }
+
+    private void verifyBinaryBranchBlendNonFiniteIsolation(Device device) {
+        Engine engine = Engine.getInstance();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDList inputs =
+                    new NDList(
+                            manager.create(
+                                    new float[] {
+                                        Float.NaN,
+                                        Float.POSITIVE_INFINITY,
+                                        5f,
+                                        6f,
+                                        Float.NaN,
+                                        Float.NEGATIVE_INFINITY
+                                    },
+                                    new Shape(3, 2)),
+                            manager.create(
+                                    new float[] {
+                                        3f,
+                                        4f,
+                                        Float.NaN,
+                                        Float.POSITIVE_INFINITY,
+                                        Float.NaN,
+                                        Float.NEGATIVE_INFINITY
+                                    },
+                                    new Shape(3, 2)),
+                            manager.create(
+                                    new float[] {Float.NaN, Float.NaN, Float.NaN}, new Shape(3, 1)),
+                            manager.create(new float[] {0f, 1f, 0f}, new Shape(3, 1)),
+                            manager.create(new float[] {1f, 0f, 0f}, new Shape(3, 1)));
+            inputs.forEach(array -> array.setRequiresGradient(true));
+            NDArray output;
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                output =
+                        FusionFunctions.binaryBranchBlend(
+                                inputs.get(0),
+                                inputs.get(1),
+                                inputs.get(2),
+                                inputs.get(3),
+                                inputs.get(4));
+                collector.backward(output.sum());
+            }
+
+            assertClose(output, new float[] {3f, 4f, 5f, 6f, 0f, 0f}, 0f);
+            for (NDArray input : inputs) {
+                Assert.assertTrue(input.hasGradient());
+                assertFinite(input.getGradient());
+            }
+
+            NDArray presentBaseline = manager.create(new float[] {Float.NaN, 2f}, new Shape(2, 1));
+            NDArray presentSelected = manager.create(new float[] {3f, Float.NaN}, new Shape(2, 1));
+            NDArray saturatedLogit =
+                    manager.create(
+                            new float[] {Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY},
+                            new Shape(2, 1));
+            NDArray presence = manager.ones(new Shape(2, 1));
+            NDArray saturatedOutput =
+                    FusionFunctions.binaryBranchBlend(
+                            presentBaseline, presentSelected, saturatedLogit, presence, presence);
+            for (float value : saturatedOutput.toFloatArray()) {
+                Assert.assertTrue(Float.isNaN(value));
+            }
         }
     }
 
@@ -317,6 +424,12 @@ public class FusionFunctionsTest {
         Assert.assertEquals(values.length, expected.length);
         for (int index = 0; index < values.length; ++index) {
             Assert.assertEquals(values[index], expected[index], tolerance);
+        }
+    }
+
+    private static void assertFinite(NDArray array) {
+        for (float value : array.toType(DataType.FLOAT32, false).toFloatArray()) {
+            Assert.assertTrue(Float.isFinite(value));
         }
     }
 

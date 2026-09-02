@@ -465,7 +465,10 @@ __global__ void mapped_grouped_masked_softmax_pool_kernel(
       for (int64_t candidate = 0; candidate < candidate_count;
            ++candidate) {
         const float probability = probabilities[candidate];
-        if (probability != 0.0f) {
+        const int64_t mask_index =
+            (batch * candidate_count + candidate) * group_count +
+            source_group;
+        if (static_cast<float>(masks[mask_index]) != 0.0f) {
           sum += probability *
               static_cast<float>(
                   values[(batch * candidate_count + candidate) * width +
@@ -485,22 +488,26 @@ __global__ void binary_branch_blend_kernel(
       static_cast<const baseline_t*>(arguments.baseline_context);
   const auto* selected_context =
       static_cast<const selected_t*>(arguments.selected_context);
+  __shared__ float baseline_presence;
+  __shared__ float selected_presence;
   __shared__ float baseline_weight;
   __shared__ float selected_weight;
   for (int64_t row = blockIdx.x; row < arguments.row_count;
        row += gridDim.x) {
     if (threadIdx.x == 0) {
-      const float selected_logit = load_fusion_float(arguments.selected_logit,
-          row, arguments.selected_logit_data_type);
-      const float selected_probability =
-          1.0f / (1.0f + expf(-selected_logit));
-      const float baseline_presence = load_fusion_float(
+      baseline_presence = load_fusion_float(
           arguments.baseline_presence, row,
           arguments.baseline_presence_data_type);
-      const float selected_presence = load_fusion_float(
+      selected_presence = load_fusion_float(
           arguments.selected_presence, row,
           arguments.selected_presence_data_type);
       const float joint_presence = baseline_presence * selected_presence;
+      float selected_probability = 0.0f;
+      if (joint_presence != 0.0f) {
+        const float selected_logit = load_fusion_float(arguments.selected_logit,
+            row, arguments.selected_logit_data_type);
+        selected_probability = 1.0f / (1.0f + expf(-selected_logit));
+      }
       baseline_weight =
           baseline_presence - joint_presence * selected_probability;
       selected_weight = selected_presence - joint_presence +
@@ -511,9 +518,14 @@ __global__ void binary_branch_blend_kernel(
     for (int64_t column = threadIdx.x; column < arguments.width;
          column += blockDim.x) {
       const int64_t index = row_offset + column;
-      arguments.output[index] =
-          baseline_weight * static_cast<float>(baseline_context[index]) +
-          selected_weight * static_cast<float>(selected_context[index]);
+      float value = 0.0f;
+      if (baseline_presence != 0.0f) {
+        value += baseline_weight * static_cast<float>(baseline_context[index]);
+      }
+      if (selected_presence != 0.0f) {
+        value += selected_weight * static_cast<float>(selected_context[index]);
+      }
+      arguments.output[index] = value;
     }
     __syncthreads();
   }
@@ -1130,17 +1142,28 @@ __global__ void single_query_attention_kernel(
   __syncthreads();
   if (threadIdx.x == 0) {
     float maximum = -INFINITY;
+    int64_t valid_count = 0;
     for (int64_t token = 0; token < token_count; ++token) {
-      maximum = fmaxf(maximum, probabilities[token]);
+      if (single_query_valid(
+              valid_mask, batch * token_count + token)) {
+        const float score = probabilities[token];
+        maximum = isnan(maximum) || isnan(score)
+            ? NAN
+            : fmaxf(maximum, score);
+        ++valid_count;
+      }
     }
-    if (isinf(maximum)) {
+    if (valid_count == 0) {
       for (int64_t token = 0; token < token_count; ++token) {
         probabilities[token] = 0.0f;
       }
     } else {
       float denominator = 0.0f;
       for (int64_t token = 0; token < token_count; ++token) {
-        const float probability = expf(probabilities[token] - maximum);
+        const float probability = single_query_valid(
+                valid_mask, batch * token_count + token)
+            ? expf(probabilities[token] - maximum)
+            : 0.0f;
         probabilities[token] = probability;
         denominator += probability;
       }
@@ -1155,10 +1178,14 @@ __global__ void single_query_attention_kernel(
        feature += blockDim.x) {
     float value = 0.0f;
     for (int64_t token = 0; token < token_count; ++token) {
-      value += probabilities[token] * static_cast<float>(
-          static_cast<scalar_t>(memory[
-              (batch * token_count + token) * kSingleQueryHiddenWidth +
-              feature]));
+      const float probability = probabilities[token];
+      if (single_query_valid(
+              valid_mask, batch * token_count + token)) {
+        value += probability * static_cast<float>(
+            static_cast<scalar_t>(memory[
+                (batch * token_count + token) * kSingleQueryHiddenWidth +
+                feature]));
+      }
     }
     pooled[feature] = value;
   }

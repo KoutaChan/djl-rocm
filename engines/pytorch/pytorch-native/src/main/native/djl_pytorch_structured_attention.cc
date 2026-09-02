@@ -72,13 +72,18 @@ torch::Tensor grouped_packed_attention_reference(const torch::Tensor& query,
   auto values = packed_key_value.slice(3, query_width, packed_width)
                     .reshape({batch, groups, key_tokens, heads, value_features})
                     .transpose(2, 3);
-  auto valid = mask.ne(0).reshape({batch, groups, 1, 1, key_tokens});
+  auto token_valid = mask.ne(0);
+  auto key_value_valid = token_valid.reshape({batch, groups, 1, key_tokens, 1});
+  keys = torch::where(key_value_valid, keys, torch::zeros_like(keys));
+  values = torch::where(key_value_valid, values, torch::zeros_like(values));
+  auto valid = token_valid.reshape({batch, groups, 1, 1, key_tokens});
   auto scores = queries.matmul(keys.transpose(3, 4)).mul(scale);
-  const double masked_score = query.scalar_type() == torch::kFloat16
-      ? -std::numeric_limits<double>::infinity()
-      : -1.0e30;
-  auto probabilities = torch::where(
-      valid, scores, torch::full_like(scores, masked_score)).softmax(4);
+  auto safe_scores = torch::where(valid, scores, torch::zeros_like(scores));
+  auto attention_valid = valid.logical_or(valid.any(4, true).logical_not());
+  auto probabilities = torch::where(valid,
+      torch::where(attention_valid, safe_scores,
+          torch::full_like(scores, -std::numeric_limits<double>::infinity())).softmax(4),
+      torch::zeros_like(scores));
   return probabilities.matmul(values)
       .transpose(2, 3)
       .contiguous()
@@ -118,9 +123,12 @@ torch::Tensor grouped_indexed_attention_reference(const torch::Tensor& query,
   auto indexed_delta_keys = indexed_deltas.slice(2, 0, key_width)
                                 .reshape({query_count, indexed_tokens, heads, key_size})
                                 .permute({0, 2, 1, 3});
-  auto keys = torch::cat({shared_keys.add(shared_delta_keys), indexed_keys.add(indexed_delta_keys)}, 2);
-  auto scores = query.unsqueeze(2).mul(keys).sum(3).mul(scale);
   auto indexed_present = stored_ids.ne(0).unsqueeze(1).expand({query_count, heads, indexed_tokens});
+  auto combined_indexed_keys = indexed_keys.add(indexed_delta_keys);
+  auto participating_indexed_keys = torch::where(
+      indexed_present.unsqueeze(3), combined_indexed_keys, torch::zeros_like(combined_indexed_keys));
+  auto keys = torch::cat({shared_keys.add(shared_delta_keys), participating_indexed_keys}, 2);
+  auto scores = query.unsqueeze(2).mul(keys).sum(3).mul(scale);
   auto indexed_scores = scores.slice(2, shared_tokens)
                             .masked_fill(indexed_present.logical_not(),
                                 -std::numeric_limits<float>::infinity());
@@ -139,7 +147,10 @@ torch::Tensor grouped_indexed_attention_reference(const torch::Tensor& query,
   auto indexed_delta_values = indexed_deltas.slice(2, key_width)
                                   .reshape({query_count, indexed_tokens, heads, value_size})
                                   .permute({0, 2, 1, 3});
-  auto values = torch::cat({shared_values.add(shared_delta_values), indexed_values.add(indexed_delta_values)}, 2);
+  auto combined_indexed_values = indexed_values.add(indexed_delta_values);
+  auto participating_indexed_values = torch::where(
+      indexed_present.unsqueeze(3), combined_indexed_values, torch::zeros_like(combined_indexed_values));
+  auto values = torch::cat({shared_values.add(shared_delta_values), participating_indexed_values}, 2);
   return weights.unsqueeze(3).mul(values).sum(2);
 }
 
@@ -195,10 +206,13 @@ class GroupedPackedAttentionFunction
   static torch::Tensor forward(torch::autograd::AutogradContext* context,
       const torch::Tensor& query, const torch::Tensor& packed_key_value,
       const torch::Tensor& mask, int64_t heads, double scale) {
+    auto boolean_mask = mask.scalar_type() == torch::kBool
+        ? mask.contiguous()
+        : mask.ne(0).contiguous();
     auto result = rocm::grouped_packed_attention_forward(query, packed_key_value,
-        mask, heads, static_cast<float>(scale), true);
+        boolean_mask, heads, static_cast<float>(scale), true);
     context->save_for_backward(
-        {query, packed_key_value, mask, result.probabilities});
+        {query, packed_key_value, boolean_mask, result.probabilities});
     context->saved_data["heads"] = heads;
     context->saved_data["scale"] = scale;
     return result.output;

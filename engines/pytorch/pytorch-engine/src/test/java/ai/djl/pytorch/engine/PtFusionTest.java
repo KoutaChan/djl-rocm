@@ -2270,10 +2270,16 @@ public class PtFusionTest {
             NDArray memory = memoryStorage.get("0:" + batchCount);
             NDArray mask = maskStorage.get("0:" + batchCount);
             NDArray querySeed = memory.get(":," + queryIndex).toType(dataType, false);
-            NDArray floatMask = mask.neq(0).toType(DataType.FLOAT32, false);
+            NDArray validTokens = mask.neq(0);
+            NDArray floatMask = validTokens.toType(DataType.FLOAT32, false);
+            NDArray selectedMemory =
+                    NDArrays.where(
+                            validTokens.expandDims(2).broadcast(memory.getShape()),
+                            memory,
+                            memory.zerosLike());
             NDArray mean =
-                    memory.toType(DataType.FLOAT32, false)
-                            .mul(floatMask.expandDims(2))
+                    selectedMemory
+                            .toType(DataType.FLOAT32, false)
                             .sum(new int[] {1})
                             .div(floatMask.sum(new int[] {1}, true).maximum(1f))
                             .toType(dataType, false);
@@ -2288,7 +2294,7 @@ public class PtFusionTest {
             int headWidth = attentionWidth / attentionHeads;
             int tokenCount = Math.toIntExact(memory.getShape().get(1));
             int hiddenWidth = Math.toIntExact(memory.getShape().get(2));
-            NDArray projectionMemory = memory.toType(dataType, false);
+            NDArray projectionMemory = selectedMemory.toType(dataType, false);
             NDArray queryHeads = query.reshape(batchCount, attentionHeads, 1, headWidth);
             NDArray keyValues =
                     projectionMemory
@@ -2305,11 +2311,18 @@ public class PtFusionTest {
                             .get("...," + attentionWidth + ':' + (2 * attentionWidth))
                             .reshape(batchCount, tokenCount, attentionHeads, headWidth)
                             .swapAxes(1, 2);
+            NDArray attentionValidTokens =
+                    validTokens.logicalOr(
+                            floatMask
+                                    .sum(new int[] {1}, true)
+                                    .eq(0)
+                                    .broadcast(validTokens.getShape()));
+            NDArray biasValues = attentionValidTokens.toType(dataType, false);
             NDArray invalidBias =
-                    mask.eq(0)
-                            .toType(DataType.FLOAT32, false)
-                            .mul(-1.0e9f)
-                            .toType(dataType, false)
+                    NDArrays.where(
+                                    attentionValidTokens,
+                                    biasValues.zerosLike(),
+                                    biasValues.zerosLike().add(Float.NEGATIVE_INFINITY))
                             .reshape(batchCount, 1, 1, tokenCount);
             NDArray probabilities =
                     queryHeads
@@ -2499,12 +2512,17 @@ public class PtFusionTest {
                             .get("...,128:192")
                             .reshape(batchCount * 4L, 29, 4, 16)
                             .swapAxes(1, 2);
+            NDArray validMask =
+                    mask.reshape(batchCount * 4L, 1, 1, 29).toType(input.getDataType(), false);
+            NDArray hasValid =
+                    validMask.sum(new int[] {3}, true).gt(0).broadcast(validMask.getShape());
+            NDArray attentionValid =
+                    NDArrays.where(hasValid, validMask.neq(0), validMask.onesLike().neq(0));
             NDArray attentionMask =
-                    mask.reshape(batchCount * 4L, 1, 1, 29)
-                            .toType(input.getDataType(), false)
-                            .neg()
-                            .add(1f)
-                            .mul(-1.0e9f);
+                    NDArrays.where(
+                            attentionValid,
+                            validMask.zerosLike(),
+                            validMask.zerosLike().add(Float.NEGATIVE_INFINITY));
             NDArray context =
                     queries.getNDArrayInternal()
                             .scaledDotProductAttention(keys, values, attentionMask, 0.0, false)

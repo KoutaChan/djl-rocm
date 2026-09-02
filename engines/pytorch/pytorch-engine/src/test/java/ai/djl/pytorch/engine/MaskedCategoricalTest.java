@@ -79,6 +79,15 @@ public class MaskedCategoricalTest {
     }
 
     @Test
+    public void maskedNonFiniteEntriesDoNotParticipate() {
+        Engine engine = Engine.getInstance();
+        verifyMaskedNonFiniteIsolation(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyMaskedNonFiniteIsolation(engine, Device.gpu());
+        }
+    }
+
+    @Test
     public void indexedMaskedSoftmaxPoolSelectsWithoutMaterializingAllChoices() {
         try (NDManager manager = NDManager.newBaseManager(Device.cpu())) {
             NDArray logits =
@@ -162,6 +171,15 @@ public class MaskedCategoricalTest {
         }
         verifyMaskedGradientParity(engine, DataType.FLOAT32, 2e-5f);
         verifyMaskedGradientParity(engine, DataType.BFLOAT16, 2e-2f);
+    }
+
+    @Test
+    public void backwardNonFiniteMaskSemanticsMatchPortableReference() {
+        Engine engine = Engine.getInstance();
+        verifyBackwardNonFiniteMaskSemantics(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyBackwardNonFiniteMaskSemantics(engine, Device.gpu());
+        }
     }
 
     @Test
@@ -332,6 +350,62 @@ public class MaskedCategoricalTest {
             Assert.assertTrue(Float.isNaN(probabilities[1]));
             Assert.assertEquals(probabilities[2], 0f);
             Assert.assertTrue(Float.isNaN(normalizer));
+        }
+    }
+
+    private static void verifyMaskedNonFiniteIsolation(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray logits = manager.create(new float[] {0f, Float.NaN}, new Shape(1, 2));
+            NDArray mask = manager.create(new int[] {1, 0}, new Shape(1, 2));
+            assertClose(
+                    NDArrays.maskedSoftmax(logits, mask, -1).toFloatArray(),
+                    new float[] {1f, 0f},
+                    0f);
+
+            NDArray normalizerLogits = manager.create(new float[] {0f, Float.NaN}, new Shape(1, 2));
+            normalizerLogits.setRequiresGradient(true);
+            NDArray normalizer;
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                normalizer = NDArrays.maskedLogSumExp(normalizerLogits, mask, -1);
+                collector.backward(normalizer.sum());
+            }
+            assertClose(normalizer.toFloatArray(), new float[] {0f}, 0f);
+            assertClose(normalizerLogits.getGradient().toFloatArray(), new float[] {1f, 0f}, 0f);
+
+            NDArray extremeLogits =
+                    manager.create(new float[] {-Float.MAX_VALUE, 0f}, new Shape(1, 2));
+            extremeLogits.setRequiresGradient(true);
+            NDArray extremeProbabilities;
+            NDArray extremeNormalizer;
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                extremeProbabilities = NDArrays.maskedSoftmax(extremeLogits, mask, -1);
+                extremeNormalizer = NDArrays.maskedLogSumExp(extremeLogits, mask, -1);
+                collector.backward(extremeProbabilities.sum().add(extremeNormalizer.sum()));
+            }
+            assertClose(extremeProbabilities.toFloatArray(), new float[] {1f, 0f}, 0f);
+            Assert.assertEquals(extremeNormalizer.getFloat(), -Float.MAX_VALUE);
+            assertClose(extremeLogits.getGradient().toFloatArray(), new float[] {1f, 0f}, 0f);
+
+            NDArray poolLogits = manager.zeros(new Shape(1, 2));
+            NDArray poolMask = manager.create(new int[] {0, 1}, new Shape(1, 2));
+            NDArray values = manager.create(new float[] {Float.NaN, 2f}, new Shape(1, 2, 1));
+            NDArray groupedMask = poolMask.expandDims(-1);
+            NDArray grouped = NDArrays.groupedMaskedSoftmaxPool(poolLogits, groupedMask, values);
+            NDArray indexed = NDArrays.indexedMaskedSoftmaxPool(poolLogits, poolMask, values, 0, 1);
+            assertClose(grouped.toFloatArray(), new float[] {2f}, 0f);
+            assertClose(indexed.toFloatArray(), new float[] {2f}, 0f);
+
+            NDArray underflowLogits = manager.create(new float[] {0f, -1000f}, new Shape(1, 2));
+            NDArray legalMask = manager.ones(new Shape(1, 2));
+            NDArray legalValues = manager.create(new float[] {1f, Float.NaN}, new Shape(1, 2, 1));
+            NDArray legalGrouped =
+                    NDArrays.groupedMaskedSoftmaxPool(
+                            underflowLogits, legalMask.expandDims(-1), legalValues);
+            NDArray legalIndexed =
+                    NDArrays.indexedMaskedSoftmaxPool(
+                            underflowLogits, legalMask, legalValues, 0, 1);
+            Assert.assertTrue(Float.isNaN(legalGrouped.getFloat()));
+            Assert.assertTrue(Float.isNaN(legalIndexed.getFloat()));
         }
     }
 
@@ -529,6 +603,45 @@ public class MaskedCategoricalTest {
             try (NDArray gradient = logits.getGradient().toType(DataType.FLOAT32, false)) {
                 assertClose(gradient.toFloatArray(), cpuGradients, tolerance);
             }
+        }
+    }
+
+    private static void verifyBackwardNonFiniteMaskSemantics(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device);
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(new float[] {0f, 2f}, new Shape(1, 2));
+            logits.setRequiresGradient(true);
+            NDArray mask = manager.create(new boolean[] {true, false}, new Shape(1, 2));
+            NDArray lossWeights = manager.create(new float[] {1f, Float.NaN}, new Shape(1, 2));
+            NDArray probabilities = NDArrays.maskedSoftmax(logits, mask, -1);
+            collector.backward(probabilities.mul(lossWeights).sum());
+            assertClose(logits.getGradient().toFloatArray(), new float[] {0f, 0f}, 0f);
+        }
+
+        try (NDManager manager = engine.newBaseManager(device);
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(new float[] {0f, 1f}, new Shape(1, 2));
+            NDArray mask =
+                    manager.create(new boolean[] {true, false, false, false}, new Shape(1, 2, 2));
+            NDArray values = manager.create(new float[] {3f, 5f}, new Shape(1, 2, 1));
+            values.setRequiresGradient(true);
+            NDArray lossWeights = manager.create(new float[] {1f, Float.NaN}, new Shape(2, 1, 1));
+            NDArray pooled = NDArrays.groupedMaskedSoftmaxPool(logits, mask, values);
+            collector.backward(pooled.mul(lossWeights).sum());
+            assertClose(values.getGradient().toFloatArray(), new float[] {1f, 0f}, 0f);
+        }
+
+        try (NDManager manager = engine.newBaseManager(device);
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logits = manager.create(new float[] {0f, -1000f}, new Shape(1, 2));
+            NDArray mask = manager.create(new boolean[] {true, true}, new Shape(1, 2));
+            NDArray values = manager.create(new float[] {3f, 5f}, new Shape(1, 2, 1));
+            values.setRequiresGradient(true);
+            NDArray pooled = NDArrays.indexedMaskedSoftmaxPool(logits, mask, values, 0, 1);
+            collector.backward(pooled.mul(Float.NaN));
+            float[] gradients = values.getGradient().toFloatArray();
+            Assert.assertTrue(Float.isNaN(gradients[0]));
+            Assert.assertTrue(Float.isNaN(gradients[1]));
         }
     }
 
