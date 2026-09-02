@@ -544,6 +544,14 @@ public final class JniUtils {
                         new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}));
     }
 
+    /** Converts a floating-point array without detaching it from the autograd graph. */
+    public static PtNDArray differentiableCast(PtNDArray ndArray, DataType dataType) {
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchDifferentiableCast(
+                        ndArray.getHandle(), dataType.ordinal()));
+    }
+
     public static PtNDArray toSparse(PtNDArray ndArray) {
         return new PtNDArray(
                 ndArray.getManager(), PyTorchLibrary.LIB.torchToSparse(ndArray.getHandle()));

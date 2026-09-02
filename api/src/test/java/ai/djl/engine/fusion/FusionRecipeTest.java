@@ -121,8 +121,7 @@ public class FusionRecipeTest {
         Assert.assertEquals(packed.getSpec().getDataType(), DataType.BFLOAT16);
         Assert.assertEquals(packed.getSpec().getMaximumShape().getShape(), new long[] {16, 8});
         Assert.assertThrows(
-                IllegalStateException.class,
-                () -> builder.outputPack("late").addSource(half));
+                IllegalStateException.class, () -> builder.outputPack("late").addSource(half));
     }
 
     @Test
@@ -134,8 +133,7 @@ public class FusionRecipeTest {
                         "round", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 1, 256));
         FusionRecipe.Input players =
                 builder.addInput(
-                        "players",
-                        FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 29, 256));
+                        "players", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4, 29, 256));
         FusionRecipe.Input tiles =
                 builder.addInput(
                         "tiles", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 34, 256));
@@ -207,8 +205,7 @@ public class FusionRecipeTest {
                 builder.addInput(
                         "wrongWidth", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 2, 5));
         FusionRecipe.Input rankTwo =
-                builder.addInput(
-                        "rankTwo", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4));
+                builder.addInput("rankTwo", FusionRecipe.TensorSpec.of(DataType.FLOAT16, batch, 4));
 
         Assert.assertThrows(
                 IllegalArgumentException.class,
@@ -224,9 +221,7 @@ public class FusionRecipeTest {
                 () -> builder.segmentedOutputPack("rankTwoPack", rankTwo));
         Assert.assertThrows(
                 IllegalArgumentException.class,
-                () ->
-                        builder.segmentedOutputPack(
-                                "emptyPack", new FusionRecipe.Value[0]));
+                () -> builder.segmentedOutputPack("emptyPack", new FusionRecipe.Value[0]));
         Assert.assertThrows(
                 IllegalArgumentException.class,
                 () ->

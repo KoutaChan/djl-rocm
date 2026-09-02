@@ -2975,9 +2975,6 @@ public final class NDArrays {
             Preconditions.checkArgument(
                     array.getDataType().isFloating(), "all arrays must be floating-point");
         }
-        if (arrays.size() == 1) {
-            return arrays.singletonOrThrow().toType(dataType, true);
-        }
         NDArray array = arrays.head();
         return array.getNDArrayInternal().concatToType(arrays.subNDList(1), axis, dataType);
     }

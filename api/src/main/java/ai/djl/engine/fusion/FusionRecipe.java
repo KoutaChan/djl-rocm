@@ -1593,6 +1593,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the ascending flattened token indices.
+         *
          * @return the ascending flattened token indices
          */
         public Value getIndices() {
@@ -1600,6 +1602,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the input LayerNorm scale.
+         *
          * @return the input LayerNorm scale
          */
         public Constant getInputNormWeight() {
@@ -1607,6 +1611,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the input LayerNorm bias.
+         *
          * @return the input LayerNorm bias
          */
         public Constant getInputNormBias() {
@@ -1614,6 +1620,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the transformer block parameters.
+         *
          * @return the transformer block parameters
          */
         public TransformerEncoderBlock getBlock() {
@@ -1621,6 +1629,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the attention head count.
+         *
          * @return the attention head count
          */
         public int getAttentionHeads() {
@@ -1628,6 +1638,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the concatenated attention width.
+         *
          * @return the concatenated attention width
          */
         public int getAttentionWidth() {
@@ -1635,6 +1647,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the feed-forward hidden width.
+         *
          * @return the feed-forward hidden width
          */
         public int getFeedForwardWidth() {
@@ -1642,6 +1656,8 @@ public final class FusionRecipe {
         }
 
         /**
+         * Returns the LayerNorm epsilon.
+         *
          * @return the LayerNorm epsilon
          */
         public float getEpsilon() {
@@ -2602,9 +2618,7 @@ public final class FusionRecipe {
                                 + " tensor with token and width axes.");
             }
             long availableTokens = innerShape[innerShape.length - 2];
-            if (tokenOffset < 0
-                    || tokenCount <= 0
-                    || tokenOffset > availableTokens - tokenCount) {
+            if (tokenOffset < 0 || tokenCount <= 0 || tokenOffset > availableTokens - tokenCount) {
                 throw new IllegalArgumentException(
                         "The segmented output-pack token slice is outside the source range.");
             }
@@ -2666,8 +2680,7 @@ public final class FusionRecipe {
                 offsets[index] = tokenOffsets.get(index);
                 counts[index] = tokenCounts.get(index);
                 outputTokens =
-                        Math.addExact(
-                                outputTokens, Math.multiplyExact(prefixCount, counts[index]));
+                        Math.addExact(outputTokens, Math.multiplyExact(prefixCount, counts[index]));
             }
 
             String checkedName = recipeBuilder.addValueName(name);
@@ -3439,8 +3452,8 @@ public final class FusionRecipe {
                         || segmentSpec.innerShape[2] != hiddenWidth) {
                     throw new IllegalArgumentException(
                             "Indexed local transformer input segments must share batch, groups,"
-                                + " hidden width, and data type and contain positive token"
-                                + " counts.");
+                                    + " hidden width, and data type and contain positive token"
+                                    + " counts.");
                 }
                 tokenCount = Math.addExact(tokenCount, segmentSpec.innerShape[1]);
             }

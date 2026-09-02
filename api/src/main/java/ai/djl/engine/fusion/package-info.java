@@ -12,16 +12,27 @@
  */
 
 /**
- * Contains backend-neutral APIs for preparing and repeatedly executing bounded fusion recipes.
+ * Contains backend-neutral APIs for differentiable fusion functions and bounded inference recipes.
  *
- * <p>A recipe declares a closed set of inference stages rather than an arbitrary operator graph.
- * {@link ai.djl.engine.fusion.FusionRecipe.AffineSum AffineSum} projects and sums dynamic values,
- * fixed singleton-leading values, and an optional bias before applying a supported activation. A
- * fixed value shaped {@code [1, ..., featureWidth]} broadcasts over the active leading extent; each
- * source may independently use FLOAT16, BFLOAT16, or FLOAT32 while weights select the common
- * projection and output data type. Backends may convert and project constant fixed values once when
- * constants are bound. {@link ai.djl.engine.fusion.FusionRecipe.OutputPack OutputPack} writes
- * several score values into one persistent FLOAT32 output. {@link
+ * <p>{@link ai.djl.engine.fusion.FusionFunctions FusionFunctions} returns ordinary caller-owned
+ * NDArrays and participates in the active engine's automatic differentiation graph. Engines may
+ * implement these functions with fused forward and backward operations while preserving their
+ * functional semantics. These results follow normal NDManager ownership and never refer to a
+ * reusable session output slot.
+ *
+ * <p>The persistent recipe API is complementary and inference-only. A recipe declares a closed set
+ * of stages rather than an arbitrary operator graph. Its {@link ai.djl.engine.fusion.FusionSession
+ * FusionSession} reuses ring-slot output and workspace storage, so session submissions do not
+ * participate in automatic differentiation. Use a corresponding method in {@code FusionFunctions}
+ * when gradients are required.
+ *
+ * <p>{@link ai.djl.engine.fusion.FusionRecipe.AffineSum AffineSum} projects and sums dynamic
+ * values, fixed singleton-leading values, and an optional bias before applying a supported
+ * activation. A fixed value shaped {@code [1, ..., featureWidth]} broadcasts over the active
+ * leading extent; each source may independently use FLOAT16, BFLOAT16, or FLOAT32 while weights
+ * select the common projection and output data type. Backends may convert and project constant
+ * fixed values once when constants are bound. {@link ai.djl.engine.fusion.FusionRecipe.OutputPack
+ * OutputPack} writes several score values into one persistent FLOAT32 output. {@link
  * ai.djl.engine.fusion.FusionRecipe.ProjectedResidualMlp ProjectedResidualMlp} evaluates a
  * two-projection SiLU MLP whose first projection supplies both its residual and hidden branches.
  * The input's fixed prefix dimensions are preserved. {@link
@@ -39,13 +50,14 @@
  * and writes multiple destination-mapped context and presence sets in one stage. Each set remains
  * contiguous, repeated source groups are allowed, and a {@code -1} destination is zero.
  *
- * <p>The lifecycle is {@code recipe -> plan -> executable -> session -> invocation -> output
- * lease}. Preparation validates shapes and builds a bounded command plan. Binding retains caller
- * constants and may create backend-owned packed constants or precomputed values. A session owns a
- * ring of maximum-shape output and workspace slots. One invocation submits the whole recipe, and
- * its lease keeps the selected slot alive until downstream work no longer uses its outputs. {@link
- * ai.djl.engine.fusion.FusionCompilationReport FusionCompilationReport} reports shared
- * per-executable storage separately from output and workspace storage allocated for every slot.
+ * <p>The persistent inference lifecycle is {@code recipe -> plan -> executable -> session ->
+ * invocation -> output lease}. Preparation validates shapes and builds a bounded command plan.
+ * Binding retains caller constants and may create backend-owned packed constants or precomputed
+ * values. A session owns a ring of maximum-shape output and workspace slots. One invocation submits
+ * the whole recipe, and its lease keeps the selected slot alive until downstream work no longer
+ * uses its outputs. {@link ai.djl.engine.fusion.FusionCompilationReport FusionCompilationReport}
+ * reports shared per-executable storage separately from output and workspace storage allocated for
+ * every slot.
  *
  * <p>Execution sessions are externally serialized: method executions using a session and its
  * derived handles are not thread-safe and must not overlap. Outstanding handle lifetimes may

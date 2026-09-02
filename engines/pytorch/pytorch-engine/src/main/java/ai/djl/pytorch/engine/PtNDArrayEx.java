@@ -63,9 +63,6 @@ public class PtNDArrayEx implements NDArrayEx {
     /** {@inheritDoc} */
     @Override
     public NDArray concatToType(NDList arrays, int axis, DataType dataType) {
-        if (!array.getDevice().isGpu()) {
-            return NDArrayEx.super.concatToType(arrays, axis, dataType);
-        }
         PtNDManager manager = array.getManager();
         PtNDArray[] inputs = new PtNDArray[arrays.size() + 1];
         inputs[0] = array;
@@ -73,6 +70,19 @@ public class PtNDArrayEx implements NDArrayEx {
             inputs[index + 1] = manager.from(arrays.get(index));
         }
         return JniUtils.concatToType(inputs, axis, dataType);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public NDArray differentiableCast(DataType dataType) {
+        if (!array.getDataType().isFloating() || !dataType.isFloating()) {
+            throw new IllegalArgumentException(
+                    "Differentiable casts require floating-point types.");
+        }
+        if (array.getDataType() == dataType) {
+            return array;
+        }
+        return JniUtils.differentiableCast(array, dataType);
     }
 
     /** {@inheritDoc} */

@@ -89,6 +89,16 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTo(
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDifferentiableCast(
+    JNIEnv* env, jobject jthis, jlong jhandle, jint jdtype) {
+  API_BEGIN()
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* result_ptr = new torch::Tensor(
+      tensor_ptr->to(utils::GetScalarTypeFromDType(jdtype)));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetItem__JJ(
     JNIEnv* env, jobject jthis, jlong jhandle, jlong jindex) {
   API_BEGIN()

@@ -15,6 +15,10 @@ package ai.djl.engine.fusion;
 /**
  * An externally serialized fusion execution lane with persistent output and workspace slots.
  *
+ * <p>A session is inference-only. Its outputs refer to reusable ring-slot storage and do not
+ * participate in automatic differentiation. Use {@link FusionFunctions} for caller-owned results
+ * that preserve autograd.
+ *
  * <p>Method executions through a session, its invocations, and its output leases are not
  * thread-safe and must be externally serialized. Outstanding invocation or lease lifetimes may
  * coexist on distinct ring slots; only their method executions must not overlap. Sequential calls

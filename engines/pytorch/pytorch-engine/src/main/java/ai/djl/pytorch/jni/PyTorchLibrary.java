@@ -145,6 +145,8 @@ final class PyTorchLibrary {
 
     native long torchTo(long handle, int dType, int[] device);
 
+    native long torchDifferentiableCast(long handle, int dataType);
+
     native long torchGetItem(long handle, long index);
 
     native long torchGetItem(long handle, long[] indices);

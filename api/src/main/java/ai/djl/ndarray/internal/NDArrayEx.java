@@ -12,6 +12,7 @@
  */
 package ai.djl.ndarray.internal;
 
+import ai.djl.engine.fusion.FusionRecipe;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
@@ -30,6 +31,20 @@ import java.util.List;
 /** An internal interface that encapsulates engine specific operations. */
 @SuppressWarnings("MissingJavadocMethod")
 public interface NDArrayEx {
+
+    /**
+     * Converts a floating-point array while preserving its automatic differentiation graph.
+     *
+     * <p>The operation may return the source array when its data type already matches.
+     */
+    default NDArray differentiableCast(DataType dataType) {
+        NDArray array = getArray();
+        if (!array.getDataType().isFloating() || !dataType.isFloating()) {
+            throw new IllegalArgumentException(
+                    "Differentiable casts require floating-point types.");
+        }
+        return array.toType(dataType, false);
+    }
 
     /*
     // NDArrays
@@ -57,11 +72,126 @@ public interface NDArrayEx {
     /** Converts floating-point arrays while concatenating them along an existing axis. */
     default NDArray concatToType(NDList arrays, int axis, DataType dataType) {
         NDList converted = new NDList(arrays.size() + 1);
-        converted.add(getArray().toType(dataType, false));
+        converted.add(differentiableCast(dataType));
         for (NDArray array : arrays) {
-            converted.add(array.toType(dataType, false));
+            converted.add(array.getNDArrayInternal().differentiableCast(dataType));
         }
-        return NDArrays.concat(converted, axis);
+        return converted.size() == 1
+                ? converted.singletonOrThrow()
+                : NDArrays.concat(converted, axis);
+    }
+
+    /** Packs selected token ranges while preserving gradients to every source. */
+    default NDArray segmentedOutputPack(
+            NDList arrays, long[] tokenOffsets, long[] tokenCounts, DataType dataType) {
+        NDList sources = new NDList(arrays.size() + 1);
+        sources.add(getArray());
+        sources.addAll(arrays);
+        if (tokenOffsets.length != sources.size() || tokenCounts.length != sources.size()) {
+            throw new IllegalArgumentException("Segment metadata must match the source count.");
+        }
+
+        NDManager outputManager = getArray().getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(sources);
+            NDList segments = new NDList(sources.size());
+            Shape firstShape = sources.get(0).getShape();
+            long hiddenWidth = firstShape.get(firstShape.dimension() - 1);
+            for (int index = 0; index < sources.size(); ++index) {
+                NDArray source = sources.get(index);
+                Shape shape = source.getShape();
+                int rank = shape.dimension();
+                long batch = shape.get(0);
+                long tokens = shape.get(rank - 2);
+                long groups = shape.slice(1, rank - 2).size();
+                long offset = tokenOffsets[index];
+                long count = tokenCounts[index];
+                NDArray segment =
+                        source.reshape(batch, groups, tokens, hiddenWidth)
+                                .get(":,:,{}:{},:", offset, Math.addExact(offset, count))
+                                .reshape(batch, Math.multiplyExact(groups, count), hiddenWidth);
+                segment = segment.getNDArrayInternal().differentiableCast(dataType);
+                segments.add(segment);
+            }
+            NDArray result =
+                    segments.size() == 1
+                            ? segments.singletonOrThrow()
+                            : NDArrays.concat(segments, 1);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /** Applies the portable differentiable binary branch blend equation. */
+    default NDArray binaryBranchBlend(
+            NDArray selectedContext,
+            NDArray selectedLogit,
+            NDArray baselinePresence,
+            NDArray selectedPresence) {
+        NDArray baselineContext = getArray();
+        NDManager outputManager = baselineContext.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(
+                    baselineContext,
+                    selectedContext,
+                    selectedLogit,
+                    baselinePresence,
+                    selectedPresence);
+            NDArray baseline = differentiableCast(DataType.FLOAT32);
+            NDArray selected =
+                    selectedContext.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            NDArray logit = selectedLogit.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            NDArray baselineMask =
+                    baselinePresence.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            NDArray selectedMask =
+                    selectedPresence.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            NDArray selectedProbability = Activation.sigmoid(logit);
+            NDArray jointPresence = baselineMask.mul(selectedMask);
+            NDArray baselineWeight = baselineMask.sub(jointPresence.mul(selectedProbability));
+            NDArray selectedWeight =
+                    selectedMask.sub(jointPresence).add(jointPresence.mul(selectedProbability));
+            NDArray result = baseline.mul(baselineWeight).add(selected.mul(selectedWeight));
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /** Applies a portable differentiable affine projection sum. */
+    default NDArray affineSum(
+            NDList inputs, NDList weights, NDArray bias, FusionRecipe.Activation activation) {
+        NDList sources = new NDList(inputs.size() + 1);
+        sources.add(getArray());
+        sources.addAll(inputs);
+        if (sources.size() != weights.size()) {
+            throw new IllegalArgumentException("Every affine input requires one weight.");
+        }
+
+        NDManager outputManager = getArray().getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(sources);
+            scope.tempAttachAll(weights);
+            if (bias != null) {
+                scope.tempAttachAll(bias);
+            }
+            NDArray result = bias;
+            for (int index = 0; index < sources.size(); ++index) {
+                NDArray weight = weights.get(index);
+                NDArray term =
+                        linear(
+                                        sources.get(index)
+                                                .getNDArrayInternal()
+                                                .differentiableCast(weight.getDataType()),
+                                        weight,
+                                        null)
+                                .singletonOrThrow();
+                result = result == null ? term : result.add(term);
+            }
+            if (activation == FusionRecipe.Activation.SILU) {
+                result = Activation.swish(result, 1.0f);
+            }
+            outputManager.attachAll(result);
+            return result;
+        }
     }
 
     /** Selects leading-axis rows while preserving all trailing dimensions. */
@@ -403,7 +533,7 @@ public interface NDArrayEx {
 
     /** Returns float32 probabilities normalized over nonzero mask entries. */
     default NDArray maskedSoftmax(NDArray mask, int axis) {
-        NDArray logits = getArray().toType(DataType.FLOAT32, false);
+        NDArray logits = differentiableCast(DataType.FLOAT32);
         NDArray floatMask =
                 mask.neq(0)
                         .toType(DataType.FLOAT32, false)
@@ -525,10 +655,17 @@ public interface NDArrayEx {
         int choiceAxis = logits.getShape().dimension() - 1;
         NDArray expandedLogits = logits.expandDims(-1).broadcast(mask.getShape());
         NDArray weights = NDArrays.maskedSoftmax(expandedLogits, mask, choiceAxis);
-        NDArray pooled =
-                weights.expandDims(-1)
-                        .mul(values.toType(DataType.FLOAT32, false).expandDims(-2))
-                        .sum(new int[] {choiceAxis});
+        Shape valueShape = values.getShape();
+        Shape pooledShape = mask.getShape().add(valueShape.get(valueShape.dimension() - 1));
+        NDArray expandedWeights = weights.expandDims(-1).broadcast(pooledShape);
+        NDArray expandedValues =
+                values.getNDArrayInternal()
+                        .differentiableCast(DataType.FLOAT32)
+                        .expandDims(-2)
+                        .broadcast(pooledShape);
+        NDArray selectedValues =
+                NDArrays.where(expandedWeights.neq(0), expandedValues, expandedValues.zerosLike());
+        NDArray pooled = expandedWeights.mul(selectedValues).sum(new int[] {choiceAxis});
         NDArray present = mask.neq(0).sum(new int[] {choiceAxis}).gt(0).expandDims(-1);
         NDArray masked = NDArrays.where(present, pooled, pooled.zerosLike());
         long groupCount = mask.getShape().get(mask.getShape().dimension() - 1);
@@ -593,7 +730,8 @@ public interface NDArrayEx {
         NDArray weights = NDArrays.maskedSoftmax(selectedLogitArray, selectedMaskArray, -1);
         NDArray pooled =
                 selectedValueArray
-                        .toType(DataType.FLOAT32, false)
+                        .getNDArrayInternal()
+                        .differentiableCast(DataType.FLOAT32)
                         .mul(weights.expandDims(-1))
                         .sum(new int[] {logitRank - 1});
         NDArray present =
@@ -629,7 +767,7 @@ public interface NDArrayEx {
 
     /** Returns the float32 log normalizer over nonzero mask entries, retaining the reduced axis. */
     default NDArray maskedLogSumExp(NDArray mask, int axis) {
-        NDArray logits = getArray().toType(DataType.FLOAT32, false);
+        NDArray logits = differentiableCast(DataType.FLOAT32);
         int normalizedAxis = axis < 0 ? axis + logits.getShape().dimension() : axis;
         long[] reducedShape = logits.getShape().getShape().clone();
         reducedShape[normalizedAxis] = 1;
@@ -979,6 +1117,123 @@ public interface NDArrayEx {
             NDArray activated = Activation.swish(hidden, 1.0f);
             NDArray update = linear(activated, outputWeight, null).singletonOrThrow();
             NDArray result = residual.add(update);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /** Gathers, projects, and scatters rows with shared destination indices. */
+    default NDArray indexedAffine(
+            NDList sources,
+            long[] indexDivisors,
+            long destinationRows,
+            NDArray hiddenWeight,
+            NDArray hiddenBias,
+            NDArray outputWeight,
+            NDArray outputBias,
+            FusionRecipe.Activation activation) {
+        NDArray destinationIndices = getArray();
+        if (sources.isEmpty() || sources.size() != indexDivisors.length) {
+            throw new IllegalArgumentException(
+                    "indexed affine requires one positive divisor per source");
+        }
+        if (destinationRows < 0) {
+            throw new IllegalArgumentException("destinationRows must be non-negative");
+        }
+
+        NDManager outputManager = destinationIndices.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(destinationIndices, hiddenWeight, outputWeight);
+            scope.tempAttachAll(sources);
+            if (hiddenBias != null) {
+                scope.tempAttachAll(hiddenBias);
+            }
+            if (outputBias != null) {
+                scope.tempAttachAll(outputBias);
+            }
+
+            NDArray routingIndices =
+                    destinationIndices.toType(DataType.INT64, false).stopGradient();
+            NDList gathered = new NDList(sources.size());
+            for (int index = 0; index < sources.size(); ++index) {
+                long divisor = indexDivisors[index];
+                if (divisor <= 0) {
+                    throw new IllegalArgumentException("index divisors must be positive");
+                }
+                NDArray sourceIndices =
+                        routingIndices
+                                .toType(DataType.FLOAT64, false)
+                                .div(divisor)
+                                .floor()
+                                .toType(DataType.INT64, false)
+                                .stopGradient();
+                gathered.add(NDArrays.gatherRows(sources.get(index), sourceIndices));
+            }
+            NDArray packed = NDArrays.concatToType(gathered, 1, hiddenWeight.getDataType());
+            NDArray hidden = linear(packed, hiddenWeight, hiddenBias).singletonOrThrow();
+            if (activation == FusionRecipe.Activation.SILU) {
+                hidden = Activation.swish(hidden, 1.0f);
+            }
+            NDArray compact = linear(hidden, outputWeight, outputBias).singletonOrThrow();
+            NDArray result = NDArrays.scatterRows(compact, routingIndices, destinationRows);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /** Pools one candidate memory into independently mapped output sets. */
+    default NDList mappedGroupedMaskedSoftmaxPool(
+            NDArray masks, NDArray values, NDList destinationGroupIndices) {
+        NDArray scores = getArray();
+        if (destinationGroupIndices.isEmpty()) {
+            throw new IllegalArgumentException("mapped grouped pool requires an output set");
+        }
+
+        NDManager outputManager = scores.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(scores, masks, values);
+            scope.tempAttachAll(destinationGroupIndices);
+            NDList contexts = new NDList(destinationGroupIndices.size());
+            NDList presence = new NDList(destinationGroupIndices.size());
+            NDArray detachedMasks = masks.stopGradient();
+            NDList routingMappings = new NDList(destinationGroupIndices.size());
+            for (NDArray mapping : destinationGroupIndices) {
+                routingMappings.add(mapping.toType(DataType.INT64, false).stopGradient());
+            }
+            NDArray routingMapping = NDArrays.concat(routingMappings, 0);
+            long destinationCount = routingMapping.getShape().get(0);
+            NDArray validMapping = routingMapping.gte(0).stopGradient();
+            NDArray gatherIndices = NDArrays.maximum(routingMapping, 0).stopGradient();
+            NDArray gatheredMasks =
+                    NDArrays.gatherRows(detachedMasks.transpose(2, 0, 1), gatherIndices);
+            NDArray mappedMasks =
+                    NDArrays.where(
+                                    validMapping
+                                            .reshape(destinationCount, 1, 1)
+                                            .broadcast(gatheredMasks.getShape()),
+                                    gatheredMasks,
+                                    gatheredMasks.zerosLike())
+                            .transpose(1, 2, 0);
+            NDArray mappedContexts =
+                    groupedMaskedSoftmaxPool(mappedMasks, values).transpose(1, 0, 2);
+            NDArray mappedPresence =
+                    mappedMasks
+                            .neq(0)
+                            .sum(new int[] {1})
+                            .gt(0)
+                            .toType(masks.getDataType(), false)
+                            .stopGradient();
+            long offset = 0;
+            for (NDArray mapping : destinationGroupIndices) {
+                long destinations = mapping.getShape().get(0);
+                long end = Math.addExact(offset, destinations);
+                contexts.add(mappedContexts.get(":,{}:{},:", offset, end));
+                presence.add(mappedPresence.get(":,{}:{}", offset, end).stopGradient());
+                offset = end;
+            }
+            NDList result = new NDList(contexts.size() + presence.size());
+            result.addAll(contexts);
+            result.addAll(presence);
             outputManager.attachAll(result);
             return result;
         }
