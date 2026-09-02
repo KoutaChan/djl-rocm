@@ -2274,6 +2274,20 @@ public final class JniUtils {
                         bias == null ? NULL_PTR : bias.getHandle()));
     }
 
+    public static PtNDArray projectedResidualMlp(
+            PtNDArray input,
+            PtNDArray combinedWeight,
+            PtNDArray combinedBias,
+            PtNDArray outputWeight) {
+        return new PtNDArray(
+                input.getManager(),
+                PyTorchLibrary.LIB.torchNNProjectedResidualMlp(
+                        input.getHandle(),
+                        combinedWeight.getHandle(),
+                        combinedBias.getHandle(),
+                        outputWeight.getHandle()));
+    }
+
     public static PtNDArray embedding(PtNDArray input, PtNDArray weight, boolean sparse) {
         return new PtNDArray(
                 input.getManager(),

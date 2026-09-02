@@ -464,6 +464,123 @@ public class FusionRecipeTest {
     }
 
     @Test
+    public void projectedResidualMlpPreservesFixedPrefixDimensions() {
+        FusionRecipe.Builder builder = FusionRecipe.builder("projected-residual-mlp");
+        FusionRecipe.Dimension batches = builder.addDimension("batches", 4096);
+        FusionRecipe.Input input =
+                builder.addInput(
+                        "input", FusionRecipe.TensorSpec.of(DataType.BFLOAT16, batches, 4, 256));
+        FusionRecipe.Constant combinedWeight =
+                builder.addConstant(
+                        "combinedWeight",
+                        FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 128, 256));
+        FusionRecipe.Constant combinedBias =
+                builder.addConstant(
+                        "combinedBias", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 128));
+        FusionRecipe.Constant outputWeight =
+                builder.addConstant(
+                        "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 64, 64));
+
+        FusionRecipe.ProjectedResidualMlp mlp =
+                builder.projectedResidualMlp("mlp", input)
+                        .setCombinedWeight(combinedWeight)
+                        .setCombinedBias(combinedBias)
+                        .setOutputWeight(outputWeight)
+                        .build();
+        builder.addOutput("output", mlp);
+        FusionRecipe recipe = builder.build();
+
+        Assert.assertSame(mlp.getInput(), input);
+        Assert.assertSame(mlp.getCombinedWeight(), combinedWeight);
+        Assert.assertSame(mlp.getCombinedBias(), combinedBias);
+        Assert.assertSame(mlp.getOutputWeight(), outputWeight);
+        Assert.assertEquals(mlp.getSpec().getDataType(), DataType.BFLOAT16);
+        Assert.assertEquals(mlp.getSpec().getInnerShape(), new long[] {4, 64});
+        Assert.assertEquals(mlp.getSpec().getMaximumShape().getShape(), new long[] {4096, 4, 64});
+        Assert.assertSame(recipe.getOutputs().get(0).getValue(), mlp);
+    }
+
+    @Test
+    public void projectedResidualMlpRejectsInvalidSchema() {
+        FusionRecipe.Builder missing = FusionRecipe.builder("missing-projected-residual-mlp");
+        FusionRecipe.Dimension missingRows = missing.addDimension("rows", 8);
+        FusionRecipe.Input missingInput =
+                missing.addInput(
+                        "input", FusionRecipe.TensorSpec.of(DataType.FLOAT32, missingRows, 6));
+        Assert.assertThrows(
+                IllegalStateException.class,
+                () -> missing.projectedResidualMlp("mlp", missingInput).build());
+
+        FusionRecipe.Builder fixed = FusionRecipe.builder("fixed-projected-residual-mlp");
+        FusionRecipe.Constant fixedInput =
+                fixed.addConstant("input", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 1, 6));
+        FusionRecipe.Constant fixedCombinedWeight =
+                fixed.addConstant(
+                        "combinedWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 7, 6));
+        FusionRecipe.Constant fixedCombinedBias =
+                fixed.addConstant(
+                        "combinedBias", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 7));
+        FusionRecipe.Constant fixedOutputWeight =
+                fixed.addConstant(
+                        "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 3, 4));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        fixed.projectedResidualMlp("mlp", fixedInput)
+                                .setCombinedWeight(fixedCombinedWeight)
+                                .setCombinedBias(fixedCombinedBias)
+                                .setOutputWeight(fixedOutputWeight)
+                                .build());
+
+        FusionRecipe.Builder mismatch = FusionRecipe.builder("mismatched-projected-residual-mlp");
+        FusionRecipe.Dimension rows = mismatch.addDimension("rows", 8);
+        FusionRecipe.Input input =
+                mismatch.addInput(
+                        "input", FusionRecipe.TensorSpec.of(DataType.FLOAT16, rows, 2, 6));
+        FusionRecipe.Constant combinedWeight =
+                mismatch.addConstant(
+                        "combinedWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 8, 6));
+        FusionRecipe.Constant combinedBias =
+                mismatch.addConstant(
+                        "combinedBias", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 7));
+        FusionRecipe.Constant outputWeight =
+                mismatch.addConstant(
+                        "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.FLOAT16, 3, 4));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        mismatch.projectedResidualMlp("mlp", input)
+                                .setCombinedWeight(combinedWeight)
+                                .setCombinedBias(combinedBias)
+                                .setOutputWeight(outputWeight)
+                                .build());
+
+        FusionRecipe.Builder mixedType = FusionRecipe.builder("mixed-type-projected-residual-mlp");
+        FusionRecipe.Dimension mixedRows = mixedType.addDimension("rows", 8);
+        FusionRecipe.Input mixedInput =
+                mixedType.addInput(
+                        "input", FusionRecipe.TensorSpec.of(DataType.FLOAT32, mixedRows, 6));
+        FusionRecipe.Constant mixedCombinedWeight =
+                mixedType.addConstant(
+                        "combinedWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 7, 6));
+        FusionRecipe.Constant mixedCombinedBias =
+                mixedType.addConstant(
+                        "combinedBias", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 7));
+        FusionRecipe.Constant mixedOutputWeight =
+                mixedType.addConstant(
+                        "outputWeight", FusionRecipe.TensorSpec.fixed(DataType.BFLOAT16, 3, 4));
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        mixedType
+                                .projectedResidualMlp("mlp", mixedInput)
+                                .setCombinedWeight(mixedCombinedWeight)
+                                .setCombinedBias(mixedCombinedBias)
+                                .setOutputWeight(mixedOutputWeight)
+                                .build());
+    }
+
+    @Test
     public void indexedAffineBuildsMixedGatherProjection() {
         FusionRecipe.Builder builder = FusionRecipe.builder("indexed-affine");
         FusionRecipe.Dimension batches = builder.addDimension("batches", 4);

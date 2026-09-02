@@ -23,6 +23,7 @@
 #include "djl_pytorch_attention.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_layer_norm.h"
+#include "djl_pytorch_projected_residual_mlp.h"
 #include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_routing_masks.h"
@@ -663,6 +664,20 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLinear(
   }
   const auto* result_ptr = new torch::Tensor(torch::nn::functional::linear(*input_ptr, *weight_ptr, bias));
   return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNProjectedResidualMlp(
+    JNIEnv* env, jobject jthis, jlong jinput, jlong jcombined_weight,
+    jlong jcombined_bias, jlong joutput_weight) {
+  API_BEGIN()
+  const auto* input = reinterpret_cast<torch::Tensor*>(jinput);
+  const auto* combined_weight = reinterpret_cast<torch::Tensor*>(jcombined_weight);
+  const auto* combined_bias = reinterpret_cast<torch::Tensor*>(jcombined_bias);
+  const auto* output_weight = reinterpret_cast<torch::Tensor*>(joutput_weight);
+  const auto* result = new torch::Tensor(djl::pytorch::projected_residual_mlp(
+      *input, *combined_weight, *combined_bias, *output_weight));
+  return reinterpret_cast<uintptr_t>(result);
   API_END_RETURN()
 }
 

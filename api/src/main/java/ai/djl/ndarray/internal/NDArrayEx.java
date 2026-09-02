@@ -950,6 +950,90 @@ public interface NDArrayEx {
 
     NDList linear(NDArray input, NDArray weight, NDArray bias);
 
+    /**
+     * Applies a projected-residual multilayer perceptron.
+     *
+     * <p>The combined projection is split along its last axis into an output-width residual and a
+     * hidden value. The hidden value is transformed with SiLU and a bias-free output projection,
+     * then added to the residual. The default implementation is a differentiable decomposition;
+     * engines may override it with equivalent fused projection and residual epilogues.
+     *
+     * @param combinedWeight combined projection weight shaped {@code [outputWidth + hiddenWidth,
+     *     inputWidth]}
+     * @param combinedBias combined projection bias shaped {@code [outputWidth + hiddenWidth]}
+     * @param outputWeight output projection weight shaped {@code [outputWidth, hiddenWidth]}
+     * @return the projected-residual output
+     */
+    default NDArray projectedResidualMlp(
+            NDArray combinedWeight, NDArray combinedBias, NDArray outputWeight) {
+        NDArray input = getArray();
+        validateProjectedResidualMlp(input, combinedWeight, combinedBias, outputWeight);
+
+        long outputWidth = outputWeight.getShape().get(0);
+        NDManager outputManager = input.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(input, combinedWeight, combinedBias, outputWeight);
+            NDArray combined = linear(input, combinedWeight, combinedBias).singletonOrThrow();
+            NDArray residual = combined.get("...,0:{}", outputWidth);
+            NDArray hidden = combined.get("...,{}:", outputWidth);
+            NDArray activated = Activation.swish(hidden, 1.0f);
+            NDArray update = linear(activated, outputWeight, null).singletonOrThrow();
+            NDArray result = residual.add(update);
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /** Validates the portable projected-residual MLP contract. */
+    static void validateProjectedResidualMlp(
+            NDArray input, NDArray combinedWeight, NDArray combinedBias, NDArray outputWeight) {
+        Shape inputShape = input.getShape();
+        Shape combinedWeightShape = combinedWeight.getShape();
+        Shape combinedBiasShape = combinedBias.getShape();
+        Shape outputWeightShape = outputWeight.getShape();
+        if (inputShape.dimension() == 0
+                || combinedWeightShape.dimension() != 2
+                || combinedBiasShape.dimension() != 1
+                || outputWeightShape.dimension() != 2) {
+            throw new IllegalArgumentException(
+                    "projected residual MLP requires input [..., inputWidth], combined weight"
+                            + " [outputWidth + hiddenWidth, inputWidth], combined bias"
+                            + " [outputWidth + hiddenWidth], and output weight [outputWidth,"
+                            + " hiddenWidth]");
+        }
+
+        long inputWidth = inputShape.get(inputShape.dimension() - 1);
+        long outputWidth = outputWeightShape.get(0);
+        long hiddenWidth = outputWeightShape.get(1);
+        long combinedWidth = Math.addExact(outputWidth, hiddenWidth);
+        if (inputWidth <= 0
+                || outputWidth <= 0
+                || hiddenWidth <= 0
+                || combinedWeightShape.get(0) != combinedWidth
+                || combinedWeightShape.get(1) != inputWidth
+                || combinedBiasShape.get(0) != combinedWidth) {
+            throw new IllegalArgumentException("projected residual MLP shapes are incompatible");
+        }
+
+        DataType dataType = input.getDataType();
+        if ((dataType != DataType.FLOAT16
+                        && dataType != DataType.BFLOAT16
+                        && dataType != DataType.FLOAT32)
+                || combinedWeight.getDataType() != dataType
+                || combinedBias.getDataType() != dataType
+                || outputWeight.getDataType() != dataType) {
+            throw new IllegalArgumentException(
+                    "projected residual MLP arrays must use one FLOAT16, BFLOAT16, or FLOAT32 data"
+                            + " type");
+        }
+        if (!input.getDevice().equals(combinedWeight.getDevice())
+                || !input.getDevice().equals(combinedBias.getDevice())
+                || !input.getDevice().equals(outputWeight.getDevice())) {
+            throw new IllegalArgumentException(
+                    "projected residual MLP arrays must use the same device");
+        }
+    }
+
     NDList embedding(NDArray input, NDArray weight, SparseFormat sparse);
 
     NDList prelu(NDArray input, NDArray alpha);

@@ -957,6 +957,36 @@ public final class NDArrays {
         return addBiasAndBroadcastResidualToOwnedAndSilu(values, bias, residual, null);
     }
 
+    /**
+     * Applies a projected-residual multilayer perceptron.
+     *
+     * <p>This operation computes the following, where {@code O} is the number of rows in {@code
+     * outputWeight}:
+     *
+     * <pre>{@code
+     * z = linear(input, combinedWeight, combinedBias)
+     * output = z[..., 0:O] + linear(silu(z[..., O:]), outputWeight, null)
+     * }</pre>
+     *
+     * <p>The input may have any number of leading dimensions. The combined weight is shaped {@code
+     * [O + H, I]}, the combined bias {@code [O + H]}, and the output weight {@code [O, H]}. All
+     * arrays must reside on one device and use one of FLOAT16, BFLOAT16, or FLOAT32. An engine may
+     * accept floating-point parameter arrays in a different type while autocast is active. The
+     * operation is differentiable. Engines may select equivalent projection and residual epilogues;
+     * results follow the engine's floating-point execution semantics.
+     *
+     * @param input input shaped {@code [..., I]}
+     * @param combinedWeight combined projection weight shaped {@code [O + H, I]}
+     * @param combinedBias combined projection bias shaped {@code [O + H]}
+     * @param outputWeight bias-free output projection weight shaped {@code [O, H]}
+     * @return output shaped {@code [..., O]}
+     */
+    public static NDArray projectedResidualMlp(
+            NDArray input, NDArray combinedWeight, NDArray combinedBias, NDArray outputWeight) {
+        return input.getNDArrayInternal()
+                .projectedResidualMlp(combinedWeight, combinedBias, outputWeight);
+    }
+
     private static NDArray canonicalRelationKeys(
             NDArray relationKeys,
             long[] leadingDimensions,

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "djl_pytorch_fusion_kernels.h"
+#include "djl_pytorch_projected_residual_mlp.h"
 #include "djl_pytorch_rocm_attention.h"
 
 namespace djl::pytorch::fusion {
@@ -74,6 +75,7 @@ constexpr int64_t kIndexedRelationTransformerEncoderStackV1 = 10;
 constexpr int64_t kMappedGroupedMaskedSoftmaxPoolGroupV1 = 12;
 constexpr int64_t kIndexedLocalTransformerEncoderSegmentedV2 = 13;
 constexpr int64_t kSegmentedOutputPackV1 = 15;
+constexpr int64_t kProjectedResidualMlpV1 = 16;
 constexpr int64_t kDimensionPrefixExtent = 1;
 constexpr int64_t kLayoutContiguous = 1;
 
@@ -211,6 +213,21 @@ struct AffineSumCommandSpec {
   std::vector<int64_t> output_prefix_shape;
   std::vector<int32_t> operand_value_indices;
   std::vector<AffineGroupSpec> groups;
+};
+
+struct ProjectedResidualMlpCommandSpec {
+  int32_t result_value_index;
+  int32_t result_storage_index;
+  int32_t input_value_index;
+  int32_t combined_weight_binding_index;
+  int32_t combined_bias_value_index;
+  int32_t output_weight_binding_index;
+  int32_t combined_storage_index;
+  int32_t activated_storage_index;
+  int32_t extent_index;
+  int64_t output_width;
+  int64_t hidden_width;
+  std::vector<int32_t> operand_value_indices;
 };
 
 struct IndexedAffineSourceSpec {
@@ -389,7 +406,8 @@ struct MappedGroupedMaskedSoftmaxPoolGroupCommandSpec {
 };
 
 using FusionCommand = std::variant<OutputPackCommandSpec, AffineSumCommandSpec,
-    IndexedAffineCommandSpec, TransformerEncoderStackCommandSpec,
+    ProjectedResidualMlpCommandSpec, IndexedAffineCommandSpec,
+    TransformerEncoderStackCommandSpec,
     BinaryBranchBlendCommandSpec, SingleQueryReadoutGroupCommandSpec,
     IndexedLocalTransformerCommandSpec,
     MappedGroupedMaskedSoftmaxPoolGroupCommandSpec>;
@@ -1132,6 +1150,98 @@ AffineSumCommandSpec BuildAffineSumCommand(FusionPlanData& plan,
   }
   command.needs_finalize = !direct_group_assigned || command.groups.size() != 1 ||
       command.bias_value_index >= 0 || command.activation != AffineActivation::kNone;
+  return command;
+}
+
+ProjectedResidualMlpCommandSpec BuildProjectedResidualMlpCommand(
+    FusionPlanData& plan, int32_t command_index,
+    const std::vector<int32_t>& results,
+    const std::vector<int32_t>& operands, int64_t flags,
+    const CommandAttributes& attributes) {
+  TORCH_CHECK(flags == 0,
+      "PROJECTED_RESIDUAL_MLP_V1 does not support command flags");
+  TORCH_CHECK(results.size() == 1,
+      "PROJECTED_RESIDUAL_MLP_V1 requires exactly one result");
+  TORCH_CHECK(operands.size() == 4,
+      "PROJECTED_RESIDUAL_MLP_V1 requires exactly four operands");
+  TORCH_CHECK(attributes.empty(),
+      "PROJECTED_RESIDUAL_MLP_V1 does not support attributes");
+
+  const int32_t result_index = results[0];
+  ValueSpec& result = plan.values[result_index];
+  TORCH_CHECK(result.kind == ValueKind::kUnbound,
+      "fusion command result already has a producer or binding");
+  TORCH_CHECK(IsFusionFloatingDataType(result.data_type) &&
+          result.dimension_index >= 0 && !result.inner_shape.empty(),
+      "PROJECTED_RESIDUAL_MLP_V1 result metadata is invalid");
+
+  const int32_t input_index = operands[0];
+  const int32_t combined_weight_index = operands[1];
+  const int32_t combined_bias_index = operands[2];
+  const int32_t output_weight_index = operands[3];
+  const ValueSpec& input = plan.values[input_index];
+  const ValueSpec& combined_weight = plan.values[combined_weight_index];
+  const ValueSpec& combined_bias = plan.values[combined_bias_index];
+  const ValueSpec& output_weight = plan.values[output_weight_index];
+  TORCH_CHECK(input.kind != ValueKind::kUnbound &&
+          input.dimension_index == result.dimension_index &&
+          input.data_type == result.data_type &&
+          input.inner_shape.size() == result.inner_shape.size() &&
+          !input.inner_shape.empty() &&
+          std::equal(input.inner_shape.begin(), input.inner_shape.end() - 1,
+              result.inner_shape.begin()),
+      "PROJECTED_RESIDUAL_MLP_V1 input metadata does not match its result");
+  TORCH_CHECK(combined_weight.kind == ValueKind::kConstant &&
+          combined_weight.dimension_index < 0 &&
+          combined_weight.data_type == result.data_type &&
+          combined_weight.inner_shape.size() == 2 &&
+          combined_weight.inner_shape[1] == input.inner_shape.back(),
+      "PROJECTED_RESIDUAL_MLP_V1 combined weight metadata is invalid");
+  TORCH_CHECK(combined_bias.kind == ValueKind::kConstant &&
+          combined_bias.dimension_index < 0 &&
+          combined_bias.data_type == result.data_type &&
+          combined_bias.inner_shape.size() == 1 &&
+          combined_bias.inner_shape[0] == combined_weight.inner_shape[0],
+      "PROJECTED_RESIDUAL_MLP_V1 combined bias metadata is invalid");
+  TORCH_CHECK(output_weight.kind == ValueKind::kConstant &&
+          output_weight.dimension_index < 0 &&
+          output_weight.data_type == result.data_type &&
+          output_weight.inner_shape.size() == 2 &&
+          output_weight.inner_shape[0] == result.inner_shape.back() &&
+          output_weight.inner_shape[1] > 0 &&
+          combined_weight.inner_shape[0] ==
+              output_weight.inner_shape[0] + output_weight.inner_shape[1],
+      "PROJECTED_RESIDUAL_MLP_V1 output weight metadata is invalid");
+
+  ProjectedResidualMlpCommandSpec command;
+  command.result_value_index = result_index;
+  command.result_storage_index = NextStorageIndex(plan);
+  command.input_value_index = input_index;
+  command.combined_weight_binding_index = combined_weight.binding_index;
+  command.combined_bias_value_index = combined_bias_index;
+  command.output_weight_binding_index = output_weight.binding_index;
+  command.extent_index = result.dimension_index;
+  command.output_width = output_weight.inner_shape[0];
+  command.hidden_width = output_weight.inner_shape[1];
+  command.operand_value_indices = operands;
+
+  result.kind = ValueKind::kComputed;
+  result.producer_index = command_index;
+  result.storage_index = command.result_storage_index;
+  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
+
+  std::vector<int64_t> combined_shape = input.maximum_shape;
+  combined_shape.back() =
+      CheckedAdd(command.output_width, command.hidden_width,
+          "PROJECTED_RESIDUAL_MLP_V1 combined width");
+  command.combined_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(
+      StorageSpec{result.data_type, std::move(combined_shape)});
+  std::vector<int64_t> activated_shape = input.maximum_shape;
+  activated_shape.back() = command.hidden_width;
+  command.activated_storage_index = NextStorageIndex(plan);
+  plan.storages.push_back(
+      StorageSpec{result.data_type, std::move(activated_shape)});
   return command;
 }
 
@@ -2310,6 +2420,10 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         plan->commands.emplace_back(BuildAffineSumCommand(
             *plan, command_index, results, operands, flags, attributes));
         break;
+      case kProjectedResidualMlpV1:
+        plan->commands.emplace_back(BuildProjectedResidualMlpCommand(
+            *plan, command_index, results, operands, flags, attributes));
+        break;
       case kIndexedAffineV1:
         plan->commands.emplace_back(BuildIndexedAffineCommand(
             *plan, command_index, results, operands, flags, attributes));
@@ -2551,6 +2665,21 @@ void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_inde
       [command.result_storage_index];
   ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
       dimensions, true, "affine result storage");
+}
+
+void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const ProjectedResidualMlpCommandSpec& command) {
+  const auto& plan = *session.executable->plan;
+  const torch::Tensor& input = ResolveValue(
+      session, buffer_index, input_handles, command.input_value_index);
+  const ValueSpec& input_spec = plan.values[command.input_value_index];
+  ValidateTensorMetadata(input, plan, input_spec, dimensions,
+      input_spec.kind == ValueKind::kComputed, "projected-residual MLP input");
+  const torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  ValidateTensorMetadata(result, plan, plan.values[command.result_value_index],
+      dimensions, true, "projected-residual MLP result storage");
 }
 
 void ValidateCommandSubmission(const FusionSession& session, int32_t buffer_index,
@@ -2880,6 +3009,44 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
         static_cast<int32_t>(command.output_prefix_shape.size()),
         command.output_width, command.activation);
   }
+}
+
+void ExecuteCommand(FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions,
+    const ProjectedResidualMlpCommandSpec& command,
+    std::size_t, bool& work_submitted) {
+  const int64_t batch_count = dimensions[command.extent_index];
+  if (batch_count == 0) {
+    return;
+  }
+  const torch::Tensor& input = ResolveValue(
+      session, buffer_index, input_handles, command.input_value_index);
+  const torch::Tensor& bias = ResolveValue(session, buffer_index,
+      input_handles, command.combined_bias_value_index);
+  const torch::Tensor& combined_weight = session.executable->constants[
+      command.combined_weight_binding_index];
+  const torch::Tensor& output_weight = session.executable->constants[
+      command.output_weight_binding_index];
+  torch::Tensor& combined = session.storages[buffer_index]
+      [command.combined_storage_index];
+  torch::Tensor& activated = session.storages[buffer_index]
+      [command.activated_storage_index];
+  torch::Tensor& result = session.storages[buffer_index]
+      [command.result_storage_index];
+  RecordCurrentStream(input);
+  RecordCurrentStream(bias);
+  RecordCurrentStream(combined_weight);
+  RecordCurrentStream(output_weight);
+  RecordCurrentStream(combined);
+  RecordCurrentStream(activated);
+  RecordCurrentStream(result);
+
+  work_submitted = true;
+  projected_residual_mlp_forward(input.narrow(0, 0, batch_count),
+      combined_weight, bias, output_weight,
+      combined.narrow(0, 0, batch_count),
+      activated.narrow(0, 0, batch_count),
+      result.narrow(0, 0, batch_count));
 }
 
 void ExecuteCommand(FusionSession& session, int32_t buffer_index,
@@ -3895,6 +4062,11 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
             *command, work_submitted);
       } else if (const auto* command =
                      std::get_if<AffineSumCommandSpec>(&fusion_command)) {
+        ExecuteCommand(*session, buffer_index, input_handles, dimensions,
+            *command, command_index, work_submitted);
+      } else if (const auto* command =
+                     std::get_if<ProjectedResidualMlpCommandSpec>(
+                         &fusion_command)) {
         ExecuteCommand(*session, buffer_index, input_handles, dimensions,
             *command, command_index, work_submitted);
       } else if (const auto* command =

@@ -591,6 +591,27 @@ __global__ void affine_finalize_kernel(AffineFinalizeArguments arguments) {
   }
 }
 
+template <typename scalar_t>
+__global__ void projected_residual_mlp_prepare_kernel(
+    const scalar_t* combined, scalar_t* activated, scalar_t* residual,
+    int64_t row_count, int64_t output_width, int64_t hidden_width) {
+  const int64_t combined_width = output_width + hidden_width;
+  const int64_t element_count = row_count * combined_width;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < element_count;
+       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t row = index / combined_width;
+    const int64_t column = index - row * combined_width;
+    float value = static_cast<float>(combined[index]);
+    if (column < output_width) {
+      residual[row * output_width + column] = static_cast<scalar_t>(value);
+    } else {
+      activated[row * hidden_width + column - output_width] =
+          static_cast<scalar_t>(value / (1.0f + expf(-value)));
+    }
+  }
+}
+
 template <typename output_t, typename input_t, typename index_t>
 __device__ void pack_indexed_affine_source(
     const IndexedAffineInputPackArguments& arguments, int32_t source_index) {
@@ -2032,6 +2053,48 @@ void LaunchAffineFinalize(const AffineSumSource* sources, int32_t source_count,
       TORCH_CHECK(false, "unsupported affine finalize data type");
   }
   CheckKernelLaunch("fusion affine finalize");
+}
+
+void LaunchProjectedResidualMlpPrepare(torch::Tensor& combined,
+    torch::Tensor& activated, torch::Tensor& residual,
+    int64_t row_count, int64_t output_width, int64_t hidden_width) {
+  TORCH_CHECK(combined.scalar_type() == activated.scalar_type() &&
+          combined.scalar_type() == residual.scalar_type(),
+      "projected-residual MLP tensors must use one data type");
+  TORCH_CHECK(output_width > 0 && hidden_width > 0 &&
+          combined.size(-1) == output_width + hidden_width,
+      "projected-residual MLP widths are invalid");
+  const int64_t combined_width = combined.size(-1);
+  const int64_t element_count = CheckedMultiply(
+      row_count, combined_width, "projected-residual MLP element count");
+  if (element_count == 0) {
+    return;
+  }
+  const uint32_t block_count = static_cast<uint32_t>(
+      std::min<int64_t>(RequiredBlockCount(element_count), 65535));
+  const auto stream = backend::GetCurrentStream(combined.get_device());
+#define LAUNCH_PROJECTED_RESIDUAL_MLP_PREPARE(scalar_type) \
+  DJL_FUSION_LAUNCH_KERNEL( \
+      (projected_residual_mlp_prepare_kernel<scalar_type>), \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, \
+      combined.data_ptr<scalar_type>(), \
+      activated.data_ptr<scalar_type>(), residual.data_ptr<scalar_type>(), \
+      row_count, output_width, hidden_width)
+  switch (combined.scalar_type()) {
+    case torch::kFloat16:
+      LAUNCH_PROJECTED_RESIDUAL_MLP_PREPARE(c10::Half);
+      break;
+    case torch::kBFloat16:
+      LAUNCH_PROJECTED_RESIDUAL_MLP_PREPARE(c10::BFloat16);
+      break;
+    case torch::kFloat32:
+      LAUNCH_PROJECTED_RESIDUAL_MLP_PREPARE(float);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported projected-residual MLP data type");
+  }
+#undef LAUNCH_PROJECTED_RESIDUAL_MLP_PREPARE
+  CheckKernelLaunch("fusion projected-residual MLP prepare");
 }
 
 template <typename output_t, typename index_t>

@@ -708,6 +708,12 @@ final class PyTorchLibrary {
 
     native long torchNNLinear(long handle, long weightHandle, long biasHandle);
 
+    native long torchNNProjectedResidualMlp(
+            long inputHandle,
+            long combinedWeightHandle,
+            long combinedBiasHandle,
+            long outputWeightHandle);
+
     native long torchNNEmbedding(long handle, long weightHandle, boolean sparse);
 
     native long torchNNRelu(long handle);

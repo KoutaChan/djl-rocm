@@ -35,9 +35,10 @@ import java.util.Set;
  * an activation. {@link IndexedAffine} gathers selected rows from several values, evaluates a
  * bounded two-layer projection, and scatters the selected results into a dense value. {@link
  * OutputPack} concatenates two-dimensional floating-point values along their last axis and converts
- * them into one configured floating-point data type. {@link SegmentedOutputPack} concatenates
- * batch-major tensor segments along their first inner axis and converts them into one configured
- * floating-point data type. {@link BinaryBranchBlend} selects or
+ * them into one configured floating-point data type. {@link ProjectedResidualMlp} evaluates a
+ * two-projection SiLU MLP whose residual is produced by the first projection. {@link
+ * SegmentedOutputPack} concatenates batch-major tensor segments along their first inner axis and
+ * converts them into one configured floating-point data type. {@link BinaryBranchBlend} selects or
  * blends two branch contexts from their presence values and a binary logit. {@link
  * TransformerEncoderStack} executes one or more fixed-width, pre-normalized transformer encoder
  * blocks over a short dense sequence, optionally using {@link IndexedRelationAttention}. {@link
@@ -455,6 +456,76 @@ public final class FusionRecipe {
          */
         public Activation getActivation() {
             return activation;
+        }
+    }
+
+    /**
+     * A bounded projected-residual multilayer perceptron.
+     *
+     * <p>For input {@code x}, this value computes {@code z = x W_c^T + b_c}, followed by {@code y =
+     * z[..., 0:O] + silu(z[..., O:]) W_o^T}. The combined projection has width {@code O + H}; the
+     * first {@code O} values form the residual and the remaining {@code H} values form the hidden
+     * input to the bias-free output projection. The input's fixed prefix dimensions are preserved.
+     * Input, parameters, intermediate values, and output use one of FLOAT16, BFLOAT16, or FLOAT32.
+     * Numerical results may round at either projection, activation, or residual-addition boundary.
+     */
+    public static final class ProjectedResidualMlp extends Value {
+
+        private final Value input;
+        private final Constant combinedWeight;
+        private final Constant combinedBias;
+        private final Constant outputWeight;
+
+        private ProjectedResidualMlp(
+                Object owner,
+                int index,
+                String name,
+                TensorSpec spec,
+                Value input,
+                Constant combinedWeight,
+                Constant combinedBias,
+                Constant outputWeight) {
+            super(owner, index, name, spec);
+            this.input = input;
+            this.combinedWeight = combinedWeight;
+            this.combinedBias = combinedBias;
+            this.outputWeight = outputWeight;
+        }
+
+        /**
+         * Returns the value projected by this stage.
+         *
+         * @return the input value
+         */
+        public Value getInput() {
+            return input;
+        }
+
+        /**
+         * Returns the {@code [outputWidth + hiddenWidth, inputWidth]} combined weight.
+         *
+         * @return the combined projection weight
+         */
+        public Constant getCombinedWeight() {
+            return combinedWeight;
+        }
+
+        /**
+         * Returns the {@code [outputWidth + hiddenWidth]} combined bias.
+         *
+         * @return the combined projection bias
+         */
+        public Constant getCombinedBias() {
+            return combinedBias;
+        }
+
+        /**
+         * Returns the {@code [outputWidth, hiddenWidth]} output weight.
+         *
+         * @return the output projection weight
+         */
+        public Constant getOutputWeight() {
+            return outputWeight;
         }
     }
 
@@ -1933,6 +2004,23 @@ public final class FusionRecipe {
                 throw new IllegalArgumentException("The affine output width must be positive.");
             }
             return new AffineSumBuilder(this, requireName(name, "value"), outputWidth);
+        }
+
+        /**
+         * Starts a projected-residual MLP stage.
+         *
+         * <p>The returned builder accepts the combined projection parameters and the bias-free
+         * output projection. Validation and value insertion complete when {@link
+         * ProjectedResidualMlpBuilder#build()} is called.
+         *
+         * @param name the value name
+         * @param input a dynamically bounded FLOAT16, BFLOAT16, or FLOAT32 value
+         * @return a builder for the projected-residual MLP value
+         */
+        public ProjectedResidualMlpBuilder projectedResidualMlp(String name, Value input) {
+            checkMutable();
+            checkValue(input);
+            return new ProjectedResidualMlpBuilder(this, requireName(name, "value"), input);
         }
 
         /**
@@ -4004,6 +4092,148 @@ public final class FusionRecipe {
                 result[resultAxis] = Math.max(leftExtent, rightExtent);
             }
             return result;
+        }
+    }
+
+    /** Builds one {@link ProjectedResidualMlp} value within a {@link Builder}. */
+    public static final class ProjectedResidualMlpBuilder {
+
+        private final Builder recipeBuilder;
+        private final String name;
+        private final Value input;
+        private Constant combinedWeight;
+        private Constant combinedBias;
+        private Constant outputWeight;
+        private boolean built;
+
+        private ProjectedResidualMlpBuilder(Builder recipeBuilder, String name, Value input) {
+            this.recipeBuilder = recipeBuilder;
+            this.name = name;
+            this.input = input;
+        }
+
+        /**
+         * Sets the required combined projection weight.
+         *
+         * @param weight a fixed {@code [outputWidth + hiddenWidth, inputWidth]} constant
+         * @return this builder
+         */
+        public ProjectedResidualMlpBuilder setCombinedWeight(Constant weight) {
+            checkMutable();
+            recipeBuilder.checkValue(weight);
+            combinedWeight = weight;
+            return this;
+        }
+
+        /**
+         * Sets the required combined projection bias.
+         *
+         * @param bias a fixed {@code [outputWidth + hiddenWidth]} constant
+         * @return this builder
+         */
+        public ProjectedResidualMlpBuilder setCombinedBias(Constant bias) {
+            checkMutable();
+            recipeBuilder.checkValue(bias);
+            combinedBias = bias;
+            return this;
+        }
+
+        /**
+         * Sets the required bias-free output projection weight.
+         *
+         * @param weight a fixed {@code [outputWidth, hiddenWidth]} constant
+         * @return this builder
+         */
+        public ProjectedResidualMlpBuilder setOutputWeight(Constant weight) {
+            checkMutable();
+            recipeBuilder.checkValue(weight);
+            outputWeight = weight;
+            return this;
+        }
+
+        /**
+         * Adds the immutable projected-residual MLP value to its recipe.
+         *
+         * @return the projected-residual MLP value
+         */
+        public ProjectedResidualMlp build() {
+            checkMutable();
+            recipeBuilder.checkMutable();
+            if (combinedWeight == null || combinedBias == null || outputWeight == null) {
+                throw new IllegalStateException(
+                        "A projected-residual MLP requires combined weight, combined bias, and"
+                                + " output weight.");
+            }
+
+            TensorSpec inputSpec = input.getSpec();
+            if (inputSpec.leadingDimension == null || inputSpec.innerShape.length == 0) {
+                throw new IllegalArgumentException(
+                        "Projected-residual MLP input must have a bounded leading dimension and a"
+                                + " feature dimension.");
+            }
+            DataType dataType = inputSpec.dataType;
+            if (!Builder.isAffineDataType(dataType)) {
+                throw new IllegalArgumentException(
+                        "Projected-residual MLP only supports FLOAT16, BFLOAT16, and FLOAT32.");
+            }
+
+            TensorSpec combinedWeightSpec = combinedWeight.getSpec();
+            TensorSpec combinedBiasSpec = combinedBias.getSpec();
+            TensorSpec outputWeightSpec = outputWeight.getSpec();
+            if (combinedWeightSpec.leadingDimension != null
+                    || combinedWeightSpec.dataType != dataType
+                    || combinedWeightSpec.innerShape.length != 2
+                    || combinedWeightSpec.innerShape[1]
+                            != inputSpec.innerShape[inputSpec.innerShape.length - 1]) {
+                throw new IllegalArgumentException(
+                        "Projected-residual MLP combined weight shape or type mismatch.");
+            }
+            if (outputWeightSpec.leadingDimension != null
+                    || outputWeightSpec.dataType != dataType
+                    || outputWeightSpec.innerShape.length != 2) {
+                throw new IllegalArgumentException(
+                        "Projected-residual MLP output weight must be a fixed rank-two tensor with"
+                                + " the input data type.");
+            }
+
+            long outputWidth = outputWeightSpec.innerShape[0];
+            long hiddenWidth = outputWeightSpec.innerShape[1];
+            long combinedWidth = Math.addExact(outputWidth, hiddenWidth);
+            if (outputWidth <= 0
+                    || hiddenWidth <= 0
+                    || combinedWeightSpec.innerShape[0] != combinedWidth
+                    || combinedBiasSpec.leadingDimension != null
+                    || combinedBiasSpec.dataType != dataType
+                    || combinedBiasSpec.innerShape.length != 1
+                    || combinedBiasSpec.innerShape[0] != combinedWidth) {
+                throw new IllegalArgumentException(
+                        "Projected-residual MLP combined and output projection shapes are"
+                                + " incompatible.");
+            }
+
+            long[] outputInnerShape = inputSpec.innerShape.clone();
+            outputInnerShape[outputInnerShape.length - 1] = outputWidth;
+            String checkedName = recipeBuilder.addValueName(name);
+            ProjectedResidualMlp value =
+                    new ProjectedResidualMlp(
+                            recipeBuilder.owner,
+                            recipeBuilder.values.size(),
+                            checkedName,
+                            TensorSpec.of(dataType, inputSpec.leadingDimension, outputInnerShape),
+                            input,
+                            combinedWeight,
+                            combinedBias,
+                            outputWeight);
+            recipeBuilder.values.add(value);
+            built = true;
+            return value;
+        }
+
+        private void checkMutable() {
+            if (built) {
+                throw new IllegalStateException(
+                        "The projected-residual MLP has already been built.");
+            }
         }
     }
 

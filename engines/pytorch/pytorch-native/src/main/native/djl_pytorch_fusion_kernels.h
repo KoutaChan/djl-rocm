@@ -129,6 +129,10 @@ void LaunchAffineFinalize(const AffineSumSource* sources, int32_t source_count,
     const int64_t* output_prefix, int32_t output_prefix_rank,
     int64_t output_width, AffineActivation activation);
 
+void LaunchProjectedResidualMlpPrepare(torch::Tensor& combined,
+    torch::Tensor& activated, torch::Tensor& residual,
+    int64_t row_count, int64_t output_width, int64_t hidden_width);
+
 void LaunchTransformerCopyAndLayerNorm(const torch::Tensor& input,
     torch::Tensor& state, torch::Tensor& normalized,
     const torch::Tensor& weight, const torch::Tensor& bias,

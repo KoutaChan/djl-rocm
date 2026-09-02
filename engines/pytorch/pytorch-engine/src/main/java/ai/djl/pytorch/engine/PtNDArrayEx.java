@@ -518,6 +518,21 @@ public class PtNDArrayEx implements NDArrayEx {
 
     /** {@inheritDoc} */
     @Override
+    public NDArray projectedResidualMlp(
+            NDArray combinedWeight, NDArray combinedBias, NDArray outputWeight) {
+        if (!array.getDevice().isGpu()) {
+            return NDArrayEx.super.projectedResidualMlp(combinedWeight, combinedBias, outputWeight);
+        }
+        PtNDManager manager = array.getManager();
+        return JniUtils.projectedResidualMlp(
+                array,
+                manager.from(combinedWeight),
+                manager.from(combinedBias),
+                manager.from(outputWeight));
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public NDList embedding(NDArray input, NDArray weight, SparseFormat sparseFormat) {
         if (!sparseFormat.equals(SparseFormat.DENSE) && !sparseFormat.equals(SparseFormat.COO)) {
             throw new IllegalArgumentException("PyTorch only supports COO");

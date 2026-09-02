@@ -22,6 +22,9 @@
  * projection and output data type. Backends may convert and project constant fixed values once when
  * constants are bound. {@link ai.djl.engine.fusion.FusionRecipe.OutputPack OutputPack} writes
  * several score values into one persistent FLOAT32 output. {@link
+ * ai.djl.engine.fusion.FusionRecipe.ProjectedResidualMlp ProjectedResidualMlp} evaluates a
+ * two-projection SiLU MLP whose first projection supplies both its residual and hidden branches.
+ * The input's fixed prefix dimensions are preserved. {@link
  * ai.djl.engine.fusion.FusionRecipe.IndexedAffine IndexedAffine} gathers selected rows from mixed
  * floating-point sources, evaluates a fixed two-layer projection, and scatters the results into a
  * zero-filled dense output without materializing individual gather or concatenation values. {@link

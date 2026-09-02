@@ -63,6 +63,8 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_row_ops.cc"
     "src/main/native/djl_pytorch_layer_norm.h"
     "src/main/native/djl_pytorch_layer_norm.cc"
+    "src/main/native/djl_pytorch_projected_residual_mlp.h"
+    "src/main/native/djl_pytorch_projected_residual_mlp.cc"
     "src/main/native/djl_pytorch_flat_gradient.h"
     "src/main/native/djl_pytorch_flat_gradient.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"

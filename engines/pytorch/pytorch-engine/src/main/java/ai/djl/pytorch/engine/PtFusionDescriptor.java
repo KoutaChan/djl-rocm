@@ -66,6 +66,7 @@ final class PtFusionDescriptor {
     static final long MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 = 12;
     static final long INDEXED_LOCAL_TRANSFORMER_ENCODER_SEGMENTED_V2 = 13;
     static final long SEGMENTED_OUTPUT_PACK_V1 = 15;
+    static final long PROJECTED_RESIDUAL_MLP_V1 = 16;
     static final long DIMENSION_PREFIX_EXTENT = 1;
     static final long LAYOUT_CONTIGUOUS = 1;
     static final long ATTRIBUTE_INT64 = 1;
@@ -143,6 +144,8 @@ final class PtFusionDescriptor {
                         Math.addExact(
                                 commandWords,
                                 affineSumCommandWords((FusionRecipe.AffineSum) value));
+            } else if (value instanceof FusionRecipe.ProjectedResidualMlp) {
+                commandWords = Math.addExact(commandWords, projectedResidualMlpCommandWords());
             } else if (value instanceof FusionRecipe.IndexedAffine) {
                 commandWords =
                         Math.addExact(
@@ -236,6 +239,9 @@ final class PtFusionDescriptor {
                 putSegmentedOutputPackCommand(descriptor, (FusionRecipe.SegmentedOutputPack) value);
             } else if (value instanceof FusionRecipe.AffineSum) {
                 putAffineSumCommand(descriptor, (FusionRecipe.AffineSum) value);
+            } else if (value instanceof FusionRecipe.ProjectedResidualMlp) {
+                putProjectedResidualMlpCommand(
+                        descriptor, (FusionRecipe.ProjectedResidualMlp) value);
             } else if (value instanceof FusionRecipe.IndexedAffine) {
                 putIndexedAffineCommand(descriptor, (FusionRecipe.IndexedAffine) value);
             } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
@@ -272,6 +278,8 @@ final class PtFusionDescriptor {
                 ++count;
             } else if (value instanceof FusionRecipe.AffineSum) {
                 ++count;
+            } else if (value instanceof FusionRecipe.ProjectedResidualMlp) {
+                ++count;
             } else if (value instanceof FusionRecipe.IndexedAffine) {
                 ++count;
             } else if (value instanceof FusionRecipe.TransformerEncoderStack) {
@@ -297,6 +305,7 @@ final class PtFusionDescriptor {
             }
         }
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, projectedResidualMlpWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedLocalTransformerWorkspaceBytes(recipe));
@@ -316,6 +325,7 @@ final class PtFusionDescriptor {
             }
         }
         bytes = Math.addExact(bytes, affineWorkspaceBytes(recipe));
+        bytes = Math.addExact(bytes, projectedResidualMlpWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedAffineWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, transformerWorkspaceBytes(recipe));
         bytes = Math.addExact(bytes, indexedLocalTransformerWorkspaceBytes(recipe));
@@ -500,6 +510,7 @@ final class PtFusionDescriptor {
         return value instanceof FusionRecipe.OutputPack
                 || value instanceof FusionRecipe.SegmentedOutputPack
                 || value instanceof FusionRecipe.AffineSum
+                || value instanceof FusionRecipe.ProjectedResidualMlp
                 || value instanceof FusionRecipe.IndexedAffine
                 || value instanceof FusionRecipe.TransformerEncoderStack
                 || value instanceof FusionRecipe.IndexedLocalTransformerEncoder
@@ -710,6 +721,30 @@ final class PtFusionDescriptor {
         return bytes;
     }
 
+    private static long projectedResidualMlpWorkspaceBytes(FusionRecipe recipe) {
+        long bytes = 0;
+        for (FusionRecipe.Value value : recipe.getValues()) {
+            if (!(value instanceof FusionRecipe.ProjectedResidualMlp)) {
+                continue;
+            }
+            FusionRecipe.ProjectedResidualMlp mlp = (FusionRecipe.ProjectedResidualMlp) value;
+            long rows = mlp.getSpec().getLeadingDimension().getMaximumExtent();
+            long[] inputShape = mlp.getInput().getSpec().getInnerShape();
+            for (int axis = 0; axis < inputShape.length - 1; ++axis) {
+                rows = Math.multiplyExact(rows, inputShape[axis]);
+            }
+            long combinedWidth = mlp.getCombinedBias().getSpec().getInnerShape()[0];
+            long hiddenWidth = mlp.getOutputWeight().getSpec().getInnerShape()[1];
+            long elements = Math.multiplyExact(rows, Math.addExact(combinedWidth, hiddenWidth));
+            bytes =
+                    Math.addExact(
+                            bytes,
+                            Math.multiplyExact(
+                                    elements, mlp.getSpec().getDataType().getNumOfBytes()));
+        }
+        return bytes;
+    }
+
     private static ArrayList<AffineGroup> affineGroups(FusionRecipe.AffineSum affineSum) {
         ArrayList<AffineGroup> groups = new ArrayList<>();
         for (FusionRecipe.AffineTerm term : affineSum.getTerms()) {
@@ -908,6 +943,25 @@ final class PtFusionDescriptor {
         putScalarAttribute(
                 descriptor, AFFINE_ACTIVATION, activationCode(affineSum.getActivation()));
         putScalarAttribute(descriptor, AFFINE_HAS_BIAS, affineSum.getBias() == null ? 0 : 1);
+    }
+
+    private static int projectedResidualMlpCommandWords() {
+        return COMMAND_RECORD_HEADER_WORDS + 1 + 4;
+    }
+
+    private static void putProjectedResidualMlpCommand(
+            ByteBuffer descriptor, FusionRecipe.ProjectedResidualMlp mlp) {
+        descriptor.putLong(projectedResidualMlpCommandWords());
+        descriptor.putLong(PROJECTED_RESIDUAL_MLP_V1);
+        descriptor.putLong(0);
+        descriptor.putLong(1);
+        descriptor.putLong(4);
+        descriptor.putLong(0);
+        descriptor.putLong(mlp.getIndex());
+        descriptor.putLong(mlp.getInput().getIndex());
+        descriptor.putLong(mlp.getCombinedWeight().getIndex());
+        descriptor.putLong(mlp.getCombinedBias().getIndex());
+        descriptor.putLong(mlp.getOutputWeight().getIndex());
     }
 
     private static int indexedAffineCommandWords(FusionRecipe.IndexedAffine indexed) {
