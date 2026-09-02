@@ -31,9 +31,6 @@
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
-#if defined(USE_ROCM)
-#include <c10/hip/HIPCachingAllocator.h>
-#endif
 
 #include <exception>
 #include <memory>
@@ -463,9 +460,7 @@ void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
 DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
   InitializeAccelerator();
   c10::CachingDeviceAllocator::DeviceStats stats;
-#if defined(USE_ROCM)
-  stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
-#elif DJL_HAS_DEVICE_ACCELERATOR
+#if DJL_HAS_DEVICE_ACCELERATOR
   stats = at::accelerator::getDeviceStats(device);
 #else
   stats = at::getDeviceAllocator(c10::DeviceType::CUDA)->getDeviceStats(device);
@@ -479,9 +474,7 @@ DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
 
 void ResetPeakMemoryStats(c10::DeviceIndex device) {
   InitializeAccelerator();
-#if defined(USE_ROCM)
-  c10::cuda::CUDACachingAllocator::resetPeakStats(device);
-#elif DJL_HAS_DEVICE_ACCELERATOR
+#if DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::resetPeakStats(device);
 #else
   at::getDeviceAllocator(c10::DeviceType::CUDA)->resetPeakStats(device);
@@ -492,9 +485,7 @@ void EmptyCache() {
   if (!IsAvailable()) {
     return;
   }
-#if defined(USE_ROCM)
-  c10::cuda::CUDACachingAllocator::emptyCache();
-#elif DJL_HAS_DEVICE_ACCELERATOR
+#if DJL_HAS_DEVICE_ACCELERATOR
   at::accelerator::emptyCache();
 #else
   at::getDeviceAllocator(c10::DeviceType::CUDA)->emptyCache();

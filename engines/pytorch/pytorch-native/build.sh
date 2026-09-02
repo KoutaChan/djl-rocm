@@ -157,11 +157,25 @@ set_rocm_arch() {
   esac
 }
 
+set_cuda_arch() {
+  if [[ -n "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
+    return
+  fi
+  case "$FLAVOR" in
+    cu13*)
+      # CUDA 13 supports Turing and newer architectures, while PyTorch's
+      # headless fallback list still includes compute_50.
+      export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+      ;;
+  esac
+}
+
 USE_CUDA=0
 USE_ROCM=0
 case "$FLAVOR" in
   cu*)
     USE_CUDA=1
+    set_cuda_arch
     ;;
   rocm*)
     # ROCm libtorch is hipified and still exposes torch::cuda::* symbols.

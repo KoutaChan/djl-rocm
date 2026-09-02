@@ -53,6 +53,7 @@ for %%V in (1.13.1 2.0.1 2.1.1 2.1.2) do (
 @rem
 
 if /i "%FLAVOR:~0,2%" == "cu" set "USE_CUDA=1"
+if /i "%FLAVOR:~0,4%" == "cu13" if not defined TORCH_CUDA_ARCH_LIST set "TORCH_CUDA_ARCH_LIST=7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
 
 @rem
 @rem Legacy libtorch patches (1.11 - 1.13 line only). The cuda.cmake
