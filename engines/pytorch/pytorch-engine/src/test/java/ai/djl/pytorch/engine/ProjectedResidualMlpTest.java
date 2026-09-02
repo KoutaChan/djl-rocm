@@ -216,6 +216,53 @@ public class ProjectedResidualMlpTest {
         }
     }
 
+    @SuppressWarnings("try")
+    @Test
+    public void gpuOneForwardAndBackwardUseTheInputDeviceWhenGpuZeroIsCurrent() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() < 2) {
+            throw new SkipException("This test requires two PyTorch CUDA or ROCm devices.");
+        }
+        Device targetDevice = Device.gpu(1);
+        try (NDManager manager = engine.newBaseManager(targetDevice);
+                NDArray input = values(manager, new Shape(64, 256), 0.011f, DataType.BFLOAT16);
+                NDArray combinedWeight =
+                        values(manager, new Shape(128, 256), -0.007f, DataType.BFLOAT16);
+                NDArray combinedBias = values(manager, new Shape(128), 0.005f, DataType.BFLOAT16);
+                NDArray outputWeight =
+                        values(manager, new Shape(64, 64), 0.009f, DataType.BFLOAT16);
+                NDArray lossWeight = values(manager, new Shape(64, 64), 0.003f, DataType.BFLOAT16);
+                TrainingResult expected =
+                        train(
+                                engine,
+                                targetDevice,
+                                input,
+                                combinedWeight,
+                                combinedBias,
+                                outputWeight,
+                                lossWeight,
+                                DataType.BFLOAT16,
+                                false);
+                PtStreamScope ignored = engine.newStreamScope(Device.gpu(0));
+                TrainingResult actual =
+                        train(
+                                engine,
+                                targetDevice,
+                                input,
+                                combinedWeight,
+                                combinedBias,
+                                outputWeight,
+                                lossWeight,
+                                DataType.BFLOAT16,
+                                true)) {
+            assertClose(actual.output, expected.output, 0.06f);
+            assertClose(actual.inputGradient, expected.inputGradient, 0.06f);
+            assertClose(actual.combinedWeightGradient, expected.combinedWeightGradient, 0.06f);
+            assertClose(actual.combinedBiasGradient, expected.combinedBiasGradient, 0.06f);
+            assertClose(actual.outputWeightGradient, expected.outputWeightGradient, 0.06f);
+        }
+    }
+
     @DataProvider
     public Object[][] fusionDataTypes() {
         return new Object[][] {
