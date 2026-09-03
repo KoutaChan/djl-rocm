@@ -40,7 +40,7 @@ public final class FusionSessionConfig {
     }
 
     /**
-     * Returns the number of persistent output and workspace slots.
+     * Returns the number of persistent output slots and concurrent workspace lanes.
      *
      * @return the ring buffer count
      */
@@ -58,7 +58,7 @@ public final class FusionSessionConfig {
         }
 
         /**
-         * Sets the number of persistent output and workspace slots.
+         * Sets the number of persistent output slots and concurrent workspace lanes.
          *
          * @param bufferCount the ring buffer count
          * @return this builder

@@ -48,6 +48,8 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_fusion.cc"
     "src/main/native/djl_pytorch_fusion_backend.h"
     "src/main/native/djl_pytorch_fusion_kernels.h"
+    "src/main/native/djl_pytorch_launch_config.h"
+    "src/main/native/djl_pytorch_launch_config.cc"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
     "src/main/native/djl_pytorch_attention.h"
@@ -203,6 +205,16 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         REQUIRED)
     target_include_directories(djl_torch PRIVATE ${HIPBLASLT_INCLUDE_DIR})
     target_link_libraries(djl_torch ${HIPBLASLT_LIBRARY})
+
+    file(STRINGS "${HIPBLASLT_INCLUDE_DIR}/hipblaslt/hipblaslt.h"
+        HIPBLASLT_SWISH_BIAS_DECLARATION
+        REGEX "HIPBLASLT_EPILOGUE_SWISH_BIAS_EXT")
+    if(HIPBLASLT_SWISH_BIAS_DECLARATION)
+        target_compile_definitions(djl_torch PRIVATE DJL_USE_HIPBLASLT_SWISH_BIAS)
+        message(STATUS "hipBLASLt Swish-bias GEMM enabled")
+    else()
+        message(STATUS "hipBLASLt Swish-bias GEMM unavailable; using separate GEMM and SiLU kernels")
+    endif()
 
     # AOTriton is packaged with ROCm-enabled libtorch. Its device-property caches in
     # releases up to 0.11.2 are initialized lazily without internal synchronization.

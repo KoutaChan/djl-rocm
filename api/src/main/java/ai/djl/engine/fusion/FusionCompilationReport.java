@@ -19,9 +19,9 @@ import java.util.Objects;
  *
  * <p>Storage sizes are logical tensor payload bytes. They exclude allocator alignment and rounding,
  * tensor metadata, stream and event objects, and backend-library scratch storage. Workspace is a
- * subset of per-slot persistent storage and must not be added to it. For a session with {@code n}
- * execution slots, the reported logical backend-owned payload is {@code executableStorageBytes + n
- * * persistentStorageBytes}; caller-owned inputs and constants are excluded.
+ * subset of per-slot peak storage and must not be added to it. Exported output bytes remain pinned
+ * for each slot; planner arena bytes may be acquired only while a submission is active and reused
+ * across plans by the backend allocator. Caller-owned inputs and constants are excluded.
  */
 public final class FusionCompilationReport {
 
@@ -30,6 +30,13 @@ public final class FusionCompilationReport {
     private final long executableStorageBytes;
     private final long persistentStorageBytes;
     private final long workspaceBytes;
+    private final long exportedOutputBytes;
+    private final long arenaBytes;
+    private final int storagePlannerVersion;
+    private final long logicalAllocationCount;
+    private final long backingAllocationCount;
+    private final long aliasViewCount;
+    private final long inPlaceReuseCount;
     private final boolean nativeOnly;
 
     private FusionCompilationReport(Builder builder) {
@@ -38,6 +45,13 @@ public final class FusionCompilationReport {
         executableStorageBytes = builder.executableStorageBytes;
         persistentStorageBytes = builder.persistentStorageBytes;
         workspaceBytes = builder.workspaceBytes;
+        exportedOutputBytes = builder.exportedOutputBytes;
+        arenaBytes = builder.arenaBytes;
+        storagePlannerVersion = builder.storagePlannerVersion;
+        logicalAllocationCount = builder.logicalAllocationCount;
+        backingAllocationCount = builder.backingAllocationCount;
+        aliasViewCount = builder.aliasViewCount;
+        inPlaceReuseCount = builder.inPlaceReuseCount;
         nativeOnly = builder.nativeOnly;
     }
 
@@ -82,9 +96,12 @@ public final class FusionCompilationReport {
     }
 
     /**
-     * Returns all persistent output and intermediate storage required by each execution slot.
+     * Returns peak output and intermediate storage required by each active execution slot.
      *
-     * @return the persistent per-slot storage size in bytes
+     * <p>This is a capacity-planning peak, not necessarily the amount retained while the session is
+     * idle. {@link #getExportedOutputBytes()} reports the portion pinned for the slot lifetime.
+     *
+     * @return the peak per-slot storage size in bytes
      */
     public long getPersistentStorageBytes() {
         return persistentStorageBytes;
@@ -100,6 +117,46 @@ public final class FusionCompilationReport {
      */
     public long getWorkspaceBytes() {
         return workspaceBytes;
+    }
+
+    /** Returns named output storage retained for the lifetime of each execution slot. */
+    public long getExportedOutputBytes() {
+        return exportedOutputBytes;
+    }
+
+    /** Returns transient planner arena storage required by each active submission. */
+    public long getArenaBytes() {
+        return arenaBytes;
+    }
+
+    /** Returns the native storage planner version, or zero when disabled. */
+    public int getStoragePlannerVersion() {
+        return storagePlannerVersion;
+    }
+
+    /** Returns whether a native storage planner phase is enabled. */
+    public boolean isStoragePlannerEnabled() {
+        return storagePlannerVersion > 0;
+    }
+
+    /** Returns the logical storage request count before arena lowering. */
+    public long getLogicalAllocationCount() {
+        return logicalAllocationCount;
+    }
+
+    /** Returns the physical backing allocation count per execution slot. */
+    public long getBackingAllocationCount() {
+        return backingAllocationCount;
+    }
+
+    /** Returns the tensor view count per execution slot. */
+    public long getAliasViewCount() {
+        return aliasViewCount;
+    }
+
+    /** Returns the number of intermediate blocks handed directly to command results. */
+    public long getInPlaceReuseCount() {
+        return inPlaceReuseCount;
     }
 
     /**
@@ -119,6 +176,13 @@ public final class FusionCompilationReport {
         private long executableStorageBytes;
         private long persistentStorageBytes;
         private long workspaceBytes;
+        private long exportedOutputBytes = -1;
+        private long arenaBytes = -1;
+        private int storagePlannerVersion = -1;
+        private long logicalAllocationCount = -1;
+        private long backingAllocationCount = -1;
+        private long aliasViewCount = -1;
+        private long inPlaceReuseCount = -1;
         private boolean nativeOnly;
 
         private Builder(String backend) {
@@ -156,9 +220,9 @@ public final class FusionCompilationReport {
         }
 
         /**
-         * Sets all persistent output and intermediate storage used by each execution slot.
+         * Sets peak output and intermediate storage used by each active execution slot.
          *
-         * @param persistentStorageBytes the persistent per-slot storage size in bytes
+         * @param persistentStorageBytes the peak per-slot storage size in bytes
          * @return this builder
          */
         public Builder optPersistentStorageBytes(long persistentStorageBytes) {
@@ -184,6 +248,54 @@ public final class FusionCompilationReport {
             return this;
         }
 
+        /** Sets named output storage retained by each execution slot. */
+        public Builder optExportedOutputBytes(long exportedOutputBytes) {
+            this.exportedOutputBytes = requireNonNegative(exportedOutputBytes, "output storage");
+            return this;
+        }
+
+        /** Sets storage backing planner-managed arenas in each execution slot. */
+        public Builder optArenaBytes(long arenaBytes) {
+            this.arenaBytes = requireNonNegative(arenaBytes, "arena storage");
+            return this;
+        }
+
+        /** Sets the native storage planner version, or zero when disabled. */
+        public Builder optStoragePlannerVersion(int storagePlannerVersion) {
+            if (storagePlannerVersion < 0) {
+                throw new IllegalArgumentException(
+                        "The storage planner version must not be negative.");
+            }
+            this.storagePlannerVersion = storagePlannerVersion;
+            return this;
+        }
+
+        /** Sets the logical storage request count. */
+        public Builder optLogicalAllocationCount(long logicalAllocationCount) {
+            this.logicalAllocationCount =
+                    requireNonNegative(logicalAllocationCount, "logical allocation count");
+            return this;
+        }
+
+        /** Sets the physical backing allocation count. */
+        public Builder optBackingAllocationCount(long backingAllocationCount) {
+            this.backingAllocationCount =
+                    requireNonNegative(backingAllocationCount, "backing allocation count");
+            return this;
+        }
+
+        /** Sets the tensor view count. */
+        public Builder optAliasViewCount(long aliasViewCount) {
+            this.aliasViewCount = requireNonNegative(aliasViewCount, "alias view count");
+            return this;
+        }
+
+        /** Sets the number of intermediate blocks handed directly to command results. */
+        public Builder optInPlaceReuseCount(long inPlaceReuseCount) {
+            this.inPlaceReuseCount = requireNonNegative(inPlaceReuseCount, "in-place reuse count");
+            return this;
+        }
+
         /**
          * Sets whether every recipe value uses native backend commands.
          *
@@ -201,11 +313,44 @@ public final class FusionCompilationReport {
          * @return the compilation report
          */
         public FusionCompilationReport build() {
+            if (exportedOutputBytes < 0
+                    || arenaBytes < 0
+                    || storagePlannerVersion < 0
+                    || logicalAllocationCount < 0
+                    || backingAllocationCount < 0
+                    || aliasViewCount < 0
+                    || inPlaceReuseCount < 0) {
+                throw new IllegalStateException(
+                        "Fusion storage planner details must be specified explicitly.");
+            }
             if (workspaceBytes > persistentStorageBytes) {
                 throw new IllegalStateException(
                         "The workspace size must not exceed persistent storage.");
             }
+            if (exportedOutputBytes > persistentStorageBytes
+                    || workspaceBytes != persistentStorageBytes - exportedOutputBytes) {
+                throw new IllegalStateException(
+                        "Persistent storage must equal output storage plus workspace.");
+            }
+            if (arenaBytes > persistentStorageBytes) {
+                throw new IllegalStateException(
+                        "Arena storage must not exceed persistent storage.");
+            }
+            if (backingAllocationCount > logicalAllocationCount + aliasViewCount) {
+                throw new IllegalStateException("Invalid Fusion allocation counts.");
+            }
+            if (inPlaceReuseCount > logicalAllocationCount) {
+                throw new IllegalStateException(
+                        "In-place reuse count must not exceed logical allocations.");
+            }
             return new FusionCompilationReport(this);
+        }
+
+        private static long requireNonNegative(long value, String name) {
+            if (value < 0) {
+                throw new IllegalArgumentException("The " + name + " must not be negative.");
+            }
+            return value;
         }
 
         private static String requireBackend(String backend) {

@@ -13,7 +13,7 @@
 #include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_fusion_backend.h"
 
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
 #include <ATen/hip/HIPContextLight.h>
 #include <hipblaslt/hipblaslt.h>
 #endif
@@ -30,7 +30,7 @@ namespace {
 
 constexpr int kThreadsPerBlock = 256;
 
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
 
 void CheckHipBlasLt(hipblasStatus_t status, const char* operation) {
   TORCH_CHECK(status == HIPBLAS_STATUS_SUCCESS, operation,
@@ -1715,7 +1715,7 @@ void CheckKernelLaunch(const char* kernel_name) {
 
 }  // namespace
 
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
 
 class LinearBiasSiluPlan {
  public:

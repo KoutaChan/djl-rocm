@@ -38,7 +38,8 @@ flavor. Fusion Plan is enabled automatically when the JNI library is built for C
 shared command implementation is in `djl_pytorch_fusion_kernels.hip`; CUDA compiles the thin
 `djl_pytorch_fusion_kernels.cu` entry point, and `djl_pytorch_fusion_backend.h` isolates the runtime
 and launch differences. Keep changes to common command behavior in the shared source so CUDA and
-ROCm do not drift.
+ROCm do not drift. Fusion storage planner settings are documented in the
+[engine guide](../../../docs/engine.md#fusion-storage-planning).
 
 ### NVIDIA CUDA
 

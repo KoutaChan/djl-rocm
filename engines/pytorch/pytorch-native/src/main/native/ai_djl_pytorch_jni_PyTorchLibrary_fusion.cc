@@ -1,14 +1,16 @@
 /*
  * Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
- * with the License. A copy of the License is located at
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may not
+ * use this file except in compliance with the License. A copy of the License is
+ * located at
  *
  * http://aws.amazon.com/apache2.0/
  *
- * or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
- * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
- * and limitations under the License.
+ * or in the "license" file accompanying this file. This file is distributed on
+ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+ * express or implied. See the License for the specific language governing
+ * permissions and limitations under the License.
  */
 #include <djl/utils.h>
 
@@ -41,8 +43,26 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPrepareFusionPlan(
   API_END_RETURN()
 }
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBindFusionPlan(
+extern "C" JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetFusionPlanStats(
+    JNIEnv* env, jobject jthis, jlong jplan) {
+  API_BEGIN()
+  const auto stats =
+      djl::pytorch::fusion::GetFusionPlanStats(reinterpret_cast<const djl::pytorch::fusion::FusionPlan*>(jplan));
+  const jlong values[]{static_cast<jlong>(stats.executable_storage_bytes),
+      static_cast<jlong>(stats.persistent_storage_bytes), static_cast<jlong>(stats.workspace_bytes),
+      static_cast<jlong>(stats.exported_output_bytes), static_cast<jlong>(stats.arena_bytes),
+      static_cast<jlong>(stats.planner_version), static_cast<jlong>(stats.logical_allocation_count),
+      static_cast<jlong>(stats.backing_allocation_count), static_cast<jlong>(stats.alias_view_count),
+      static_cast<jlong>(stats.in_place_reuse_count)};
+  constexpr jsize kStorageStatCount = 10;
+  jlongArray result = env->NewLongArray(kStorageStatCount);
+  TORCH_CHECK(result != nullptr, "failed to allocate fusion storage statistics");
+  env->SetLongArrayRegion(result, 0, kStorageStatCount, values);
+  return result;
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBindFusionPlan(
     JNIEnv* env, jobject jthis, jlong jplan, jobject jconstant_handles) {
   API_BEGIN()
   const auto* constant_handles =

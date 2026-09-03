@@ -13,7 +13,8 @@
 package ai.djl.engine.fusion;
 
 /**
- * An externally serialized fusion execution lane with persistent output and workspace slots.
+ * An externally serialized fusion execution lane with persistent output slots and transient
+ * submission workspace.
  *
  * <p>A session is inference-only. Its outputs refer to reusable ring-slot storage and do not
  * participate in automatic differentiation. Use {@link FusionFunctions} for caller-owned results
@@ -47,7 +48,7 @@ public interface FusionSession extends AutoCloseable {
     FusionInvocation acquire();
 
     /**
-     * Releases session-owned output storage and workspace.
+     * Releases session-owned output storage and native resources.
      *
      * <p>The caller must close or otherwise finish every invocation and output lease before closing
      * the session. A backend may exceptionally wait for an incomplete failed submission during

@@ -68,6 +68,8 @@ final class PyTorchLibrary {
 
     native long torchPrepareFusionPlan(int[] device, ByteBuffer descriptor);
 
+    native long[] torchGetFusionPlanStats(long planHandle);
+
     native long torchBindFusionPlan(long planHandle, ByteBuffer constantHandles);
 
     native long torchCreateFusionSession(long executableHandle, int bufferCount);

@@ -184,6 +184,10 @@ public final class JniUtils {
                 new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}, descriptor);
     }
 
+    public static long[] getFusionPlanStats(long planHandle) {
+        return PyTorchLibrary.LIB.torchGetFusionPlanStats(planHandle);
+    }
+
     /**
      * Returns the fusion backend compiled into the loaded native library.
      *

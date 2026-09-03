@@ -15,6 +15,7 @@ package ai.djl.pytorch.engine;
 import ai.djl.Device;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
+import ai.djl.engine.fusion.FusionCompilationReport;
 import ai.djl.engine.fusion.FusionConstantBindings;
 import ai.djl.engine.fusion.FusionExecutable;
 import ai.djl.engine.fusion.FusionInvocation;
@@ -388,6 +389,43 @@ public class PtFusionTest {
                         lease.get(fixture.output).toFloatArray(),
                         new float[] {4f, 6f, 8f, 10f, 20f, 30f, 4f, 5f, 6f, 0f, 0f, 0f},
                         1e-3f);
+            }
+        }
+    }
+
+    @Test
+    public void gpuIdentityPackChainUsesExportedOutputBacking() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        IdentityPackChainFixture fixture = new IdentityPackChainFixture();
+        Device device = Device.gpu(0);
+        try (NDManager manager = engine.newBaseManager(device);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                FusionSession session =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                NDArray input = manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2));
+                FusionInvocation invocation = session.acquire()) {
+            FusionCompilationReport report = plan.getCompilationReport();
+            Assert.assertEquals(report.getStoragePlannerVersion(), 4);
+            Assert.assertEquals(report.getPersistentStorageBytes(), 32L);
+            Assert.assertEquals(report.getExportedOutputBytes(), 32L);
+            Assert.assertEquals(report.getWorkspaceBytes(), 0L);
+            Assert.assertEquals(report.getArenaBytes(), 0L);
+            Assert.assertEquals(report.getInPlaceReuseCount(), 1L);
+            Assert.assertEquals(report.getBackingAllocationCount(), 1L);
+            Assert.assertEquals(report.getAliasViewCount(), 1L);
+
+            invocation.setInput(fixture.input, input);
+            invocation.setDimension(fixture.rows, 2);
+            try (FusionOutputLease lease = invocation.submit()) {
+                lease.synchronize();
+                NDArray output = lease.get(fixture.output);
+                Assert.assertEquals(output.getShape(), new Shape(4, 2));
+                Assert.assertEquals(output.get("0:2").toFloatArray(), input.toFloatArray());
             }
         }
     }
@@ -1387,6 +1425,11 @@ public class PtFusionTest {
                     FusionSession session =
                             executable.newSession(manager, FusionSessionConfig.defaults());
                     FusionInvocation invocation = session.acquire()) {
+                FusionCompilationReport report = plan.getCompilationReport();
+                Assert.assertEquals(report.getStoragePlannerVersion(), 4);
+                Assert.assertTrue(report.getArenaBytes() > 0);
+                Assert.assertTrue(
+                        report.getBackingAllocationCount() < report.getLogicalAllocationCount());
                 fixture.setInputs(invocation, first, second, 2);
                 try (FusionOutputLease lease = invocation.submit()) {
                     lease.synchronize();
@@ -2813,6 +2856,25 @@ public class PtFusionTest {
                             baselinePresence,
                             selectedPresence);
             output = builder.addOutput("output", blend);
+            recipe = builder.build();
+        }
+    }
+
+    private static final class IdentityPackChainFixture {
+
+        private final FusionRecipe.Dimension rows;
+        private final FusionRecipe.Input input;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private IdentityPackChainFixture() {
+            FusionRecipe.Builder builder = FusionRecipe.builder("identity-pack-chain");
+            rows = builder.addDimension("rows", 4);
+            input =
+                    builder.addInput(
+                            "input", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 2));
+            FusionRecipe.OutputPack first = builder.outputPack("first", input);
+            output = builder.addOutput("output", builder.outputPack("second", first));
             recipe = builder.build();
         }
     }

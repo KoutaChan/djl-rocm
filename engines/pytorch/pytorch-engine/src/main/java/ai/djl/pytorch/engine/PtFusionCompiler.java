@@ -60,18 +60,32 @@ final class PtFusionCompiler implements FusionCompiler {
 
         String backendName = fusionBackendName(JniUtils.getFusionBackend());
         ByteBuffer descriptor = PtFusionDescriptor.encode(recipe);
-        FusionCompilationReport report =
-                FusionCompilationReport.builder("PyTorch " + backendName + " AOT")
-                        .optCommandCount(PtFusionDescriptor.commandCount(recipe))
-                        .optExecutableStorageBytes(
-                                PtFusionDescriptor.executableStorageBytes(recipe))
-                        .optPersistentStorageBytes(
-                                PtFusionDescriptor.persistentStorageBytes(recipe))
-                        .optWorkspaceBytes(PtFusionDescriptor.workspaceBytes(recipe))
-                        .optNativeOnly(true)
-                        .build();
         long handle = JniUtils.prepareFusionPlan(device, descriptor);
         try {
+            long[] stats = JniUtils.getFusionPlanStats(handle);
+            if (stats == null || stats.length != 10) {
+                throw new IllegalStateException("Invalid native Fusion plan statistics.");
+            }
+            for (long value : stats) {
+                if (value < 0) {
+                    throw new IllegalStateException("Invalid native Fusion plan statistics.");
+                }
+            }
+            FusionCompilationReport report =
+                    FusionCompilationReport.builder("PyTorch " + backendName + " AOT")
+                            .optCommandCount(PtFusionDescriptor.commandCount(recipe))
+                            .optExecutableStorageBytes(stats[0])
+                            .optPersistentStorageBytes(stats[1])
+                            .optWorkspaceBytes(stats[2])
+                            .optExportedOutputBytes(stats[3])
+                            .optArenaBytes(stats[4])
+                            .optStoragePlannerVersion(Math.toIntExact(stats[5]))
+                            .optLogicalAllocationCount(stats[6])
+                            .optBackingAllocationCount(stats[7])
+                            .optAliasViewCount(stats[8])
+                            .optInPlaceReuseCount(stats[9])
+                            .optNativeOnly(true)
+                            .build();
             return new PtFusionPlan(device, recipe, report, handle);
         } catch (RuntimeException | Error failure) {
             try {

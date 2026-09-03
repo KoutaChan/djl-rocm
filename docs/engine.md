@@ -53,3 +53,38 @@ You can also choose the default engine manually. Each engine has a name which ca
 engine's javadoc or README. You can set the default engine by setting either the 
 "DJL_DEFAULT_ENGINE" environment variable or the "ai.djl.default_engine" Java property. 
 Either one should be set to the name of the desired default engine.
+
+## Fusion storage planning
+
+Engines that implement `FusionCompiler` may reduce accelerator memory by sharing command scratch,
+reusing storage after a computed value's last consumer, and executing certified operations in place.
+These optimizations are enabled by default. They preserve public output storage until its output
+lease is released and never share storage between session buffer slots.
+
+The following environment variables control the planner phases:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `DJL_FUSION_SCRATCH_PLANNER` | `true` | Shares command-local scratch storage according to its command-internal lifetime. |
+| `DJL_FUSION_INTERMEDIATE_PLANNER` | `true` | Reuses computed intermediate storage after its final consumer. |
+| `DJL_FUSION_INPLACE_PLANNER` | `true` | Hands dead intermediate storage to operations with a verified in-place execution path. Requires intermediate planning. |
+
+Set a variable to `0` or `false` before the process starts to disable that phase for diagnostics or
+performance comparison. Accepted enabled values are `1` and `true`; other values are rejected.
+Disabling intermediate planning also disables in-place planning.
+
+Planner statistics are available through `FusionPlan.getCompilationReport()`, including persistent,
+workspace, exported-output, and arena bytes as well as logical allocation, backing allocation,
+alias-view, and in-place reuse counts.
+
+`getPersistentStorageBytes()` is the peak payload for an active slot. Only exported-output storage
+is pinned for the full slot lifetime. Planner arenas are acquired on the submission stream and
+released after work is enqueued, allowing the engine's device-wide caching allocator to reuse that
+workspace across plans and sessions once stream work completes. Consequently, idle Fusion plans do
+not each retain their reported arena capacity; concurrent submissions still receive independent
+storage. When scratch and intermediate planning are both enabled, temporary tensors of different
+data types share one alignment-safe byte arena according to their lifetimes.
+
+The settings are engine-neutral. Currently, the native planner is implemented by the PyTorch CUDA
+and ROCm Fusion backend. Other engines may adopt the same settings when they implement equivalent
+storage lifetime guarantees.

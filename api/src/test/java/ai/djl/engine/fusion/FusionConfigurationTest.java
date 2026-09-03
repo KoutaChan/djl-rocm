@@ -80,6 +80,13 @@ public class FusionConfigurationTest {
                         .optExecutableStorageBytes(64)
                         .optPersistentStorageBytes(256)
                         .optWorkspaceBytes(128)
+                        .optExportedOutputBytes(128)
+                        .optArenaBytes(96)
+                        .optStoragePlannerVersion(2)
+                        .optLogicalAllocationCount(7)
+                        .optBackingAllocationCount(4)
+                        .optAliasViewCount(5)
+                        .optInPlaceReuseCount(2)
                         .optNativeOnly(true)
                         .build();
         Assert.assertEquals(report.getBackend(), "test-backend");
@@ -87,6 +94,14 @@ public class FusionConfigurationTest {
         Assert.assertEquals(report.getExecutableStorageBytes(), 64);
         Assert.assertEquals(report.getPersistentStorageBytes(), 256);
         Assert.assertEquals(report.getWorkspaceBytes(), 128);
+        Assert.assertEquals(report.getExportedOutputBytes(), 128);
+        Assert.assertEquals(report.getArenaBytes(), 96);
+        Assert.assertEquals(report.getStoragePlannerVersion(), 2);
+        Assert.assertTrue(report.isStoragePlannerEnabled());
+        Assert.assertEquals(report.getLogicalAllocationCount(), 7);
+        Assert.assertEquals(report.getBackingAllocationCount(), 4);
+        Assert.assertEquals(report.getAliasViewCount(), 5);
+        Assert.assertEquals(report.getInPlaceReuseCount(), 2);
         Assert.assertTrue(report.isNativeOnly());
 
         FusionSessionConfig defaults = FusionSessionConfig.defaults();
@@ -109,11 +124,23 @@ public class FusionConfigurationTest {
                 IllegalArgumentException.class,
                 () -> FusionCompilationReport.builder("test").optWorkspaceBytes(-1));
         Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> FusionCompilationReport.builder("test").optInPlaceReuseCount(-1));
+        Assert.assertThrows(
+                IllegalStateException.class, () -> FusionCompilationReport.builder("test").build());
+        Assert.assertThrows(
                 IllegalStateException.class,
                 () ->
                         FusionCompilationReport.builder("test")
                                 .optPersistentStorageBytes(64)
                                 .optWorkspaceBytes(128)
+                                .build());
+        Assert.assertThrows(
+                IllegalStateException.class,
+                () ->
+                        FusionCompilationReport.builder("test")
+                                .optLogicalAllocationCount(1)
+                                .optInPlaceReuseCount(2)
                                 .build());
     }
 
