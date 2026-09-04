@@ -23,7 +23,7 @@
 
 #if defined(DJL_USE_ROCM_KERNELS)
 #include <ATen/hip/HIPContextLight.h>
-#include <ATen/cuda/tunable/Tunable.h>
+#include <ATen/hip/tunable/Tunable.h>
 #include <c10/hip/HIPCachingAllocator.h>
 #include <c10/hip/HIPStream.h>
 #include <hipblaslt/hipblaslt.h>
