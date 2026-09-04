@@ -22,9 +22,9 @@
  *
  * <p>The persistent recipe API is complementary and inference-only. A recipe declares a closed set
  * of stages rather than an arbitrary operator graph. Its {@link ai.djl.engine.fusion.FusionSession
- * FusionSession} reuses ring-slot output and workspace storage, so session submissions do not
- * participate in automatic differentiation. Use a corresponding method in {@code FusionFunctions}
- * when gradients are required.
+ * FusionSession} reuses ring-slot output storage and engine-owned device-stream temporary arenas,
+ * so session submissions do not participate in automatic differentiation. Use a corresponding
+ * method in {@code FusionFunctions} when gradients are required.
  *
  * <p>{@link ai.djl.engine.fusion.FusionRecipe.AffineSum AffineSum} projects and sums dynamic
  * values, fixed singleton-leading values, and an optional bias before applying a supported
@@ -53,14 +53,18 @@
  * <p>The persistent inference lifecycle is {@code recipe -> plan -> executable -> session ->
  * invocation -> output lease}. Preparation validates shapes and builds a bounded command plan.
  * Binding retains caller constants and may create backend-owned packed constants or precomputed
- * values. A session owns a ring of maximum-shape output and workspace slots. One invocation submits
- * the whole recipe, and its lease keeps the selected slot alive until downstream work no longer
- * uses its outputs. {@link ai.djl.engine.fusion.FusionCompilationReport FusionCompilationReport}
- * reports shared per-executable storage separately from output and workspace storage allocated for
- * every slot.
+ * values. Preparation may compile smaller storage-capacity profiles in addition to the always
+ * available recipe-maximum plan. A session fixes one selected profile for its lifetime and owns a
+ * ring of output slots at that capacity. The engine shares a planner arena across sessions that
+ * submit on the same device stream. One invocation submits the whole recipe, and its lease keeps
+ * the selected output slot alive until downstream work no longer uses its outputs. {@link
+ * ai.djl.engine.fusion.FusionCompilationReport FusionCompilationReport} reports shared
+ * per-executable storage, session-retained slot storage, and execution-lane arena capacity
+ * separately for the maximum plan and each compiled profile.
  *
  * <p>Execution sessions are externally serialized: method executions using a session and its
  * derived handles are not thread-safe and must not overlap. Outstanding handle lifetimes may
- * coexist on distinct ring slots, and sequential calls may move between threads.
+ * coexist on distinct ring slots. The first submission selects the session's accelerator stream;
+ * sequential calls may move between threads only while that same stream is current.
  */
 package ai.djl.engine.fusion;

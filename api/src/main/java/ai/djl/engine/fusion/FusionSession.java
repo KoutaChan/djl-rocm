@@ -13,7 +13,7 @@
 package ai.djl.engine.fusion;
 
 /**
- * An externally serialized fusion execution lane with persistent output and workspace slots.
+ * An externally serialized fusion execution session with persistent output slots.
  *
  * <p>A session is inference-only. Its outputs refer to reusable ring-slot storage and do not
  * participate in automatic differentiation. Use {@link FusionFunctions} for caller-owned results
@@ -22,7 +22,9 @@ package ai.djl.engine.fusion;
  * <p>Method executions through a session, its invocations, and its output leases are not
  * thread-safe and must be externally serialized. Outstanding invocation or lease lifetimes may
  * coexist on distinct ring slots; only their method executions must not overlap. Sequential calls
- * may move between threads after the preceding call completes.
+ * may move between threads after the preceding call completes when the same accelerator stream is
+ * current. The first submission selects that stream for the session. Sessions selected onto the
+ * same device stream share engine-owned temporary planner storage.
  */
 public interface FusionSession extends AutoCloseable {
 
@@ -32,6 +34,14 @@ public interface FusionSession extends AutoCloseable {
      * @return the fusion recipe
      */
     FusionRecipe getRecipe();
+
+    /**
+     * Returns the fixed storage capacity selected for a recipe dimension.
+     *
+     * @param dimension the recipe dimension
+     * @return the session capacity
+     */
+    long getCapacity(FusionRecipe.Dimension dimension);
 
     /**
      * Acquires an available ring slot for one invocation.
@@ -47,7 +57,7 @@ public interface FusionSession extends AutoCloseable {
     FusionInvocation acquire();
 
     /**
-     * Releases session-owned output storage and workspace.
+     * Releases session-owned output storage and native resources.
      *
      * <p>The caller must close or otherwise finish every invocation and output lease before closing
      * the session. A backend may exceptionally wait for an incomplete failed submission during

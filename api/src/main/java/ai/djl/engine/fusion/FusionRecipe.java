@@ -26,9 +26,9 @@ import java.util.Set;
  * Describes a bounded, inference-only computation that an engine can prepare for repeated use.
  *
  * <p>A recipe is immutable and does not contain engine resources. Tensor storage has a fixed
- * maximum shape. A tensor may use one named leading {@link Dimension}; an invocation supplies the
- * active extent of that dimension without changing the storage capacity. Inner dimensions are
- * always fixed.
+ * declared maximum shape. A tensor may use one named leading {@link Dimension}; a compiled shape
+ * profile may select a smaller fixed session capacity, and an invocation supplies an active extent
+ * within that capacity without changing storage. Inner dimensions are always fixed.
  *
  * <p>The API exposes a closed set of inference stages. {@link AffineSum} projects several values
  * into one width, adds the projected values with fixed-shape broadcasting, and optionally applies

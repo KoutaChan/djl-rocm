@@ -15,6 +15,7 @@
 
 #include <ATen/autocast_mode.h>
 #include <ATen/ops/addmm.h>
+#include <c10/core/DeviceGuard.h>
 #include <torch/csrc/autograd/custom_function.h>
 
 #if defined(DJL_USE_FUSION_KERNELS)
@@ -97,6 +98,7 @@ class ProjectedResidualMlpFunction
     const auto& combined_weight = saved.at(1);
     const auto& output_weight = saved.at(2);
     const auto& combined = saved.at(3);
+    c10::DeviceGuard device_guard(flattened_input.device());
     const int64_t rows = flattened_input.size(0);
     const int64_t output_width = output_weight.size(0);
     const int64_t hidden_width = output_weight.size(1);
@@ -152,6 +154,7 @@ ProjectedResidualMlpForwardResult projected_residual_mlp_forward(
     const torch::Tensor& input, const torch::Tensor& combined_weight,
     const torch::Tensor& combined_bias, const torch::Tensor& output_weight,
     torch::Tensor combined, torch::Tensor activated, torch::Tensor output) {
+  c10::DeviceGuard device_guard(input.device());
   const int64_t input_width = input.size(-1);
   const int64_t rows = input.numel() / input_width;
   const int64_t output_width = output_weight.size(0);
@@ -195,6 +198,7 @@ ProjectedResidualMlpForwardResult projected_residual_mlp_forward(
 torch::Tensor projected_residual_mlp(const torch::Tensor& input,
     const torch::Tensor& combined_weight, const torch::Tensor& combined_bias,
     const torch::Tensor& output_weight) {
+  c10::DeviceGuard device_guard(input.device());
 #if defined(DJL_USE_FUSION_KERNELS)
   torch::Tensor operation_input = input;
   torch::Tensor operation_combined_weight = combined_weight;

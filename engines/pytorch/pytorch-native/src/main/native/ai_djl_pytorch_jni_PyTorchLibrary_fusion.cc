@@ -1,14 +1,16 @@
 /*
  * Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
- * with the License. A copy of the License is located at
+ * Licensed under the Apache License, Version 2.0 (the "License"). You may not
+ * use this file except in compliance with the License. A copy of the License is
+ * located at
  *
  * http://aws.amazon.com/apache2.0/
  *
- * or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
- * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
- * and limitations under the License.
+ * or in the "license" file accompanying this file. This file is distributed on
+ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+ * express or implied. See the License for the specific language governing
+ * permissions and limitations under the License.
  */
 #include <djl/utils.h>
 
@@ -26,8 +28,9 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetFusionBackend(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPrepareFusionPlan(
-    JNIEnv* env, jobject jthis, jintArray jdevice, jobject jdescriptor) {
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPrepareFusionPlanWithProfiles(
+    JNIEnv* env, jobject jthis, jintArray jdevice, jobject jdescriptor,
+    jobject jprofile_descriptor) {
   API_BEGIN()
   const torch::Device device = utils::GetDeviceFromJDevice(env, jdevice);
   const auto* descriptor =
@@ -36,13 +39,44 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchPrepareFusionPlan(
   TORCH_CHECK(capacity >= 0 && capacity % sizeof(int64_t) == 0 &&
           (capacity == 0 || descriptor != nullptr),
       "fusion descriptor must be a direct long buffer");
+  const auto* profile_descriptor = static_cast<const int64_t*>(
+      env->GetDirectBufferAddress(jprofile_descriptor));
+  const jlong profile_capacity =
+      env->GetDirectBufferCapacity(jprofile_descriptor);
+  TORCH_CHECK(profile_capacity >= 0 &&
+          profile_capacity % sizeof(int64_t) == 0 &&
+          (profile_capacity == 0 || profile_descriptor != nullptr),
+      "fusion profile descriptor must be a direct long buffer");
   return reinterpret_cast<uintptr_t>(djl::pytorch::fusion::PrepareFusionPlan(
-      device, descriptor, static_cast<std::size_t>(capacity) / sizeof(int64_t)));
+      device, descriptor, static_cast<std::size_t>(capacity) / sizeof(int64_t),
+      profile_descriptor,
+      static_cast<std::size_t>(profile_capacity) / sizeof(int64_t)));
   API_END_RETURN()
 }
 
-extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBindFusionPlan(
+extern "C" JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetFusionPlanVariantStats(
+    JNIEnv* env, jobject jthis, jlong jplan, jint jvariant_index) {
+  API_BEGIN()
+  const auto stats =
+      djl::pytorch::fusion::GetFusionPlanStats(
+          reinterpret_cast<const djl::pytorch::fusion::FusionPlan*>(jplan),
+          jvariant_index);
+  const jlong values[]{static_cast<jlong>(stats.executable_storage_bytes),
+      static_cast<jlong>(stats.persistent_storage_bytes), static_cast<jlong>(stats.workspace_bytes),
+      static_cast<jlong>(stats.exported_output_bytes), static_cast<jlong>(stats.arena_bytes),
+      static_cast<jlong>(stats.planner_version), static_cast<jlong>(stats.logical_allocation_count),
+      static_cast<jlong>(stats.backing_allocation_count), static_cast<jlong>(stats.alias_view_count),
+      static_cast<jlong>(stats.in_place_reuse_count),
+      static_cast<jlong>(stats.backend_workspace_upper_bound_bytes)};
+  constexpr jsize kStorageStatCount = 11;
+  jlongArray result = env->NewLongArray(kStorageStatCount);
+  TORCH_CHECK(result != nullptr, "failed to allocate fusion storage statistics");
+  env->SetLongArrayRegion(result, 0, kStorageStatCount, values);
+  return result;
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBindFusionPlan(
     JNIEnv* env, jobject jthis, jlong jplan, jobject jconstant_handles) {
   API_BEGIN()
   const auto* constant_handles =
@@ -58,29 +92,31 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBindFusionPlan(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateFusionSession(
-    JNIEnv* env, jobject jthis, jlong jexecutable, jint jbuffer_count) {
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchCreateFusionProfileSession(
+    JNIEnv* env, jobject jthis, jlong jexecutable, jint jvariant_index,
+    jint joutput_slot_count) {
   API_BEGIN()
   return reinterpret_cast<uintptr_t>(djl::pytorch::fusion::NewFusionSession(
       reinterpret_cast<const djl::pytorch::fusion::FusionExecutable*>(jexecutable),
-      jbuffer_count));
+      jvariant_index, joutput_slot_count));
   API_END_RETURN()
 }
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetFusionSessionOutput(
-    JNIEnv* env, jobject jthis, jlong jsession, jint jbuffer_index, jint joutput_index) {
+    JNIEnv* env, jobject jthis, jlong jsession, jint joutput_slot_index,
+    jint joutput_index) {
   API_BEGIN()
   torch::Tensor output = djl::pytorch::fusion::GetFusionSessionOutput(
       reinterpret_cast<const djl::pytorch::fusion::FusionSession*>(jsession),
-      jbuffer_index, joutput_index);
+      joutput_slot_index, joutput_index);
   return reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(output)));
   API_END_RETURN()
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSubmitFusion(
-    JNIEnv* env, jobject jthis, jlong jsession, jint jbuffer_index,
+    JNIEnv* env, jobject jthis, jlong jsession, jint joutput_slot_index,
     jobject jinput_handles, jobject jdimensions) {
   API_BEGIN()
   const auto* input_handles =
@@ -97,7 +133,7 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSubmitFusion(
       "fusion dimensions must be a direct long buffer");
   djl::pytorch::fusion::SubmitFusion(
       reinterpret_cast<djl::pytorch::fusion::FusionSession*>(jsession),
-      jbuffer_index, input_handles,
+      joutput_slot_index, input_handles,
       static_cast<std::size_t>(input_capacity) / sizeof(int64_t), dimensions,
       static_cast<std::size_t>(dimension_capacity) / sizeof(int64_t));
   API_END()
@@ -105,11 +141,11 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSubmitFusion(
 
 extern "C" JNIEXPORT void JNICALL
 Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSynchronizeFusionOutput(
-    JNIEnv* env, jobject jthis, jlong jsession, jint jbuffer_index) {
+    JNIEnv* env, jobject jthis, jlong jsession, jint joutput_slot_index) {
   API_BEGIN()
   djl::pytorch::fusion::SynchronizeFusionOutput(
       reinterpret_cast<djl::pytorch::fusion::FusionSession*>(jsession),
-      jbuffer_index);
+      joutput_slot_index);
   API_END()
 }
 

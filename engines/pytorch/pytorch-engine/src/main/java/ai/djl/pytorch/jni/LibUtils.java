@@ -127,6 +127,9 @@ public final class LibUtils {
         boolean isCuda = libTorch.flavor.startsWith("cu");
         boolean isRocm = libTorch.flavor.startsWith("rocm");
         boolean isWindowsRocm = isRocm && libTorch.classifier.startsWith("win");
+        if (libTorch.flavor.startsWith("rocm10.") && !isWindowsRocm) {
+            preloadRocmLibraries(libTorch.flavor);
+        }
         List<String> deferred =
                 Arrays.asList(
                         System.mapLibraryName("fbgemm"),
@@ -260,6 +263,80 @@ public final class LibUtils {
         addIfExists(libraries, libDir, System.mapLibraryName("torch_hip"));
         addIfExists(libraries, libDir, System.mapLibraryName("torch"));
         return libraries;
+    }
+
+    private static void preloadRocmLibraries(String flavor) {
+        File root = findRocmRoot(flavor);
+        if (root == null) {
+            return;
+        }
+        List<Path> directories =
+                Arrays.asList(
+                        root.toPath().resolve("lib"),
+                        root.toPath().resolve("lib/host-math/lib"),
+                        root.toPath().resolve("lib/rocm_sysdeps/lib"));
+        List<String> libraries =
+                Arrays.asList(
+                        "amd_comgr",
+                        "amdhip64",
+                        "rocprofiler-sdk",
+                        "rocprofiler-sdk-roctx",
+                        "roctracer64",
+                        "roctx64",
+                        "hiprtc",
+                        "hipblas",
+                        "hipfft",
+                        "hiprand",
+                        "hipsparse",
+                        "hipsparselt",
+                        "hipsolver",
+                        "rccl",
+                        "hipblaslt",
+                        "MIOpen",
+                        "hipdnn",
+                        "rocm-openblas",
+                        "rocm_smi64");
+        for (String library : libraries) {
+            Path path = findVersionedLibrary(directories, library);
+            if (path != null) {
+                loadNativeLibrary(path.toString());
+            }
+        }
+    }
+
+    private static Path findVersionedLibrary(List<Path> directories, String shortName) {
+        String prefix = "lib" + shortName + ".so";
+        for (Path directory : directories) {
+            if (!Files.isDirectory(directory)) {
+                continue;
+            }
+            try (Stream<Path> paths = Files.list(directory)) {
+                Path match =
+                        paths.filter(Files::isRegularFile)
+                                .filter(path -> path.getFileName().toString().startsWith(prefix))
+                                .sorted()
+                                .findFirst()
+                                .orElse(null);
+                if (match != null) {
+                    return match.toAbsolutePath();
+                }
+            } catch (IOException e) {
+                logger.debug("Failed to inspect ROCm library directory: {}", directory, e);
+            }
+        }
+        return null;
+    }
+
+    static String detectRocmFlavor() {
+        String override = Utils.getEnvOrSystemProperty("DJL_ROCM_VERSION");
+        if (override != null && !override.isEmpty()) {
+            return "rocm" + override;
+        }
+        if (!System.getProperty("os.name", "").toLowerCase().startsWith("linux")) {
+            return null;
+        }
+        File root = findRocmRoot(null);
+        return root == null ? null : "rocm" + readRocmVersion(root);
     }
 
     private static void addIfExists(List<Path> libraries, Path libDir, String name) {
@@ -641,7 +718,7 @@ public final class LibUtils {
             }
             flavor = Utils.getEnvOrSystemProperty("PYTORCH_FLAVOR");
             if (flavor == null || flavor.isEmpty()) {
-                String rocmFlavor = detectRocmFlavor();
+                String rocmFlavor = LibUtils.detectRocmFlavor();
                 if (CudaUtils.getGpuCount() > 0) {
                     flavor = "cu" + CudaUtils.getCudaVersionString() + "-precxx11";
                 } else if (rocmFlavor != null) {
@@ -661,51 +738,58 @@ public final class LibUtils {
             this.classifier = platform.getClassifier();
             this.flavor = flavor;
         }
+    }
 
-        /**
-         * Detect a ROCm installation under /opt/rocm* and return a flavor string (e.g. "rocm6.3"),
-         * or {@code null} if none is found. Override with the {@code DJL_ROCM_VERSION} env var
-         * (e.g. {@code DJL_ROCM_VERSION=6.3}).
-         */
-        private static String detectRocmFlavor() {
-            String override = Utils.getEnvOrSystemProperty("DJL_ROCM_VERSION");
-            if (override != null && !override.isEmpty()) {
-                return "rocm" + override;
-            }
-            if (!System.getProperty("os.name", "").toLowerCase().startsWith("linux")) {
-                return null;
-            }
-            File rocmRoot = new File("/opt/rocm");
-            if (!rocmRoot.exists()) {
-                return null;
-            }
-            File versionFile = new File(rocmRoot, ".info/version");
-            if (versionFile.exists()) {
-                try {
-                    String version =
-                            new String(
-                                            Files.readAllBytes(versionFile.toPath()),
-                                            StandardCharsets.UTF_8)
-                                    .trim();
-                    Matcher m = Pattern.compile("(\\d+\\.\\d+)").matcher(version);
-                    if (m.find()) {
-                        return "rocm" + m.group(1);
-                    }
-                } catch (IOException ignored) {
-                    // fall through
-                }
-            }
-            // fallback: look for sibling directories like /opt/rocm-6.3
-            File[] siblings = rocmRoot.getParentFile().listFiles();
-            if (siblings != null) {
-                for (File f : siblings) {
-                    Matcher m = Pattern.compile("rocm-(\\d+\\.\\d+)").matcher(f.getName());
-                    if (m.matches()) {
-                        return "rocm" + m.group(1);
-                    }
-                }
-            }
-            return null;
+    private static File findRocmRoot(String flavor) {
+        String configured = Utils.getEnvOrSystemProperty("ROCM_PATH");
+        if (configured == null || configured.isEmpty()) {
+            configured = Utils.getEnvOrSystemProperty("ROCM_HOME");
         }
+        if (configured != null && !configured.isEmpty()) {
+            File root = new File(configured);
+            if (readRocmVersion(root) != null) {
+                return root;
+            }
+        }
+
+        String requested = flavor == null ? null : flavor.substring("rocm".length());
+        File opt = new File("/opt");
+        File rocm = new File(opt, "rocm");
+        List<File> candidates = new ArrayList<>();
+        candidates.add(rocm);
+        File[] cores =
+                rocm.listFiles(file -> file.isDirectory() && file.getName().startsWith("core-"));
+        if (cores != null) {
+            candidates.addAll(Arrays.asList(cores));
+        }
+        File[] siblings =
+                opt.listFiles(file -> file.isDirectory() && file.getName().startsWith("rocm-"));
+        if (siblings != null) {
+            candidates.addAll(Arrays.asList(siblings));
+        }
+        return candidates.stream()
+                .filter(file -> readRocmVersion(file) != null)
+                .filter(file -> requested == null || readRocmVersion(file).startsWith(requested))
+                .max(Comparator.comparing(file -> new Version(readRocmVersion(file))))
+                .orElse(null);
+    }
+
+    static String readRocmVersion(File root) {
+        File versionFile = new File(root, ".info/version");
+        if (versionFile.isFile()) {
+            try {
+                String text =
+                        new String(Files.readAllBytes(versionFile.toPath()), StandardCharsets.UTF_8)
+                                .trim();
+                Matcher matcher = Pattern.compile("(\\d+\\.\\d+)(?:\\.\\d+)?").matcher(text);
+                if (matcher.find()) {
+                    return matcher.group(1);
+                }
+            } catch (IOException ignored) {
+                // Try the directory name below.
+            }
+        }
+        Matcher matcher = Pattern.compile("(?:rocm-|core-)(\\d+\\.\\d+)").matcher(root.getName());
+        return matcher.matches() ? matcher.group(1) : null;
     }
 }

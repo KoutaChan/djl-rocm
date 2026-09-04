@@ -4,7 +4,7 @@
 #
 # Expected env vars:
 #   PT_VERSION         e.g. 2.9.1
-#   FLAVOR             e.g. cpu, cu128, rocm7.2
+#   FLAVOR             e.g. cpu, cu128, rocm7.2, rocm10.0
 #   CLASSIFIER         e.g. linux-x86_64
 #   GITHUB_ACTOR       passed through for Maven publish auth
 #   GITHUB_TOKEN       passed through for Maven publish auth
@@ -16,7 +16,7 @@
 set -euxo pipefail
 
 install_base_packages() {
-    local packages=(git curl unzip cmake g++ make ca-certificates)
+    local packages=(git curl unzip cmake g++ make ca-certificates python3 python3-pip python3-venv)
     if ! command -v java >/dev/null 2>&1; then
         packages+=(openjdk-21-jdk-headless)
     fi
@@ -49,6 +49,23 @@ install_cuda_packages() {
 }
 
 install_rocm_packages() {
+    if [[ "$FLAVOR" == rocm10.* ]]; then
+        python3 -m venv /opt/djl-rocm-build
+        source /opt/djl-rocm-build/bin/activate
+        python -m pip install --upgrade pip
+        python -m pip install \
+            --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+            "torch[device-gfx1100]==${PT_VERSION}+rocm10.0.0" \
+            "rocm[libraries,devel,device-gfx1100]==10.0.0"
+        rocm-sdk init
+        export ROCM_PATH
+        ROCM_PATH=$(rocm-sdk path --root)
+        export CMAKE_PREFIX_PATH
+        CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)
+        export PATH="$(rocm-sdk path --bin):${PATH}"
+        export PYTORCH_ROCM_ARCH=gfx1100
+        return
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rccl-dev
     export REQUIRE_DISTRIBUTED_NCCL=ON
 }

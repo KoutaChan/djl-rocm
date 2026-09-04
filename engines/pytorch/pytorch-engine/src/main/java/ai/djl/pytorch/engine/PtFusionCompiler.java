@@ -22,6 +22,8 @@ import ai.djl.engine.fusion.FusionShapeProfile;
 import ai.djl.pytorch.jni.JniUtils;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /** PyTorch accelerator implementation of the bounded fusion compiler. */
@@ -51,28 +53,33 @@ final class PtFusionCompiler implements FusionCompiler {
             throw new UnsupportedOperationException(
                     "PyTorch fusion requires a CUDA or ROCm device.");
         }
-        for (FusionShapeProfile profile : config.getShapeProfiles()) {
-            if (profile.getRecipe() != recipe) {
-                throw new IllegalArgumentException(
-                        "A shape profile belongs to a different fusion recipe.");
-            }
-        }
-
+        List<FusionShapeProfile> profiles = new ArrayList<>(config.getShapeProfiles());
+        PtFusionProfileDescriptor.Encoded profileDescriptor =
+                PtFusionProfileDescriptor.encode(recipe, profiles);
         String backendName = fusionBackendName(JniUtils.getFusionBackend());
         ByteBuffer descriptor = PtFusionDescriptor.encode(recipe);
-        FusionCompilationReport report =
-                FusionCompilationReport.builder("PyTorch " + backendName + " AOT")
-                        .optCommandCount(PtFusionDescriptor.commandCount(recipe))
-                        .optExecutableStorageBytes(
-                                PtFusionDescriptor.executableStorageBytes(recipe))
-                        .optPersistentStorageBytes(
-                                PtFusionDescriptor.persistentStorageBytes(recipe))
-                        .optWorkspaceBytes(PtFusionDescriptor.workspaceBytes(recipe))
-                        .optNativeOnly(true)
-                        .build();
-        long handle = JniUtils.prepareFusionPlan(device, descriptor);
+        long handle =
+                JniUtils.prepareFusionPlan(device, descriptor, profileDescriptor.getDescriptor());
         try {
-            return new PtFusionPlan(device, recipe, report, handle);
+            int commandCount = PtFusionDescriptor.commandCount(recipe);
+            FusionCompilationReport report =
+                    buildReport(backendName, commandCount, JniUtils.getFusionPlanStats(handle, 0));
+            List<FusionCompilationReport> profileReports = new ArrayList<>(profiles.size());
+            for (int i = 0; i < profiles.size(); ++i) {
+                profileReports.add(
+                        buildReport(
+                                backendName,
+                                commandCount,
+                                JniUtils.getFusionPlanStats(handle, i + 1)));
+            }
+            return new PtFusionPlan(
+                    device,
+                    recipe,
+                    report,
+                    profiles,
+                    profileDescriptor.getCatalog(),
+                    profileReports,
+                    handle);
         } catch (RuntimeException | Error failure) {
             try {
                 JniUtils.deleteFusionPlan(handle);
@@ -81,6 +88,33 @@ final class PtFusionCompiler implements FusionCompiler {
             }
             throw failure;
         }
+    }
+
+    private static FusionCompilationReport buildReport(
+            String backendName, int commandCount, long[] stats) {
+        if (stats == null || stats.length != 11) {
+            throw new IllegalStateException("Invalid native Fusion plan statistics.");
+        }
+        for (long value : stats) {
+            if (value < 0) {
+                throw new IllegalStateException("Invalid native Fusion plan statistics.");
+            }
+        }
+        return FusionCompilationReport.builder("PyTorch " + backendName + " AOT")
+                .optCommandCount(commandCount)
+                .optExecutableStorageBytes(stats[0])
+                .optExecutionStorageBytes(stats[1])
+                .optWorkspaceBytes(stats[2])
+                .optExportedOutputBytes(stats[3])
+                .optArenaBytes(stats[4])
+                .optStoragePlannerVersion(Math.toIntExact(stats[5]))
+                .optLogicalAllocationCount(stats[6])
+                .optBackingAllocationCount(stats[7])
+                .optAliasViewCount(stats[8])
+                .optInPlaceReuseCount(stats[9])
+                .optBackendWorkspaceUpperBoundBytes(stats[10])
+                .optNativeOnly(true)
+                .build();
     }
 
     private static String fusionBackendName(int backend) {

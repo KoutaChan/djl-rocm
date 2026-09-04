@@ -36,11 +36,13 @@ public interface FusionExecutable extends AutoCloseable {
     /**
      * Creates an externally serialized execution session.
      *
-     * <p>The session allocates {@code bufferCount} persistent output slots at each output's maximum
-     * shape. Method executions using the session, its invocations, and its output leases must be
-     * externally serialized, but outstanding handles may coexist on distinct slots and sequential
-     * calls may move between threads. The supplied manager and its device resources must outlive
-     * the session.
+     * <p>The session selects one compiled storage-capacity profile for its lifetime and allocates
+     * the configured number of persistent output slots at that capacity. Temporary planner storage
+     * is supplied by an engine execution lane shared with other sessions on the same device stream.
+     * Method executions using the session, its invocations, and its output leases must be
+     * externally serialized. All submissions use the accelerator stream selected by the first
+     * submission. Outstanding handles may coexist on distinct output slots. The supplied manager
+     * and its device resources must outlive the session.
      *
      * @param manager the manager used to allocate session resources
      * @param config the session configuration

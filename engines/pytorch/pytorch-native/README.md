@@ -38,7 +38,20 @@ flavor. Fusion Plan is enabled automatically when the JNI library is built for C
 shared command implementation is in `djl_pytorch_fusion_kernels.hip`; CUDA compiles the thin
 `djl_pytorch_fusion_kernels.cu` entry point, and `djl_pytorch_fusion_backend.h` isolates the runtime
 and launch differences. Keep changes to common command behavior in the shared source so CUDA and
-ROCm do not drift.
+ROCm do not drift. Fusion storage planner settings are documented in the
+[engine guide](../../../docs/engine.md#fusion-storage-planning).
+
+### Fusion execution-lane lifetime
+
+Fusion planner arenas are shared by sessions that submit on the same accelerator device and
+stream. Each data-type arena grows to the largest capacity requested on that lane and does not
+shrink while any session retains the lane. A smaller storage-capacity profile avoids a larger arena
+allocation only when the lane has not already observed a larger plan. The lane and its high-water
+allocations are released after the last retaining session is closed; the global registry keeps only
+weak references. This grow-only lifetime avoids allocator traffic and synchronization in the steady
+state. On ROCm, the lane also owns one lazy, grow-only hipBLASLt workspace sized to the largest
+selected fused linear algorithm. This avoids PyTorch's process-lifetime handle/stream workspace
+registry while preserving the selected algorithm and adding no submission synchronization.
 
 ### NVIDIA CUDA
 
@@ -79,6 +92,28 @@ The ROCm flavor configures both `USE_CUDA=1` and `USE_ROCM=1` because hipified l
 PyTorch runtime. The provided ROCm Gradle flavor uses `build.sh` on Linux. A direct Windows build
 also requires a CMake generator and host compiler combination supported by the installed HIP
 toolchain.
+
+ROCm 10 uses AMD's split ROCm and PyTorch wheels instead of the monolithic libtorch archive used by
+earlier releases. Install the matching development SDK and PyTorch package, then build against the
+installed `torch` directory:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+    "torch[device-gfx1100]==2.11.0+rocm10.0.0" \
+    "rocm[libraries,devel,device-gfx1100]==10.0.0"
+rocm-sdk init
+export ROCM_PATH="$(rocm-sdk path --root)"
+export PATH="$(rocm-sdk path --bin):$PATH"
+export PYTORCH_ROCM_ARCH=gfx1100
+./gradlew compileJNI -Pcuda=rocm10.0 -Ppt_version=2.11.0
+```
+
+For a native ROCm 10 SDK installation, set `ROCM_PATH` to its development root (for example
+`/opt/rocm/core-10.0`) and `LIBTORCH_ROOT` to an extracted AMD `torch` wheel. At runtime, keep the
+official wheel packages installed and set `PYTORCH_LIBRARY_PATH` to the wheel's `torch/lib`
+directory. This preserves AMD's version-locked ROCm libraries and per-device `.kpack` packages.
 
 ### Format C++ code
 It uses clang-format to format the code.

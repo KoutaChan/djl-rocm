@@ -15,6 +15,7 @@ package ai.djl.pytorch.engine;
 import ai.djl.Device;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
+import ai.djl.engine.fusion.FusionCompileConfig;
 import ai.djl.engine.fusion.FusionConstantBindings;
 import ai.djl.engine.fusion.FusionExecutable;
 import ai.djl.engine.fusion.FusionInvocation;
@@ -23,6 +24,7 @@ import ai.djl.engine.fusion.FusionPlan;
 import ai.djl.engine.fusion.FusionRecipe;
 import ai.djl.engine.fusion.FusionSession;
 import ai.djl.engine.fusion.FusionSessionConfig;
+import ai.djl.engine.fusion.FusionShapeProfile;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
@@ -99,7 +101,9 @@ public class PtMappedGroupedMaskedSoftmaxPoolTest {
                         FusionSession session =
                                 executable.newSession(
                                         manager,
-                                        FusionSessionConfig.builder().optBufferCount(2).build());
+                                        FusionSessionConfig.builder()
+                                                .optOutputSlotCount(2)
+                                                .build());
                         Inputs inputs = new Inputs(manager, dataType)) {
                     for (int batch : batches) {
                         try (FusionOutputLease lease = fixture.submit(session, inputs, batch)) {
@@ -132,7 +136,7 @@ public class PtMappedGroupedMaskedSoftmaxPoolTest {
                 FusionSession session =
                         executable.newSession(
                                 sessionManager,
-                                FusionSessionConfig.builder().optBufferCount(2).build());
+                                FusionSessionConfig.builder().optOutputSlotCount(2).build());
                 Inputs first = new Inputs(firstInputManager, DataType.FLOAT32);
                 Inputs second = new Inputs(secondInputManager, DataType.FLOAT32)) {
             exercisePair(fixture, session, first, 1, second, 384);
@@ -143,6 +147,56 @@ public class PtMappedGroupedMaskedSoftmaxPoolTest {
             }
             Assert.assertTrue(Float.isFinite(first.scores.getFloat(0, 0)));
             Assert.assertTrue(Float.isFinite(second.values.getFloat(0, 0, 0)));
+        }
+    }
+
+    @Test
+    public void rocmCapacityProfileKeepsMappedOutputOffsetsCapacityRelative() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        int capacity = 31;
+        Fixture fixture = new Fixture(DataType.FLOAT32, ALTERNATIVES, PASS);
+        FusionShapeProfile profile =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.batch, capacity)
+                        .build();
+        FusionCompileConfig compileConfig =
+                FusionCompileConfig.builder().addShapeProfile(profile).build();
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray alternativeMapping = manager.create(ALTERNATIVES);
+                NDArray passMapping = manager.create(PASS);
+                FusionPlan plan =
+                        engine.newFusionCompiler(device).prepare(fixture.recipe, compileConfig);
+                FusionExecutable executable =
+                        plan.bind(fixture.bindings(alternativeMapping, passMapping));
+                FusionSession session =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(profile)
+                                        .optProfileFallback(
+                                                FusionSessionConfig.ProfileFallback.EXACT)
+                                        .build());
+                Inputs inputs = new Inputs(manager, DataType.FLOAT32);
+                FusionOutputLease lease = fixture.submit(session, inputs, capacity)) {
+            lease.synchronize();
+            Assert.assertEquals(session.getCapacity(fixture.batch), capacity);
+            Assert.assertEquals(
+                    lease.get(fixture.alternativeContexts).getShape(),
+                    new Shape(capacity, fixture.firstMapping.length, WIDTH));
+            Assert.assertEquals(
+                    lease.get(fixture.alternativePresence).getShape(),
+                    new Shape(capacity, fixture.firstMapping.length));
+            Assert.assertEquals(
+                    lease.get(fixture.passContext).getShape(),
+                    new Shape(capacity, fixture.secondMapping.length, WIDTH));
+            Assert.assertEquals(
+                    lease.get(fixture.passPresence).getShape(),
+                    new Shape(capacity, fixture.secondMapping.length));
+            assertParity(fixture, lease, inputs, capacity, DataType.FLOAT32, 0);
         }
     }
 

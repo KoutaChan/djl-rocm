@@ -30,8 +30,9 @@ final class PtFusionSlot {
     }
 
     private final PtFusionSession session;
-    private final int bufferIndex;
+    private final int outputSlotIndex;
     private final FusionRecipe recipe;
+    private final long[] capacities;
     private final NDArray[] inputs;
     private final boolean[] inputSet;
     private final boolean[] dimensionSet;
@@ -42,10 +43,12 @@ final class PtFusionSlot {
     private int unsetInputs;
     private int unsetDimensions;
 
-    PtFusionSlot(PtFusionSession session, int bufferIndex, FusionRecipe recipe) {
+    PtFusionSlot(
+            PtFusionSession session, int outputSlotIndex, FusionRecipe recipe, long[] capacities) {
         this.session = session;
-        this.bufferIndex = bufferIndex;
+        this.outputSlotIndex = outputSlotIndex;
         this.recipe = recipe;
+        this.capacities = capacities;
         inputs = new NDArray[recipe.getInputs().size()];
         inputSet = new boolean[inputs.length];
         dimensionSet = new boolean[recipe.getDimensions().size()];
@@ -88,9 +91,9 @@ final class PtFusionSlot {
     void setDimension(long expectedGeneration, FusionRecipe.Dimension dimension, long extent) {
         checkState(expectedGeneration, State.ACQUIRED);
         int index = checkedDimensionIndex(dimension);
-        if (extent < 0 || extent > dimension.getMaximumExtent()) {
+        if (extent < 0 || extent > capacities[index]) {
             throw new IllegalArgumentException(
-                    "The active extent must be between zero and the dimension maximum.");
+                    "The active extent must be between zero and the session capacity.");
         }
         dimensions.putLong(index * Long.BYTES, extent);
         if (!dimensionSet[index]) {
@@ -105,13 +108,13 @@ final class PtFusionSlot {
             throw new IllegalStateException(
                     "Every fusion input and dimension must be set before submission.");
         }
-        session.submit(bufferIndex, inputHandles, dimensions);
+        session.submit(outputSlotIndex, inputHandles, dimensions);
         state = State.SUBMITTED;
     }
 
     NDArray getOutput(long expectedGeneration, FusionRecipe.Output output) {
         checkState(expectedGeneration, State.SUBMITTED);
-        return session.getOutput(bufferIndex, Objects.requireNonNull(output, "output"));
+        return session.getOutput(outputSlotIndex, Objects.requireNonNull(output, "output"));
     }
 
     long getDimension(long expectedGeneration, FusionRecipe.Dimension dimension) {
@@ -122,7 +125,7 @@ final class PtFusionSlot {
 
     void synchronize(long expectedGeneration) {
         checkState(expectedGeneration, State.SUBMITTED);
-        session.synchronize(bufferIndex);
+        session.synchronize(outputSlotIndex);
     }
 
     void closeInvocation(long expectedGeneration) {

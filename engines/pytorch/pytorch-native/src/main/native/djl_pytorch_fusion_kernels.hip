@@ -13,17 +13,36 @@
 #include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_fusion_backend.h"
 
+#include <ATen/Context.h>
+#include <ATen/TensorSubclassLikeUtils.h>
+#include <ATen/autocast_mode.h>
+#include <c10/core/DeviceGuard.h>
+#include <c10/core/InferenceMode.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
+#include <torch/version.h>
+
 #if defined(DJL_USE_ROCM_KERNELS)
 #include <ATen/hip/HIPContextLight.h>
+#include <ATen/cuda/tunable/Tunable.h>
+#include <c10/hip/HIPCachingAllocator.h>
+#include <c10/hip/HIPStream.h>
 #include <hipblaslt/hipblaslt.h>
 #endif
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace djl::pytorch::fusion {
 namespace {
@@ -50,118 +69,312 @@ hipDataType HipBlasLtDataType(torch::ScalarType data_type) {
   }
 }
 
-struct LinearBiasSiluKey {
+enum class FusionMatmulEpilogue : uint8_t {
+  kNone,
+  kBias,
+  kSwishBias,
+};
+
+struct FusionMatmulKey {
   int32_t device;
   torch::ScalarType data_type;
+  int64_t batch_count;
   int64_t rows;
-  int64_t input_width;
-  int64_t output_width;
+  int64_t columns;
+  int64_t reduction;
+  int64_t left_row_stride;
+  int64_t right_leading_dimension;
+  int64_t output_row_stride;
+  int64_t left_batch_stride;
+  int64_t right_batch_stride;
+  int64_t output_batch_stride;
+  bool right_transposed;
+  FusionMatmulEpilogue epilogue;
 
-  bool operator==(const LinearBiasSiluKey& other) const {
+  bool operator==(const FusionMatmulKey& other) const {
     return device == other.device && data_type == other.data_type &&
-        rows == other.rows && input_width == other.input_width &&
-        output_width == other.output_width;
+        batch_count == other.batch_count && rows == other.rows &&
+        columns == other.columns && reduction == other.reduction &&
+        left_row_stride == other.left_row_stride &&
+        right_leading_dimension == other.right_leading_dimension &&
+        output_row_stride == other.output_row_stride &&
+        left_batch_stride == other.left_batch_stride &&
+        right_batch_stride == other.right_batch_stride &&
+        output_batch_stride == other.output_batch_stride &&
+        right_transposed == other.right_transposed &&
+        epilogue == other.epilogue;
   }
 };
 
-struct LinearBiasSiluKeyHash {
-  std::size_t operator()(const LinearBiasSiluKey& key) const {
-    std::size_t value = static_cast<std::size_t>(key.device);
-    value = value * 31 + static_cast<std::size_t>(key.data_type);
-    value = value * 31 + static_cast<std::size_t>(key.rows);
-    value = value * 31 + static_cast<std::size_t>(key.input_width);
-    return value * 31 + static_cast<std::size_t>(key.output_width);
+void HashCombine(std::size_t& hash, std::size_t value) {
+  hash ^= value + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+}
+
+struct FusionMatmulKeyHash {
+  std::size_t operator()(const FusionMatmulKey& key) const {
+    std::size_t hash = std::hash<int32_t>{}(key.device);
+    HashCombine(hash, std::hash<int>{}(static_cast<int>(key.data_type)));
+    HashCombine(hash, std::hash<int64_t>{}(key.batch_count));
+    HashCombine(hash, std::hash<int64_t>{}(key.rows));
+    HashCombine(hash, std::hash<int64_t>{}(key.columns));
+    HashCombine(hash, std::hash<int64_t>{}(key.reduction));
+    HashCombine(hash, std::hash<int64_t>{}(key.left_row_stride));
+    HashCombine(hash,
+        std::hash<int64_t>{}(key.right_leading_dimension));
+    HashCombine(hash, std::hash<int64_t>{}(key.output_row_stride));
+    HashCombine(hash, std::hash<int64_t>{}(key.left_batch_stride));
+    HashCombine(hash, std::hash<int64_t>{}(key.right_batch_stride));
+    HashCombine(hash, std::hash<int64_t>{}(key.output_batch_stride));
+    HashCombine(hash, std::hash<bool>{}(key.right_transposed));
+    HashCombine(hash, std::hash<int>{}(static_cast<int>(key.epilogue)));
+    return hash;
   }
 };
 
-class LinearBiasSiluExecutable {
+bool FusionMatmulDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("DJL_ROCM_MATMUL_CONTEXT_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0';
+  }();
+  return enabled;
+}
+
+void LogFusionMatmulGeometry(const FusionMatmulKey& key,
+    const char* result, std::size_t workspace_size) {
+  if (!FusionMatmulDiagnosticsEnabled()) {
+    return;
+  }
+  std::fprintf(stderr,
+      "[djl-rocm-matmul] geometry result=%s device=%d dtype=%d "
+      "batch=%lld rows=%lld columns=%lld reduction=%lld "
+      "left_row_stride=%lld right_ld=%lld output_row_stride=%lld "
+      "left_batch_stride=%lld right_batch_stride=%lld "
+      "output_batch_stride=%lld right_transposed=%d epilogue=%d "
+      "workspace=%zu\n",
+      result, key.device, static_cast<int>(key.data_type),
+      static_cast<long long>(key.batch_count),
+      static_cast<long long>(key.rows),
+      static_cast<long long>(key.columns),
+      static_cast<long long>(key.reduction),
+      static_cast<long long>(key.left_row_stride),
+      static_cast<long long>(key.right_leading_dimension),
+      static_cast<long long>(key.output_row_stride),
+      static_cast<long long>(key.left_batch_stride),
+      static_cast<long long>(key.right_batch_stride),
+      static_cast<long long>(key.output_batch_stride),
+      key.right_transposed ? 1 : 0, static_cast<int>(key.epilogue),
+      workspace_size);
+}
+
+void ConfigureBatchLayout(hipblasLtMatrixLayout_t layout,
+    int64_t batch_count, int64_t batch_stride, const char* name) {
+  if (batch_count == 1) {
+    return;
+  }
+  TORCH_CHECK(batch_count > 1 &&
+          batch_count <= std::numeric_limits<int32_t>::max(),
+      name, " batch count exceeds the hipBLASLt range");
+  const int32_t count = static_cast<int32_t>(batch_count);
+  CheckHipBlasLt(hipblasLtMatrixLayoutSetAttribute(layout,
+      HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count, sizeof(count)), name);
+  CheckHipBlasLt(hipblasLtMatrixLayoutSetAttribute(layout,
+      HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &batch_stride,
+      sizeof(batch_stride)), name);
+}
+
+class FusionMatmulExecutable {
  public:
-  LinearBiasSiluExecutable(const LinearBiasSiluKey& key,
-      const torch::Tensor& bias) {
-    const hipDataType data_type = HipBlasLtDataType(key.data_type);
-    CheckHipBlasLt(hipblasLtMatmulDescCreate(
-        &operation_, HIPBLAS_COMPUTE_32F, HIP_R_32F),
-        "hipblasLtMatmulDescCreate");
-    const hipblasLtEpilogue_t epilogue =
-        HIPBLASLT_EPILOGUE_SWISH_BIAS_EXT;
-    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
-        HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)),
-        "hipblasLtMatmulDescSetAttribute(epilogue)");
-    const void* bias_pointer = bias.const_data_ptr();
-    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
-        HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
-        sizeof(bias_pointer)),
-        "hipblasLtMatmulDescSetAttribute(bias)");
-    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
-        HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &data_type,
-        sizeof(data_type)),
-        "hipblasLtMatmulDescSetAttribute(bias type)");
-
-    // Contiguous row-major [M,K] * [K,N] is the same memory as the
-    // column-major product [N,K] * [K,M] -> [N,M]. This also makes the
-    // hipBLASLt bias dimension N, matching a Linear output channel.
-    CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&weight_, data_type,
-        key.output_width, key.input_width, key.output_width),
-        "hipblasLtMatrixLayoutCreate(weight)");
-    CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&input_, data_type,
-        key.input_width, key.rows, key.input_width),
-        "hipblasLtMatrixLayoutCreate(input)");
-    CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&output_, data_type,
-        key.output_width, key.rows, key.output_width),
-        "hipblasLtMatrixLayoutCreate(output)");
-
+  FusionMatmulExecutable(
+      hipblasLtHandle_t handle, const FusionMatmulKey& key,
+      const void* heuristic_bias_pointer)
+      : epilogue_(key.epilogue) {
     hipblasLtMatmulPreference_t preference = nullptr;
-    CheckHipBlasLt(hipblasLtMatmulPreferenceCreate(&preference),
-        "hipblasLtMatmulPreferenceCreate");
-    const size_t workspace_size = at::cuda::getCUDABlasLtWorkspaceSize();
-    CheckHipBlasLt(hipblasLtMatmulPreferenceSetAttribute(preference,
-        HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size,
-        sizeof(workspace_size)),
-        "hipblasLtMatmulPreferenceSetAttribute");
-    hipblasLtMatmulHeuristicResult_t result{};
-    int result_count = 0;
-    const hipblasStatus_t heuristic_status = hipblasLtMatmulAlgoGetHeuristic(
-        at::cuda::getCurrentCUDABlasLtHandle(), operation_, weight_, input_,
-        output_, output_, preference, 1, &result, &result_count);
-    hipblasLtMatmulPreferenceDestroy(preference);
-    CheckHipBlasLt(heuristic_status, "hipblasLtMatmulAlgoGetHeuristic");
-    TORCH_CHECK(result_count == 1 && result.state == HIPBLAS_STATUS_SUCCESS,
-        "hipBLASLt has no Swish-bias GEMM algorithm for the requested shape");
-    algorithm_ = result.algo;
-    workspace_size_ = result.workspaceSize;
+    try {
+      const hipDataType data_type = HipBlasLtDataType(key.data_type);
+      CheckHipBlasLt(hipblasLtMatmulDescCreate(
+          &operation_, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+          "hipblasLtMatmulDescCreate");
+      if (key.right_transposed) {
+        const hipblasOperation_t transpose = HIPBLAS_OP_T;
+        CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+            HIPBLASLT_MATMUL_DESC_TRANSA, &transpose, sizeof(transpose)),
+            "hipblasLtMatmulDescSetAttribute(right transpose)");
+      }
+      if (key.epilogue != FusionMatmulEpilogue::kNone) {
+        hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_BIAS;
+        if (key.epilogue == FusionMatmulEpilogue::kSwishBias) {
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
+          epilogue = HIPBLASLT_EPILOGUE_SWISH_BIAS_EXT;
+#else
+          TORCH_CHECK(false,
+              "hipBLASLt Swish-bias epilogue is unavailable in this build");
+#endif
+        }
+        CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+            HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)),
+            "hipblasLtMatmulDescSetAttribute(epilogue)");
+        // hipBLASLt requires a non-null device pointer while selecting a bias
+        // epilogue algorithm. Run() replaces this context-owned placeholder
+        // with the invocation's bias pointer before enqueueing the matmul.
+        TORCH_CHECK(heuristic_bias_pointer != nullptr,
+            "hipBLASLt bias heuristic requires a device placeholder");
+        CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+            HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &heuristic_bias_pointer,
+            sizeof(heuristic_bias_pointer)),
+            "hipblasLtMatmulDescSetAttribute(heuristic bias)");
+        CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+            HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &data_type,
+            sizeof(data_type)),
+            "hipblasLtMatmulDescSetAttribute(bias type)");
+      }
+
+      // A row-major [M,K] * [K,N] product is the same memory as the
+      // column-major [N,K] * [K,M] -> [N,M] product with operands reversed.
+      const int64_t right_layout_rows =
+          key.right_transposed ? key.reduction : key.columns;
+      const int64_t right_layout_columns =
+          key.right_transposed ? key.columns : key.reduction;
+      CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&right_, data_type,
+          right_layout_rows, right_layout_columns,
+          key.right_leading_dimension),
+          "hipblasLtMatrixLayoutCreate(right)");
+      CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&left_, data_type,
+          key.reduction, key.rows, key.left_row_stride),
+          "hipblasLtMatrixLayoutCreate(left)");
+      CheckHipBlasLt(hipblasLtMatrixLayoutCreate(&output_, data_type,
+          key.columns, key.rows, key.output_row_stride),
+          "hipblasLtMatrixLayoutCreate(output)");
+      ConfigureBatchLayout(right_, key.batch_count, key.right_batch_stride,
+          "hipblasLtMatrixLayoutSetAttribute(right batch)");
+      ConfigureBatchLayout(left_, key.batch_count, key.left_batch_stride,
+          "hipblasLtMatrixLayoutSetAttribute(left batch)");
+      ConfigureBatchLayout(output_, key.batch_count, key.output_batch_stride,
+          "hipblasLtMatrixLayoutSetAttribute(output batch)");
+
+      CheckHipBlasLt(hipblasLtMatmulPreferenceCreate(&preference),
+          "hipblasLtMatmulPreferenceCreate");
+      const size_t workspace_bound =
+          at::cuda::getCUDABlasLtWorkspaceSize();
+      CheckHipBlasLt(hipblasLtMatmulPreferenceSetAttribute(preference,
+          HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bound,
+          sizeof(workspace_bound)),
+          "hipblasLtMatmulPreferenceSetAttribute");
+      hipblasLtMatmulHeuristicResult_t result{};
+      int result_count = 0;
+      const hipblasStatus_t heuristic_status =
+          hipblasLtMatmulAlgoGetHeuristic(
+          handle, operation_, right_, left_,
+          output_, output_, preference, 1, &result, &result_count);
+      const hipblasStatus_t destroy_status =
+          hipblasLtMatmulPreferenceDestroy(preference);
+      preference = nullptr;
+      CheckHipBlasLt(destroy_status, "hipblasLtMatmulPreferenceDestroy");
+      if (heuristic_status == HIPBLAS_STATUS_NOT_SUPPORTED) {
+        LogFusionMatmulGeometry(
+            key, "heuristic-not-supported", 0);
+        return;
+      }
+      CheckHipBlasLt(
+          heuristic_status, "hipblasLtMatmulAlgoGetHeuristic");
+      TORCH_CHECK(result_count == 0 || result_count == 1,
+          "hipblasLtMatmulAlgoGetHeuristic returned an invalid result count: ",
+          result_count);
+      if (result_count == 0 ||
+          result.state == HIPBLAS_STATUS_NOT_SUPPORTED) {
+        LogFusionMatmulGeometry(key,
+            result_count == 0 ? "no-algorithm" : "algorithm-not-supported",
+            0);
+        return;
+      }
+      CheckHipBlasLt(
+          result.state, "hipblasLtMatmulAlgoGetHeuristic result");
+      TORCH_CHECK(result.workspaceSize <= workspace_bound,
+          "hipblasLt heuristic exceeded the requested workspace bound");
+      algorithm_ = result.algo;
+      workspace_size_ = result.workspaceSize;
+      supported_ = true;
+      LogFusionMatmulGeometry(key, "supported", workspace_size_);
+    } catch (...) {
+      if (preference != nullptr) {
+        hipblasLtMatmulPreferenceDestroy(preference);
+      }
+      Reset();
+      throw;
+    }
   }
 
-  ~LinearBiasSiluExecutable() {
-    hipblasLtMatrixLayoutDestroy(output_);
-    hipblasLtMatrixLayoutDestroy(input_);
-    hipblasLtMatrixLayoutDestroy(weight_);
-    hipblasLtMatmulDescDestroy(operation_);
+  ~FusionMatmulExecutable() {
+    Reset();
   }
 
-  LinearBiasSiluExecutable(const LinearBiasSiluExecutable&) = delete;
-  LinearBiasSiluExecutable& operator=(const LinearBiasSiluExecutable&) = delete;
+  FusionMatmulExecutable(const FusionMatmulExecutable&) = delete;
+  FusionMatmulExecutable& operator=(const FusionMatmulExecutable&) = delete;
 
-  void Run(torch::Tensor& output, const torch::Tensor& input,
-      const torch::Tensor& weight) const {
+  void Run(hipblasLtHandle_t handle, backend::Stream stream,
+      torch::Tensor& output, const torch::Tensor& left,
+      const torch::Tensor& right, const torch::Tensor* bias,
+      void* workspace, std::size_t workspace_capacity, float beta) {
     constexpr float alpha = 1.0f;
-    constexpr float beta = 0.0f;
-    void* workspace = at::cuda::getCUDABlasLtWorkspace();
+    TORCH_CHECK(supported_,
+        "cannot run an unsupported direct ROCm matmul geometry");
+    TORCH_CHECK(workspace_size_ <= workspace_capacity,
+        "Fusion matmul workspace is smaller than the selected algorithm requires");
+    TORCH_CHECK(workspace_size_ == 0 || workspace != nullptr,
+        "Fusion matmul workspace must not be null");
+    if (epilogue_ != FusionMatmulEpilogue::kNone) {
+      TORCH_CHECK(bias != nullptr,
+          "Fusion matmul bias epilogue requires a bias tensor");
+      const void* bias_pointer = bias->const_data_ptr();
+      CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+          HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
+          sizeof(bias_pointer)),
+          "hipblasLtMatmulDescSetAttribute(bias)");
+    }
     CheckHipBlasLt(hipblasLtMatmul(
-        at::cuda::getCurrentCUDABlasLtHandle(), operation_, &alpha,
-        weight.const_data_ptr(), weight_, input.const_data_ptr(), input_,
+        handle, operation_, &alpha,
+        right.const_data_ptr(), right_, left.const_data_ptr(), left_,
         &beta, output.const_data_ptr(), output_, output.data_ptr(), output_,
-        &algorithm_, workspace, workspace_size_,
-        backend::GetCurrentStream(output.get_device())),
-        "hipblasLtMatmul(Swish-bias)");
+        &algorithm_, workspace, workspace_size_, stream),
+        "hipblasLtMatmul(Fusion)");
+  }
+
+  std::size_t WorkspaceSize() const {
+    return workspace_size_;
+  }
+
+  bool IsSupported() const {
+    return supported_;
   }
 
  private:
+  void Reset() noexcept {
+    if (output_ != nullptr) {
+      hipblasLtMatrixLayoutDestroy(output_);
+      output_ = nullptr;
+    }
+    if (left_ != nullptr) {
+      hipblasLtMatrixLayoutDestroy(left_);
+      left_ = nullptr;
+    }
+    if (right_ != nullptr) {
+      hipblasLtMatrixLayoutDestroy(right_);
+      right_ = nullptr;
+    }
+    if (operation_ != nullptr) {
+      hipblasLtMatmulDescDestroy(operation_);
+      operation_ = nullptr;
+    }
+  }
+
   hipblasLtMatmulDesc_t operation_ = nullptr;
-  hipblasLtMatrixLayout_t weight_ = nullptr;
-  hipblasLtMatrixLayout_t input_ = nullptr;
+  hipblasLtMatrixLayout_t right_ = nullptr;
+  hipblasLtMatrixLayout_t left_ = nullptr;
   hipblasLtMatrixLayout_t output_ = nullptr;
   hipblasLtMatmulAlgo_t algorithm_{};
   size_t workspace_size_ = 0;
+  FusionMatmulEpilogue epilogue_ = FusionMatmulEpilogue::kNone;
+  bool supported_ = false;
 };
 
 #endif
@@ -375,7 +588,8 @@ __global__ void mapped_grouped_masked_softmax_pool_kernel(
     const score_t* scores, const mask_t* masks, const value_t* values,
     const int32_t* destination_metadata, float* contexts,
     mask_t* presence, int64_t batch_count, int64_t candidate_count,
-    int64_t group_count, int64_t width, int64_t destination_count) {
+    int64_t group_count, int64_t width, int64_t destination_count,
+    int64_t output_batch_capacity) {
   __shared__ float probabilities[256];
   __shared__ int32_t has_values;
   const int64_t row_count = batch_count * destination_count;
@@ -385,7 +599,7 @@ __global__ void mapped_grouped_masked_softmax_pool_kernel(
     const int32_t* metadata = destination_metadata + destination * 4;
     const int32_t source_group = metadata[0];
     const int64_t output_row =
-        static_cast<int64_t>(metadata[2]) +
+        static_cast<int64_t>(metadata[2]) * output_batch_capacity +
         batch * static_cast<int64_t>(metadata[1]) + metadata[3];
     if (source_group < 0) {
       if (threadIdx.x == 0) {
@@ -1717,70 +1931,1527 @@ void CheckKernelLaunch(const char* kernel_name) {
 
 #if defined(DJL_USE_ROCM_KERNELS)
 
-class LinearBiasSiluPlan {
+namespace {
+
+struct FusionMatmulStreamKey {
+  int32_t device;
+  std::uintptr_t stream;
+
+  bool operator==(const FusionMatmulStreamKey& other) const {
+    return device == other.device && stream == other.stream;
+  }
+};
+
+struct FusionMatmulStreamKeyHash {
+  std::size_t operator()(const FusionMatmulStreamKey& key) const {
+    std::size_t hash = std::hash<int32_t>{}(key.device);
+    HashCombine(hash, std::hash<std::uintptr_t>{}(key.stream));
+    return hash;
+  }
+};
+
+std::uintptr_t FusionMatmulStreamIdentity(backend::Stream stream) {
+  return reinterpret_cast<std::uintptr_t>(stream);
+}
+
+}  // namespace
+
+enum class FusionMatmulExecutionResult : uint8_t {
+  kExecuted,
+  kUnsupported,
+  kRetry,
+};
+
+class FusionMatmulStreamContext {
  public:
-  std::shared_ptr<LinearBiasSiluExecutable> GetOrCreate(
-      const LinearBiasSiluKey& key, const torch::Tensor& bias) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto found = executables_.find(key);
-    if (found != executables_.end()) {
-      return found->second;
+  FusionMatmulStreamContext(int32_t device, backend::Stream stream)
+      : device_(device), stream_(FusionMatmulStreamIdentity(stream)) {
+    c10::DeviceGuard device_guard(
+        c10::Device(c10::DeviceType::CUDA, device_));
+    bias_placeholder_ = torch::empty({1},
+        torch::TensorOptions()
+            .device(c10::Device(c10::DeviceType::CUDA, device_))
+            .dtype(torch::kUInt8));
+    CheckHipBlasLt(hipblasLtCreate(&handle_), "hipblasLtCreate");
+    if (FusionMatmulDiagnosticsEnabled()) {
+      std::fprintf(stderr,
+          "[djl-rocm-matmul] create device=%d stream=%p\n",
+          device_, reinterpret_cast<void*>(stream));
     }
-    auto executable =
-        std::make_shared<LinearBiasSiluExecutable>(key, bias);
-    executables_.emplace(key, executable);
-    return executable;
+  }
+
+  FusionMatmulStreamContext(const FusionMatmulStreamContext&) = delete;
+  FusionMatmulStreamContext& operator=(
+      const FusionMatmulStreamContext&) = delete;
+
+  bool Matches(int32_t device, backend::Stream stream) const {
+    return device_ == device &&
+        stream_.load(std::memory_order_acquire) ==
+        FusionMatmulStreamIdentity(stream);
+  }
+
+  std::unique_lock<std::mutex> Lock() {
+    return std::unique_lock<std::mutex>(mutex_);
+  }
+
+  std::unique_lock<std::mutex> TryLock() {
+    return std::unique_lock<std::mutex>(mutex_, std::try_to_lock);
+  }
+
+  void PinLocked() {
+    TORCH_CHECK(pin_count_ < std::numeric_limits<std::size_t>::max(),
+        "direct ROCm matmul context pin count overflow");
+    ++pin_count_;
+  }
+
+  void PrepareAndPinForGraphLocked(c10::Device device) {
+    TORCH_CHECK(device.index() == device_,
+        "direct ROCm matmul graph pin changed devices");
+    EnsureWorkspaceCapacityLocked(
+        at::cuda::getCUDABlasLtWorkspaceSize(), device);
+    PinLocked();
+  }
+
+  void CheckPinnedLocked() const {
+    TORCH_CHECK(pin_count_ > 0,
+        "direct ROCm matmul context is not pinned");
+  }
+
+  void UnpinLockedAfterValidation() noexcept {
+    --pin_count_;
+  }
+
+  bool CanRebindIfIdleLocked(
+      backend::Stream stream, backend::Stream* previous_stream) {
+    TORCH_CHECK(previous_stream != nullptr,
+        "direct ROCm matmul rebind requires the previous stream");
+    if (pin_count_ != 0) {
+      return false;
+    }
+    const backend::Stream bound_stream = BoundStreamLocked();
+    if (bound_stream == stream) {
+      *previous_stream = bound_stream;
+      return true;
+    }
+    c10::DeviceGuard device_guard(
+        c10::Device(c10::DeviceType::CUDA, device_));
+    const hipError_t query_status = hipStreamQuery(bound_stream);
+    if (query_status == hipErrorNotReady) {
+      return false;
+    }
+    TORCH_CHECK(query_status == hipSuccess,
+        "hipStreamQuery failed while recycling a direct ROCm matmul "
+        "context: ", hipGetErrorString(query_status));
+    *previous_stream = bound_stream;
+    return true;
+  }
+
+  void RebindLocked(backend::Stream stream) {
+    const backend::Stream previous_stream = BoundStreamLocked();
+    stream_.store(
+        FusionMatmulStreamIdentity(stream), std::memory_order_release);
+    if (FusionMatmulDiagnosticsEnabled()) {
+      std::fprintf(stderr,
+          "[djl-rocm-matmul] rebind device=%d old_stream=%p "
+          "new_stream=%p\n",
+          device_, reinterpret_cast<void*>(previous_stream),
+          reinterpret_cast<void*>(stream));
+    }
+  }
+
+  FusionMatmulExecutionResult ResolveExecutableLocked(
+      backend::Stream stream, const FusionMatmulKey& key,
+      FusionMatmulExecutable** executable) {
+    TORCH_CHECK(executable != nullptr,
+        "direct ROCm matmul executable output must not be null");
+    *executable = nullptr;
+    if (!MatchesLocked(key.device, stream)) {
+      return FusionMatmulExecutionResult::kRetry;
+    }
+    auto found = executables_.find(key);
+    if (found == executables_.end()) {
+      auto created = std::make_unique<FusionMatmulExecutable>(
+          handle_, key, bias_placeholder_.const_data_ptr());
+      found = executables_.emplace(key, std::move(created)).first;
+    }
+    if (!found->second->IsSupported()) {
+      return FusionMatmulExecutionResult::kUnsupported;
+    }
+    *executable = found->second.get();
+    return FusionMatmulExecutionResult::kExecuted;
+  }
+
+  FusionMatmulExecutionResult ExecuteResolvedLocked(
+      backend::Stream stream, const FusionMatmulKey& key,
+      FusionMatmulExecutable& executable, torch::Tensor& output,
+      const torch::Tensor& left, const torch::Tensor& right,
+      const torch::Tensor* bias, float beta) {
+    if (!MatchesLocked(key.device, stream)) {
+      return FusionMatmulExecutionResult::kRetry;
+    }
+    TORCH_CHECK(executable.IsSupported(),
+        "direct ROCm matmul executable became unsupported");
+    if (!output.defined()) {
+      TORCH_CHECK(beta == 0.0f,
+          "deferred direct ROCm matmul output requires an overwrite");
+      if (key.output_batch_stride == 0) {
+        output = torch::empty({key.rows, key.columns},
+            left.options().requires_grad(false));
+      } else {
+        output = torch::empty(
+            {key.batch_count, key.rows, key.columns},
+            left.options().requires_grad(false));
+      }
+    }
+    const std::size_t required_workspace = executable.WorkspaceSize();
+    void* workspace = AcquireWorkspace(required_workspace, left.device());
+    executable.Run(handle_, stream, output, left, right, bias, workspace,
+        WorkspaceCapacity(), beta);
+    return FusionMatmulExecutionResult::kExecuted;
   }
 
  private:
+  backend::Stream BoundStreamLocked() const {
+    return reinterpret_cast<backend::Stream>(
+        stream_.load(std::memory_order_relaxed));
+  }
+
+  bool MatchesLocked(int32_t device, backend::Stream stream) const {
+    return device_ == device &&
+        stream_.load(std::memory_order_relaxed) ==
+        FusionMatmulStreamIdentity(stream);
+  }
+
+  void EnsureWorkspaceCapacityLocked(
+      std::size_t required_bytes, c10::Device device) {
+    TORCH_CHECK(required_bytes <=
+            static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
+        "direct ROCm matmul workspace exceeds the supported range");
+    c10::impl::VirtualGuardImpl guard_impl(device.type());
+    const c10::Stream stream = guard_impl.getStream(device);
+    if (workspace_.defined()) {
+      TORCH_CHECK(workspace_.device() == device,
+          "direct ROCm matmul workspace changed devices");
+    }
+    if (required_bytes > 0 &&
+        (!workspace_.defined() ||
+            workspace_.numel() < static_cast<int64_t>(required_bytes))) {
+      TORCH_CHECK(pin_count_ == 0,
+          "direct ROCm matmul workspace cannot grow while an accelerator "
+          "graph retains its address");
+      if (FusionMatmulDiagnosticsEnabled()) {
+        std::fprintf(stderr,
+            "[djl-rocm-matmul] workspace-grow device=%d stream=%p "
+            "previous=%zu required=%zu\n",
+            device_, reinterpret_cast<void*>(BoundStreamLocked()),
+            WorkspaceCapacity(), required_bytes);
+      }
+      if (workspace_.defined()) {
+        guard_impl.recordDataPtrOnStream(
+            workspace_.storage().data_ptr(), stream);
+      }
+      workspace_ = torch::empty({static_cast<int64_t>(required_bytes)},
+          torch::TensorOptions().device(device).dtype(torch::kUInt8));
+    }
+  }
+
+  void* AcquireWorkspace(
+      std::size_t required_bytes, c10::Device device) {
+    EnsureWorkspaceCapacityLocked(required_bytes, device);
+    return workspace_.defined() ? workspace_.data_ptr() : nullptr;
+  }
+
+  std::size_t WorkspaceCapacity() const {
+    return workspace_.defined()
+        ? static_cast<std::size_t>(workspace_.numel())
+        : 0;
+  }
+
+  int32_t device_;
+  std::atomic<std::uintptr_t> stream_;
+  hipblasLtHandle_t handle_ = nullptr;
   std::mutex mutex_;
-  std::unordered_map<LinearBiasSiluKey,
-      std::shared_ptr<LinearBiasSiluExecutable>, LinearBiasSiluKeyHash>
+  std::unordered_map<FusionMatmulKey,
+      std::unique_ptr<FusionMatmulExecutable>, FusionMatmulKeyHash>
       executables_;
+  torch::Tensor bias_placeholder_;
+  torch::Tensor workspace_;
+  std::size_t pin_count_ = 0;
 };
 
-std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan() {
-  return std::make_shared<LinearBiasSiluPlan>();
+namespace {
+
+thread_local FusionMatmulStreamContext* current_matmul_stream_context =
+    nullptr;
+
+struct FusionMatmulStreamRegistry {
+  std::mutex mutex;
+  std::unordered_map<FusionMatmulStreamKey,
+      FusionMatmulStreamContext*, FusionMatmulStreamKeyHash>
+      by_stream;
+  std::unordered_map<int32_t, std::vector<FusionMatmulStreamContext*>>
+      by_device;
+};
+
+FusionMatmulStreamRegistry& MatmulStreamRegistry() {
+  // The c10 stream pool is process-global and bounded. Retaining contexts
+  // avoids hipblasLtDestroy's device synchronization; idle contexts are
+  // rebound instead of retaining one large workspace per historical stream.
+  static auto* registry = new FusionMatmulStreamRegistry();
+  return *registry;
 }
 
-bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>& plan,
-    torch::Tensor& output, const torch::Tensor& input,
-    const torch::Tensor& weight, const torch::Tensor& bias) {
-  if (output.scalar_type() != torch::kFloat16) {
-    return false;
+#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 11
+
+struct PyTorchLtWorkspaceLifetimeRegistry {
+  std::mutex mutex;
+  std::unordered_map<FusionMatmulStreamKey, std::size_t,
+      FusionMatmulStreamKeyHash> graph_pins_by_stream;
+};
+
+PyTorchLtWorkspaceLifetimeRegistry& PyTorchLtWorkspaceLifetime() {
+  // Thread-local destructors may run during process shutdown. Keep the
+  // coordinator alive because cross-library destruction order is unspecified.
+  static auto* registry = new PyTorchLtWorkspaceLifetimeRegistry();
+  return *registry;
+}
+
+bool IsPyTorchLtWorkspaceStreamGraphPinnedLocked(
+    const PyTorchLtWorkspaceLifetimeRegistry& registry,
+    int32_t device, void* stream) {
+  const auto found = registry.graph_pins_by_stream.find({device,
+      reinterpret_cast<std::uintptr_t>(stream)});
+  return found != registry.graph_pins_by_stream.end() &&
+      found->second != 0;
+}
+
+struct RetiredPyTorchLtWorkspace {
+  at::DataPtr workspace;
+  hipStream_t stream;
+  c10::DeviceIndex device;
+};
+
+static_assert(
+    std::is_nothrow_move_constructible_v<RetiredPyTorchLtWorkspace>,
+    "retiring a PyTorch Lt workspace must not throw after map removal");
+
+void ReleaseRetiredPyTorchLtWorkspaces(
+    std::vector<RetiredPyTorchLtWorkspace>& retired) noexcept {
+  for (auto& entry : retired) {
+    try {
+      c10::cuda::CUDACachingAllocator::recordStream(
+          entry.workspace,
+          c10::hip::getStreamFromExternal(entry.stream, entry.device));
+    } catch (...) {
+      // The normal path never synchronizes. If allocator bookkeeping is
+      // unexpectedly unavailable during teardown, wait before releasing;
+      // on a failed wait, intentionally retain the allocation.
+      bool synchronized = false;
+      try {
+        c10::DeviceGuard device_guard(c10::Device(
+            c10::DeviceType::CUDA, entry.device));
+        synchronized = hipStreamSynchronize(entry.stream) == hipSuccess;
+      } catch (...) {
+        // Fall through to the safe leak below.
+      }
+      if (!synchronized) {
+        static_cast<void>(entry.workspace.release_context());
+      }
+    }
   }
-  TORCH_CHECK(plan != nullptr, "linear bias-SiLU plan must not be null");
-  TORCH_CHECK(output.is_cuda() && input.is_cuda() && weight.is_cuda() &&
-          bias.is_cuda(),
-      "linear bias-SiLU tensors must be on a ROCm device");
-  TORCH_CHECK(output.is_contiguous() && input.is_contiguous() &&
-          weight.is_contiguous() && bias.is_contiguous(),
-      "linear bias-SiLU tensors must be contiguous");
-  TORCH_CHECK(output.dim() == 2 && input.dim() == 2 && weight.dim() == 2 &&
-          bias.dim() == 1 && output.size(0) == input.size(0) &&
-          input.size(1) == weight.size(0) &&
-          output.size(1) == weight.size(1) &&
-          bias.size(0) == output.size(1),
-      "linear bias-SiLU tensor shapes are inconsistent");
-  TORCH_CHECK(input.scalar_type() == output.scalar_type() &&
-          weight.scalar_type() == output.scalar_type() &&
-          bias.scalar_type() == output.scalar_type(),
-      "linear bias-SiLU tensor data types are inconsistent");
-  const LinearBiasSiluKey key{output.get_device(), output.scalar_type(),
-      output.size(0), input.size(1), output.size(1)};
-  plan->GetOrCreate(key, bias)->Run(output, input, weight);
-  return true;
+}
+
+struct RegisteredPyTorchLtHandle {
+  int32_t device;
+  void* handle;
+};
+
+class ThreadPyTorchLtWorkspaceRetirement {
+ public:
+  ThreadPyTorchLtWorkspaceRetirement() = default;
+  ThreadPyTorchLtWorkspaceRetirement(
+      const ThreadPyTorchLtWorkspaceRetirement&) = delete;
+  ThreadPyTorchLtWorkspaceRetirement& operator=(
+      const ThreadPyTorchLtWorkspaceRetirement&) = delete;
+
+  ~ThreadPyTorchLtWorkspaceRetirement() noexcept {
+    try {
+      std::vector<RetiredPyTorchLtWorkspace> retired;
+      PyTorchLtWorkspaceLifetimeRegistry& lifetime =
+          PyTorchLtWorkspaceLifetime();
+      {
+        std::lock_guard<std::mutex> lifetime_lock(lifetime.mutex);
+        at::cuda::WorkspaceMapWithMutex& workspaces =
+            at::cuda::cublaslt_handle_stream_to_workspace();
+        using WorkspaceMap = decltype(workspaces.map);
+        static_assert(std::is_same_v<typename WorkspaceMap::mapped_type,
+            at::DataPtr>,
+            "PyTorch 2.11 Lt workspace map ABI changed");
+        std::unique_lock<std::shared_mutex> workspace_lock(
+            workspaces.mutex);
+        std::vector<WorkspaceMap::iterator> candidates;
+        candidates.reserve(workspaces.map.size());
+        for (auto entry = workspaces.map.begin();
+             entry != workspaces.map.end(); ++entry) {
+          const int32_t device = entry->second.device().index();
+          const void* handle = std::get<0>(entry->first);
+          const bool registered = std::find_if(handles_.begin(),
+              handles_.end(), [device, handle](const auto& candidate) {
+                return candidate.device == device &&
+                    candidate.handle == handle;
+              }) != handles_.end();
+          if (registered &&
+              !IsPyTorchLtWorkspaceStreamGraphPinnedLocked(lifetime,
+                  device, std::get<1>(entry->first))) {
+            candidates.push_back(entry);
+          }
+        }
+        retired.reserve(candidates.size());
+        for (const auto candidate : candidates) {
+          const c10::DeviceIndex device =
+              candidate->second.device().index();
+          retired.push_back({std::move(candidate->second),
+              reinterpret_cast<hipStream_t>(
+                  std::get<1>(candidate->first)), device});
+          workspaces.map.erase(candidate);
+        }
+      }
+        ReleaseRetiredPyTorchLtWorkspaces(retired);
+    } catch (...) {
+      // Thread teardown cannot report failures. Retaining a workspace is safe.
+    }
+  }
+
+  bool IsDeviceRegistered(int32_t device) const {
+    return std::find_if(handles_.begin(), handles_.end(),
+        [device](const auto& candidate) {
+          return candidate.device == device;
+        }) != handles_.end();
+  }
+
+  void Register(int32_t device, void* handle) {
+    if (!IsDeviceRegistered(device)) {
+      handles_.push_back({device, handle});
+    }
+  }
+
+ private:
+  std::vector<RegisteredPyTorchLtHandle> handles_;
+};
+
+void RegisterCurrentThreadPyTorchLtWorkspaceRetirement(c10::Device device) {
+  thread_local ThreadPyTorchLtWorkspaceRetirement* retirement = nullptr;
+  if (retirement != nullptr &&
+      retirement->IsDeviceRegistered(device.index())) {
+    return;
+  }
+  c10::DeviceGuard device_guard(device);
+  // Construct PyTorch's PoolWindow first. Reverse TLS destruction then erases
+  // workspace entries before this thread returns its Lt handle to that pool.
+  void* handle = reinterpret_cast<void*>(
+      at::cuda::getCurrentCUDABlasLtHandle());
+  if (retirement == nullptr) {
+    thread_local ThreadPyTorchLtWorkspaceRetirement owned_retirement;
+    retirement = &owned_retirement;
+  }
+  retirement->Register(device.index(), handle);
+}
+
+void PinCurrentPyTorchLtWorkspaceStream(
+    c10::Device device, backend::Stream stream) {
+  PyTorchLtWorkspaceLifetimeRegistry& lifetime =
+      PyTorchLtWorkspaceLifetime();
+  std::lock_guard<std::mutex> lock(lifetime.mutex);
+  std::size_t& pins = lifetime.graph_pins_by_stream[{device.index(),
+      FusionMatmulStreamIdentity(stream)}];
+  TORCH_CHECK(pins < std::numeric_limits<std::size_t>::max(),
+      "PyTorch ROCm Lt workspace graph pin count overflow");
+  ++pins;
+}
+
+void UnpinCurrentPyTorchLtWorkspaceStream(
+    c10::Device device, backend::Stream stream) {
+  PyTorchLtWorkspaceLifetimeRegistry& lifetime =
+      PyTorchLtWorkspaceLifetime();
+  std::lock_guard<std::mutex> lock(lifetime.mutex);
+  const auto pin = lifetime.graph_pins_by_stream.find({device.index(),
+      FusionMatmulStreamIdentity(stream)});
+  TORCH_CHECK(pin != lifetime.graph_pins_by_stream.end() &&
+          pin->second != 0,
+      "PyTorch ROCm Lt workspace stream is not graph-pinned");
+  if (--pin->second == 0) {
+    lifetime.graph_pins_by_stream.erase(pin);
+  }
 }
 
 #else
 
-class LinearBiasSiluPlan {};
+void RegisterCurrentThreadPyTorchLtWorkspaceRetirement(c10::Device) {}
+void PinCurrentPyTorchLtWorkspaceStream(c10::Device, backend::Stream) {}
+void UnpinCurrentPyTorchLtWorkspaceStream(c10::Device, backend::Stream) {}
 
-std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan() {
-  return std::make_shared<LinearBiasSiluPlan>();
+#endif
+
+struct FusionMatmulStreamContextLease {
+  FusionMatmulStreamContext* context;
+  std::unique_lock<std::mutex> lock;
+};
+
+FusionMatmulStreamContextLease ResolveMatmulStreamContextLease(
+    c10::Device device, backend::Stream stream) {
+  TORCH_CHECK(device.is_cuda(),
+      "direct ROCm matmul requires a ROCm device");
+  c10::DeviceGuard device_guard(device);
+  RegisterCurrentThreadPyTorchLtWorkspaceRetirement(device);
+  FusionMatmulStreamRegistry& registry = MatmulStreamRegistry();
+  const FusionMatmulStreamKey key{device.index(),
+      FusionMatmulStreamIdentity(stream)};
+  for (;;) {
+    FusionMatmulStreamContext* mapped_context = nullptr;
+    std::vector<FusionMatmulStreamContext*> device_contexts;
+    {
+      std::lock_guard<std::mutex> registry_lock(registry.mutex);
+      auto found = registry.by_stream.find(key);
+      if (found != registry.by_stream.end()) {
+        mapped_context = found->second;
+      } else {
+        auto device_found = registry.by_device.find(device.index());
+        if (device_found != registry.by_device.end()) {
+          device_contexts = device_found->second;
+        }
+      }
+    }
+
+    if (mapped_context != nullptr) {
+      std::unique_lock<std::mutex> context_lock = mapped_context->Lock();
+      if (!mapped_context->Matches(device.index(), stream)) {
+        continue;
+      }
+      current_matmul_stream_context = mapped_context;
+      return FusionMatmulStreamContextLease{
+          mapped_context, std::move(context_lock)};
+    }
+
+    bool retry_mapped_context = false;
+    for (FusionMatmulStreamContext* context : device_contexts) {
+      std::unique_lock<std::mutex> context_lock = context->TryLock();
+      if (!context_lock.owns_lock()) {
+        continue;
+      }
+      backend::Stream previous_stream = nullptr;
+      if (!context->CanRebindIfIdleLocked(stream, &previous_stream)) {
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> registry_lock(registry.mutex);
+        if (registry.by_stream.find(key) != registry.by_stream.end()) {
+          retry_mapped_context = true;
+        } else {
+          const FusionMatmulStreamKey previous_key{device.index(),
+              FusionMatmulStreamIdentity(previous_stream)};
+          auto previous = registry.by_stream.find(previous_key);
+          if (previous != registry.by_stream.end() &&
+              previous->second == context) {
+            registry.by_stream.erase(previous);
+          }
+          context->RebindLocked(stream);
+          registry.by_stream.emplace(key, context);
+        }
+      }
+      if (retry_mapped_context) {
+        break;
+      }
+      current_matmul_stream_context = context;
+      return FusionMatmulStreamContextLease{
+          context, std::move(context_lock)};
+    }
+    if (retry_mapped_context) {
+      continue;
+    }
+
+    {
+      std::lock_guard<std::mutex> registry_lock(registry.mutex);
+      if (registry.by_stream.find(key) != registry.by_stream.end()) {
+        continue;
+      }
+      auto* context =
+          new FusionMatmulStreamContext(device.index(), stream);
+      std::unique_lock<std::mutex> context_lock = context->Lock();
+      registry.by_device[device.index()].push_back(context);
+      registry.by_stream.emplace(key, context);
+      current_matmul_stream_context = context;
+      return FusionMatmulStreamContextLease{
+          context, std::move(context_lock)};
+    }
+  }
 }
 
-bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>&,
+struct FusionMatmulExecutableLease {
+  FusionMatmulStreamContext* context;
+  backend::Stream stream;
+  FusionMatmulExecutable* executable;
+  FusionMatmulExecutionResult result;
+  std::unique_lock<std::mutex> lock;
+};
+
+FusionMatmulExecutableLease ResolveMatmulExecutableLease(
+    const FusionMatmulKey& key) {
+  const c10::Device device(c10::DeviceType::CUDA, key.device);
+  c10::DeviceGuard device_guard(device);
+  for (;;) {
+    const backend::Stream stream =
+        backend::GetCurrentStream(device.index());
+    FusionMatmulStreamContext* context = nullptr;
+    std::unique_lock<std::mutex> context_lock;
+    if (current_matmul_stream_context != nullptr &&
+        current_matmul_stream_context->Matches(device.index(), stream)) {
+      context = current_matmul_stream_context;
+      context_lock = context->Lock();
+    } else {
+      FusionMatmulStreamContextLease context_lease =
+          ResolveMatmulStreamContextLease(device, stream);
+      context = context_lease.context;
+      context_lock = std::move(context_lease.lock);
+    }
+    FusionMatmulExecutable* executable = nullptr;
+    const FusionMatmulExecutionResult result =
+        context->ResolveExecutableLocked(stream, key, &executable);
+    if (result == FusionMatmulExecutionResult::kRetry) {
+      current_matmul_stream_context = nullptr;
+      continue;
+    }
+    return FusionMatmulExecutableLease{context, stream, executable,
+        result, std::move(context_lock)};
+  }
+}
+
+FusionMatmulExecutionResult TryExecuteOnCurrentMatmulStream(
+    const FusionMatmulKey& key, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor* bias, float beta) {
+  FusionMatmulExecutableLease lease =
+      ResolveMatmulExecutableLease(key);
+  if (lease.result != FusionMatmulExecutionResult::kExecuted) {
+    return lease.result;
+  }
+  return lease.context->ExecuteResolvedLocked(lease.stream, key,
+      *lease.executable, output, left, right, bias, beta);
+}
+
+}  // namespace
+
+void PinCurrentRocmMatmulStreamContext(c10::Device device) {
+  TORCH_CHECK(device.is_cuda(),
+      "direct ROCm matmul context pin requires a ROCm device");
+  c10::DeviceGuard device_guard(device);
+  const backend::Stream stream =
+      backend::GetCurrentStream(device.index());
+  RegisterCurrentThreadPyTorchLtWorkspaceRetirement(device);
+  PinCurrentPyTorchLtWorkspaceStream(device, stream);
+  try {
+    if (current_matmul_stream_context != nullptr &&
+        current_matmul_stream_context->Matches(device.index(), stream)) {
+      std::unique_lock<std::mutex> lock =
+          current_matmul_stream_context->Lock();
+      if (current_matmul_stream_context->Matches(device.index(), stream)) {
+        current_matmul_stream_context->PrepareAndPinForGraphLocked(device);
+        return;
+      }
+      current_matmul_stream_context = nullptr;
+    }
+    FusionMatmulStreamContextLease lease =
+        ResolveMatmulStreamContextLease(device, stream);
+    lease.context->PrepareAndPinForGraphLocked(device);
+  } catch (...) {
+    UnpinCurrentPyTorchLtWorkspaceStream(device, stream);
+    throw;
+  }
+}
+
+void UnpinCurrentRocmMatmulStreamContext(c10::Device device) {
+  TORCH_CHECK(device.is_cuda(),
+      "direct ROCm matmul context unpin requires a ROCm device");
+  c10::DeviceGuard device_guard(device);
+  const backend::Stream stream =
+      backend::GetCurrentStream(device.index());
+  FusionMatmulStreamRegistry& registry = MatmulStreamRegistry();
+  const FusionMatmulStreamKey key{device.index(),
+      FusionMatmulStreamIdentity(stream)};
+  FusionMatmulStreamContext* context = nullptr;
+  {
+    std::lock_guard<std::mutex> registry_lock(registry.mutex);
+    auto found = registry.by_stream.find(key);
+    TORCH_CHECK(found != registry.by_stream.end(),
+        "pinned direct ROCm matmul stream context is missing");
+    context = found->second;
+  }
+  std::unique_lock<std::mutex> context_lock = context->Lock();
+  TORCH_CHECK(context->Matches(device.index(), stream),
+      "pinned direct ROCm matmul stream context changed streams");
+  context->CheckPinnedLocked();
+
+#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 11
+  // No path acquires a matmul context lock while holding the lifetime lock.
+  // Keep this order and validate both counters before changing either one so
+  // a failed unpin remains retryable.
+  PyTorchLtWorkspaceLifetimeRegistry& lifetime =
+      PyTorchLtWorkspaceLifetime();
+  std::unique_lock<std::mutex> lifetime_lock(lifetime.mutex);
+  const auto pin = lifetime.graph_pins_by_stream.find({device.index(),
+      FusionMatmulStreamIdentity(stream)});
+  TORCH_CHECK(pin != lifetime.graph_pins_by_stream.end() &&
+          pin->second != 0,
+      "PyTorch ROCm Lt workspace stream is not graph-pinned");
+
+  std::vector<RetiredPyTorchLtWorkspace> retired;
+  if (pin->second == 1) {
+    // Graph streams are exclusive DJL-owned leases. Once the last graph pin is
+    // released, no unrelated operation can still use this raw stream, so also
+    // retire workspaces skipped by a capture thread's TLS destructor.
+    at::cuda::WorkspaceMapWithMutex& workspaces =
+        at::cuda::cublaslt_handle_stream_to_workspace();
+    using WorkspaceMap = decltype(workspaces.map);
+    static_assert(std::is_same_v<typename WorkspaceMap::mapped_type,
+        at::DataPtr>,
+        "PyTorch 2.11 Lt workspace map ABI changed");
+    std::unique_lock<std::shared_mutex> workspace_lock(workspaces.mutex);
+    const std::uintptr_t stream_identity =
+        FusionMatmulStreamIdentity(stream);
+    std::size_t candidate_count = 0;
+    for (const auto& entry : workspaces.map) {
+      if (entry.second.device().index() == device.index() &&
+          reinterpret_cast<std::uintptr_t>(
+              std::get<1>(entry.first)) == stream_identity) {
+        ++candidate_count;
+      }
+    }
+    retired.reserve(candidate_count);
+    for (auto entry = workspaces.map.begin();
+         entry != workspaces.map.end();) {
+      if (entry->second.device().index() != device.index() ||
+          reinterpret_cast<std::uintptr_t>(
+              std::get<1>(entry->first)) != stream_identity) {
+        ++entry;
+        continue;
+      }
+      const auto candidate = entry++;
+      const c10::DeviceIndex workspace_device =
+          candidate->second.device().index();
+      retired.push_back({std::move(candidate->second),
+          reinterpret_cast<hipStream_t>(
+              std::get<1>(candidate->first)),
+          workspace_device});
+      workspaces.map.erase(candidate);
+    }
+  }
+  if (--pin->second == 0) {
+    lifetime.graph_pins_by_stream.erase(pin);
+  }
+  context->UnpinLockedAfterValidation();
+  lifetime_lock.unlock();
+  context_lock.unlock();
+  ReleaseRetiredPyTorchLtWorkspaces(retired);
+#else
+  context->UnpinLockedAfterValidation();
+#endif
+}
+
+class FusionMatmulWorkspace {
+ public:
+  FusionMatmulExecutionResult TryExecute(const FusionMatmulKey& key,
+      torch::Tensor& output, const torch::Tensor& left,
+      const torch::Tensor& right, const torch::Tensor* bias, float beta) {
+    return TryExecuteOnCurrentMatmulStream(
+        key, output, left, right, bias, beta);
+  }
+};
+
+bool IsFusionMatmulSupported() {
+  return true;
+}
+
+bool IsLinearBiasSiluSupported() {
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
+  return true;
+#else
+  return false;
+#endif
+}
+
+std::size_t GetFusionMatmulWorkspaceUpperBoundBytes() {
+  return at::cuda::getCUDABlasLtWorkspaceSize();
+}
+
+class FusionMatmulPlan {};
+
+std::shared_ptr<FusionMatmulPlan> CreateFusionMatmulPlan() {
+  return std::make_shared<FusionMatmulPlan>();
+}
+
+std::shared_ptr<FusionMatmulWorkspace> CreateFusionMatmulWorkspace() {
+  return std::make_shared<FusionMatmulWorkspace>();
+}
+
+FusionMatmulKey BuildFusionMatmulKey(torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    FusionMatmulEpilogue epilogue, const torch::Tensor* bias) {
+  TORCH_CHECK(output.is_cuda() && left.is_cuda() && right.is_cuda(),
+      "Fusion matmul tensors must be on a ROCm device");
+  TORCH_CHECK(output.device() == left.device() &&
+          output.device() == right.device(),
+      "Fusion matmul tensors must be on one device");
+  TORCH_CHECK(output.scalar_type() == left.scalar_type() &&
+          output.scalar_type() == right.scalar_type(),
+      "Fusion matmul tensors must use one data type");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat16 ||
+          output.scalar_type() == torch::kBFloat16 ||
+          output.scalar_type() == torch::kFloat32,
+      "Fusion matmul requires FLOAT16, BFLOAT16, or FLOAT32 tensors");
+  TORCH_CHECK(output.dim() == left.dim() && output.dim() == right.dim() &&
+          (output.dim() == 2 || output.dim() == 3),
+      "Fusion matmul requires matching rank-2 or rank-3 tensors");
+
+  const int64_t matrix_axis = output.dim() - 2;
+  const int64_t batch_count = output.dim() == 3 ? output.size(0) : 1;
+  const int64_t rows = left.size(matrix_axis);
+  const int64_t reduction = left.size(matrix_axis + 1);
+  const int64_t columns = right.size(matrix_axis + 1);
+  TORCH_CHECK(rows > 0 && columns > 0 && reduction > 0 &&
+          right.size(matrix_axis) == reduction &&
+          output.size(matrix_axis) == rows &&
+          output.size(matrix_axis + 1) == columns,
+      "Fusion matmul tensor shapes are inconsistent");
+  if (output.dim() == 3) {
+    TORCH_CHECK(left.size(0) == batch_count && right.size(0) == batch_count,
+        "Fusion batched matmul batch counts are inconsistent");
+  }
+  TORCH_CHECK(left.stride(matrix_axis + 1) == 1 &&
+          output.stride(matrix_axis + 1) == 1,
+      "Fusion matmul requires contiguous left and output final dimensions");
+  const int64_t left_row_stride = left.stride(matrix_axis);
+  const int64_t output_row_stride = output.stride(matrix_axis);
+  const bool right_row_major = right.stride(matrix_axis + 1) == 1 &&
+      right.stride(matrix_axis) >= columns;
+  const bool right_transpose_view = right.stride(matrix_axis) == 1 &&
+      right.stride(matrix_axis + 1) >= reduction;
+  TORCH_CHECK(right_row_major || right_transpose_view,
+      "Fusion matmul right operand must be row-major or a transpose view");
+  const bool right_transposed = !right_row_major;
+  int64_t right_leading_dimension;
+  if (right_transposed) {
+    right_leading_dimension = right.stride(matrix_axis + 1);
+  } else {
+    right_leading_dimension = right.stride(matrix_axis);
+  }
+  TORCH_CHECK(left_row_stride >= reduction && output_row_stride >= columns,
+      "Fusion matmul left or output leading dimension is too small");
+  const int64_t left_batch_stride =
+      output.dim() == 3 ? left.stride(0) : 0;
+  const int64_t right_batch_stride =
+      output.dim() == 3 ? right.stride(0) : 0;
+  const int64_t output_batch_stride =
+      output.dim() == 3 ? output.stride(0) : 0;
+  TORCH_CHECK(left_batch_stride >= 0 && right_batch_stride >= 0 &&
+          output_batch_stride >= 0,
+      "Fusion matmul does not support negative batch strides");
+  TORCH_CHECK(output.dim() == 2 || output_batch_stride >= CheckedMultiply(
+          rows, output_row_stride, "Fusion matmul output batch span"),
+      "Fusion matmul output batches must not overlap");
+  if (epilogue != FusionMatmulEpilogue::kNone) {
+    TORCH_CHECK(bias != nullptr && bias->is_cuda() &&
+            bias->device() == output.device() &&
+            bias->scalar_type() == output.scalar_type() &&
+            bias->dim() == 1 && bias->size(0) == columns &&
+            bias->is_contiguous(),
+        "Fusion matmul bias tensor is inconsistent");
+  }
+  return FusionMatmulKey{output.get_device(), output.scalar_type(),
+      batch_count, rows, columns, reduction, left_row_stride,
+      right_leading_dimension, output_row_stride, left_batch_stride,
+      right_batch_stride, output_batch_stride, right_transposed, epilogue};
+}
+
+FusionMatmulKey BuildRocmInferenceMatmulKey(
+    const torch::Tensor& left, const torch::Tensor& right,
+    FusionMatmulEpilogue epilogue) {
+  const int64_t matrix_axis = left.dim() - 2;
+  const int64_t batch_count = left.dim() == 3 ? left.size(0) : 1;
+  const int64_t rows = left.size(matrix_axis);
+  const int64_t columns = right.size(matrix_axis + 1);
+  const bool right_row_major =
+      right.stride(matrix_axis + 1) == 1 &&
+      right.stride(matrix_axis) >= columns;
+  const bool right_transposed = !right_row_major;
+  const int64_t right_leading_dimension =
+      right_transposed
+      ? right.stride(matrix_axis + 1)
+      : right.stride(matrix_axis);
+  const int64_t output_batch_stride = left.dim() == 3
+      ? rows * columns
+      : 0;
+  return FusionMatmulKey{left.get_device(), left.scalar_type(),
+      batch_count, rows, columns, left.size(matrix_axis + 1),
+      left.stride(matrix_axis), right_leading_dimension, columns,
+      left.dim() == 3 ? left.stride(0) : 0,
+      right.dim() == 3 ? right.stride(0) : 0,
+      output_batch_stride,
+      right_transposed, epilogue};
+}
+
+bool CanUseDirectRocmInferenceMatmul() {
+  const at::BlasBackend preferred_backend =
+      at::globalContext().blasPreferredBackend();
+  return c10::InferenceMode::is_enabled() &&
+      !at::globalContext().deterministicAlgorithms() &&
+      !at::globalContext()._SMCarveout_EXPERIMENTAL().has_value() &&
+      !at::cuda::tunable::getTuningContext()->IsTunableOpEnabled() &&
+      preferred_backend == at::BlasBackend::Cublaslt;
+}
+
+bool HasOnlyPositiveSizesAndNonNegativeStrides(
+    const torch::Tensor& tensor) {
+  for (const int64_t size : tensor.sizes()) {
+    if (size <= 0) {
+      return false;
+    }
+  }
+  for (const int64_t stride : tensor.strides()) {
+    if (stride < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SupportsRocmInferenceTensor(
+    const torch::Tensor& tensor, int64_t minimum_dimensions) {
+  return tensor.defined() && tensor.is_cuda() &&
+      tensor.layout() == c10::kStrided &&
+      tensor.dim() >= minimum_dimensions && !tensor.has_names() &&
+      !at::isTensorSubclassLike(tensor) && !tensor.is_conj() &&
+      !tensor.is_neg() &&
+      HasOnlyPositiveSizesAndNonNegativeStrides(tensor);
+}
+
+bool TryMultiplyPositive(
+    int64_t left, int64_t right, int64_t* product) {
+  if (product == nullptr || left <= 0 || right <= 0 ||
+      left > std::numeric_limits<int64_t>::max() / right) {
+    return false;
+  }
+  *product = left * right;
+  return true;
+}
+
+bool TryPositiveProduct(c10::IntArrayRef sizes, int64_t* product) {
+  if (product == nullptr) {
+    return false;
+  }
+  int64_t value = 1;
+  for (const int64_t size : sizes) {
+    if (!TryMultiplyPositive(value, size, &value)) {
+      return false;
+    }
+  }
+  *product = value;
+  return true;
+}
+
+bool TryCollapseLeadingDimensions(c10::IntArrayRef sizes,
+    c10::IntArrayRef strides,
+    int64_t leading_dimensions, int64_t* element_count,
+    int64_t* flattened_stride) {
+  if (sizes.size() != strides.size() || leading_dimensions < 0 ||
+      leading_dimensions > static_cast<int64_t>(sizes.size()) ||
+      element_count == nullptr || flattened_stride == nullptr ||
+      !TryPositiveProduct(sizes.slice(0, leading_dimensions),
+          element_count)) {
+    return false;
+  }
+  bool found_non_unit_dimension = false;
+  int64_t expected_outer_stride = 0;
+  *flattened_stride = 0;
+  for (int64_t axis = leading_dimensions - 1; axis >= 0; --axis) {
+    const int64_t size = sizes[axis];
+    if (size == 1) {
+      continue;
+    }
+    const int64_t stride = strides[axis];
+    if (!found_non_unit_dimension) {
+      *flattened_stride = stride;
+      if (stride > std::numeric_limits<int64_t>::max() / size) {
+        return false;
+      }
+      expected_outer_stride = stride * size;
+      found_non_unit_dimension = true;
+      continue;
+    }
+    if (stride != expected_outer_stride ||
+        expected_outer_stride >
+            std::numeric_limits<int64_t>::max() / size) {
+      return false;
+    }
+    expected_outer_stride *= size;
+  }
+  return true;
+}
+
+bool TryCollapseLeadingDimensions(const torch::Tensor& tensor,
+    int64_t leading_dimensions, int64_t* element_count,
+    int64_t* flattened_stride) {
+  return TryCollapseLeadingDimensions(tensor.sizes(), tensor.strides(),
+      leading_dimensions, element_count, flattened_stride);
+}
+
+bool HasSupportedLeftMatrixLayout(const torch::Tensor& tensor) {
+  return tensor.stride(-1) == 1 &&
+      tensor.stride(-2) >= tensor.size(-1);
+}
+
+bool HasSupportedLeftMatrixLayout(
+    int64_t row_stride, int64_t column_stride, int64_t columns) {
+  return column_stride == 1 && row_stride >= columns;
+}
+
+bool HasSupportedRightMatrixLayout(const torch::Tensor& tensor) {
+  const bool row_major = tensor.stride(-1) == 1 &&
+      tensor.stride(-2) >= tensor.size(-1);
+  const bool transpose_view = tensor.stride(-2) == 1 &&
+      tensor.stride(-1) >= tensor.size(-2);
+  return row_major || transpose_view;
+}
+
+bool HasSupportedRightMatrixLayout(int64_t row_stride,
+    int64_t column_stride, int64_t rows, int64_t columns) {
+  const bool row_major = column_stride == 1 && row_stride >= columns;
+  const bool transpose_view = row_stride == 1 && column_stride >= rows;
+  return row_major || transpose_view;
+}
+
+bool IsRocmInferenceMatmulDataType(torch::ScalarType data_type) {
+  return data_type == torch::kFloat16 ||
+      data_type == torch::kBFloat16;
+}
+
+bool TryInferBroadcastBatchShape(c10::IntArrayRef left,
+    c10::IntArrayRef right, std::vector<int64_t>* output) {
+  if (output == nullptr) {
+    return false;
+  }
+  const std::size_t dimensions = std::max(left.size(), right.size());
+  output->assign(dimensions, 1);
+  for (std::size_t offset = 0; offset < dimensions; ++offset) {
+    const int64_t left_size = offset < left.size()
+        ? left[left.size() - 1 - offset]
+        : 1;
+    const int64_t right_size = offset < right.size()
+        ? right[right.size() - 1 - offset]
+        : 1;
+    if (left_size != right_size && left_size != 1 && right_size != 1) {
+      return false;
+    }
+    (*output)[dimensions - 1 - offset] =
+        std::max(left_size, right_size);
+  }
+  return true;
+}
+
+struct BatchedMatmulOperandPlan {
+  torch::Tensor expanded;
+  int64_t batch_count;
+  int64_t rows;
+  int64_t columns;
+  int64_t batch_stride;
+  int64_t row_stride;
+  int64_t column_stride;
+  bool requires_materialization;
+};
+
+bool TryPlanBatchedMatmulOperand(const torch::Tensor& tensor,
+    c10::IntArrayRef output_batch_shape, int64_t batch_count,
+    BatchedMatmulOperandPlan* plan) {
+  if (plan == nullptr) {
+    return false;
+  }
+
+  std::vector<int64_t> expanded_sizes(
+      output_batch_shape.begin(), output_batch_shape.end());
+  expanded_sizes.push_back(tensor.size(-2));
+  expanded_sizes.push_back(tensor.size(-1));
+  torch::Tensor expanded = tensor.expand(expanded_sizes);
+
+  int64_t expanded_batch_count;
+  int64_t expanded_batch_stride;
+  if (TryCollapseLeadingDimensions(expanded, expanded.dim() - 2,
+          &expanded_batch_count, &expanded_batch_stride)) {
+    if (expanded_batch_count != batch_count) {
+      return false;
+    }
+    *plan = BatchedMatmulOperandPlan{std::move(expanded), batch_count,
+        tensor.size(-2), tensor.size(-1), expanded_batch_stride,
+        tensor.stride(-2), tensor.stride(-1), false};
+    return true;
+  }
+
+  int64_t matrix_elements;
+  if (!TryMultiplyPositive(
+          tensor.size(-2), tensor.size(-1), &matrix_elements)) {
+    return false;
+  }
+  // Defer the same necessary materialization as PyTorch's batched matmul
+  // until hipBLASLt has confirmed that the resulting geometry is supported.
+  *plan = BatchedMatmulOperandPlan{std::move(expanded), batch_count,
+      tensor.size(-2), tensor.size(-1), matrix_elements,
+      tensor.size(-1), 1, true};
+  return true;
+}
+
+torch::Tensor PrepareBatchedMatmulOperand(
+    const BatchedMatmulOperandPlan& plan) {
+  torch::Tensor prepared = plan.requires_materialization
+      ? plan.expanded.contiguous().view(
+            {plan.batch_count, plan.rows, plan.columns})
+      : plan.expanded.as_strided(
+            {plan.batch_count, plan.rows, plan.columns},
+            {plan.batch_stride, plan.row_stride, plan.column_stride});
+  TORCH_CHECK(prepared.stride(0) == plan.batch_stride &&
+          prepared.stride(1) == plan.row_stride &&
+          prepared.stride(2) == plan.column_stride,
+      "direct ROCm batched matmul preparation changed its planned layout");
+  return prepared;
+}
+
+FusionMatmulKey BuildRocmInferenceMatmulKey(
+    const BatchedMatmulOperandPlan& left,
+    const BatchedMatmulOperandPlan& right, c10::Device device,
+    torch::ScalarType data_type, FusionMatmulEpilogue epilogue) {
+  const bool right_row_major = right.column_stride == 1 &&
+      right.row_stride >= right.columns;
+  const int64_t right_leading_dimension = right_row_major
+      ? right.row_stride
+      : right.column_stride;
+  int64_t output_batch_stride;
+  TORCH_CHECK(TryMultiplyPositive(
+          left.rows, right.columns, &output_batch_stride),
+      "direct ROCm batched matmul output stride exceeds the supported range");
+  return FusionMatmulKey{device.index(), data_type, left.batch_count,
+      left.rows, right.columns, left.columns, left.row_stride,
+      right_leading_dimension, right.columns, left.batch_stride,
+      right.batch_stride, output_batch_stride, !right_row_major, epilogue};
+}
+
+bool SupportsRocmInferenceMatmulStructure(const torch::Tensor& left,
+    const torch::Tensor& right, const torch::Tensor* bias) {
+  if (!SupportsRocmInferenceTensor(left, 2) ||
+      !SupportsRocmInferenceTensor(right, 2) ||
+      left.device() != right.device() ||
+      left.dim() != right.dim() ||
+      (left.dim() != 2 && left.dim() != 3)) {
+    return false;
+  }
+  const int64_t matrix_axis = left.dim() - 2;
+  const int64_t batch_count = left.dim() == 3 ? left.size(0) : 1;
+  const int64_t rows = left.size(matrix_axis);
+  const int64_t reduction = left.size(matrix_axis + 1);
+  const int64_t columns = right.size(matrix_axis + 1);
+  int64_t output_matrix_elements;
+  int64_t output_elements;
+  if (right.size(matrix_axis) != reduction ||
+      (left.dim() == 3 && right.size(0) != batch_count) ||
+      batch_count > std::numeric_limits<int32_t>::max() ||
+      !HasSupportedLeftMatrixLayout(left) ||
+      !TryMultiplyPositive(rows, columns, &output_matrix_elements) ||
+      !TryMultiplyPositive(
+          batch_count, output_matrix_elements, &output_elements) ||
+      output_elements <= 0) {
+    return false;
+  }
+  if (!HasSupportedRightMatrixLayout(right)) {
+    return false;
+  }
+  if (bias != nullptr &&
+      (!SupportsRocmInferenceTensor(*bias, 1) ||
+          bias->device() != left.device() ||
+          bias->dim() != 1 || bias->size(0) != columns ||
+          !bias->is_contiguous())) {
+    return false;
+  }
+  return true;
+}
+
+bool SupportsRocmInferenceMatmul(const torch::Tensor& left,
+    const torch::Tensor& right, const torch::Tensor* bias) {
+  return CanUseDirectRocmInferenceMatmul() &&
+      SupportsRocmInferenceMatmulStructure(left, right, bias) &&
+      left.scalar_type() == right.scalar_type() &&
+      (bias == nullptr || bias->scalar_type() == left.scalar_type()) &&
+      IsRocmInferenceMatmulDataType(left.scalar_type());
+}
+
+torch::Tensor CastRocmAutocastTensor(
+    const torch::Tensor& tensor, torch::ScalarType data_type) {
+  return tensor.scalar_type() == data_type
+      ? tensor
+      : at::autocast::cached_cast(
+            data_type, tensor, at::DeviceType::CUDA);
+}
+
+bool TryExecutePreparedRocmInferenceMatmul(torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor* bias) {
+  if (!SupportsRocmInferenceMatmul(left, right, bias)) {
+    return false;
+  }
+  c10::DeviceGuard device_guard(left.device());
+  torch::Tensor result;
+  const FusionMatmulEpilogue epilogue = bias == nullptr
+      ? FusionMatmulEpilogue::kNone
+      : FusionMatmulEpilogue::kBias;
+  const FusionMatmulKey key =
+      BuildRocmInferenceMatmulKey(left, right, epilogue);
+  if (TryExecuteOnCurrentMatmulStream(
+          key, result, left, right, bias, 0.0f) !=
+      FusionMatmulExecutionResult::kExecuted) {
+    return false;
+  }
+  output = std::move(result);
+  return true;
+}
+
+bool TryPrepareLinearInput(const torch::Tensor& input,
+    int64_t output_width, torch::Tensor* flattened,
+    std::vector<int64_t>* output_shape) {
+  if (flattened == nullptr || output_shape == nullptr ||
+      input.stride(-1) != 1) {
+    return false;
+  }
+  int64_t flattened_rows;
+  int64_t flattened_row_stride;
+  if (!TryCollapseLeadingDimensions(input, input.dim() - 1,
+          &flattened_rows, &flattened_row_stride)) {
+    return false;
+  }
+  if (flattened_rows == 1 && flattened_row_stride == 0) {
+    flattened_row_stride = input.size(-1);
+  }
+  int64_t output_elements;
+  if (flattened_row_stride < input.size(-1) ||
+      !TryMultiplyPositive(
+          flattened_rows, output_width, &output_elements) ||
+      output_elements <= 0) {
+    return false;
+  }
+  *flattened = input.as_strided(
+      {flattened_rows, input.size(-1)},
+      {flattened_row_stride, input.stride(-1)});
+  *output_shape = input.sizes().vec();
+  output_shape->back() = output_width;
+  return true;
+}
+
+bool TryExecuteRocmInferenceMatmul(torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor* bias) {
+  const bool matrix_product = left.dim() == 2 && right.dim() == 2;
+  const bool batched_product = left.dim() >= 3 && right.dim() >= 3;
+  if (!CanUseDirectRocmInferenceMatmul() ||
+      !SupportsRocmInferenceTensor(left, 2) ||
+      !SupportsRocmInferenceTensor(right, 2) ||
+      (!matrix_product && !batched_product) ||
+      left.device() != right.device() ||
+      left.size(-1) != right.size(-2) ||
+      (bias != nullptr &&
+          (!SupportsRocmInferenceTensor(*bias, 1) ||
+              bias->device() != left.device() ||
+              bias->dim() != 1 ||
+              bias->size(0) != right.size(-1) ||
+              !bias->is_contiguous()))) {
+    return false;
+  }
+  c10::DeviceGuard device_guard(left.device());
+  torch::Tensor operation_left = left;
+  torch::Tensor operation_right = right;
+  torch::Tensor operation_bias;
+  const torch::Tensor* operation_bias_ptr = bias;
+  const bool autocast_enabled =
+      at::autocast::is_autocast_enabled(at::DeviceType::CUDA);
+  if (autocast_enabled) {
+    const torch::ScalarType data_type =
+        at::autocast::get_autocast_dtype(at::DeviceType::CUDA);
+    if (data_type != torch::kFloat16 &&
+        data_type != torch::kBFloat16) {
+      return false;
+    }
+    operation_left = CastRocmAutocastTensor(left, data_type);
+    operation_right = CastRocmAutocastTensor(right, data_type);
+    if (bias != nullptr) {
+      operation_bias = CastRocmAutocastTensor(*bias, data_type);
+      operation_bias_ptr = &operation_bias;
+    }
+  }
+  if (operation_left.scalar_type() != operation_right.scalar_type() ||
+      (operation_bias_ptr != nullptr &&
+          operation_bias_ptr->scalar_type() !=
+              operation_left.scalar_type()) ||
+      !IsRocmInferenceMatmulDataType(operation_left.scalar_type()) ||
+      !HasSupportedLeftMatrixLayout(operation_left) ||
+      !HasSupportedRightMatrixLayout(operation_right)) {
+    return false;
+  }
+  if (matrix_product) {
+    return TryExecutePreparedRocmInferenceMatmul(output,
+        operation_left, operation_right, operation_bias_ptr);
+  }
+
+  std::vector<int64_t> output_batch_shape;
+  if (!TryInferBroadcastBatchShape(
+          operation_left.sizes().slice(0, operation_left.dim() - 2),
+          operation_right.sizes().slice(0, operation_right.dim() - 2),
+          &output_batch_shape)) {
+    return false;
+  }
+  int64_t batch_count;
+  int64_t output_matrix_elements;
+  int64_t output_elements;
+  if (!TryPositiveProduct(output_batch_shape, &batch_count) ||
+      batch_count > std::numeric_limits<int32_t>::max() ||
+      !TryMultiplyPositive(operation_left.size(-2),
+          operation_right.size(-1), &output_matrix_elements) ||
+      !TryMultiplyPositive(
+          batch_count, output_matrix_elements, &output_elements) ||
+      output_elements <= 0) {
+    return false;
+  }
+
+  BatchedMatmulOperandPlan left_plan;
+  BatchedMatmulOperandPlan right_plan;
+  if (!TryPlanBatchedMatmulOperand(operation_left,
+          output_batch_shape, batch_count, &left_plan) ||
+      !TryPlanBatchedMatmulOperand(operation_right,
+          output_batch_shape, batch_count, &right_plan) ||
+      !HasSupportedLeftMatrixLayout(left_plan.row_stride,
+          left_plan.column_stride, left_plan.columns) ||
+      !HasSupportedRightMatrixLayout(right_plan.row_stride,
+          right_plan.column_stride, right_plan.rows,
+          right_plan.columns)) {
+    return false;
+  }
+
+  const FusionMatmulEpilogue epilogue = operation_bias_ptr == nullptr
+      ? FusionMatmulEpilogue::kNone
+      : FusionMatmulEpilogue::kBias;
+  const FusionMatmulKey key = BuildRocmInferenceMatmulKey(
+      left_plan, right_plan, operation_left.device(),
+      operation_left.scalar_type(), epilogue);
+  FusionMatmulExecutableLease lease =
+      ResolveMatmulExecutableLease(key);
+  if (lease.result == FusionMatmulExecutionResult::kUnsupported) {
+    return false;
+  }
+  TORCH_CHECK(lease.result == FusionMatmulExecutionResult::kExecuted &&
+          lease.executable != nullptr,
+      "direct ROCm matmul failed to reserve a supported executable");
+
+  const torch::Tensor batched_left =
+      PrepareBatchedMatmulOperand(left_plan);
+  const torch::Tensor batched_right =
+      PrepareBatchedMatmulOperand(right_plan);
+  TORCH_CHECK(SupportsRocmInferenceMatmulStructure(
+          batched_left, batched_right, operation_bias_ptr),
+      "direct ROCm batched matmul preparation produced an invalid layout");
+  TORCH_CHECK(BuildRocmInferenceMatmulKey(
+          batched_left, batched_right, epilogue) == key,
+      "direct ROCm batched matmul preparation changed its planned geometry");
+  torch::Tensor batched_result;
+  TORCH_CHECK(lease.context->ExecuteResolvedLocked(lease.stream, key,
+          *lease.executable, batched_result, batched_left,
+          batched_right, operation_bias_ptr, 0.0f) ==
+          FusionMatmulExecutionResult::kExecuted,
+      "direct ROCm matmul stream changed while its context was leased");
+  std::vector<int64_t> output_shape = output_batch_shape;
+  output_shape.push_back(operation_left.size(-2));
+  output_shape.push_back(operation_right.size(-1));
+  output = batched_result.view(output_shape);
+  return true;
+}
+
+bool TryExecuteRocmInferenceLinear(torch::Tensor& output,
+    const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor* bias) {
+  if (!CanUseDirectRocmInferenceMatmul() ||
+      !SupportsRocmInferenceTensor(input, 2) ||
+      !SupportsRocmInferenceTensor(weight, 2) ||
+      weight.dim() != 2 ||
+      input.device() != weight.device() ||
+      input.size(-1) != weight.size(1) ||
+      (bias != nullptr && input.dim() > 2 && !input.is_contiguous()) ||
+      (bias != nullptr &&
+          (!SupportsRocmInferenceTensor(*bias, 1) ||
+              bias->device() != input.device() ||
+              bias->dim() != 1 ||
+              bias->size(0) != weight.size(0) ||
+              !bias->is_contiguous()))) {
+    return false;
+  }
+  c10::DeviceGuard device_guard(input.device());
+  torch::Tensor operation_input = input;
+  torch::Tensor operation_weight = weight;
+  torch::Tensor operation_bias;
+  const torch::Tensor* operation_bias_ptr = bias;
+  const bool autocast_enabled =
+      at::autocast::is_autocast_enabled(at::DeviceType::CUDA);
+  if (autocast_enabled) {
+    const torch::ScalarType data_type =
+        at::autocast::get_autocast_dtype(at::DeviceType::CUDA);
+    if (data_type != torch::kFloat16 &&
+        data_type != torch::kBFloat16) {
+      return false;
+    }
+    operation_input = CastRocmAutocastTensor(input, data_type);
+    // Cast the parameter before creating its transpose so the transpose stays
+    // a metadata-only view.
+    operation_weight = CastRocmAutocastTensor(weight, data_type);
+    if (bias != nullptr) {
+      operation_bias = CastRocmAutocastTensor(*bias, data_type);
+      operation_bias_ptr = &operation_bias;
+    }
+  }
+
+  torch::Tensor flattened_input;
+  std::vector<int64_t> output_shape;
+  if (!TryPrepareLinearInput(operation_input, operation_weight.size(0),
+          &flattened_input, &output_shape)) {
+    return false;
+  }
+  const torch::Tensor transposed_weight =
+      operation_weight.transpose(0, 1);
+  torch::Tensor flattened_result;
+  if (!TryExecutePreparedRocmInferenceMatmul(flattened_result,
+          flattened_input, transposed_weight, operation_bias_ptr)) {
+    return false;
+  }
+  output = flattened_result.view(output_shape);
+  return true;
+}
+
+void ExecuteFusionMatmulImpl(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    FusionMatmulEpilogue epilogue, const torch::Tensor* bias,
+    float beta) {
+  TORCH_CHECK(plan != nullptr, "Fusion matmul plan must not be null");
+  TORCH_CHECK(beta == 0.0f ||
+          (beta == 1.0f && epilogue == FusionMatmulEpilogue::kNone),
+      "Fusion matmul beta must be zero, or one without an epilogue");
+  const FusionMatmulKey key =
+      BuildFusionMatmulKey(output, left, right, epilogue, bias);
+  TORCH_CHECK(workspace.TryExecute(
+          key, output, left, right, bias, beta) ==
+          FusionMatmulExecutionResult::kExecuted,
+      "hipBLASLt has no direct Fusion GEMM algorithm for the requested geometry");
+}
+
+bool ExecuteFusionMatmul(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right) {
+  ExecuteFusionMatmulImpl(plan, workspace, output, left, right,
+      FusionMatmulEpilogue::kNone, nullptr, 0.0f);
+  return true;
+}
+
+bool ExecuteFusionMatmulBias(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor& bias) {
+  ExecuteFusionMatmulImpl(plan, workspace, output, left, right,
+      FusionMatmulEpilogue::kBias, &bias, 0.0f);
+  return true;
+}
+
+bool ExecuteFusionMatmulAccumulate(
+    const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right) {
+  ExecuteFusionMatmulImpl(plan, workspace, output, left, right,
+      FusionMatmulEpilogue::kNone, nullptr, 1.0f);
+  return true;
+}
+
+bool ExecuteLinearBiasSilu(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace,
+    torch::Tensor& output, const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias) {
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
+  if (output.scalar_type() != torch::kFloat16) {
+    return false;
+  }
+  ExecuteFusionMatmulImpl(plan, workspace, output, input, weight,
+      FusionMatmulEpilogue::kSwishBias, &bias, 0.0f);
+  return true;
+#else
+  return false;
+#endif
+}
+
+#else
+
+class FusionMatmulPlan {};
+class FusionMatmulWorkspace {};
+
+void PinCurrentRocmMatmulStreamContext(c10::Device) {}
+void UnpinCurrentRocmMatmulStreamContext(c10::Device) {}
+
+bool IsFusionMatmulSupported() {
+  return false;
+}
+
+bool IsLinearBiasSiluSupported() {
+  return false;
+}
+
+std::size_t GetFusionMatmulWorkspaceUpperBoundBytes() {
+  return 0;
+}
+
+std::shared_ptr<FusionMatmulPlan> CreateFusionMatmulPlan() {
+  return std::make_shared<FusionMatmulPlan>();
+}
+
+std::shared_ptr<FusionMatmulWorkspace> CreateFusionMatmulWorkspace() {
+  return std::make_shared<FusionMatmulWorkspace>();
+}
+
+bool TryExecuteRocmInferenceMatmul(torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor*) {
+  return false;
+}
+
+bool TryExecuteRocmInferenceLinear(torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor*) {
+  return false;
+}
+
+bool ExecuteFusionMatmul(const std::shared_ptr<FusionMatmulPlan>&,
+    FusionMatmulWorkspace&, torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&) {
+  return false;
+}
+
+bool ExecuteFusionMatmulBias(const std::shared_ptr<FusionMatmulPlan>&,
+    FusionMatmulWorkspace&, torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&) {
+  return false;
+}
+
+bool ExecuteFusionMatmulAccumulate(
+    const std::shared_ptr<FusionMatmulPlan>&,
+    FusionMatmulWorkspace&, torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&) {
+  return false;
+}
+
+bool ExecuteLinearBiasSilu(const std::shared_ptr<FusionMatmulPlan>&,
+    FusionMatmulWorkspace&,
     torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&) {
   return false;
@@ -3134,8 +4805,9 @@ void LaunchMappedGroupedMaskedSoftmaxPoolTyped(
     const torch::Tensor& scores, const torch::Tensor& masks,
     const torch::Tensor& values, const torch::Tensor& destination_metadata,
     torch::Tensor& contexts, torch::Tensor& presence, int64_t batch_count,
-    int64_t candidate_count, int64_t group_count, int64_t width,
-    int64_t destination_count, backend::Stream stream) {
+    int64_t output_batch_capacity, int64_t candidate_count,
+    int64_t group_count, int64_t width, int64_t destination_count,
+    backend::Stream stream) {
   const int64_t row_count = CheckedMultiply(
       batch_count, destination_count, "mapped grouped pool row count");
   const uint32_t block_count = static_cast<uint32_t>(
@@ -3147,16 +4819,20 @@ void LaunchMappedGroupedMaskedSoftmaxPoolTyped(
       scores.data_ptr<score_t>(), masks.data_ptr<mask_t>(),
       values.data_ptr<value_t>(), destination_metadata.data_ptr<int32_t>(),
       contexts.data_ptr<float>(), presence.data_ptr<mask_t>(), batch_count,
-      candidate_count, group_count, width, destination_count);
+      candidate_count, group_count, width, destination_count,
+      output_batch_capacity);
 }
 
 void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
     const torch::Tensor& masks, const torch::Tensor& values,
     const torch::Tensor& destination_metadata, torch::Tensor& contexts,
-    torch::Tensor& presence, int64_t batch_count, int64_t candidate_count,
+    torch::Tensor& presence, int64_t batch_count,
+    int64_t output_batch_capacity, int64_t candidate_count,
     int64_t group_count, int64_t width, int64_t destination_count) {
   TORCH_CHECK(candidate_count > 0 && candidate_count <= 256 &&
-          group_count > 0 && width > 0 && destination_count > 0,
+          output_batch_capacity > 0 && batch_count >= 0 &&
+          batch_count <= output_batch_capacity && group_count > 0 &&
+          width > 0 && destination_count > 0,
       "mapped grouped pool metadata is unsupported");
   TORCH_CHECK(destination_metadata.scalar_type() == torch::kInt32 &&
           destination_metadata.is_contiguous() &&
@@ -3174,8 +4850,8 @@ void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
 #define LAUNCH_MAPPED_POOL(score_type, mask_type, value_type) \
   LaunchMappedGroupedMaskedSoftmaxPoolTyped<score_type, mask_type, value_type>( \
       scores, masks, values, destination_metadata, contexts, presence, \
-      batch_count, candidate_count, group_count, width, destination_count, \
-      stream)
+      batch_count, output_batch_capacity, candidate_count, group_count, width, \
+      destination_count, stream)
 #define DISPATCH_MAPPED_POOL_VALUE(score_type, mask_type) \
   switch (values.scalar_type()) { \
     case torch::kFloat16: \

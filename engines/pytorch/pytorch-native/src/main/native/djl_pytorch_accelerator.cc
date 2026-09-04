@@ -11,6 +11,7 @@
  * and limitations under the License.
  */
 #include "djl_pytorch_accelerator.h"
+#include "djl_pytorch_fusion_kernels.h"
 
 #if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(USE_ROCM)
 #include <ATen/hip/HIPGraph.h>
@@ -31,10 +32,17 @@
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
+#if defined(USE_ROCM)
+#include <c10/hip/HIPStream.h>
+#include <hip/hip_runtime_api.h>
+#endif
 
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 namespace djl_pytorch {
 namespace accel {
@@ -78,6 +86,93 @@ c10::Stream GetCurrentStream(c10::Device device) {
   return guard_impl.getStream(device);
 }
 
+#if defined(USE_ROCM)
+struct ReusableDeviceStreamPool {
+  struct DeviceState {
+    std::vector<c10::Stream> idle;
+    std::unordered_map<c10::StreamId, std::size_t> lease_counts;
+    std::vector<hipStream_t> owned_streams;
+  };
+
+  std::mutex mutex;
+  std::unordered_map<int32_t, DeviceState> devices;
+};
+
+ReusableDeviceStreamPool& DeviceStreamPool() {
+  // Device streams are process-lifetime resources. Keeping the registry alive
+  // avoids shutdown-time stream destruction synchronization and prevents
+  // PyTorch's bounded global stream pool from aliasing these streams.
+  static auto* pool = new ReusableDeviceStreamPool();
+  return *pool;
+}
+
+c10::Stream AcquireDeviceStream(c10::Device device) {
+  if (device.index() < 0) {
+    c10::impl::VirtualGuardImpl guard_impl(device.type());
+    device = guard_impl.getDevice();
+  }
+  ReusableDeviceStreamPool& pool = DeviceStreamPool();
+  std::lock_guard<std::mutex> lock(pool.mutex);
+  auto& state = pool.devices[device.index()];
+  if (!state.idle.empty()) {
+    c10::Stream stream = state.idle.back();
+    state.idle.pop_back();
+    ++state.lease_counts.at(stream.id());
+    return stream;
+  }
+
+  c10::DeviceGuard device_guard(device);
+  hipStream_t raw_stream = nullptr;
+  const hipError_t create_status =
+      hipStreamCreateWithFlags(&raw_stream, hipStreamNonBlocking);
+  TORCH_CHECK(create_status == hipSuccess,
+      "failed to create a reusable ROCm device stream: ",
+      hipGetErrorString(create_status));
+  try {
+    c10::Stream stream =
+        c10::hip::getStreamFromExternal(raw_stream, device.index());
+    state.owned_streams.push_back(raw_stream);
+    try {
+      const bool inserted =
+          state.lease_counts.emplace(stream.id(), 1).second;
+      TORCH_CHECK(inserted,
+          "new ROCm device stream reused an existing stream identity");
+    } catch (...) {
+      state.owned_streams.pop_back();
+      throw;
+    }
+    return stream;
+  } catch (...) {
+    // No work was submitted before publication, so destruction cannot wait
+    // for device work. Published streams remain owned for process lifetime.
+    static_cast<void>(hipStreamDestroy(raw_stream));
+    throw;
+  }
+}
+
+void ReleaseDeviceStream(const c10::Stream& stream) noexcept {
+  try {
+    ReusableDeviceStreamPool& pool = DeviceStreamPool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    auto device = pool.devices.find(stream.device_index());
+    if (device == pool.devices.end()) {
+      return;
+    }
+    auto lease = device->second.lease_counts.find(stream.id());
+    if (lease == device->second.lease_counts.end() ||
+        lease->second == 0) {
+      return;
+    }
+    if (--lease->second == 0) {
+      device->second.idle.push_back(stream);
+    }
+  } catch (...) {
+    // Dropping the lease from the idle index quarantines the process-lifetime
+    // stream. A later acquisition creates another stream without aliasing it.
+  }
+}
+#endif
+
 void CheckBuffer(const torch::Tensor& tensor, const HostBuffer* buffer) {
   TORCH_CHECK(buffer != nullptr, "host buffer must not be null");
   TORCH_CHECK(tensor.layout() == c10::kStrided, "pinned host transfer requires a strided tensor");
@@ -112,12 +207,41 @@ struct AcceleratorGraph {
   c10::Stream stream;
   at::cuda::CUDAGraph graph;
   std::unique_ptr<c10::StreamGuard> capture_guard;
+  bool rocm_matmul_context_pinned = false;
 
   AcceleratorGraph(c10::Device device, c10::Stream stream)
       : device(device), stream(stream), graph(false) {}
 };
 #else
 struct AcceleratorGraph {};
+#endif
+
+#if defined(DJL_USE_ACCELERATOR_GRAPH) && defined(USE_ROCM) && \
+    defined(DJL_USE_ROCM_KERNELS)
+[[noreturn]] void RethrowAfterFailedGraphCaptureCleanup(
+    AcceleratorGraph* graph, const std::exception_ptr& failure) {
+  c10::DeviceGuard device_guard(graph->device);
+  bool graph_reset = false;
+  try {
+    graph->graph.reset();
+    graph_reset = true;
+  } catch (...) {
+    // Preserve the capture failure. CUDAGraph::reset is best-effort on a
+    // failed capture and its destructor will make another cleanup attempt.
+  }
+  graph->capture_guard.reset();
+  if (graph_reset && graph->rocm_matmul_context_pinned) {
+    try {
+      c10::StreamGuard stream_guard(graph->stream);
+      djl::pytorch::fusion::UnpinCurrentRocmMatmulStreamContext(
+          graph->device);
+      graph->rocm_matmul_context_pinned = false;
+    } catch (...) {
+      // Keep the pin flag set so DeleteAcceleratorGraph can retry cleanup.
+    }
+  }
+  std::rethrow_exception(failure);
+}
 #endif
 
 std::optional<c10::DeviceType> GetAcceleratorType() {
@@ -325,8 +449,18 @@ DeviceStream* NewDeviceStream(c10::Device device) {
   if (!IsAcceleratorDevice(device)) {
     return nullptr;
   }
+#if defined(USE_ROCM)
+  c10::Stream stream = AcquireDeviceStream(device);
+  try {
+    return new DeviceStream(stream);
+  } catch (...) {
+    ReleaseDeviceStream(stream);
+    throw;
+  }
+#else
   c10::impl::VirtualGuardImpl guard_impl(device.type());
   return new DeviceStream(guard_impl.getStreamFromGlobalPool(device));
+#endif
 }
 
 StreamScope* OpenDeviceStream(DeviceStream* stream) {
@@ -337,6 +471,11 @@ StreamScope* OpenDeviceStream(DeviceStream* stream) {
 }
 
 void DeleteDeviceStream(DeviceStream* stream) {
+#if defined(USE_ROCM)
+  if (stream != nullptr) {
+    ReleaseDeviceStream(stream->stream);
+  }
+#endif
   delete stream;
 }
 
@@ -383,9 +522,19 @@ void DeleteDeviceEvent(DeviceEvent* event) {
 AcceleratorGraph* NewAcceleratorGraph(c10::Device device) {
 #if defined(DJL_USE_ACCELERATOR_GRAPH)
   TORCH_CHECK(IsAcceleratorDevice(device), "accelerator graph requires an accelerator device");
+#if defined(USE_ROCM)
+  c10::Stream stream = AcquireDeviceStream(device);
+  try {
+    return new AcceleratorGraph(stream.device(), stream);
+  } catch (...) {
+    ReleaseDeviceStream(stream);
+    throw;
+  }
+#else
   c10::DeviceGuard device_guard(device);
   c10::impl::VirtualGuardImpl guard_impl(device.type());
   return new AcceleratorGraph(device, guard_impl.getStreamFromGlobalPool(device));
+#endif
 #else
   TORCH_CHECK(false, "accelerator graph is unavailable in this build");
 #endif
@@ -401,9 +550,25 @@ void BeginAcceleratorGraphCapture(AcceleratorGraph* graph) {
     ready.record(caller_stream);
     ready.block(graph->stream);
   }
+#if defined(USE_ROCM) && defined(DJL_USE_ROCM_KERNELS)
+  TORCH_CHECK(!graph->rocm_matmul_context_pinned,
+      "accelerator graph capture already owns a ROCm matmul context pin");
+#endif
   graph->capture_guard = std::make_unique<c10::StreamGuard>(graph->stream);
 #if defined(USE_ROCM)
+#if defined(DJL_USE_ROCM_KERNELS)
+  try {
+    djl::pytorch::fusion::PinCurrentRocmMatmulStreamContext(
+        graph->device);
+    graph->rocm_matmul_context_pinned = true;
+    graph->graph.capture_begin({0, 0}, hipStreamCaptureModeThreadLocal);
+  } catch (...) {
+    RethrowAfterFailedGraphCaptureCleanup(
+        graph, std::current_exception());
+  }
+#else
   graph->graph.capture_begin({0, 0}, hipStreamCaptureModeThreadLocal);
+#endif
 #else
   graph->graph.capture_begin({0, 0}, cudaStreamCaptureModeThreadLocal);
 #endif
@@ -415,7 +580,17 @@ void BeginAcceleratorGraphCapture(AcceleratorGraph* graph) {
 void EndAcceleratorGraphCapture(AcceleratorGraph* graph) {
 #if defined(DJL_USE_ACCELERATOR_GRAPH)
   c10::DeviceGuard device_guard(graph->device);
-  graph->graph.capture_end();
+  try {
+    graph->graph.capture_end();
+  } catch (...) {
+#if defined(USE_ROCM) && defined(DJL_USE_ROCM_KERNELS)
+    RethrowAfterFailedGraphCaptureCleanup(
+        graph, std::current_exception());
+#else
+    graph->capture_guard.reset();
+    throw;
+#endif
+  }
   graph->capture_guard.reset();
 #else
   TORCH_CHECK(false, "accelerator graph is unavailable in this build");
@@ -449,8 +624,56 @@ void ReplayAcceleratorGraph(AcceleratorGraph* graph) {
 void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
 #if defined(DJL_USE_ACCELERATOR_GRAPH)
   if (graph != nullptr) {
-    c10::DeviceGuard device_guard(graph->device);
-    delete graph;
+    const c10::Device device = graph->device;
+    const c10::Stream stream = graph->stream;
+#if defined(USE_ROCM) && defined(DJL_USE_ROCM_KERNELS)
+    const bool unpin_rocm_matmul_context =
+        graph->rocm_matmul_context_pinned;
+#endif
+    c10::DeviceGuard device_guard(device);
+    std::exception_ptr failure;
+#if defined(USE_ROCM)
+    bool graph_destroyed = false;
+#endif
+#if defined(USE_ROCM) && defined(DJL_USE_ROCM_KERNELS)
+    if (unpin_rocm_matmul_context) {
+      try {
+        stream.synchronize();
+      } catch (...) {
+        failure = std::current_exception();
+      }
+    }
+#endif
+    try {
+      delete graph;
+#if defined(USE_ROCM)
+      graph_destroyed = true;
+#endif
+    } catch (...) {
+      if (failure == nullptr) {
+        failure = std::current_exception();
+      }
+    }
+#if defined(USE_ROCM) && defined(DJL_USE_ROCM_KERNELS)
+    if (unpin_rocm_matmul_context && graph_destroyed) {
+      try {
+        c10::StreamGuard stream_guard(stream);
+        djl::pytorch::fusion::UnpinCurrentRocmMatmulStreamContext(device);
+      } catch (...) {
+        if (failure == nullptr) {
+          failure = std::current_exception();
+        }
+      }
+    }
+#endif
+#if defined(USE_ROCM)
+    if (graph_destroyed && failure == nullptr) {
+      ReleaseDeviceStream(stream);
+    }
+#endif
+    if (failure != nullptr) {
+      std::rethrow_exception(failure);
+    }
   }
 #else
   delete graph;

@@ -53,3 +53,55 @@ You can also choose the default engine manually. Each engine has a name which ca
 engine's javadoc or README. You can set the default engine by setting either the 
 "DJL_DEFAULT_ENGINE" environment variable or the "ai.djl.default_engine" Java property. 
 Either one should be set to the name of the desired default engine.
+
+## Fusion storage planning
+
+Engines that implement `FusionCompiler` may reduce accelerator memory by sharing command scratch,
+reusing storage after a computed value's last consumer, and executing certified operations in place.
+These optimizations are enabled by default. They preserve public output storage until its output
+lease is released. Temporary planner storage is shared across sessions that submit on the same
+device stream.
+
+The following environment variables control the planner phases:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `DJL_FUSION_SCRATCH_PLANNER` | `true` | Shares command-local scratch storage according to its command-internal lifetime. |
+| `DJL_FUSION_INTERMEDIATE_PLANNER` | `true` | Reuses computed intermediate storage after its final consumer. |
+| `DJL_FUSION_INPLACE_PLANNER` | `true` | Hands dead intermediate storage to operations with a verified in-place execution path. Requires intermediate planning. |
+
+Set a variable to `0` or `false` before the process starts to disable that phase for diagnostics or
+performance comparison. Accepted enabled values are `1` and `true`; other values are rejected.
+Disabling intermediate planning also disables in-place planning.
+
+Planner statistics are available through `FusionPlan.getCompilationReport()`, including persistent,
+workspace, exported-output, arena, and backend-workspace-upper-bound bytes as well as logical
+allocation, backing allocation, alias-view, and in-place reuse counts.
+
+`FusionCompileConfig.addShapeProfile(...)` may additionally prepare smaller fixed storage-capacity
+variants without changing the recipe descriptor or its declared maxima. The maximum variant is
+always available. `FusionSessionConfig` either selects the maximum variant, requires an exact
+compiled capacity, or chooses the compiled component-wise fitting variant with the smallest
+isolated-session storage report and falls back to the maximum. A session never reallocates or
+changes variants after construction. `FusionPlan.getShapeProfileReports()` exposes the retained
+output, workspace, and lane-arena requirements of every compiled profile.
+
+`getExecutionStorageBytes()` is the logical tensor payload for one submission. Storage outside the
+planner arena, including named outputs, is retained separately for each session output slot;
+`getRetainedSessionStorageBytes(outputSlotCount)` reports that payload. The engine retains planner
+arenas on a device-stream execution lane, grows each data-type arena to the largest plan requirement
+seen by that lane, and reuses it across sessions without adding device synchronization.
+ROCm hipBLASLt scratch is likewise retained by the device-stream lane, allocated lazily to the
+largest selected-algorithm requirement, and released with the final session retaining that lane.
+It is not registered in PyTorch's process-global handle/stream workspace map.
+`getRequiredExecutionLaneStorageBytes()` reports the arena plus the backend-workspace upper bound,
+while
+`getSessionStorageBytes(outputSlotCount)` is a conservative isolated-session estimate that also
+counts that requirement once. All submissions in a session use the accelerator stream selected by
+the first submission. The stream's FIFO ordering makes arena reuse asynchronous and allocation-free
+in steady state. When scratch and intermediate planning are both enabled, temporary tensors of
+different data types share one alignment-safe byte arena according to their lifetimes.
+
+The settings are engine-neutral. Currently, the native planner is implemented by the PyTorch CUDA
+and ROCm Fusion backend. Other engines may adopt the same settings when they implement equivalent
+storage lifetime guarantees.

@@ -11,16 +11,19 @@
  * and limitations under the License.
  */
 #include <ATen/autocast_mode.h>
+#include <c10/core/InferenceMode.h>
 #include <djl/utils.h>
 #include <torch/torch.h>
 
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
+#include <utility>
 #include <vector>
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_attention.h"
+#include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_layer_norm.h"
 #include "djl_pytorch_projected_residual_mlp.h"
@@ -662,7 +665,18 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLinear(
   if (jbias != djl::utils::jni::NULL_PTR) {
     bias = *reinterpret_cast<torch::Tensor*>(jbias);
   }
-  const auto* result_ptr = new torch::Tensor(torch::nn::functional::linear(*input_ptr, *weight_ptr, bias));
+  torch::Tensor result;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (c10::InferenceMode::is_enabled()) {
+    const torch::Tensor* bias_ptr = bias.defined() ? &bias : nullptr;
+    djl::pytorch::fusion::TryExecuteRocmInferenceLinear(
+        result, *input_ptr, *weight_ptr, bias_ptr);
+  }
+#endif
+  if (!result.defined()) {
+    result = torch::nn::functional::linear(*input_ptr, *weight_ptr, bias);
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }
