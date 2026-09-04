@@ -38,7 +38,8 @@ jobs:
 
   # Linux x86_64, ROCm flavors (via rocm/dev-ubuntu-*-complete container).
   # Each ROCm version is paired with the latest PyTorch libtorch published
-  # for it on pytorch.org: rocm6.4->2.9.1, rocm7.0->2.10.0, rocm7.1/7.2->2.11.0.
+  # for it: rocm6.4->2.9.1, rocm7.0->2.10.0, rocm7.1/7.2/10.0->2.11.0.
+  # ROCm 10 uses AMD's official split PyTorch/ROCm wheels instead of a libtorch zip.
   jni-rocm:
     name: Build ${{ matrix.flavor }} (PyTorch ${{ matrix.pt }})
     runs-on: ubuntu-22.04
@@ -58,6 +59,9 @@ jobs:
           - flavor: rocm7.2
             pt: "2.11.0"
             image: rocm/dev-ubuntu-24.04:7.2-complete
+          - flavor: rocm10.0
+            pt: "2.11.0"
+            image: ubuntu:24.04
     steps:
       - name: Free disk space
         if: runner.environment == 'github-hosted'

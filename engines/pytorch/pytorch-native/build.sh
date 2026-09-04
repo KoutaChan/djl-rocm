@@ -5,7 +5,7 @@
 #
 # Usage: build.sh <VERSION> <FLAVOR> [precxx11] <ARCH>
 #   VERSION  e.g. 2.11.0
-#   FLAVOR   cpu / cu128 / cu129 / cu130 / rocm6.4 / rocm7.0 / rocm7.1 / rocm7.2
+#   FLAVOR   cpu / cu128 / cu129 / cu130 / rocm6.4 / rocm7.0 / rocm7.1 / rocm7.2 / rocm10.0
 #   3rd arg  "precxx11" to strip the -cxx11-abi- infix (older PyTorch)
 #   ARCH     amd64 / aarch64 (linux+darwin)
 
@@ -65,7 +65,7 @@ download_and_extract_zip() (
 )
 
 download_libtorch_linux() {
-  if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|cu129|cu130|rocm[67]\.[0-9]+)$ ]]; then
+  if [[ ! "$FLAVOR" =~ ^(cpu|cu117|cu121|cu124|cu128|cu129|cu130|rocm(6|7|10)\.[0-9]+)$ ]]; then
     echo "$FLAVOR is not supported." >&2
     exit 1
   fi
@@ -79,6 +79,48 @@ download_libtorch_linux() {
     download_and_extract_zip "https://download.pytorch.org/libtorch/${FLAVOR}/libtorch${CXX11ABI}-shared-with-deps-${VERSION}%2B${FLAVOR}.zip"
   fi
 }
+
+find_python_torch() {
+  python3 -c 'import importlib.util, pathlib; spec = importlib.util.find_spec("torch"); print(pathlib.Path(spec.origin).parent if spec else "")'
+}
+
+find_rocm_root() {
+  local requested=${FLAVOR#rocm}
+  local candidate
+  for candidate in \
+      "${ROCM_PATH:-}" \
+      "${ROCM_HOME:-}" \
+      "/opt/rocm/core-${requested}" \
+      "/opt/rocm-${requested}" \
+      /opt/rocm; do
+    if [[ -n "$candidate" && -x "$candidate/bin/hipcc" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  echo "A ROCm ${requested} development SDK was not found. Set ROCM_PATH." >&2
+  exit 1
+}
+
+TORCH_ROOT="${LIBTORCH_ROOT:-${WORK_DIR}/libtorch}"
+if [[ "$FLAVOR" == rocm10.* && ! -f "$TORCH_ROOT/lib/libtorch.so" ]]; then
+  if [[ -n "${PYTORCH_LIBRARY_PATH:-}" ]]; then
+    if [[ -f "$PYTORCH_LIBRARY_PATH/libtorch.so" ]]; then
+      TORCH_ROOT=$(dirname "$PYTORCH_LIBRARY_PATH")
+    elif [[ -f "$PYTORCH_LIBRARY_PATH/lib/libtorch.so" ]]; then
+      TORCH_ROOT=$PYTORCH_LIBRARY_PATH
+    fi
+  fi
+  if [[ ! -f "$TORCH_ROOT/lib/libtorch.so" ]]; then
+    TORCH_ROOT=$(find_python_torch)
+  fi
+  if [[ ! -f "$TORCH_ROOT/lib/libtorch.so" ]]; then
+    echo "ROCm 10 libtorch is distributed in AMD's torch wheel." >&2
+    echo "Install torch[device-<gfx>] from https://stable.repo.amd.com/rocm/whl-next/" >&2
+    echo "or set LIBTORCH_ROOT to an extracted torch package." >&2
+    exit 1
+  fi
+fi
 
 download_libtorch_darwin() {
   # PyTorch 2.2+ ships macOS libtorch directly on pytorch.org (arm64 +
@@ -105,7 +147,7 @@ download_libtorch_darwin() {
 # Check for the actual libtorch library, not just the directory. CI bind
 # mounts an empty /mnt/libtorch onto this path so the pure directory check
 # would silently skip the download and leave us with an empty libtorch/.
-if [[ ! -f "libtorch/lib/libtorch.so" && ! -f "libtorch/lib/libtorch.dylib" && ! -f "libtorch/lib/torch.dll" ]]; then
+if [[ ! -f "$TORCH_ROOT/lib/libtorch.so" && ! -f "$TORCH_ROOT/lib/libtorch.dylib" && ! -f "$TORCH_ROOT/lib/torch.dll" ]]; then
   case "$PLATFORM" in
     linux)  download_libtorch_linux ;;
     darwin) download_libtorch_darwin ;;
@@ -113,8 +155,8 @@ if [[ ! -f "libtorch/lib/libtorch.so" && ! -f "libtorch/lib/libtorch.dylib" && !
   esac
 fi
 
-if [[ ! -d "libtorch" ]]; then
-  echo "ERROR: libtorch directory is missing after download." >&2
+if [[ ! -d "$TORCH_ROOT" ]]; then
+  echo "ERROR: libtorch directory is missing after download: $TORCH_ROOT" >&2
   exit 1
 fi
 
@@ -129,7 +171,7 @@ stub_cuda_cmake_macros() {
   # Drop a stub so consumers that pull in CUDACachingAllocator & friends can
   # compile. The file only defines build-time #defines so an empty one is
   # equivalent to "default everything".
-  local stub="libtorch/include/c10/cuda/impl/cuda_cmake_macros.h"
+  local stub="$TORCH_ROOT/include/c10/cuda/impl/cuda_cmake_macros.h"
   if [[ ! -f "$stub" ]]; then
     echo "note: synthesising missing $stub"
     mkdir -p "$(dirname "$stub")"
@@ -150,6 +192,9 @@ set_rocm_arch() {
       ;;
     rocm7.*)
       export PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
+      ;;
+    rocm10.*)
+      export PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
       ;;
     *)
       export PYTORCH_ROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201"
@@ -185,6 +230,10 @@ case "$FLAVOR" in
     USE_ROCM=1
     stub_cuda_cmake_macros
     set_rocm_arch
+    ROCM_PATH=$(find_rocm_root)
+    export ROCM_PATH ROCM_HOME="$ROCM_PATH"
+    export PATH="$ROCM_PATH/bin:$PATH"
+    export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib/host-math/lib:$ROCM_PATH/lib/rocm_sysdeps/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     ;;
 esac
 
@@ -217,7 +266,7 @@ if [[ -z "${JAVA_HOME:-}" ]] && command -v javac >/dev/null 2>&1; then
   echo "note: auto-detected JAVA_HOME=${JAVA_HOME}"
 fi
 
-cmake -DCMAKE_PREFIX_PATH="${WORK_DIR}/libtorch" \
+cmake -DCMAKE_PREFIX_PATH="${TORCH_ROOT}${ROCM_PATH:+;${ROCM_PATH}}" \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
       -DPT_VERSION="${PT_VERSION_MACRO}" \
       -DUSE_CUDA="$USE_CUDA" \

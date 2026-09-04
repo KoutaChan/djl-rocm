@@ -13,7 +13,7 @@ val ptVersion: String = when {
 }
 
 // `flavor` covers everything published under download.pytorch.org/libtorch/:
-// cpu, cu121, cu124, cu128, rocm6.4, rocm7.0, rocm7.1, rocm7.2, ... The
+// cpu, cu121, cu124, cu128, rocm6.4, rocm7.0, rocm7.1, rocm7.2, rocm10.0, ... The
 // legacy `rocm_flavor` property is kept as a fallback for callers still
 // passing the ROCm-specific name.
 val flavor: String = when {

@@ -81,6 +81,28 @@ PyTorch runtime. The provided ROCm Gradle flavor uses `build.sh` on Linux. A dir
 also requires a CMake generator and host compiler combination supported by the installed HIP
 toolchain.
 
+ROCm 10 uses AMD's split ROCm and PyTorch wheels instead of the monolithic libtorch archive used by
+earlier releases. Install the matching development SDK and PyTorch package, then build against the
+installed `torch` directory:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+    "torch[device-gfx1100]==2.11.0+rocm10.0.0" \
+    "rocm[libraries,devel,device-gfx1100]==10.0.0"
+rocm-sdk init
+export ROCM_PATH="$(rocm-sdk path --root)"
+export PATH="$(rocm-sdk path --bin):$PATH"
+export PYTORCH_ROCM_ARCH=gfx1100
+./gradlew compileJNI -Pcuda=rocm10.0 -Ppt_version=2.11.0
+```
+
+For a native ROCm 10 SDK installation, set `ROCM_PATH` to its development root (for example
+`/opt/rocm/core-10.0`) and `LIBTORCH_ROOT` to an extracted AMD `torch` wheel. At runtime, keep the
+official wheel packages installed and set `PYTORCH_LIBRARY_PATH` to the wheel's `torch/lib`
+directory. This preserves AMD's version-locked ROCm libraries and per-device `.kpack` packages.
+
 ### Format C++ code
 It uses clang-format to format the code.
 
