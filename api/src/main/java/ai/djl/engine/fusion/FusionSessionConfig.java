@@ -12,13 +12,19 @@
  */
 package ai.djl.engine.fusion;
 
+import java.util.Objects;
+
 /** Immutable configuration for a {@link FusionSession}. */
 public final class FusionSessionConfig {
 
-    private final int bufferCount;
+    private final int outputSlotCount;
+    private final FusionShapeProfile requestedShapeProfile;
+    private final ProfileFallback profileFallback;
 
     private FusionSessionConfig(Builder builder) {
-        bufferCount = builder.bufferCount;
+        outputSlotCount = builder.outputSlotCount;
+        requestedShapeProfile = builder.requestedShapeProfile;
+        profileFallback = builder.profileFallback;
     }
 
     /**
@@ -40,34 +46,94 @@ public final class FusionSessionConfig {
     }
 
     /**
-     * Returns the number of persistent output slots and concurrent workspace lanes.
+     * Returns the number of persistent output slots.
      *
-     * @return the ring buffer count
+     * @return the output slot count
      */
-    public int getBufferCount() {
-        return bufferCount;
+    public int getOutputSlotCount() {
+        return outputSlotCount;
+    }
+
+    /**
+     * Returns the minimum storage-capacity profile requested for the session.
+     *
+     * <p>A {@code null} value selects the recipe's declared maximum capacities.
+     *
+     * @return the requested profile, or {@code null}
+     */
+    public FusionShapeProfile getRequestedShapeProfile() {
+        return requestedShapeProfile;
+    }
+
+    /**
+     * Returns the behavior used when the requested profile is not compiled exactly.
+     *
+     * @return the profile fallback policy
+     */
+    public ProfileFallback getProfileFallback() {
+        return profileFallback;
+    }
+
+    /** Controls selection of a compiled storage-capacity profile. */
+    public enum ProfileFallback {
+        /** Selects the smallest compiled profile that fits, or the recipe maximum. */
+        SMALLEST_FITTING_OR_MAXIMUM,
+
+        /**
+         * Requires an exact compiled profile, except that the recipe maximum is always available.
+         */
+        EXACT
     }
 
     /** Builds an immutable {@link FusionSessionConfig}. */
     public static final class Builder {
 
-        private int bufferCount;
+        private int outputSlotCount;
+        private FusionShapeProfile requestedShapeProfile;
+        private ProfileFallback profileFallback;
 
         private Builder() {
-            bufferCount = 1;
+            outputSlotCount = 1;
+            profileFallback = ProfileFallback.SMALLEST_FITTING_OR_MAXIMUM;
         }
 
         /**
-         * Sets the number of persistent output slots and concurrent workspace lanes.
+         * Sets the number of persistent output slots.
          *
-         * @param bufferCount the ring buffer count
+         * @param outputSlotCount the output slot count
          * @return this builder
          */
-        public Builder optBufferCount(int bufferCount) {
-            if (bufferCount <= 0) {
-                throw new IllegalArgumentException("The buffer count must be positive.");
+        public Builder optOutputSlotCount(int outputSlotCount) {
+            if (outputSlotCount <= 0) {
+                throw new IllegalArgumentException("The output slot count must be positive.");
             }
-            this.bufferCount = bufferCount;
+            this.outputSlotCount = outputSlotCount;
+            return this;
+        }
+
+        /**
+         * Requests a minimum storage-capacity profile for the session.
+         *
+         * <p>The executable selects a compiled profile according to {@link #optProfileFallback}.
+         * Profile capacities are fixed for the session lifetime.
+         *
+         * @param requestedShapeProfile the requested profile
+         * @return this builder
+         */
+        public Builder optRequestedShapeProfile(FusionShapeProfile requestedShapeProfile) {
+            this.requestedShapeProfile =
+                    Objects.requireNonNull(requestedShapeProfile, "requestedShapeProfile");
+            return this;
+        }
+
+        /**
+         * Sets how a requested capacity profile is matched to compiled profiles.
+         *
+         * @param profileFallback the fallback policy
+         * @return this builder
+         */
+        public Builder optProfileFallback(ProfileFallback profileFallback) {
+            this.profileFallback = Objects.requireNonNull(profileFallback, "profileFallback");
             return this;
         }
 

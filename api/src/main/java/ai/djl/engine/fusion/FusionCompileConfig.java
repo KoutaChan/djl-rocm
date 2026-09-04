@@ -56,7 +56,7 @@ public final class FusionCompileConfig {
     }
 
     /**
-     * Returns the preferred runtime shape specializations.
+     * Returns the compiled storage-capacity profiles.
      *
      * @return the shape profiles
      */
@@ -93,7 +93,7 @@ public final class FusionCompileConfig {
         }
 
         /**
-         * Adds a preferred runtime shape specialization.
+         * Adds a storage-capacity specialization.
          *
          * @param shapeProfile the shape profile
          * @return this builder

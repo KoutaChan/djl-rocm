@@ -41,6 +41,18 @@ and launch differences. Keep changes to common command behavior in the shared so
 ROCm do not drift. Fusion storage planner settings are documented in the
 [engine guide](../../../docs/engine.md#fusion-storage-planning).
 
+### Fusion execution-lane lifetime
+
+Fusion planner arenas are shared by sessions that submit on the same accelerator device and
+stream. Each data-type arena grows to the largest capacity requested on that lane and does not
+shrink while any session retains the lane. A smaller storage-capacity profile avoids a larger arena
+allocation only when the lane has not already observed a larger plan. The lane and its high-water
+allocations are released after the last retaining session is closed; the global registry keeps only
+weak references. This grow-only lifetime avoids allocator traffic and synchronization in the steady
+state. On ROCm, the lane also owns one lazy, grow-only hipBLASLt workspace sized to the largest
+selected fused linear algorithm. This avoids PyTorch's process-lifetime handle/stream workspace
+registry while preserving the selected algorithm and adding no submission synchronization.
+
 ### NVIDIA CUDA
 
 Install a CUDA toolkit compatible with the selected libtorch flavor and make `nvcc` available to

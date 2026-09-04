@@ -66,20 +66,26 @@ final class PyTorchLibrary {
 
     native int torchGetFusionBackend();
 
-    native long torchPrepareFusionPlan(int[] device, ByteBuffer descriptor);
+    native long torchPrepareFusionPlanWithProfiles(
+            int[] device, ByteBuffer descriptor, ByteBuffer profileDescriptor);
 
-    native long[] torchGetFusionPlanStats(long planHandle);
+    native long[] torchGetFusionPlanVariantStats(long planHandle, int variantIndex);
 
     native long torchBindFusionPlan(long planHandle, ByteBuffer constantHandles);
 
-    native long torchCreateFusionSession(long executableHandle, int bufferCount);
+    native long torchCreateFusionProfileSession(
+            long executableHandle, int variantIndex, int outputSlotCount);
 
-    native long torchGetFusionSessionOutput(long sessionHandle, int bufferIndex, int outputIndex);
+    native long torchGetFusionSessionOutput(
+            long sessionHandle, int outputSlotIndex, int outputIndex);
 
     native void torchSubmitFusion(
-            long sessionHandle, int bufferIndex, ByteBuffer inputHandles, ByteBuffer dimensions);
+            long sessionHandle,
+            int outputSlotIndex,
+            ByteBuffer inputHandles,
+            ByteBuffer dimensions);
 
-    native void torchSynchronizeFusionOutput(long sessionHandle, int bufferIndex);
+    native void torchSynchronizeFusionOutput(long sessionHandle, int outputSlotIndex);
 
     native void torchDeleteFusionPlan(long handle);
 

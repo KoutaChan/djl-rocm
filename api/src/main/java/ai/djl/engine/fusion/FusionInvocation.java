@@ -42,22 +42,22 @@ public interface FusionInvocation extends AutoCloseable {
      * Sets the active extent of a named leading dimension.
      *
      * @param dimension the recipe dimension handle
-     * @param extent the active extent, between zero and the configured maximum
+     * @param extent the active extent, between zero and the session capacity
      */
     void setDimension(FusionRecipe.Dimension dimension, long extent);
 
     /**
-     * Enqueues this invocation on the engine-current device stream.
+     * Enqueues this invocation on the session's device stream.
      *
      * <p>This operation does not transfer inputs from host memory, transfer outputs to host memory,
      * or synchronize the device. The backend submits the already-bound plan using the configured
      * input handles and runtime extents. Implementations should cross the hot native boundary once.
-     * The returned lease owns the ring slot until it is closed. Work submitted through the
-     * engine-current stream is ordered with consumers subsequently enqueued on that same stream. A
-     * consumer on another stream requires an explicit event/wait dependency. If submission fails
-     * after the backend may have enqueued work, the backend must either establish completion before
-     * returning or retain every referenced resource until the owning session is closed
-     * successfully.
+     * The returned lease owns the ring slot until it is closed. Work submitted through the first
+     * submission selects the engine-current stream; later submissions must use that same stream.
+     * Work is ordered with consumers subsequently enqueued on the session stream. A consumer on
+     * another stream requires an explicit event/wait dependency. If submission fails after the
+     * backend may have enqueued work, the backend must either establish completion before returning
+     * or retain every referenced resource until the owning session is closed successfully.
      *
      * @return a lease for the persistent output slot
      */

@@ -26,7 +26,7 @@ import ai.djl.ndarray.NDArray;
 public interface FusionOutputLease extends AutoCloseable {
 
     /**
-     * Returns the maximum-capacity storage for an output.
+     * Returns storage sized for the session's selected capacity.
      *
      * <p>The active leading extent is available through {@link #getDimension}. The returned array
      * is owned by the session. The caller must not close it, attach it to another manager, or use
@@ -58,10 +58,9 @@ public interface FusionOutputLease extends AutoCloseable {
      *
      * <p>The caller must ensure that the fusion producer and every device or host transfer
      * consuming its output have completed before closing the lease. Work ordered after the producer
-     * on the same stream satisfies the producer dependency, but a slot that may next be submitted
-     * on a different stream requires explicit event completion or {@link #synchronize()} first. In
-     * particular, an asynchronous device-to-host transfer on another stream must finish before the
-     * slot can be reused. No method may be invoked through this reference after it is closed.
+     * on the session stream satisfies the producer dependency. In particular, an asynchronous
+     * device-to-host transfer or consumer on another stream must finish before the slot can be
+     * reused. No method may be invoked through this reference after it is closed.
      */
     @Override
     void close();

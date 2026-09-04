@@ -14,6 +14,7 @@ package ai.djl.pytorch.engine;
 
 import ai.djl.Device;
 import ai.djl.engine.Engine;
+import ai.djl.engine.fusion.FusionCompilationReport;
 import ai.djl.engine.fusion.FusionConstantBindings;
 import ai.djl.engine.fusion.FusionExecutable;
 import ai.djl.engine.fusion.FusionInvocation;
@@ -36,6 +37,10 @@ import org.testng.SkipException;
 import org.testng.annotations.Test;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /** Tests indexed-relation transformer descriptor encoding and ROCm eager parity. */
 public class PtFusionIndexedRelationAttentionTest {
@@ -119,7 +124,9 @@ public class PtFusionIndexedRelationAttentionTest {
                         FusionSession session =
                                 executable.newSession(
                                         manager,
-                                        FusionSessionConfig.builder().optBufferCount(2).build())) {
+                                        FusionSessionConfig.builder()
+                                                .optOutputSlotCount(2)
+                                                .build())) {
                     for (int iteration = 0; iteration < 2; ++iteration) {
                         try (NDManager workingManager = manager.newSubManager()) {
                             for (int batchCount : batchCounts) {
@@ -138,6 +145,153 @@ public class PtFusionIndexedRelationAttentionTest {
                     }
                 }
             }
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void rocmIndexedRelationWorkspaceIsSharedAcrossThreadsOnOneStream() throws Exception {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch ROCm device.");
+        }
+        int batchCount = 32;
+        Fixture fixture = new Fixture(DataType.FLOAT16, batchCount, 1);
+        Device device = Device.gpu(0);
+
+        try (NDManager manager = engine.newBaseManager(device);
+                Parameters parameters = new Parameters(manager, DataType.FLOAT16);
+                NDArray firstInput =
+                        patternedArray(
+                                manager,
+                                DataType.FLOAT16,
+                                new Shape(batchCount, TOKENS, HIDDEN_WIDTH),
+                                47,
+                                23,
+                                0.015f);
+                NDArray secondInput =
+                        patternedArray(
+                                manager,
+                                DataType.FLOAT16,
+                                new Shape(batchCount, TOKENS, HIDDEN_WIDTH),
+                                53,
+                                26,
+                                0.012f);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable = plan.bind(fixture.bindings(parameters));
+                PtStream stream = engine.newStream(device);
+                FusionSession firstSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                FusionSession secondSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults())) {
+            FusionCompilationReport report = plan.getCompilationReport();
+            long backendWorkspaceUpperBound = report.getBackendWorkspaceUpperBoundBytes();
+            if (backendWorkspaceUpperBound == 0) {
+                throw new SkipException(
+                        "This test requires the ROCm hipBLASLt linear bias-SiLU path.");
+            }
+
+            float[] expectedFirst;
+            float[] expectedSecond;
+            try (NDArray expected = reference(firstInput, parameters, 1)) {
+                expectedFirst = expected.toFloatArray();
+            }
+            try (NDArray expected = reference(secondInput, parameters, 1)) {
+                expectedSecond = expected.toFloatArray();
+            }
+
+            // Warm the lane on the same stream before measuring. A process-global workspace
+            // implementation would still allocate one additional workspace for each live worker
+            // thread because PyTorch's hipBLASLt handles are thread-local.
+            try (PtStreamScope ignored = stream.openScope();
+                    FusionOutputLease warmup =
+                            submit(firstSession, fixture, firstInput, batchCount)) {
+                warmup.synchronize();
+            }
+            long allocatedBeforeWorkers = engine.getMemoryStats(device).getAllocatedBytes();
+
+            ExecutorService firstWorker = Executors.newSingleThreadExecutor();
+            ExecutorService secondWorker = Executors.newSingleThreadExecutor();
+            try {
+                Future<FusionOutputLease> first =
+                        firstWorker.submit(
+                                () ->
+                                        submitOnSharedStream(
+                                                stream,
+                                                firstSession,
+                                                fixture,
+                                                firstInput,
+                                                batchCount));
+
+                // PtStream permits one active host scope. Wait only for the first
+                // enqueue/scope close, not GPU completion, before submitting from the
+                // second host thread. Both GPU submissions remain unsynchronized.
+                try (FusionOutputLease firstLease = first.get(120, TimeUnit.SECONDS)) {
+                    Future<FusionOutputLease> second =
+                            secondWorker.submit(
+                                    () ->
+                                            submitOnSharedStream(
+                                                    stream,
+                                                    secondSession,
+                                                    fixture,
+                                                    secondInput,
+                                                    batchCount));
+                    try (FusionOutputLease secondLease = second.get(120, TimeUnit.SECONDS)) {
+                        firstLease.synchronize();
+                        secondLease.synchronize();
+                        Assert.assertEquals(
+                                firstLease.get(fixture.output).toFloatArray(),
+                                expectedFirst,
+                                4.0e-2f);
+                        Assert.assertEquals(
+                                secondLease.get(fixture.output).toFloatArray(),
+                                expectedSecond,
+                                4.0e-2f);
+                    }
+                }
+
+                long allocatedAfterWorkers = engine.getMemoryStats(device).getAllocatedBytes();
+                long maximumGrowth =
+                        Math.addExact(backendWorkspaceUpperBound, backendWorkspaceUpperBound / 2);
+                Assert.assertTrue(
+                        allocatedAfterWorkers <= allocatedBeforeWorkers + maximumGrowth,
+                        "Two host threads retained independent hipBLASLt workspaces: before="
+                                + allocatedBeforeWorkers
+                                + ", after="
+                                + allocatedAfterWorkers
+                                + ", backendWorkspaceUpperBound="
+                                + backendWorkspaceUpperBound);
+            } finally {
+                firstWorker.shutdownNow();
+                secondWorker.shutdownNow();
+                Assert.assertTrue(
+                        firstWorker.awaitTermination(30, TimeUnit.SECONDS),
+                        "First Fusion workspace test worker did not terminate.");
+                Assert.assertTrue(
+                        secondWorker.awaitTermination(30, TimeUnit.SECONDS),
+                        "Second Fusion workspace test worker did not terminate.");
+            }
+        }
+    }
+
+    private static FusionOutputLease submit(
+            FusionSession session, Fixture fixture, NDArray input, int batchCount) {
+        try (FusionInvocation invocation = session.acquire()) {
+            invocation.setInput(fixture.input, input);
+            invocation.setDimension(fixture.batch, batchCount);
+            return invocation.submit();
+        }
+    }
+
+    @SuppressWarnings("try")
+    private static FusionOutputLease submitOnSharedStream(
+            PtStream stream,
+            FusionSession session,
+            Fixture fixture,
+            NDArray input,
+            int batchCount) {
+        try (PtStreamScope ignored = stream.openScope()) {
+            return submit(session, fixture, input, batchCount);
         }
     }
 

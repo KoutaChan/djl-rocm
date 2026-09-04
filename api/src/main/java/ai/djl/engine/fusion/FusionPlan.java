@@ -12,6 +12,8 @@
  */
 package ai.djl.engine.fusion;
 
+import java.util.Map;
+
 /** An immutable, device-specific lowering of a {@link FusionRecipe}. */
 public interface FusionPlan extends AutoCloseable {
 
@@ -28,6 +30,25 @@ public interface FusionPlan extends AutoCloseable {
      * @return the compilation report
      */
     FusionCompilationReport getCompilationReport();
+
+    /**
+     * Returns diagnostics for one explicitly compiled storage-capacity profile.
+     *
+     * @param profile a profile passed to the compile configuration
+     * @return the profile-specific compilation report
+     * @throws IllegalArgumentException if the profile was not compiled by this plan
+     */
+    FusionCompilationReport getCompilationReport(FusionShapeProfile profile);
+
+    /**
+     * Returns profile-specific diagnostics in compile-configuration order.
+     *
+     * <p>The recipe-maximum plan is reported by {@link #getCompilationReport()} and is not included
+     * in this map.
+     *
+     * @return an immutable map from compiled profiles to their reports
+     */
+    Map<FusionShapeProfile, FusionCompilationReport> getShapeProfileReports();
 
     /**
      * Binds model constants and creates an executable.

@@ -29,7 +29,9 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -37,6 +39,9 @@
 #include <vector>
 
 #include "djl_pytorch_fusion_kernels.h"
+#if defined(DJL_USE_FUSION_KERNELS)
+#include "djl_pytorch_fusion_backend.h"
+#endif
 #include "djl_pytorch_launch_config.h"
 #include "djl_pytorch_projected_residual_mlp.h"
 #include "djl_pytorch_rocm_attention.h"
@@ -54,6 +59,12 @@ constexpr std::size_t kValueRecordHeaderWords = 7;
 constexpr std::size_t kBindingRecordWords = 2;
 constexpr std::size_t kCommandRecordHeaderWords = 6;
 constexpr std::size_t kOutputRecordWords = 2;
+
+// Shape profiles use a separate descriptor so the stable recipe V2 wire
+// schema remains unchanged.
+constexpr int64_t kProfileDescriptorMagic = 0x444a4c5f46535031LL;
+constexpr int64_t kProfileDescriptorVersion = 1;
+constexpr std::size_t kProfileHeaderWords = 5;
 
 constexpr int64_t kDTypeFloat16 = 1;
 constexpr int64_t kDTypeBFloat16 = 2;
@@ -135,6 +146,7 @@ enum class StorageRole {
 
 struct DimensionSpec {
   int64_t maximum_extent;
+  int64_t declared_maximum_extent;
 };
 
 struct ValueSpec {
@@ -402,7 +414,7 @@ struct MappedGroupedMaskedSoftmaxPoolOutputSetSpec {
   int32_t contexts_storage_index;
   int32_t presence_storage_index;
   int64_t destination_count;
-  int64_t backing_row_offset;
+  int64_t backing_destination_offset;
 };
 
 struct MappedGroupedMaskedSoftmaxPoolGroupCommandSpec {
@@ -471,20 +483,25 @@ struct FusionPlanData {
   int64_t arena_bytes = 0;
   int64_t logical_allocation_count = 0;
   int64_t in_place_reuse_count = 0;
+  bool uses_linear_bias_silu = false;
+  int64_t backend_workspace_upper_bound_bytes = 0;
   std::vector<int32_t> transient_arena_indices;
   std::vector<int32_t> transient_storage_indices;
 };
 
 struct FusionExecutableData {
-  std::shared_ptr<const FusionPlanData> plan;
+  std::vector<std::shared_ptr<const FusionPlanData>> plans;
   std::vector<torch::Tensor> constants;
+#if defined(DJL_USE_ROCM_KERNELS)
+  // Declared after constants so descriptors with fixed epilogue-bias pointers
+  // are destroyed before the tensors that own those pointers.
+  std::shared_ptr<FusionMatmulPlan> matmul_plan;
+#endif
   std::vector<std::vector<torch::Tensor>> affine_weights;
   std::vector<std::vector<torch::Tensor>> affine_products;
   std::vector<torch::Tensor> indexed_affine_weights;
   std::vector<std::vector<std::array<torch::Tensor, 4>>>
       transformer_encoder_weights;
-  std::vector<std::vector<std::shared_ptr<LinearBiasSiluPlan>>>
-      transformer_expansion_plans;
   std::vector<std::vector<IndexedRelationBlockWeights>>
       indexed_relation_transformer_weights;
   std::vector<torch::Tensor> indexed_relation_ids;
@@ -690,8 +707,9 @@ void CheckTensor(const torch::Tensor& tensor, const FusionPlanData& plan, const 
     return;
   }
   const int64_t active_extent = dimensions[spec.dimension_index];
-  TORCH_CHECK(tensor.size(0) <= spec.maximum_shape[0],
-      "fusion ", kind, " row capacity exceeds the prepared range");
+  TORCH_CHECK(tensor.size(0) <=
+          plan.dimensions[spec.dimension_index].declared_maximum_extent,
+      "fusion ", kind, " row capacity exceeds the recipe range");
   TORCH_CHECK(active_extent <= tensor.size(0),
       "fusion active extent exceeds the ", kind, " row count");
   for (std::size_t axis = 0; axis < spec.inner_shape.size(); ++axis) {
@@ -946,6 +964,112 @@ int64_t TensorPayloadBytes(const std::vector<int64_t>& shape,
   return CheckedMultiply(Product(shape, name),
       static_cast<int64_t>(element_size), name);
 }
+
+#if defined(DJL_USE_FUSION_KERNELS)
+struct FusionExecutionLaneKey {
+  c10::DeviceType device_type;
+  c10::DeviceIndex device_index;
+  std::uintptr_t stream;
+
+  bool operator==(const FusionExecutionLaneKey& other) const {
+    return device_type == other.device_type && device_index == other.device_index &&
+        stream == other.stream;
+  }
+};
+
+struct FusionExecutionLaneKeyHash {
+  std::size_t operator()(const FusionExecutionLaneKey& key) const {
+    std::size_t hash = std::hash<int>{}(static_cast<int>(key.device_type));
+    hash ^= std::hash<int>{}(static_cast<int>(key.device_index)) +
+        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+    hash ^= std::hash<std::uintptr_t>{}(key.stream) +
+        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+    return hash;
+  }
+};
+
+class FusionExecutionLane {
+ public:
+  FusionExecutionLane(c10::Device device, backend::Stream stream)
+      : device_(device), stream_(stream) {}
+
+  std::unique_lock<std::mutex> Lock() {
+    std::unique_lock<std::mutex> lock(submission_mutex_);
+    TORCH_CHECK(!poisoned_,
+        "fusion execution lane is poisoned by an incomplete failed submission");
+    return lock;
+  }
+
+  // The caller holds submission_mutex_ while changing lane health.
+  void Poison() {
+    poisoned_ = true;
+  }
+
+  torch::Tensor Arena(torch::ScalarType data_type,
+      const std::vector<int64_t>& shape) {
+    TORCH_CHECK(stream_ == backend::GetCurrentStream(device_.index()),
+        "fusion execution lane is not current on this thread");
+    const int64_t elements = Product(shape, "fusion execution lane arena capacity");
+    TORCH_CHECK(elements > 0, "fusion execution lane arena must not be empty");
+    torch::Tensor& root = arenas_[static_cast<int>(data_type)];
+    if (!root.defined() || root.numel() < elements) {
+      if (root.defined()) {
+        RecordCurrentStream(root);
+      }
+      root = torch::empty({elements},
+          torch::TensorOptions().device(device_).dtype(data_type));
+    }
+    torch::Tensor arena =
+        root.numel() == elements ? root : root.narrow(0, 0, elements);
+    return arena.view(shape);
+  }
+
+  FusionMatmulWorkspace& BackendWorkspace() {
+    TORCH_CHECK(stream_ == backend::GetCurrentStream(device_.index()),
+        "fusion execution lane is not current on this thread");
+    if (backend_workspace_ == nullptr) {
+      backend_workspace_ = CreateFusionMatmulWorkspace();
+      TORCH_CHECK(backend_workspace_ != nullptr,
+          "failed to create the fusion backend workspace");
+    }
+    return *backend_workspace_;
+  }
+
+ private:
+  c10::Device device_;
+  backend::Stream stream_;
+  std::mutex submission_mutex_;
+  std::unordered_map<int, torch::Tensor> arenas_;
+  std::shared_ptr<FusionMatmulWorkspace> backend_workspace_;
+  bool poisoned_ = false;
+};
+
+std::shared_ptr<FusionExecutionLane> AcquireFusionExecutionLane(
+    c10::Device device, backend::Stream stream) {
+  static std::mutex registry_mutex;
+  static std::unordered_map<FusionExecutionLaneKey,
+      std::weak_ptr<FusionExecutionLane>, FusionExecutionLaneKeyHash> registry;
+  const FusionExecutionLaneKey key{
+      device.type(), device.index(), reinterpret_cast<std::uintptr_t>(stream)};
+  std::lock_guard<std::mutex> lock(registry_mutex);
+  for (auto it = registry.begin(); it != registry.end();) {
+    if (it->second.expired()) {
+      it = registry.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  auto found = registry.find(key);
+  if (found != registry.end()) {
+    if (std::shared_ptr<FusionExecutionLane> lane = found->second.lock()) {
+      return lane;
+    }
+  }
+  auto lane = std::make_shared<FusionExecutionLane>(device, stream);
+  registry[key] = lane;
+  return lane;
+}
+#endif
 
 int32_t StorageRoot(const std::vector<StorageSpec>& storages, int32_t storage_index) {
   std::size_t traversed = 0;
@@ -1535,14 +1659,22 @@ void PlanStorage(FusionPlanData& plan) {
           "fusion temporary storages overlap while simultaneously live");
     }
   }
+  std::unordered_set<int> arena_data_types;
   for (std::size_t index = 0; index < plan.storages.size(); ++index) {
     const auto& storage = plan.storages[index];
     if (storage.transient_arena_root) {
+      TORCH_CHECK(arena_data_types.insert(static_cast<int>(storage.data_type)).second,
+          "fusion plan contains multiple transient arenas with the same data type");
       plan.transient_arena_indices.push_back(static_cast<int32_t>(index));
     } else if (storage.source_storage_index >= 0 &&
         plan.storages[storage.source_storage_index].transient_arena_root) {
       plan.transient_storage_indices.push_back(static_cast<int32_t>(index));
     }
+  }
+  for (const auto& output : plan.outputs) {
+    TORCH_CHECK(!plan.storages[StorageRoot(plan.storages, output.storage_index)]
+            .transient_arena_root,
+        "fusion output must not alias transient arena storage");
   }
 }
 
@@ -2219,6 +2351,13 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
   result.storage_index = command.result_storage_index;
   plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape});
 
+#if defined(DJL_USE_FUSION_KERNELS)
+  if (indexed_relation && result.data_type == torch::kFloat16 &&
+      IsLinearBiasSiluSupported()) {
+    plan.uses_linear_bias_silu = true;
+  }
+#endif
+
   command.normalized_storage_index = NextStorageIndex(plan);
   plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape, -1, 0, command_index});
   command.query_key_value_storage_index = NextStorageIndex(plan);
@@ -2663,7 +2802,7 @@ BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(FusionPlanData& plan,
       "candidates<=256 and positive groups and width");
 
   command.output_sets.reserve(output_set_count);
-  int64_t backing_row_offset = 0;
+  int64_t backing_destination_offset = 0;
   for (std::size_t output_set_index = 0;
        output_set_index < output_set_count; ++output_set_index) {
     const int32_t contexts_index = results[2 * output_set_index];
@@ -2689,11 +2828,10 @@ BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(FusionPlanData& plan,
         "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 mapping must be a "
         "matching fixed INT32 or INT64 constant");
     command.output_sets.push_back(MappedGroupedMaskedSoftmaxPoolOutputSetSpec{
-        contexts_index, presence_index, mapping_index, -1, -1, destination_count, backing_row_offset});
-    backing_row_offset = CheckedAdd(backing_row_offset,
-        CheckedMultiply(command.maximum_batches, destination_count,
-            "mapped grouped pool output-set capacity"),
-        "mapped grouped pool result capacity");
+        contexts_index, presence_index, mapping_index, -1, -1,
+        destination_count, backing_destination_offset});
+    backing_destination_offset = CheckedAdd(backing_destination_offset,
+        destination_count, "mapped grouped pool destination count");
   }
   command.total_destination_count = 0;
   for (const auto& output_set : command.output_sets) {
@@ -2701,13 +2839,18 @@ BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(FusionPlanData& plan,
         command.total_destination_count, output_set.destination_count,
         "mapped grouped pool destination count");
   }
+  TORCH_CHECK(command.total_destination_count == backing_destination_offset,
+      "mapped grouped pool destination accounting is inconsistent");
+  const int64_t backing_row_count = CheckedMultiply(
+      command.maximum_batches, command.total_destination_count,
+      "mapped grouped pool result capacity");
 
   command.contexts_backing_storage_index = NextStorageIndex(plan);
   plan.storages.push_back(StorageSpec{torch::kFloat32,
-      {backing_row_offset, command.width}});
+      {backing_row_count, command.width}});
   command.presence_backing_storage_index = NextStorageIndex(plan);
   plan.storages.push_back(StorageSpec{command.mask_data_type,
-      {backing_row_offset}});
+      {backing_row_count}});
   for (auto& output_set : command.output_sets) {
     ValueSpec& contexts = plan.values[output_set.contexts_value_index];
     contexts.kind = ValueKind::kComputed;
@@ -2717,7 +2860,11 @@ BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(FusionPlanData& plan,
     plan.storages.push_back(StorageSpec{contexts.data_type, contexts.maximum_shape,
         command.contexts_backing_storage_index,
         CheckedMultiply(
-            CheckedMultiply(output_set.backing_row_offset, command.width, "mapped grouped pool context alias offset"),
+            CheckedMultiply(
+                CheckedMultiply(output_set.backing_destination_offset,
+                    command.maximum_batches,
+                    "mapped grouped pool context alias rows"),
+                command.width, "mapped grouped pool context alias offset"),
             static_cast<int64_t>(c10::elementSize(contexts.data_type)),
             "mapped grouped pool context alias byte offset")});
 
@@ -2728,7 +2875,11 @@ BuildMappedGroupedMaskedSoftmaxPoolGroupCommand(FusionPlanData& plan,
     presence.storage_index = output_set.presence_storage_index;
     plan.storages.push_back(
         StorageSpec{presence.data_type, presence.maximum_shape, command.presence_backing_storage_index,
-            CheckedMultiply(output_set.backing_row_offset, static_cast<int64_t>(c10::elementSize(presence.data_type)),
+            CheckedMultiply(
+                CheckedMultiply(output_set.backing_destination_offset,
+                    command.maximum_batches,
+                    "mapped grouped pool presence alias rows"),
+                static_cast<int64_t>(c10::elementSize(presence.data_type)),
                 "mapped grouped pool presence alias byte offset")});
   }
   return command;
@@ -2775,7 +2926,8 @@ void CheckReachability(const FusionPlanData& plan) {
 }
 
 std::shared_ptr<const FusionPlanData> ParsePlan(
-    c10::Device device, const int64_t* descriptor, std::size_t descriptor_size) {
+    c10::Device device, const int64_t* descriptor, std::size_t descriptor_size,
+    const std::vector<int64_t>* profile_capacities = nullptr) {
   TORCH_CHECK(descriptor != nullptr, "fusion descriptor must not be null");
   TORCH_CHECK(descriptor_size >= kHeaderWords, "truncated fusion descriptor header");
   TORCH_CHECK(descriptor[0] == kDescriptorMagic, "invalid fusion descriptor magic");
@@ -2796,6 +2948,9 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
   TORCH_CHECK(value_count > 0, "fusion descriptor must contain values");
   TORCH_CHECK(command_count > 0, "fusion descriptor must contain commands");
   TORCH_CHECK(output_count > 0, "fusion descriptor must contain outputs");
+  TORCH_CHECK(profile_capacities == nullptr ||
+          profile_capacities->size() == static_cast<std::size_t>(dimension_count),
+      "fusion shape profile dimension count does not match the recipe");
 
   const std::size_t dimension_offset = CheckedSize(descriptor[10],
       "fusion dimension table offset");
@@ -2853,9 +3008,18 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
         "invalid fusion dimension record size");
     TORCH_CHECK(dimension_reader.Read() == kDimensionPrefixExtent,
         "unsupported fusion dimension kind");
-    const int64_t maximum_extent = dimension_reader.Read();
-    TORCH_CHECK(maximum_extent > 0, "fusion dimension maximum must be positive");
-    plan->dimensions[record] = DimensionSpec{maximum_extent};
+    const int64_t declared_maximum_extent = dimension_reader.Read();
+    TORCH_CHECK(declared_maximum_extent > 0,
+        "fusion dimension maximum must be positive");
+    const int64_t maximum_extent = profile_capacities == nullptr
+        ? declared_maximum_extent
+        : (*profile_capacities)[static_cast<std::size_t>(record)];
+    TORCH_CHECK(maximum_extent > 0 &&
+            maximum_extent <= declared_maximum_extent,
+        "fusion shape profile capacity must be positive and must not exceed "
+        "the recipe maximum");
+    plan->dimensions[record] =
+        DimensionSpec{maximum_extent, declared_maximum_extent};
   }
   TORCH_CHECK(dimension_reader.IsComplete(), "invalid fusion dimension table size");
 
@@ -3048,6 +3212,26 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
     }
   }
   TORCH_CHECK(command_reader.IsComplete(), "invalid fusion command table size");
+#if defined(DJL_USE_FUSION_KERNELS)
+  const bool uses_matmul = std::any_of(plan->commands.begin(),
+      plan->commands.end(), [](const FusionCommand& command) {
+        return std::holds_alternative<AffineSumCommandSpec>(command) ||
+            std::holds_alternative<ProjectedResidualMlpCommandSpec>(command) ||
+            std::holds_alternative<IndexedAffineCommandSpec>(command) ||
+            std::holds_alternative<TransformerEncoderStackCommandSpec>(command) ||
+            std::holds_alternative<IndexedLocalTransformerCommandSpec>(command) ||
+            std::holds_alternative<SingleQueryReadoutGroupCommandSpec>(command);
+      });
+  if (uses_matmul && IsFusionMatmulSupported()) {
+    const std::size_t upper_bound =
+        GetFusionMatmulWorkspaceUpperBoundBytes();
+    TORCH_CHECK(upper_bound <=
+            static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
+        "Fusion matmul workspace upper bound exceeds the supported range");
+    plan->backend_workspace_upper_bound_bytes =
+        static_cast<int64_t>(upper_bound);
+  }
+#endif
   for (const auto& value : plan->values) {
     TORCH_CHECK(value.kind != ValueKind::kUnbound,
         "fusion value does not have a binding or producer");
@@ -3073,14 +3257,660 @@ std::shared_ptr<const FusionPlanData> ParsePlan(
   return plan;
 }
 
+std::vector<std::vector<int64_t>> ParseProfileDescriptor(
+    const int64_t* descriptor, std::size_t descriptor_size,
+    const FusionPlanData& maximum_plan) {
+  TORCH_CHECK(descriptor != nullptr,
+      "fusion profile descriptor must not be null");
+  TORCH_CHECK(descriptor_size >= kProfileHeaderWords,
+      "truncated fusion profile descriptor header");
+  TORCH_CHECK(descriptor[0] == kProfileDescriptorMagic,
+      "invalid fusion profile descriptor magic");
+  TORCH_CHECK(descriptor[1] == kProfileDescriptorVersion,
+      "unsupported fusion profile descriptor version");
+  const std::size_t total_words = CheckedSize(
+      descriptor[2], "fusion profile descriptor total size");
+  TORCH_CHECK(total_words == descriptor_size,
+      "fusion profile descriptor size does not match its header");
+  const int32_t profile_count = CheckedCount(
+      descriptor[3], "fusion shape profile count");
+  const int32_t dimension_count = CheckedCount(
+      descriptor[4], "fusion shape profile dimension count");
+  TORCH_CHECK(dimension_count == maximum_plan.dimension_count,
+      "fusion shape profile dimension count does not match the recipe");
+  TORCH_CHECK(profile_count == 0 || dimension_count > 0,
+      "fusion shape profiles require at least one recipe dimension");
+  const int64_t payload_words = CheckedMultiply(profile_count,
+      dimension_count, "fusion shape profile descriptor payload size");
+  const int64_t expected_words = CheckedAdd(
+      static_cast<int64_t>(kProfileHeaderWords), payload_words,
+      "fusion shape profile descriptor size");
+  TORCH_CHECK(expected_words == static_cast<int64_t>(total_words),
+      "fusion profile descriptor contains trailing or truncated data");
+
+  std::vector<int64_t> maximum_capacities;
+  maximum_capacities.reserve(maximum_plan.dimensions.size());
+  for (const auto& dimension : maximum_plan.dimensions) {
+    maximum_capacities.push_back(dimension.declared_maximum_extent);
+  }
+  std::vector<std::vector<int64_t>> profiles;
+  profiles.reserve(static_cast<std::size_t>(profile_count));
+  DescriptorReader reader(
+      descriptor + kProfileHeaderWords, descriptor + total_words);
+  for (int32_t profile_index = 0; profile_index < profile_count;
+       ++profile_index) {
+    std::vector<int64_t> capacities;
+    capacities.reserve(static_cast<std::size_t>(dimension_count));
+    for (int32_t dimension_index = 0; dimension_index < dimension_count;
+         ++dimension_index) {
+      const int64_t capacity = reader.Read();
+      const int64_t declared_maximum = maximum_plan
+          .dimensions[static_cast<std::size_t>(dimension_index)]
+          .declared_maximum_extent;
+      TORCH_CHECK(capacity > 0 && capacity <= declared_maximum,
+          "fusion shape profile capacity must be positive and must not "
+          "exceed the recipe maximum");
+      capacities.push_back(capacity);
+    }
+    TORCH_CHECK(capacities != maximum_capacities &&
+            std::find(profiles.begin(), profiles.end(), capacities) ==
+                profiles.end(),
+        "fusion shape profiles must be unique and must not duplicate the "
+        "recipe maximum");
+    profiles.push_back(std::move(capacities));
+  }
+  TORCH_CHECK(reader.IsComplete(),
+      "invalid fusion profile descriptor size");
+  return profiles;
+}
+
+int64_t ElementPayloadBytes(int64_t elements, torch::ScalarType data_type,
+    const char* name) {
+  TORCH_CHECK(elements >= 0, name, " element count must not be negative");
+  const std::size_t element_size = c10::elementSize(data_type);
+  TORCH_CHECK(element_size <=
+          static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
+      name, " element size exceeds the supported range");
+  return CheckedMultiply(elements, static_cast<int64_t>(element_size), name);
+}
+
+int64_t ValuePayloadBytes(const FusionPlanData& plan, int32_t value_index,
+    const char* name) {
+  TORCH_CHECK(value_index >= 0 &&
+          static_cast<std::size_t>(value_index) < plan.values.size(),
+      name, " value index is outside the plan range");
+  const auto& value = plan.values[static_cast<std::size_t>(value_index)];
+  return TensorPayloadBytes(value.maximum_shape, value.data_type, name);
+}
+
+const ValueSpec& ConstantValueSpec(const FusionPlanData& plan,
+    int32_t binding_index, const char* name) {
+  TORCH_CHECK(binding_index >= 0 &&
+          static_cast<std::size_t>(binding_index) <
+              plan.constant_value_indices.size(),
+      name, " binding index is outside the constant range");
+  const int32_t value_index =
+      plan.constant_value_indices[static_cast<std::size_t>(binding_index)];
+  TORCH_CHECK(value_index >= 0 &&
+          static_cast<std::size_t>(value_index) < plan.values.size(),
+      name, " constant value index is outside the plan range");
+  return plan.values[static_cast<std::size_t>(value_index)];
+}
+
+int64_t ConstantPayloadBytes(const FusionPlanData& plan,
+    int32_t binding_index, const char* name) {
+  const auto& value = ConstantValueSpec(plan, binding_index, name);
+  return TensorPayloadBytes(value.maximum_shape, value.data_type, name);
+}
+
+int64_t ExecutableStorageBytes(const FusionPlanData& plan) {
+  int64_t bytes = 0;
+  const auto add = [&](int64_t payload, const char* name) {
+    bytes = CheckedAdd(bytes, payload, name);
+  };
+  for (const auto& fusion_command : plan.commands) {
+    if (const auto* command =
+            std::get_if<AffineSumCommandSpec>(&fusion_command)) {
+      const auto data_type =
+          plan.values[command->result_value_index].data_type;
+      for (const auto& group : command->groups) {
+        const int64_t rows = group.precompute_at_bind
+            ? group.rows_per_batch
+            : group.packed_input_width;
+        const int64_t elements = CheckedMultiply(rows,
+            command->output_width, "fusion affine executable elements");
+        add(ElementPayloadBytes(elements, data_type,
+                "fusion affine executable payload size"),
+            "fusion executable storage payload size");
+      }
+      continue;
+    }
+    if (const auto* command =
+            std::get_if<IndexedAffineCommandSpec>(&fusion_command)) {
+      add(ConstantPayloadBytes(plan, command->hidden_weight_binding_index,
+              "fusion indexed-affine packed weight payload size"),
+          "fusion executable storage payload size");
+      continue;
+    }
+    if (const auto* command =
+            std::get_if<TransformerEncoderStackCommandSpec>(
+                &fusion_command)) {
+      for (const auto& block : command->blocks) {
+        const std::array<int32_t, 4> binding_indices{
+            block.query_key_value_weight_binding_index,
+            block.attention_output_weight_binding_index,
+            block.feed_forward_expansion_weight_binding_index,
+            block.feed_forward_projection_weight_binding_index};
+        for (int32_t binding_index : binding_indices) {
+          add(ConstantPayloadBytes(plan, binding_index,
+                  "fusion transformer packed weight payload size"),
+              "fusion executable storage payload size");
+        }
+      }
+      if (command->relation_ids_value_index >= 0) {
+        add(ValuePayloadBytes(plan, command->relation_ids_value_index,
+                "fusion relation ID table payload size"),
+            "fusion executable storage payload size");
+        const int64_t pair_count = CheckedMultiply(command->token_count,
+            command->token_count, "fusion relation pair count");
+        const int64_t pair_bias_elements = CheckedMultiply(
+            command->attention_heads, pair_count,
+            "fusion relation pair-bias element count");
+        for (const auto& block : command->blocks) {
+          add(ConstantPayloadBytes(plan, block.relation_key_binding_index,
+                  "fusion packed relation-key payload size"),
+              "fusion executable storage payload size");
+          const auto relation_bias_type = ConstantValueSpec(plan,
+              block.relation_bias_binding_index,
+              "fusion relation-bias constant").data_type;
+          add(ElementPayloadBytes(pair_bias_elements, relation_bias_type,
+                  "fusion packed relation-bias payload size"),
+              "fusion executable storage payload size");
+        }
+      }
+      continue;
+    }
+    if (const auto* command =
+            std::get_if<SingleQueryReadoutGroupCommandSpec>(
+                &fusion_command)) {
+      constexpr std::array<int32_t, 14> kUnpaddedParameters{
+          0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 15, 16};
+      for (const auto& readout : command->readouts) {
+        for (int32_t parameter_index : kUnpaddedParameters) {
+          add(ValuePayloadBytes(plan, readout.value_indices[parameter_index],
+                  "fusion packed single-query parameter payload size"),
+              "fusion executable storage payload size");
+        }
+        const auto expansion_type =
+            plan.values[readout.value_indices[11]].data_type;
+        const auto expansion_bias_type =
+            plan.values[readout.value_indices[12]].data_type;
+        const auto projection_type =
+            plan.values[readout.value_indices[13]].data_type;
+        const int64_t matrix_elements = CheckedMultiply(
+            command->hidden_width, command->maximum_feed_forward_width,
+            "fusion padded single-query matrix element count");
+        add(ElementPayloadBytes(matrix_elements, expansion_type,
+                "fusion padded single-query expansion payload size"),
+            "fusion executable storage payload size");
+        add(ElementPayloadBytes(command->maximum_feed_forward_width,
+                expansion_bias_type,
+                "fusion padded single-query expansion-bias payload size"),
+            "fusion executable storage payload size");
+        add(ElementPayloadBytes(matrix_elements, projection_type,
+                "fusion padded single-query projection payload size"),
+            "fusion executable storage payload size");
+      }
+      continue;
+    }
+    if (const auto* command =
+            std::get_if<IndexedLocalTransformerCommandSpec>(
+                &fusion_command)) {
+      const std::array<int32_t, 4> binding_indices{
+          command->query_key_value_weight_binding_index,
+          command->attention_output_weight_binding_index,
+          command->feed_forward_expansion_weight_binding_index,
+          command->feed_forward_projection_weight_binding_index};
+      for (int32_t binding_index : binding_indices) {
+        add(ConstantPayloadBytes(plan, binding_index,
+                "fusion indexed-local packed weight payload size"),
+            "fusion executable storage payload size");
+      }
+      continue;
+    }
+    if (const auto* command =
+            std::get_if<MappedGroupedMaskedSoftmaxPoolGroupCommandSpec>(
+                &fusion_command)) {
+      const int64_t metadata_elements = CheckedMultiply(
+          command->total_destination_count, 4,
+          "fusion mapped-pool metadata element count");
+      add(ElementPayloadBytes(metadata_elements, torch::kInt32,
+              "fusion mapped-pool metadata payload size"),
+          "fusion executable storage payload size");
+    }
+  }
+  return bytes;
+}
+
+int64_t BoundExecutableStorageBytes(const FusionExecutableData& executable) {
+  int64_t bytes = 0;
+  const auto add_tensor = [&](const torch::Tensor& tensor) {
+    if (tensor.defined()) {
+      bytes = CheckedAdd(bytes,
+          ElementPayloadBytes(tensor.numel(), tensor.scalar_type(),
+              "bound fusion executable tensor payload size"),
+          "bound fusion executable storage payload size");
+    }
+  };
+  for (const auto& command : executable.affine_weights) {
+    for (const auto& tensor : command) {
+      add_tensor(tensor);
+    }
+  }
+  for (const auto& command : executable.affine_products) {
+    for (const auto& tensor : command) {
+      add_tensor(tensor);
+    }
+  }
+  for (const auto& tensor : executable.indexed_affine_weights) {
+    add_tensor(tensor);
+  }
+  for (const auto& command : executable.transformer_encoder_weights) {
+    for (const auto& block : command) {
+      for (const auto& tensor : block) {
+        add_tensor(tensor);
+      }
+    }
+  }
+  for (const auto& command :
+       executable.indexed_relation_transformer_weights) {
+    for (const auto& block : command) {
+      add_tensor(block.relation_keys);
+      add_tensor(block.pair_bias);
+    }
+  }
+  for (const auto& tensor : executable.indexed_relation_ids) {
+    add_tensor(tensor);
+  }
+  for (const auto& weights : executable.single_query_readout_weights) {
+    const std::array<const torch::Tensor*, 17> tensors{
+        &weights.query_seed_weight,
+        &weights.query_seed_bias,
+        &weights.query_weight,
+        &weights.query_bias,
+        &weights.key_value_weight,
+        &weights.context_weight,
+        &weights.context_bias,
+        &weights.query_norm_weight,
+        &weights.query_norm_bias,
+        &weights.feed_forward_norm_weight,
+        &weights.feed_forward_norm_bias,
+        &weights.feed_forward_expansion_weight,
+        &weights.feed_forward_expansion_bias,
+        &weights.feed_forward_projection_weight,
+        &weights.feed_forward_projection_bias,
+        &weights.output_norm_weight,
+        &weights.output_norm_bias};
+    for (const torch::Tensor* tensor : tensors) {
+      add_tensor(*tensor);
+    }
+  }
+  for (const auto& command : executable.indexed_local_transformer_weights) {
+    for (const auto& tensor : command) {
+      add_tensor(tensor);
+    }
+  }
+  for (const auto& tensor : executable.mapped_grouped_pool_mappings) {
+    add_tensor(tensor);
+  }
+  return bytes;
+}
+
+void CheckCommandTopology(const OutputPackCommandSpec& maximum,
+    const OutputPackCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_index == profile.result_value_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.output_width == profile.output_width &&
+          maximum.preserve_data_type == profile.preserve_data_type &&
+          maximum.sources.size() == profile.sources.size() &&
+          maximum.segmented_sources.size() == profile.segmented_sources.size(),
+      "fusion shape profile changes output-pack command topology");
+  for (std::size_t index = 0; index < maximum.sources.size(); ++index) {
+    const auto& left = maximum.sources[index];
+    const auto& right = profile.sources[index];
+    TORCH_CHECK(left.value_index == right.value_index &&
+            left.data_type == right.data_type && left.width == right.width &&
+            left.destination_offset == right.destination_offset,
+        "fusion shape profile changes output-pack source topology");
+  }
+  for (std::size_t index = 0;
+       index < maximum.segmented_sources.size(); ++index) {
+    const auto& left = maximum.segmented_sources[index];
+    const auto& right = profile.segmented_sources[index];
+    TORCH_CHECK(left.value_index == right.value_index &&
+            left.data_type == right.data_type &&
+            left.source_prefix_count == right.source_prefix_count &&
+            left.source_token_count == right.source_token_count &&
+            left.token_offset == right.token_offset &&
+            left.token_count == right.token_count &&
+            left.hidden_width == right.hidden_width &&
+            left.destination_offset == right.destination_offset,
+        "fusion shape profile changes segmented output-pack topology");
+  }
+}
+
+void CheckCommandTopology(const AffineSumCommandSpec& maximum,
+    const AffineSumCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_index == profile.result_value_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.bias_value_index == profile.bias_value_index &&
+          maximum.output_width == profile.output_width &&
+          maximum.output_rows_per_batch == profile.output_rows_per_batch &&
+          maximum.output_prefix_shape == profile.output_prefix_shape &&
+          maximum.activation == profile.activation &&
+          maximum.needs_finalize == profile.needs_finalize &&
+          maximum.groups.size() == profile.groups.size(),
+      "fusion shape profile changes affine command topology");
+  for (std::size_t group_index = 0;
+       group_index < maximum.groups.size(); ++group_index) {
+    const auto& left = maximum.groups[group_index];
+    const auto& right = profile.groups[group_index];
+    TORCH_CHECK(left.prefix_shape == right.prefix_shape &&
+            left.dynamic_leading == right.dynamic_leading &&
+            left.precompute_at_bind == right.precompute_at_bind &&
+            left.rows_per_batch == right.rows_per_batch &&
+            left.packed_input_width == right.packed_input_width &&
+            left.requires_input_pack == right.requires_input_pack &&
+            left.output_strides == right.output_strides &&
+            left.terms.size() == right.terms.size(),
+        "fusion shape profile changes affine group topology");
+    for (std::size_t term_index = 0;
+         term_index < left.terms.size(); ++term_index) {
+      const auto& left_term = left.terms[term_index];
+      const auto& right_term = right.terms[term_index];
+      TORCH_CHECK(left_term.input_value_index == right_term.input_value_index &&
+              left_term.weight_value_index == right_term.weight_value_index &&
+              left_term.weight_binding_index ==
+                  right_term.weight_binding_index &&
+              left_term.input_data_type == right_term.input_data_type &&
+              left_term.input_width == right_term.input_width,
+          "fusion shape profile changes affine term topology");
+    }
+  }
+}
+
+void CheckCommandTopology(const ProjectedResidualMlpCommandSpec& maximum,
+    const ProjectedResidualMlpCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_index == profile.result_value_index &&
+          maximum.input_value_index == profile.input_value_index &&
+          maximum.combined_weight_binding_index ==
+              profile.combined_weight_binding_index &&
+          maximum.combined_bias_value_index ==
+              profile.combined_bias_value_index &&
+          maximum.output_weight_binding_index ==
+              profile.output_weight_binding_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.output_width == profile.output_width &&
+          maximum.hidden_width == profile.hidden_width,
+      "fusion shape profile changes projected-residual MLP topology");
+}
+
+void CheckCommandTopology(const IndexedAffineCommandSpec& maximum,
+    const IndexedAffineCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_index == profile.result_value_index &&
+          maximum.active_extent_index == profile.active_extent_index &&
+          maximum.destination_extent_index ==
+              profile.destination_extent_index &&
+          maximum.indices_value_index == profile.indices_value_index &&
+          maximum.hidden_weight_binding_index ==
+              profile.hidden_weight_binding_index &&
+          maximum.hidden_bias_value_index ==
+              profile.hidden_bias_value_index &&
+          maximum.output_weight_value_index ==
+              profile.output_weight_value_index &&
+          maximum.output_bias_value_index ==
+              profile.output_bias_value_index &&
+          maximum.index_data_type == profile.index_data_type &&
+          maximum.input_width == profile.input_width &&
+          maximum.hidden_width == profile.hidden_width &&
+          maximum.output_width == profile.output_width &&
+          maximum.activation == profile.activation &&
+          maximum.sources.size() == profile.sources.size(),
+      "fusion shape profile changes indexed-affine command topology");
+  for (std::size_t index = 0; index < maximum.sources.size(); ++index) {
+    const auto& left = maximum.sources[index];
+    const auto& right = profile.sources[index];
+    TORCH_CHECK(left.value_index == right.value_index &&
+            left.extent_index == right.extent_index &&
+            left.data_type == right.data_type && left.width == right.width &&
+            left.destination_offset == right.destination_offset &&
+            left.index_divisor == right.index_divisor,
+        "fusion shape profile changes indexed-affine source topology");
+  }
+}
+
+void CheckCommandTopology(
+    const TransformerEncoderStackCommandSpec& maximum,
+    const TransformerEncoderStackCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_index == profile.result_value_index &&
+          maximum.input_value_index == profile.input_value_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.relation_ids_value_index ==
+              profile.relation_ids_value_index &&
+          maximum.token_count == profile.token_count &&
+          maximum.hidden_width == profile.hidden_width &&
+          maximum.attention_heads == profile.attention_heads &&
+          maximum.attention_width == profile.attention_width &&
+          maximum.feed_forward_width == profile.feed_forward_width &&
+          maximum.relation_count == profile.relation_count &&
+          maximum.padded_token_count == profile.padded_token_count &&
+          maximum.epsilon == profile.epsilon &&
+          maximum.reuse_output_normalization ==
+              profile.reuse_output_normalization &&
+          maximum.blocks.size() == profile.blocks.size(),
+      "fusion shape profile changes transformer command topology");
+  for (std::size_t index = 0; index < maximum.blocks.size(); ++index) {
+    const auto& left = maximum.blocks[index];
+    const auto& right = profile.blocks[index];
+    TORCH_CHECK(left.value_indices == right.value_indices &&
+            left.query_key_value_weight_binding_index ==
+                right.query_key_value_weight_binding_index &&
+            left.attention_output_weight_binding_index ==
+                right.attention_output_weight_binding_index &&
+            left.feed_forward_expansion_weight_binding_index ==
+                right.feed_forward_expansion_weight_binding_index &&
+            left.feed_forward_projection_weight_binding_index ==
+                right.feed_forward_projection_weight_binding_index &&
+            left.relation_key_value_index == right.relation_key_value_index &&
+            left.relation_bias_value_index ==
+                right.relation_bias_value_index &&
+            left.relation_key_binding_index ==
+                right.relation_key_binding_index &&
+            left.relation_bias_binding_index ==
+                right.relation_bias_binding_index,
+        "fusion shape profile changes transformer block topology");
+  }
+}
+
+void CheckCommandTopology(const BinaryBranchBlendCommandSpec& maximum,
+    const BinaryBranchBlendCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_index == profile.result_value_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.baseline_context_value_index ==
+              profile.baseline_context_value_index &&
+          maximum.selected_context_value_index ==
+              profile.selected_context_value_index &&
+          maximum.selected_logit_value_index ==
+              profile.selected_logit_value_index &&
+          maximum.baseline_presence_value_index ==
+              profile.baseline_presence_value_index &&
+          maximum.selected_presence_value_index ==
+              profile.selected_presence_value_index &&
+          maximum.width == profile.width,
+      "fusion shape profile changes binary-branch topology");
+}
+
+void CheckCommandTopology(
+    const SingleQueryReadoutGroupCommandSpec& maximum,
+    const SingleQueryReadoutGroupCommandSpec& profile) {
+  TORCH_CHECK(maximum.result_value_indices == profile.result_value_indices &&
+          maximum.memory_value_index == profile.memory_value_index &&
+          maximum.query_source_value_index ==
+              profile.query_source_value_index &&
+          maximum.valid_mask_value_index == profile.valid_mask_value_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.token_count == profile.token_count &&
+          maximum.hidden_width == profile.hidden_width &&
+          maximum.query_token_count == profile.query_token_count &&
+          maximum.query_index == profile.query_index &&
+          maximum.attention_heads == profile.attention_heads &&
+          maximum.attention_width == profile.attention_width &&
+          maximum.maximum_feed_forward_width ==
+              profile.maximum_feed_forward_width &&
+          maximum.epsilon == profile.epsilon &&
+          maximum.mask_data_type == profile.mask_data_type &&
+          maximum.norm_data_type == profile.norm_data_type &&
+          maximum.readouts.size() == profile.readouts.size(),
+      "fusion shape profile changes single-query command topology");
+  for (std::size_t index = 0; index < maximum.readouts.size(); ++index) {
+    TORCH_CHECK(maximum.readouts[index].value_indices ==
+                profile.readouts[index].value_indices &&
+            maximum.readouts[index].feed_forward_width ==
+                profile.readouts[index].feed_forward_width,
+        "fusion shape profile changes single-query readout topology");
+  }
+}
+
+void CheckCommandTopology(const IndexedLocalTransformerCommandSpec& maximum,
+    const IndexedLocalTransformerCommandSpec& profile) {
+  TORCH_CHECK(maximum.value_indices == profile.value_indices &&
+          maximum.input_value_indices == profile.input_value_indices &&
+          maximum.segment_token_offsets == profile.segment_token_offsets &&
+          maximum.segment_token_counts == profile.segment_token_counts &&
+          maximum.result_value_index == profile.result_value_index &&
+          maximum.indices_value_index == profile.indices_value_index &&
+          maximum.batch_extent_index == profile.batch_extent_index &&
+          maximum.active_extent_index == profile.active_extent_index &&
+          maximum.query_key_value_weight_binding_index ==
+              profile.query_key_value_weight_binding_index &&
+          maximum.attention_output_weight_binding_index ==
+              profile.attention_output_weight_binding_index &&
+          maximum.feed_forward_expansion_weight_binding_index ==
+              profile.feed_forward_expansion_weight_binding_index &&
+          maximum.feed_forward_projection_weight_binding_index ==
+              profile.feed_forward_projection_weight_binding_index &&
+          maximum.group_count == profile.group_count &&
+          maximum.token_count == profile.token_count &&
+          maximum.hidden_width == profile.hidden_width &&
+          maximum.attention_heads == profile.attention_heads &&
+          maximum.attention_width == profile.attention_width &&
+          maximum.feed_forward_width == profile.feed_forward_width &&
+          maximum.epsilon == profile.epsilon &&
+          maximum.index_data_type == profile.index_data_type,
+      "fusion shape profile changes indexed-local transformer topology");
+}
+
+void CheckCommandTopology(
+    const MappedGroupedMaskedSoftmaxPoolGroupCommandSpec& maximum,
+    const MappedGroupedMaskedSoftmaxPoolGroupCommandSpec& profile) {
+  TORCH_CHECK(maximum.scores_value_index == profile.scores_value_index &&
+          maximum.masks_value_index == profile.masks_value_index &&
+          maximum.values_value_index == profile.values_value_index &&
+          maximum.extent_index == profile.extent_index &&
+          maximum.candidate_count == profile.candidate_count &&
+          maximum.group_count == profile.group_count &&
+          maximum.width == profile.width &&
+          maximum.total_destination_count ==
+              profile.total_destination_count &&
+          maximum.score_data_type == profile.score_data_type &&
+          maximum.mask_data_type == profile.mask_data_type &&
+          maximum.value_data_type == profile.value_data_type &&
+          maximum.output_sets.size() == profile.output_sets.size(),
+      "fusion shape profile changes mapped-pool command topology");
+  for (std::size_t index = 0; index < maximum.output_sets.size(); ++index) {
+    const auto& left = maximum.output_sets[index];
+    const auto& right = profile.output_sets[index];
+    TORCH_CHECK(left.contexts_value_index == right.contexts_value_index &&
+            left.presence_value_index == right.presence_value_index &&
+            left.mapping_value_index == right.mapping_value_index &&
+            left.destination_count == right.destination_count &&
+            left.backing_destination_offset ==
+                right.backing_destination_offset,
+        "fusion shape profile changes mapped-pool output topology");
+  }
+}
+
+void CheckVariantTopology(const FusionPlanData& maximum,
+    const FusionPlanData& profile) {
+  TORCH_CHECK(maximum.device == profile.device &&
+          maximum.input_count == profile.input_count &&
+          maximum.dimension_count == profile.dimension_count &&
+          maximum.constant_count == profile.constant_count &&
+          maximum.dimensions.size() == profile.dimensions.size() &&
+          maximum.input_value_indices == profile.input_value_indices &&
+          maximum.constant_value_indices == profile.constant_value_indices &&
+          maximum.values.size() == profile.values.size() &&
+          maximum.commands.size() == profile.commands.size() &&
+          maximum.uses_linear_bias_silu ==
+              profile.uses_linear_bias_silu &&
+          maximum.backend_workspace_upper_bound_bytes ==
+              profile.backend_workspace_upper_bound_bytes &&
+          maximum.outputs.size() == profile.outputs.size(),
+      "fusion shape profile changes executable binding topology");
+  for (std::size_t index = 0; index < maximum.dimensions.size(); ++index) {
+    TORCH_CHECK(maximum.dimensions[index].declared_maximum_extent ==
+            profile.dimensions[index].declared_maximum_extent,
+        "fusion shape profile changes a declared dimension maximum");
+  }
+  for (std::size_t index = 0; index < maximum.values.size(); ++index) {
+    const auto& left = maximum.values[index];
+    const auto& right = profile.values[index];
+    TORCH_CHECK(left.data_type == right.data_type &&
+            left.dimension_index == right.dimension_index &&
+            left.inner_shape == right.inner_shape && left.kind == right.kind &&
+            left.binding_index == right.binding_index &&
+            left.producer_index == right.producer_index,
+        "fusion shape profile changes value binding topology");
+  }
+  for (std::size_t index = 0; index < maximum.commands.size(); ++index) {
+    const auto& left = maximum.commands[index];
+    const auto& right = profile.commands[index];
+    TORCH_CHECK(left.index() == right.index(),
+        "fusion shape profile changes command type topology");
+    std::visit(
+        [&](const auto& maximum_command) {
+          using Command = std::decay_t<decltype(maximum_command)>;
+          const auto& profile_command = std::get<Command>(right);
+          TORCH_CHECK(maximum_command.operand_value_indices ==
+                  profile_command.operand_value_indices,
+              "fusion shape profile changes command operand topology");
+          CheckCommandTopology(maximum_command, profile_command);
+        },
+        left);
+  }
+  for (std::size_t index = 0; index < maximum.outputs.size(); ++index) {
+    TORCH_CHECK(maximum.outputs[index].value_index ==
+            profile.outputs[index].value_index,
+        "fusion shape profile changes exported output topology");
+  }
+}
+
 const torch::Tensor& ResolveValue(const FusionSession& session, int32_t buffer_index,
     const int64_t* input_handles, int32_t value_index);
 
 }  // namespace
 
 struct FusionPlan {
-  explicit FusionPlan(std::shared_ptr<const FusionPlanData> data) : data(std::move(data)) {}
+  explicit FusionPlan(
+      std::vector<std::shared_ptr<const FusionPlanData>> variants)
+      : variants(std::move(variants)) {
+    TORCH_CHECK(!this->variants.empty(),
+        "fusion plan must contain a recipe-maximum variant");
+    data = this->variants.front();
+  }
 
+  std::vector<std::shared_ptr<const FusionPlanData>> variants;
+  // Variant 0 is the recipe-maximum plan used for one-time binding.
   std::shared_ptr<const FusionPlanData> data;
 };
 
@@ -3092,40 +3922,44 @@ struct FusionExecutable {
 };
 
 struct FusionSession {
-  FusionSession(std::shared_ptr<const FusionExecutableData> executable, int32_t buffer_count)
-      : executable(std::move(executable)), storages(static_cast<std::size_t>(buffer_count)),
-        allocation_waited(static_cast<std::size_t>(buffer_count), false),
-        binding_waited(static_cast<std::size_t>(buffer_count), false),
-        submission_streams(static_cast<std::size_t>(buffer_count)) {
-    const auto& plan = this->executable->plan;
-    c10::DeviceGuard device_guard(plan->device);
-    const torch::TensorOptions options = torch::TensorOptions().device(plan->device);
-    for (auto& buffer : storages) {
-      buffer.resize(plan->storages.size());
-      for (std::size_t storage_index = 0; storage_index < plan->storages.size(); ++storage_index) {
-        const auto& storage = plan->storages[storage_index];
+  FusionSession(std::shared_ptr<const FusionExecutableData> executable,
+      std::shared_ptr<const FusionPlanData> plan,
+      int32_t output_slot_count)
+      : executable(std::move(executable)),
+        plan(std::move(plan)),
+        storages(static_cast<std::size_t>(output_slot_count)),
+        submission_streams(static_cast<std::size_t>(output_slot_count)) {
+    c10::DeviceGuard device_guard(this->plan->device);
+    const torch::TensorOptions options =
+        torch::TensorOptions().device(this->plan->device);
+    for (auto& slot : storages) {
+      slot.resize(this->plan->storages.size());
+      for (std::size_t storage_index = 0;
+           storage_index < this->plan->storages.size(); ++storage_index) {
+        const auto& storage = this->plan->storages[storage_index];
         if (storage.source_storage_index < 0 && !storage.transient_arena_root) {
-          buffer[storage_index] = torch::empty(
+          slot[storage_index] = torch::empty(
               storage.maximum_shape, options.dtype(storage.data_type));
         }
       }
-      BindViews(buffer);
-      for (std::size_t storage_index = 0; storage_index < plan->storages.size(); ++storage_index) {
-        if (!buffer[storage_index].defined()) {
-          TORCH_CHECK(plan->storages[StorageRoot(plan->storages, static_cast<int32_t>(storage_index))]
+      BindViews(slot);
+      for (std::size_t storage_index = 0;
+           storage_index < this->plan->storages.size(); ++storage_index) {
+        if (!slot[storage_index].defined()) {
+          TORCH_CHECK(this->plan->storages[StorageRoot(
+                  this->plan->storages, static_cast<int32_t>(storage_index))]
                   .transient_arena_root,
               "fusion persistent storage could not be materialized");
         }
       }
     }
-    c10::impl::VirtualGuardImpl guard_impl(plan->device.type());
-    allocation_ready = std::make_unique<c10::Event>(plan->device.type());
-    allocation_ready->record(guard_impl.getStream(plan->device));
-    retained_inputs.reserve(static_cast<std::size_t>(plan->input_count));
+    c10::impl::VirtualGuardImpl guard_impl(this->plan->device.type());
+    allocation_ready = std::make_unique<c10::Event>(this->plan->device.type());
+    allocation_ready->record(guard_impl.getStream(this->plan->device));
+    retained_inputs.reserve(static_cast<std::size_t>(this->plan->input_count));
   }
 
   void BindView(std::vector<torch::Tensor>& buffer, int32_t storage_index) {
-    const auto& plan = executable->plan;
     const auto& storage = plan->storages[storage_index];
     if (buffer[storage_index].defined() || storage.source_storage_index < 0) {
       return;
@@ -3149,71 +3983,105 @@ struct FusionSession {
   }
 
   void BindViews(std::vector<torch::Tensor>& buffer) {
-    for (std::size_t storage_index = 0; storage_index < executable->plan->storages.size(); ++storage_index) {
+    for (std::size_t storage_index = 0;
+         storage_index < plan->storages.size(); ++storage_index) {
       BindView(buffer, static_cast<int32_t>(storage_index));
     }
   }
 
-  void BindWorkspace(int32_t buffer_index) {
-    const auto& plan = executable->plan;
-    auto& buffer = storages[buffer_index];
-    const torch::TensorOptions options = torch::TensorOptions().device(plan->device);
+#if defined(DJL_USE_FUSION_KERNELS)
+  void BindWorkspace(int32_t output_slot_index) {
+    TORCH_CHECK(plan->transient_arena_indices.empty() || execution_lane != nullptr,
+        "fusion execution lane has not been selected");
+    auto& slot = storages[output_slot_index];
     for (int32_t storage_index : plan->transient_arena_indices) {
       const auto& storage = plan->storages[storage_index];
-      TORCH_CHECK(!buffer[storage_index].defined(),
+      TORCH_CHECK(!slot[storage_index].defined(),
           "fusion transient arena is already materialized");
-      buffer[storage_index] = torch::empty(storage.maximum_shape, options.dtype(storage.data_type));
+      slot[storage_index] =
+          execution_lane->Arena(storage.data_type, storage.maximum_shape);
     }
     for (int32_t storage_index : plan->transient_storage_indices) {
-      BindView(buffer, storage_index);
-      TORCH_CHECK(buffer[storage_index].defined(), "fusion transient storage could not be materialized");
+      BindView(slot, storage_index);
+      TORCH_CHECK(slot[storage_index].defined(),
+          "fusion transient storage could not be materialized");
     }
   }
 
-  void ClearWorkspace(int32_t buffer_index) {
-    const auto& plan = executable->plan;
-    auto& buffer = storages[buffer_index];
+  void ClearWorkspace(int32_t output_slot_index) {
+    auto& slot = storages[output_slot_index];
+    // Arena roots remain owned by the fixed-stream execution lane. Clearing
+    // these session views neither releases nor transfers their storage.
+    for (int32_t storage_index : plan->transient_storage_indices) {
+      slot[storage_index] = torch::Tensor();
+    }
     for (int32_t storage_index : plan->transient_arena_indices) {
-      if (buffer[storage_index].defined()) {
-        RecordCurrentStream(buffer[storage_index]);
+      slot[storage_index] = torch::Tensor();
+    }
+  }
+
+  void BindExecutionStream(backend::Stream stream) {
+    if (!execution_stream.has_value()) {
+      std::shared_ptr<FusionExecutionLane> lane;
+      if (!plan->transient_arena_indices.empty() ||
+          plan->backend_workspace_upper_bound_bytes != 0) {
+        lane = AcquireFusionExecutionLane(plan->device, stream);
       }
-    }
-    for (int32_t storage_index : plan->transient_storage_indices) {
-      buffer[storage_index] = torch::Tensor();
-    }
-    for (int32_t storage_index : plan->transient_arena_indices) {
-      buffer[storage_index] = torch::Tensor();
+      execution_lane = std::move(lane);
+      execution_stream = stream;
+    } else {
+      TORCH_CHECK(*execution_stream == stream,
+          "fusion session submissions must use the same accelerator stream");
     }
   }
 
-  void WaitForAllocation(int32_t buffer_index, const c10::Stream& stream) {
-    if (!allocation_waited[buffer_index]) {
+  std::unique_lock<std::mutex> LockExecutionLane() {
+    return execution_lane == nullptr ? std::unique_lock<std::mutex>()
+                                     : execution_lane->Lock();
+  }
+
+  FusionMatmulWorkspace& BackendWorkspace() {
+    TORCH_CHECK(execution_lane != nullptr,
+        "fusion execution lane has not been selected");
+    return execution_lane->BackendWorkspace();
+  }
+
+  void PoisonExecutionLane() {
+    if (execution_lane != nullptr) {
+      execution_lane->Poison();
+    }
+  }
+#endif
+
+  void WaitForAllocation(const c10::Stream& stream) {
+    if (!allocation_waited) {
       allocation_ready->block(stream);
-      allocation_waited[buffer_index] = true;
+      allocation_waited = true;
     }
   }
 
-  void WaitForBinding(int32_t buffer_index, const c10::Stream& stream) {
-    if (!binding_waited[buffer_index]) {
+  void WaitForBinding(const c10::Stream& stream) {
+    if (!binding_waited) {
       executable->binding_ready->block(stream);
-      binding_waited[buffer_index] = true;
+      binding_waited = true;
     }
   }
 
-  void SetSubmissionStream(int32_t buffer_index, const c10::Stream& stream) {
-    submission_streams[buffer_index] = stream;
+  void SetSubmissionStream(int32_t output_slot_index, const c10::Stream& stream) {
+    submission_streams[output_slot_index] = stream;
   }
 
-  void Synchronize(int32_t buffer_index) {
-    TORCH_CHECK(submission_streams[buffer_index].has_value(),
+  void Synchronize(int32_t output_slot_index) {
+    TORCH_CHECK(submission_streams[output_slot_index].has_value(),
         "fusion output slot has not been submitted");
-    c10::Event completion(executable->plan->device.type());
-    completion.record(*submission_streams[buffer_index]);
+    c10::Event completion(plan->device.type());
+    completion.record(*submission_streams[output_slot_index]);
     completion.synchronize();
   }
 
-  void RetainIncompleteSubmission(
+  void ArmSubmission(
       const c10::Stream& stream, const int64_t* input_handles, std::size_t input_count) {
+    TORCH_CHECK(!poisoned, "fusion session already has an incomplete submission");
     retained_inputs.clear();
     for (std::size_t index = 0; index < input_count; ++index) {
       const auto* input = reinterpret_cast<const torch::Tensor*>(input_handles[index]);
@@ -3221,6 +4089,12 @@ struct FusionSession {
     }
     incomplete_submission_stream = stream;
     poisoned = true;
+  }
+
+  void CompleteSubmission() {
+    retained_inputs.clear();
+    incomplete_submission_stream.reset();
+    poisoned = false;
   }
 
   void DrainIncompleteSubmission() {
@@ -3233,13 +4107,20 @@ struct FusionSession {
   }
 
   std::shared_ptr<const FusionExecutableData> executable;
+  std::shared_ptr<const FusionPlanData> plan;
   std::vector<std::vector<torch::Tensor>> storages;
+#if defined(DJL_USE_FUSION_KERNELS)
+  std::shared_ptr<FusionExecutionLane> execution_lane;
+#endif
   std::unique_ptr<c10::Event> allocation_ready;
-  std::vector<bool> allocation_waited;
-  std::vector<bool> binding_waited;
   std::vector<std::optional<c10::Stream>> submission_streams;
+#if defined(DJL_USE_FUSION_KERNELS)
+  std::optional<backend::Stream> execution_stream;
+#endif
   std::vector<torch::Tensor> retained_inputs;
   std::optional<c10::Stream> incomplete_submission_stream;
+  bool allocation_waited = false;
+  bool binding_waited = false;
   bool poisoned = false;
 };
 
@@ -3247,7 +4128,7 @@ namespace {
 
 const torch::Tensor& ResolveValue(const FusionSession& session, int32_t buffer_index,
     const int64_t* input_handles, int32_t value_index) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   const ValueSpec& value = plan.values[value_index];
   switch (value.kind) {
     case ValueKind::kInput: {
@@ -3268,7 +4149,7 @@ const torch::Tensor& ResolveValue(const FusionSession& session, int32_t buffer_i
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const OutputPackCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   for (const auto& source : command.sources) {
     const torch::Tensor& tensor = ResolveValue(
         session, buffer_index, input_handles, source.value_index);
@@ -3287,7 +4168,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const AffineSumCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   for (const auto& group : command.groups) {
     for (const auto& term : group.terms) {
       const torch::Tensor& input = ResolveValue(
@@ -3304,7 +4185,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const ProjectedResidualMlpCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   const torch::Tensor& input = ResolveValue(
       session, buffer_index, input_handles, command.input_value_index);
   const ValueSpec& input_spec = plan.values[command.input_value_index];
@@ -3317,7 +4198,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const IndexedAffineCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   const torch::Tensor& indices = ResolveValue(session, buffer_index, input_handles, command.indices_value_index);
   CheckTensor(
       indices, plan, plan.values[command.indices_value_index], dimensions, false, "indexed-affine indices");
@@ -3333,7 +4214,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const TransformerEncoderStackCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   const torch::Tensor& input = ResolveValue(session, buffer_index, input_handles, command.input_value_index);
   CheckTensor(
       input, plan, plan.values[command.input_value_index], dimensions, false, "transformer encoder input");
@@ -3344,7 +4225,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const BinaryBranchBlendCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   for (int32_t operand_index : command.operand_value_indices) {
     const torch::Tensor& operand = ResolveValue(
         session, buffer_index, input_handles, operand_index);
@@ -3359,7 +4240,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const SingleQueryReadoutGroupCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   const std::array<std::pair<int32_t, const char*>, 3> inputs{{
       {command.memory_value_index, "single-query readout memory"},
       {command.query_source_value_index, "single-query readout query source"},
@@ -3377,7 +4258,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const IndexedLocalTransformerCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   for (int32_t input_value_index : command.input_value_indices) {
     const torch::Tensor& input = ResolveValue(session, buffer_index, input_handles, input_value_index);
     CheckTensor(
@@ -3393,7 +4274,7 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
 
 void CheckCommand(const FusionSession& session, int32_t buffer_index, const int64_t* input_handles,
     const int64_t* dimensions, const MappedGroupedMaskedSoftmaxPoolGroupCommandSpec& command) {
-  const auto& plan = *session.executable->plan;
+  const auto& plan = *session.plan;
   const std::array<std::pair<int32_t, const char*>, 3> inputs{{
       {command.scores_value_index, "mapped grouped pool scores"},
       {command.masks_value_index, "mapped grouped pool masks"},
@@ -3415,9 +4296,10 @@ void CheckCommand(const FusionSession& session, int32_t buffer_index, const int6
   }
 }
 
-void CheckSubmission(
-    const FusionSession& session, int32_t buffer_index, const int64_t* input_handles, const int64_t* dimensions) {
-  const auto& plan = *session.executable->plan;
+void CheckSubmissionInputs(
+    const FusionSession& session, const int64_t* input_handles,
+    const int64_t* dimensions) {
+  const auto& plan = *session.plan;
   for (std::size_t index = 0; index < plan.dimensions.size(); ++index) {
     TORCH_CHECK(dimensions[index] >= 0 &&
             dimensions[index] <= plan.dimensions[index].maximum_extent,
@@ -3428,6 +4310,12 @@ void CheckSubmission(
     TORCH_CHECK(input != nullptr, "fusion input handle must not be null");
     CheckTensor(*input, plan, plan.values[plan.input_value_indices[index]], dimensions, false, "input");
   }
+}
+
+void CheckSubmissionStorage(
+    const FusionSession& session, int32_t buffer_index,
+    const int64_t* input_handles, const int64_t* dimensions) {
+  const auto& plan = *session.plan;
   for (const auto& fusion_command : plan.commands) {
     std::visit(
         [&](const auto& command) {
@@ -3521,6 +4409,51 @@ torch::Tensor ActiveAffineMatrix(const torch::Tensor& tensor, int64_t batch_coun
        width});
 }
 
+#if defined(DJL_USE_ROCM_KERNELS)
+void ExecuteBackendMatmul(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right) {
+  const bool executed =
+      ExecuteFusionMatmul(plan, workspace, output, left, right);
+  TORCH_CHECK(executed,
+      "ROCm Fusion matmul must not fall back to the PyTorch workspace cache");
+}
+
+void ExecuteBackendMatmulBias(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor& bias) {
+  const bool executed = ExecuteFusionMatmulBias(
+      plan, workspace, output, left, right, bias);
+  TORCH_CHECK(executed,
+      "ROCm Fusion bias matmul must not fall back to the PyTorch workspace cache");
+}
+
+void ExecuteBackendMatmulAccumulate(
+    const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right) {
+  const bool executed = ExecuteFusionMatmulAccumulate(
+      plan, workspace, output, left, right);
+  TORCH_CHECK(executed,
+      "ROCm Fusion accumulating matmul must not fall back to the PyTorch workspace cache");
+}
+#endif
+
+void ExecuteSessionMatmul(FusionSession& session, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right) {
+#if defined(DJL_USE_ROCM_KERNELS)
+  ExecuteBackendMatmul(session.executable->matmul_plan,
+      session.BackendWorkspace(), output, left, right);
+#else
+  if (output.dim() == 2) {
+    at::mm_out(output, left, right);
+  } else {
+    at::bmm_out(output, left, right);
+  }
+#endif
+}
+
 void ExecuteCommand(FusionSession& session, int32_t buffer_index,
     const int64_t* input_handles, const int64_t* dimensions,
     const AffineSumCommandSpec& command, std::size_t command_index,
@@ -3593,7 +4526,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
     torch::Tensor product_matrix = ActiveAffineMatrix(
         product, matrix_batch_count, group.rows_per_batch, command.output_width);
     work_submitted = true;
-    at::mm_out(product_matrix, input_matrix, packed_weight);
+    ExecuteSessionMatmul(
+        session, product_matrix, input_matrix, packed_weight);
 
     sum_sources[group_index].data = product.data_ptr();
     sum_sources[group_index].rows_per_batch =
@@ -3653,11 +4587,37 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   RecordCurrentStream(result);
 
   work_submitted = true;
+#if defined(DJL_USE_ROCM_KERNELS)
+  const int64_t input_width = combined_weight.size(1);
+  const int64_t combined_width = command.output_width + command.hidden_width;
+  torch::Tensor input_matrix = input.narrow(0, 0, batch_count).view(
+      {-1, input_width});
+  const int64_t row_count = input_matrix.size(0);
+  torch::Tensor combined_matrix = combined.narrow(0, 0, batch_count).view(
+      {row_count, combined_width});
+  torch::Tensor activated_matrix = activated.narrow(0, 0, batch_count).view(
+      {row_count, command.hidden_width});
+  torch::Tensor result_matrix = result.narrow(0, 0, batch_count).view(
+      {row_count, command.output_width});
+  torch::Tensor combined_weight_transposed =
+      combined_weight.transpose(0, 1);
+  torch::Tensor output_weight_transposed = output_weight.transpose(0, 1);
+
+  ExecuteBackendMatmulBias(session.executable->matmul_plan,
+      session.BackendWorkspace(), combined_matrix, input_matrix,
+      combined_weight_transposed, bias);
+  LaunchProjectedResidualMlpPrepare(combined_matrix, activated_matrix,
+      result_matrix, row_count, command.output_width, command.hidden_width);
+  ExecuteBackendMatmulAccumulate(session.executable->matmul_plan,
+      session.BackendWorkspace(), result_matrix, activated_matrix,
+      output_weight_transposed);
+#else
   projected_residual_mlp_forward(input.narrow(0, 0, batch_count),
       combined_weight, bias, output_weight,
       combined.narrow(0, 0, batch_count),
       activated.narrow(0, 0, batch_count),
       result.narrow(0, 0, batch_count));
+#endif
 }
 
 void ExecuteCommand(FusionSession& session, int32_t buffer_index,
@@ -3709,7 +4669,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
     RecordCurrentStream(hidden);
     torch::Tensor input_matrix = packed_input.narrow(0, 0, active_rows);
     torch::Tensor hidden_matrix = hidden.narrow(0, 0, active_rows);
-    at::mm_out(hidden_matrix, input_matrix, packed_weight);
+    ExecuteSessionMatmul(
+        session, hidden_matrix, input_matrix, packed_weight);
   }
 
   const void* hidden_bias = nullptr;
@@ -3859,7 +4820,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
           command.token_count, command.hidden_width, command.epsilon,
           block_index == 0);
     }
-    at::mm_out(query_key_value_matrix, normalized_matrix, weights[0]);
+    ExecuteSessionMatmul(
+        session, query_key_value_matrix, normalized_matrix, weights[0]);
     if (indexed_relation) {
       const auto& relation = (*relation_blocks)[block_index];
       RecordCurrentStream(relation.relation_keys);
@@ -3888,7 +4850,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
               command.relation_count)
           .view({command.attention_heads, active_rows,
               command.relation_count});
-      at::bmm_out(relation_logits, relation_queries, relation.relation_keys);
+      ExecuteSessionMatmul(session, relation_logits, relation_queries,
+          relation.relation_keys);
       const float attention_scale =
           1.0f / std::sqrt(static_cast<float>(head_width));
       torch::Tensor active_attention_bias =
@@ -3921,7 +4884,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       }
       attention_context_matrix =
           attention_context.reshape({active_rows, command.attention_width});
-      at::mm_out(normalized_matrix, attention_context_matrix, weights[1]);
+      ExecuteSessionMatmul(session, normalized_matrix,
+          attention_context_matrix, weights[1]);
       LaunchTransformerResidualLayerNorm(state, normalized_matrix,
           attention_output_bias, feed_forward_input_weight,
           feed_forward_input_bias, normalized, active_rows,
@@ -3930,25 +4894,29 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       LaunchTransformerAttention(query_key_value, normalized, batch_count,
           command.token_count, command.attention_heads,
           command.attention_width, command.hidden_width);
-      at::mm_out(
-          attention_output_matrix, attention_context_matrix, weights[1]);
+      ExecuteSessionMatmul(session, attention_output_matrix,
+          attention_context_matrix, weights[1]);
       LaunchTransformerResidualLayerNorm(state, attention_output_matrix,
           attention_output_bias, feed_forward_input_weight,
           feed_forward_input_bias, normalized, active_rows,
           command.hidden_width, command.epsilon);
     }
-    if (!(indexed_relation &&
-            ExecuteLinearBiasSilu(
-                session.executable->transformer_expansion_plans[command_index]
-                    [block_index],
-                expanded_matrix, normalized_matrix, weights[2],
-                expansion_bias))) {
-      at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
+    bool fused_expansion = false;
+#if defined(DJL_USE_HIPBLASLT_SWISH_BIAS)
+    fused_expansion = indexed_relation &&
+        session.plan->uses_linear_bias_silu && ExecuteLinearBiasSilu(
+            session.executable->matmul_plan, session.BackendWorkspace(),
+            expanded_matrix, normalized_matrix, weights[2], expansion_bias);
+#endif
+    if (!fused_expansion) {
+      ExecuteSessionMatmul(
+          session, expanded_matrix, normalized_matrix, weights[2]);
       LaunchTransformerBiasSilu(
           expanded, expansion_bias, active_rows, command.feed_forward_width,
           indexed_relation);
     }
-    at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
+    ExecuteSessionMatmul(
+        session, normalized_matrix, expanded_matrix, weights[3]);
     torch::Tensor& normalized_output =
         indexed_relation && block_index + 1 < command.blocks.size() ? normalized : state;
     LaunchTransformerResidualLayerNorm(state, normalized,
@@ -4022,7 +4990,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
           result, normalized, active_offset, tile_rows, dense_rows, command.group_count, command.token_count,
           command.hidden_width, command.epsilon);
     }
-    at::mm_out(query_key_value_matrix, normalized_matrix, weights[0]);
+    ExecuteSessionMatmul(
+        session, query_key_value_matrix, normalized_matrix, weights[0]);
   }
 
   if (active_rows != 0) {
@@ -4050,7 +5019,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
       // packing it.
       torch::Tensor context = query_key_value.narrow(0, active_offset, tile_rows)
                                   .as_strided({tile_rows, command.attention_width}, {3 * command.attention_width, 1});
-      at::mm_out(normalized_matrix, context, weights[1]);
+      ExecuteSessionMatmul(
+          session, normalized_matrix, context, weights[1]);
       LaunchIndexedLocalTransformerResidualLayerNorm(result, normalized_matrix, attention_output_bias, indices,
           command.index_data_type, feed_forward_norm_weight, feed_forward_norm_bias, normalized, active_offset,
           tile_rows, dense_rows, command.hidden_width, command.epsilon);
@@ -4063,9 +5033,11 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
                                               CheckedMultiply(tile_rows, command.feed_forward_width,
                                                   "indexed local transformer expansion elements"))
                                           .view({tile_rows, command.feed_forward_width});
-      at::mm_out(expanded_matrix, normalized_matrix, weights[2]);
+      ExecuteSessionMatmul(
+          session, expanded_matrix, normalized_matrix, weights[2]);
       LaunchIndexedLocalTransformerBiasSilu(expanded_matrix, expansion_bias, tile_rows, command.feed_forward_width);
-      at::mm_out(normalized_matrix, expanded_matrix, weights[3]);
+      ExecuteSessionMatmul(
+          session, normalized_matrix, expanded_matrix, weights[3]);
       LaunchIndexedLocalTransformerFinalize(result, normalized_matrix, indices, command.index_data_type,
           projection_bias, output_norm_weight, output_norm_bias, active_offset, tile_rows, dense_rows,
           command.hidden_width, command.epsilon);
@@ -4132,7 +5104,8 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
   LaunchSingleQueryReadoutSeedInput(memory, query_source, valid_mask, seed_input,
       batch_count, command.token_count, command.hidden_width,
       command.query_token_count, command.query_index);
-  at::mm_out(seed_products, seed_input, weights.query_seed_weight);
+  ExecuteSessionMatmul(
+      session, seed_products, seed_input, weights.query_seed_weight);
 
   torch::Tensor context = workspace.narrow(0, 0,
       CheckedMultiply(readout_batch, command.attention_width,
@@ -4156,7 +5129,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
   RecordCurrentStream(weights.context_bias);
   RecordCurrentStream(weights.query_norm_weight);
   RecordCurrentStream(weights.query_norm_bias);
-  at::bmm_out(update, context, weights.context_weight);
+  ExecuteSessionMatmul(session, update, context, weights.context_weight);
   LaunchSingleQueryReadoutResidualLayerNorm(state, update,
       &weights.query_seed_bias, weights.context_bias,
       weights.query_norm_weight, weights.query_norm_bias, state,
@@ -4180,7 +5153,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
       {readout_count, batch_count, command.maximum_feed_forward_width});
   RecordCurrentStream(weights.feed_forward_expansion_weight);
   RecordCurrentStream(weights.feed_forward_expansion_bias);
-  at::bmm_out(expanded, normalized,
+  ExecuteSessionMatmul(session, expanded, normalized,
       weights.feed_forward_expansion_weight);
   LaunchSingleQueryReadoutBiasSilu(expanded,
       weights.feed_forward_expansion_bias, batch_count, readout_count,
@@ -4190,7 +5163,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
   RecordCurrentStream(weights.feed_forward_projection_bias);
   RecordCurrentStream(weights.output_norm_weight);
   RecordCurrentStream(weights.output_norm_bias);
-  at::bmm_out(normalized, expanded,
+  ExecuteSessionMatmul(session, normalized, expanded,
       weights.feed_forward_projection_weight);
   LaunchSingleQueryReadoutResidualLayerNorm(state, normalized, nullptr,
       weights.feed_forward_projection_bias, weights.output_norm_weight,
@@ -4226,8 +5199,9 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   RecordCurrentStream(contexts);
   RecordCurrentStream(presence);
   LaunchMappedGroupedMaskedSoftmaxPool(scores, masks, values, mapping,
-      contexts, presence, batch_count, command.candidate_count,
-      command.group_count, command.width, command.total_destination_count);
+      contexts, presence, batch_count, command.maximum_batches,
+      command.candidate_count, command.group_count, command.width,
+      command.total_destination_count);
 }
 
 }  // namespace
@@ -4243,37 +5217,41 @@ FusionBackend GetFusionBackend() {
 }
 
 FusionPlan* PrepareFusionPlan(
-    c10::Device device, const int64_t* descriptor, std::size_t descriptor_size) {
+    c10::Device device, const int64_t* descriptor, std::size_t descriptor_size,
+    const int64_t* profile_descriptor,
+    std::size_t profile_descriptor_size) {
 #if defined(DJL_USE_FUSION_KERNELS)
   TORCH_CHECK(device.is_cuda(), "PyTorch fusion requires a CUDA or ROCm device");
   c10::DeviceGuard device_guard(device);
-  return new FusionPlan(ParsePlan(device, descriptor, descriptor_size));
+  auto maximum_plan = ParsePlan(device, descriptor, descriptor_size);
+  const auto profiles = ParseProfileDescriptor(
+      profile_descriptor, profile_descriptor_size, *maximum_plan);
+  std::vector<std::shared_ptr<const FusionPlanData>> variants;
+  variants.reserve(profiles.size() + 1);
+  variants.push_back(std::move(maximum_plan));
+  for (const auto& capacities : profiles) {
+    variants.push_back(
+        ParsePlan(device, descriptor, descriptor_size, &capacities));
+  }
+  return new FusionPlan(std::move(variants));
 #else
   TORCH_CHECK(false,
       "PyTorch fusion requires native CUDA or ROCm fusion kernels");
 #endif
 }
 
-FusionPlanStats GetFusionPlanStats(const FusionPlan* plan) {
+FusionPlanStats GetFusionPlanStats(
+    const FusionPlan* plan, int32_t variant_index) {
   TORCH_CHECK(plan != nullptr, "fusion plan must not be null");
-  const auto& storages = plan->data->storages;
+  TORCH_CHECK(variant_index >= 0 &&
+          static_cast<std::size_t>(variant_index) < plan->variants.size(),
+      "fusion plan variant index is outside the prepared range");
+  const auto& variant = *plan->variants[static_cast<std::size_t>(variant_index)];
+  const auto& storages = variant.storages;
 
-  int64_t executable_storage_bytes = 0;
-  for (const auto& fusion_command : plan->data->commands) {
-    const auto* command = std::get_if<AffineSumCommandSpec>(&fusion_command);
-    if (command == nullptr) {
-      continue;
-    }
-    const auto& result = plan->data->values[command->result_value_index];
-    const int64_t element_size = static_cast<int64_t>(c10::elementSize(result.data_type));
-    for (const auto& group : command->groups) {
-      const int64_t rows = group.precompute_at_bind ? group.rows_per_batch : group.packed_input_width;
-      executable_storage_bytes = CheckedAdd(executable_storage_bytes,
-          CheckedMultiply(CheckedMultiply(rows, command->output_width, "fusion affine executable elements"),
-              element_size, "fusion affine executable payload size"),
-          "fusion executable storage payload size");
-    }
-  }
+  const auto& binding_plan = *plan->data;
+  const int64_t executable_storage_bytes =
+      ExecutableStorageBytes(binding_plan);
 
   int64_t persistent_storage_bytes = 0;
   int64_t output_storage_bytes = 0;
@@ -4294,25 +5272,31 @@ FusionPlanStats GetFusionPlanStats(const FusionPlan* plan) {
       output_storage_bytes = CheckedAdd(output_storage_bytes, storage_bytes, "fusion output storage payload size");
     }
   }
-  const int64_t planner_version = plan->data->scratch_planner_enabled && plan->data->intermediate_planner_enabled ? 4
-                                  : plan->data->in_place_planner_enabled ? 3
-                                  : plan->data->intermediate_planner_enabled
+  const int64_t planner_version = variant.scratch_planner_enabled && variant.intermediate_planner_enabled ? 4
+                                  : variant.in_place_planner_enabled ? 3
+                                  : variant.intermediate_planner_enabled
                                       ? 2
-                                      : (plan->data->scratch_planner_enabled ? 1 : 0);
+                                      : (variant.scratch_planner_enabled ? 1 : 0);
   return FusionPlanStats{executable_storage_bytes, persistent_storage_bytes,
-      persistent_storage_bytes - output_storage_bytes, output_storage_bytes, plan->data->arena_bytes, planner_version,
-      plan->data->logical_allocation_count, backing_allocation_count, alias_view_count,
-      plan->data->in_place_reuse_count};
+      persistent_storage_bytes - output_storage_bytes, output_storage_bytes,
+      variant.arena_bytes, planner_version, variant.logical_allocation_count,
+      backing_allocation_count, alias_view_count,
+      variant.in_place_reuse_count,
+      variant.backend_workspace_upper_bound_bytes};
 }
 
 FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant_handles, std::size_t constant_count) {
   TORCH_CHECK(plan != nullptr, "fusion plan must not be null");
+  for (std::size_t variant_index = 1;
+       variant_index < plan->variants.size(); ++variant_index) {
+    CheckVariantTopology(*plan->data, *plan->variants[variant_index]);
+  }
   TORCH_CHECK(constant_count == static_cast<std::size_t>(plan->data->constant_count),
       "fusion constant count does not match the prepared plan");
   c10::DeviceGuard device_guard(plan->data->device);
   c10::InferenceMode inference_mode;
   auto data = std::make_shared<FusionExecutableData>();
-  data->plan = plan->data;
+  data->plans = plan->variants;
   data->constants.reserve(constant_count);
   for (std::size_t index = 0; index < constant_count; ++index) {
     const auto* constant = reinterpret_cast<const torch::Tensor*>(constant_handles[index]);
@@ -4321,11 +5305,19 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant
     CheckTensor(*constant, *plan->data, spec, nullptr, true, "constant");
     data->constants.push_back(*constant);
   }
+#if defined(DJL_USE_ROCM_KERNELS)
+  data->matmul_plan = CreateFusionMatmulPlan();
+  TORCH_CHECK(data->matmul_plan != nullptr,
+      "failed to create the Fusion matmul plan");
+  std::shared_ptr<FusionMatmulWorkspace> binding_matmul_workspace =
+      CreateFusionMatmulWorkspace();
+  TORCH_CHECK(binding_matmul_workspace != nullptr,
+      "failed to create the Fusion binding matmul workspace");
+#endif
   data->affine_weights.resize(plan->data->commands.size());
   data->affine_products.resize(plan->data->commands.size());
   data->indexed_affine_weights.resize(plan->data->commands.size());
   data->transformer_encoder_weights.resize(plan->data->commands.size());
-  data->transformer_expansion_plans.resize(plan->data->commands.size());
   data->indexed_relation_transformer_weights.resize(
       plan->data->commands.size());
   data->indexed_relation_ids.resize(plan->data->commands.size());
@@ -4354,16 +5346,8 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant
         auto& executable_blocks =
             data->transformer_encoder_weights[command_index];
         executable_blocks.resize(transformer_command->blocks.size());
-        auto& expansion_plans =
-            data->transformer_expansion_plans[command_index];
-        expansion_plans.resize(transformer_command->blocks.size());
         for (std::size_t block_index = 0;
              block_index < transformer_command->blocks.size(); ++block_index) {
-#if defined(DJL_USE_FUSION_KERNELS)
-          if (transformer_command->relation_ids_value_index >= 0) {
-            expansion_plans[block_index] = CreateLinearBiasSiluPlan();
-          }
-#endif
           const auto& block = transformer_command->blocks[block_index];
           const std::array<int32_t, 4> binding_indices{
               block.query_key_value_weight_binding_index,
@@ -4572,11 +5556,14 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant
             const int64_t source_group = mapping_spec.data_type == torch::kInt32
                                              ? static_cast<int64_t>(host_mapping.data_ptr<int32_t>()[local_destination])
                                              : host_mapping.data_ptr<int64_t>()[local_destination];
-            TORCH_CHECK(source_group >= -1 && source_group < mapped_pool_command->group_count,
+            TORCH_CHECK(source_group >= -1 &&
+                    source_group <= std::numeric_limits<int32_t>::max() &&
+                    source_group < mapped_pool_command->group_count,
                 "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 mapping "
-                "value is outside [-1, groupCount)");
+                "value is outside the representable [-1, groupCount) range");
             TORCH_CHECK(output_set.destination_count <= std::numeric_limits<int32_t>::max() &&
-                            output_set.backing_row_offset <= std::numeric_limits<int32_t>::max() &&
+                            output_set.backing_destination_offset <=
+                                std::numeric_limits<int32_t>::max() &&
                             local_destination <= std::numeric_limits<int32_t>::max(),
                 "MAPPED_GROUPED_MASKED_SOFTMAX_POOL_GROUP_V1 metadata "
                 "exceeds INT32");
@@ -4584,7 +5571,8 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant
             metadata.push_back(
                 static_cast<int32_t>(output_set.destination_count));
             metadata.push_back(
-                static_cast<int32_t>(output_set.backing_row_offset));
+                static_cast<int32_t>(
+                    output_set.backing_destination_offset));
             metadata.push_back(static_cast<int32_t>(local_destination));
             ++observed_destinations;
           }
@@ -4646,7 +5634,15 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant
           : torch::cat(constant_inputs, -1);
       const torch::Tensor input_matrix = packed_input.view(
           {group.rows_per_batch, group.packed_input_width});
+#if defined(DJL_USE_ROCM_KERNELS)
+      torch::Tensor product = torch::empty(
+          {group.rows_per_batch, command->output_width},
+          input_matrix.options());
+      ExecuteBackendMatmul(data->matmul_plan, *binding_matmul_workspace,
+          product, input_matrix, packed_weight);
+#else
       torch::Tensor product = at::mm(input_matrix, packed_weight);
+#endif
       std::vector<int64_t> product_shape;
       product_shape.reserve(group.prefix_shape.size() + 2);
       product_shape.push_back(1);
@@ -4657,30 +5653,41 @@ FusionExecutable* BindFusionPlan(const FusionPlan* plan, const int64_t* constant
       RecordCurrentStream(product_groups[group_index]);
     }
   }
+  TORCH_CHECK(BoundExecutableStorageBytes(*data) ==
+          ExecutableStorageBytes(*plan->data),
+      "fusion executable storage report does not match the bound packed "
+      "tensor payload");
   c10::impl::VirtualGuardImpl guard_impl(plan->data->device.type());
   data->binding_ready = std::make_unique<c10::Event>(plan->data->device.type());
   data->binding_ready->record(guard_impl.getStream(plan->data->device));
   return new FusionExecutable(std::move(data));
 }
 
-FusionSession* NewFusionSession(const FusionExecutable* executable, int32_t buffer_count) {
+FusionSession* NewFusionSession(const FusionExecutable* executable,
+    int32_t variant_index, int32_t output_slot_count) {
   TORCH_CHECK(executable != nullptr, "fusion executable must not be null");
-  TORCH_CHECK(buffer_count > 0, "fusion session buffer count must be positive");
-  return new FusionSession(executable->data, buffer_count);
+  TORCH_CHECK(variant_index >= 0 &&
+          static_cast<std::size_t>(variant_index) <
+              executable->data->plans.size(),
+      "fusion executable variant index is outside the prepared range");
+  TORCH_CHECK(output_slot_count > 0, "fusion session output slot count must be positive");
+  return new FusionSession(executable->data,
+      executable->data->plans[static_cast<std::size_t>(variant_index)],
+      output_slot_count);
 }
 
 torch::Tensor GetFusionSessionOutput(
-    const FusionSession* session, int32_t buffer_index, int32_t output_index) {
+    const FusionSession* session, int32_t output_slot_index, int32_t output_index) {
   TORCH_CHECK(session != nullptr, "fusion session must not be null");
-  TORCH_CHECK(buffer_index >= 0 &&
-          static_cast<std::size_t>(buffer_index) < session->storages.size(),
-      "fusion output buffer index is outside the session range");
+  TORCH_CHECK(output_slot_index >= 0 &&
+          static_cast<std::size_t>(output_slot_index) < session->storages.size(),
+      "fusion output slot index is outside the session range");
   TORCH_CHECK(output_index >= 0 &&
-          static_cast<std::size_t>(output_index) < session->executable->plan->outputs.size(),
+          static_cast<std::size_t>(output_index) < session->plan->outputs.size(),
       "fusion output index is outside the plan range");
   const int32_t storage_index =
-      session->executable->plan->outputs[output_index].storage_index;
-  return session->storages[buffer_index][storage_index];
+      session->plan->outputs[output_index].storage_index;
+  return session->storages[output_slot_index][storage_index];
 }
 
 void SubmitFusion(FusionSession* session, int32_t buffer_index,
@@ -4689,11 +5696,11 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
   TORCH_CHECK(session != nullptr, "fusion session must not be null");
   TORCH_CHECK(buffer_index >= 0 &&
           static_cast<std::size_t>(buffer_index) < session->storages.size(),
-      "fusion output buffer index is outside the session range");
+      "fusion output slot index is outside the session range");
 #if defined(DJL_USE_FUSION_KERNELS)
   TORCH_CHECK(!session->poisoned,
       "fusion session is poisoned by an incomplete failed submission");
-  const auto& plan = session->executable->plan;
+  const auto& plan = session->plan;
   TORCH_CHECK(input_count == static_cast<std::size_t>(plan->input_count),
       "fusion input handle count does not match the prepared plan");
   TORCH_CHECK(dimension_count == static_cast<std::size_t>(plan->dimension_count),
@@ -4705,14 +5712,20 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
   c10::DeviceGuard device_guard(plan->device);
   c10::impl::VirtualGuardImpl guard_impl(plan->device.type());
   const c10::Stream submission_stream = guard_impl.getStream(plan->device);
+  const backend::Stream execution_stream = backend::GetCurrentStream(plan->device.index());
 
-  session->WaitForAllocation(buffer_index, submission_stream);
-  session->WaitForBinding(buffer_index, submission_stream);
   c10::InferenceMode inference_mode;
+  CheckSubmissionInputs(*session, input_handles, dimensions);
+  session->BindExecutionStream(execution_stream);
+  std::unique_lock<std::mutex> execution_lane_lock =
+      session->LockExecutionLane();
+  session->WaitForAllocation(submission_stream);
+  session->WaitForBinding(submission_stream);
+  session->ArmSubmission(submission_stream, input_handles, input_count);
   bool work_submitted = false;
   try {
     session->BindWorkspace(buffer_index);
-    CheckSubmission(*session, buffer_index, input_handles, dimensions);
+    CheckSubmissionStorage(*session, buffer_index, input_handles, dimensions);
     for (std::size_t command_index = 0; command_index < plan->commands.size(); ++command_index) {
       const auto& fusion_command = plan->commands[command_index];
       if (const auto* command = std::get_if<OutputPackCommandSpec>(&fusion_command)) {
@@ -4757,23 +5770,44 @@ void SubmitFusion(FusionSession* session, int32_t buffer_index,
       }
     }
     session->ClearWorkspace(buffer_index);
+    session->SetSubmissionStream(buffer_index, submission_stream);
+    session->CompleteSubmission();
   } catch (...) {
     const std::exception_ptr submission_failure = std::current_exception();
-    session->ClearWorkspace(buffer_index);
+    try {
+      session->ClearWorkspace(buffer_index);
+    } catch (...) {
+      if (work_submitted) {
+        try {
+          session->DrainIncompleteSubmission();
+        } catch (...) {
+          session->PoisonExecutionLane();
+          TORCH_CHECK(false,
+              "fusion session is poisoned because cleanup of a failed "
+              "submission could not be established; its execution lane is "
+              "also poisoned");
+        }
+      } else {
+        session->CompleteSubmission();
+      }
+      TORCH_CHECK(false,
+          "fusion session workspace cleanup failed after a submission error");
+    }
     if (work_submitted) {
-      session->RetainIncompleteSubmission(submission_stream, input_handles, input_count);
       try {
         session->DrainIncompleteSubmission();
       } catch (...) {
+        session->PoisonExecutionLane();
         TORCH_CHECK(false,
             "fusion session is poisoned because completion of a "
-            "failed submission "
-            "could not be established");
+            "failed submission could not be established; its execution "
+            "lane is also poisoned");
       }
+    } else {
+      session->CompleteSubmission();
     }
     std::rethrow_exception(submission_failure);
   }
-  session->SetSubmissionStream(buffer_index, submission_stream);
 #else
   TORCH_CHECK(false,
       "PyTorch fusion requires native CUDA or ROCm fusion kernels");
@@ -4784,8 +5818,8 @@ void SynchronizeFusionOutput(FusionSession* session, int32_t buffer_index) {
   TORCH_CHECK(session != nullptr, "fusion session must not be null");
   TORCH_CHECK(buffer_index >= 0 &&
           static_cast<std::size_t>(buffer_index) < session->storages.size(),
-      "fusion output buffer index is outside the session range");
-  c10::DeviceGuard device_guard(session->executable->plan->device);
+      "fusion output slot index is outside the session range");
+  c10::DeviceGuard device_guard(session->plan->device);
   session->Synchronize(buffer_index);
 }
 

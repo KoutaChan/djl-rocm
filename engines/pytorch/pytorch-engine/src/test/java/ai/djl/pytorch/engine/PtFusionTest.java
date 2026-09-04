@@ -16,6 +16,7 @@ import ai.djl.Device;
 import ai.djl.engine.Engine;
 import ai.djl.engine.EngineException;
 import ai.djl.engine.fusion.FusionCompilationReport;
+import ai.djl.engine.fusion.FusionCompileConfig;
 import ai.djl.engine.fusion.FusionConstantBindings;
 import ai.djl.engine.fusion.FusionExecutable;
 import ai.djl.engine.fusion.FusionInvocation;
@@ -24,6 +25,7 @@ import ai.djl.engine.fusion.FusionPlan;
 import ai.djl.engine.fusion.FusionRecipe;
 import ai.djl.engine.fusion.FusionSession;
 import ai.djl.engine.fusion.FusionSessionConfig;
+import ai.djl.engine.fusion.FusionShapeProfile;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDList;
@@ -159,6 +161,51 @@ public class PtFusionTest {
                 PtFusionDescriptor.DTYPE_BFLOAT16, (long) DataType.BFLOAT16.ordinal());
         Assert.assertEquals(PtFusionDescriptor.ACTIVATION_NONE, 0L);
         Assert.assertEquals(PtFusionDescriptor.ACTIVATION_SILU, 1L);
+    }
+
+    @Test
+    public void capacityProfileDescriptorResolvesProfilesAndRejectsResolvedDuplicates() {
+        MultiDimensionCapacityFixture fixture = new MultiDimensionCapacityFixture();
+        FusionShapeProfile partial =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 2).build();
+        FusionShapeProfile distinct =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.rows, 3)
+                        .setCapacity(fixture.items, 2)
+                        .build();
+        PtFusionProfileDescriptor.Encoded encoded =
+                PtFusionProfileDescriptor.encode(fixture.recipe, Arrays.asList(partial, distinct));
+        ByteBuffer descriptor = encoded.getDescriptor();
+
+        Assert.assertTrue(descriptor.isDirect());
+        Assert.assertEquals(descriptor.order(), ByteOrder.nativeOrder());
+        Assert.assertEquals(descriptor.getLong(0), PtFusionProfileDescriptor.MAGIC);
+        Assert.assertEquals(descriptor.getLong(Long.BYTES), PtFusionProfileDescriptor.VERSION);
+        Assert.assertEquals(descriptor.getLong(2 * Long.BYTES), 9L);
+        Assert.assertEquals(descriptor.getLong(3 * Long.BYTES), 2L);
+        Assert.assertEquals(descriptor.getLong(4 * Long.BYTES), 2L);
+        Assert.assertEquals(descriptor.getLong(5 * Long.BYTES), 2L);
+        Assert.assertEquals(descriptor.getLong(6 * Long.BYTES), 4L);
+        Assert.assertEquals(descriptor.getLong(7 * Long.BYTES), 3L);
+        Assert.assertEquals(descriptor.getLong(8 * Long.BYTES), 2L);
+        Assert.assertEquals(encoded.getCapacities().get(0), new long[] {2, 4});
+        Assert.assertEquals(encoded.getCapacities().get(1), new long[] {3, 2});
+
+        FusionShapeProfile explicitDuplicate =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.rows, 2)
+                        .setCapacity(fixture.items, 4)
+                        .build();
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        PtFusionProfileDescriptor.encode(
+                                fixture.recipe, Arrays.asList(partial, explicitDuplicate)));
+
+        FusionShapeProfile recipeMaximum = FusionShapeProfile.builder(fixture.recipe).build();
+        Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> PtFusionProfileDescriptor.encode(fixture.recipe, List.of(recipeMaximum)));
     }
 
     @Test
@@ -411,7 +458,7 @@ public class PtFusionTest {
                 FusionInvocation invocation = session.acquire()) {
             FusionCompilationReport report = plan.getCompilationReport();
             Assert.assertEquals(report.getStoragePlannerVersion(), 4);
-            Assert.assertEquals(report.getPersistentStorageBytes(), 32L);
+            Assert.assertEquals(report.getExecutionStorageBytes(), 32L);
             Assert.assertEquals(report.getExportedOutputBytes(), 32L);
             Assert.assertEquals(report.getWorkspaceBytes(), 0L);
             Assert.assertEquals(report.getArenaBytes(), 0L);
@@ -489,7 +536,9 @@ public class PtFusionTest {
                         FusionSession session =
                                 executable.newSession(
                                         manager,
-                                        FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                        FusionSessionConfig.builder()
+                                                .optOutputSlotCount(1)
+                                                .build())) {
                     for (int batch : batches) {
                         try (FusionInvocation invocation = session.acquire()) {
                             invocation.setInput(fixture.memory, memory);
@@ -560,7 +609,9 @@ public class PtFusionTest {
                         FusionSession session =
                                 executable.newSession(
                                         manager,
-                                        FusionSessionConfig.builder().optBufferCount(2).build())) {
+                                        FusionSessionConfig.builder()
+                                                .optOutputSlotCount(2)
+                                                .build())) {
                     for (int batchCount : batches) {
                         int activeRows = pattern.presentCount(batchCount);
                         try (NDArray input = maximumInput.get("0:" + batchCount);
@@ -633,7 +684,9 @@ public class PtFusionTest {
                         FusionSession session =
                                 executable.newSession(
                                         manager,
-                                        FusionSessionConfig.builder().optBufferCount(2).build())) {
+                                        FusionSessionConfig.builder()
+                                                .optOutputSlotCount(2)
+                                                .build())) {
                     for (int batchCount : batches) {
                         int activeRows = pattern.presentCount(batchCount);
                         try (NDArray input = maximumInput.get("0:" + batchCount);
@@ -855,6 +908,387 @@ public class PtFusionTest {
     }
 
     @Test
+    public void gpuCapacityProfilesReportAndSelectFixedSessionStorage() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        FusionFixture fixture = new FusionFixture();
+        FusionShapeProfile capacityThree =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 3).build();
+        FusionShapeProfile capacityTwo =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 2).build();
+        FusionShapeProfile capacityOne =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 1).build();
+        FusionShapeProfile maximumCapacity =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 4).build();
+        FusionCompileConfig compileConfig =
+                FusionCompileConfig.builder()
+                        .addShapeProfile(capacityThree)
+                        .addShapeProfile(capacityTwo)
+                        .build();
+        Device device = Device.gpu(0);
+
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray half =
+                        typed(
+                                manager,
+                                DataType.FLOAT16,
+                                new float[] {1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f},
+                                new Shape(4, 2));
+                NDArray bfloat =
+                        typed(
+                                manager,
+                                DataType.BFLOAT16,
+                                new float[] {9f, 10f, 11f, 12f},
+                                new Shape(4, 1));
+                NDArray single =
+                        manager.create(
+                                new float[] {
+                                    13f, 14f, 15f, 16f, 17f, 18f,
+                                    19f, 20f, 21f, 22f, 23f, 24f
+                                },
+                                new Shape(4, 3));
+                FusionPlan plan =
+                        engine.newFusionCompiler(device).prepare(fixture.recipe, compileConfig);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                FusionSession smallestFitting =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optOutputSlotCount(2)
+                                        .optRequestedShapeProfile(capacityOne)
+                                        .build());
+                FusionSession exact =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(capacityThree)
+                                        .optProfileFallback(
+                                                FusionSessionConfig.ProfileFallback.EXACT)
+                                        .build());
+                FusionSession maximum =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(maximumCapacity)
+                                        .optProfileFallback(
+                                                FusionSessionConfig.ProfileFallback.EXACT)
+                                        .build());
+                FusionSession fallbackMaximum =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(maximumCapacity)
+                                        .build())) {
+            FusionCompilationReport maximumReport = plan.getCompilationReport();
+            FusionCompilationReport capacityThreeReport = plan.getCompilationReport(capacityThree);
+            FusionCompilationReport capacityTwoReport = plan.getCompilationReport(capacityTwo);
+            Assert.assertEquals(plan.getShapeProfileReports().size(), 2);
+            Assert.assertSame(
+                    plan.getShapeProfileReports().get(capacityThree), capacityThreeReport);
+            Assert.assertSame(plan.getShapeProfileReports().get(capacityTwo), capacityTwoReport);
+            Assert.assertEquals(maximumReport.getExportedOutputBytes(), 96L);
+            Assert.assertEquals(capacityThreeReport.getExportedOutputBytes(), 72L);
+            Assert.assertEquals(capacityTwoReport.getExportedOutputBytes(), 48L);
+            Assert.assertTrue(
+                    capacityTwoReport.getSessionStorageBytes(1)
+                            < capacityThreeReport.getSessionStorageBytes(1));
+            Assert.assertTrue(
+                    capacityThreeReport.getSessionStorageBytes(1)
+                            < maximumReport.getSessionStorageBytes(1));
+            Assert.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> plan.getShapeProfileReports().clear());
+
+            Assert.assertEquals(smallestFitting.getCapacity(fixture.rows), 2L);
+            Assert.assertEquals(exact.getCapacity(fixture.rows), 3L);
+            Assert.assertEquals(maximum.getCapacity(fixture.rows), 4L);
+            Assert.assertEquals(fallbackMaximum.getCapacity(fixture.rows), 4L);
+            Assert.assertThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            executable.newSession(
+                                    manager,
+                                    FusionSessionConfig.builder()
+                                            .optRequestedShapeProfile(capacityOne)
+                                            .optProfileFallback(
+                                                    FusionSessionConfig.ProfileFallback.EXACT)
+                                            .build()));
+
+            try (FusionOutputLease first =
+                            submit(smallestFitting, fixture, half, bfloat, single, 1);
+                    FusionOutputLease second =
+                            submit(smallestFitting, fixture, half, bfloat, single, 2)) {
+                second.synchronize();
+                first.synchronize();
+                Assert.assertEquals(first.getDimension(fixture.rows), 1L);
+                Assert.assertEquals(second.getDimension(fixture.rows), 2L);
+                Assert.assertEquals(first.get(fixture.output).getShape(), new Shape(2, 6));
+                Assert.assertEquals(second.get(fixture.output).getShape(), new Shape(2, 6));
+                Assert.assertNotSame(first.get(fixture.output), second.get(fixture.output));
+                try (NDArray firstActive = first.get(fixture.output).get("0:1");
+                        NDArray secondActive = second.get(fixture.output).get("0:2")) {
+                    Assert.assertEquals(
+                            firstActive.toFloatArray(),
+                            new float[] {1f, 2f, 9f, 13f, 14f, 15f},
+                            1e-3f);
+                    Assert.assertEquals(
+                            secondActive.toFloatArray(),
+                            new float[] {
+                                1f, 2f, 9f, 13f, 14f, 15f,
+                                3f, 4f, 10f, 16f, 17f, 18f
+                            },
+                            1e-3f);
+                }
+            }
+            try (FusionInvocation invocation = smallestFitting.acquire()) {
+                Assert.assertThrows(
+                        IllegalArgumentException.class,
+                        () -> invocation.setDimension(fixture.rows, 3));
+            }
+        }
+    }
+
+    @Test
+    public void gpuCapacityProfilesSelectComponentWiseFitByPlannedStorage() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        MultiDimensionCapacityFixture fixture = new MultiDimensionCapacityFixture();
+        FusionShapeProfile firstLargerFit =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 2).build();
+        FusionShapeProfile laterSmallerFit =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.rows, 3)
+                        .setCapacity(fixture.items, 2)
+                        .build();
+        FusionShapeProfile request =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.rows, 2)
+                        .setCapacity(fixture.items, 2)
+                        .build();
+        FusionCompileConfig config =
+                FusionCompileConfig.builder()
+                        .addShapeProfile(firstLargerFit)
+                        .addShapeProfile(laterSmallerFit)
+                        .build();
+        Device device = Device.gpu(0);
+
+        try (NDManager manager = engine.newBaseManager(device);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe, config);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                FusionSession session =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(request)
+                                        .build())) {
+            Assert.assertEquals(
+                    plan.getCompilationReport(firstLargerFit).getExportedOutputBytes(), 24L);
+            Assert.assertEquals(
+                    plan.getCompilationReport(laterSmallerFit).getExportedOutputBytes(), 20L);
+            Assert.assertEquals(session.getCapacity(fixture.rows), 3L);
+            Assert.assertEquals(session.getCapacity(fixture.items), 2L);
+            Assert.assertThrows(
+                    IllegalArgumentException.class, () -> plan.getCompilationReport(request));
+        }
+    }
+
+    @Test
+    public void gpuCapacityProfilesPreserveOrderOnStorageTieAndFallbackToMaximum() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        MultiDimensionCapacityFixture fixture = new MultiDimensionCapacityFixture();
+        FusionShapeProfile firstTie =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 2).build();
+        FusionShapeProfile secondTie =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.items, 2).build();
+        FusionShapeProfile request =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.rows, 2)
+                        .setCapacity(fixture.items, 2)
+                        .build();
+        FusionShapeProfile maximumRequest =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.rows, 4)
+                        .setCapacity(fixture.items, 4)
+                        .build();
+        FusionCompileConfig config =
+                FusionCompileConfig.builder()
+                        .addShapeProfile(firstTie)
+                        .addShapeProfile(secondTie)
+                        .build();
+        Device device = Device.gpu(0);
+
+        try (NDManager manager = engine.newBaseManager(device);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe, config);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                FusionSession tied =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(request)
+                                        .build());
+                FusionSession fallbackMaximum =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(maximumRequest)
+                                        .build())) {
+            Assert.assertEquals(
+                    plan.getCompilationReport(firstTie).getSessionStorageBytes(1),
+                    plan.getCompilationReport(secondTie).getSessionStorageBytes(1));
+            Assert.assertEquals(tied.getCapacity(fixture.rows), 2L);
+            Assert.assertEquals(tied.getCapacity(fixture.items), 4L);
+            Assert.assertEquals(fallbackMaximum.getCapacity(fixture.rows), 4L);
+            Assert.assertEquals(fallbackMaximum.getCapacity(fixture.items), 4L);
+        }
+    }
+
+    @Test
+    public void gpuSingleQueryCapacityProfileUsesSpecializedOutputStrides() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        int maximumBatch = 4;
+        int activeBatch = 2;
+        PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture fixture =
+                new PtSingleQueryReadoutTestSupport.SingleQueryReadoutFixture(
+                        DataType.FLOAT32,
+                        DataType.FLOAT32,
+                        DataType.FLOAT32,
+                        maximumBatch,
+                        true,
+                        3);
+        FusionShapeProfile profile =
+                FusionShapeProfile.builder(fixture.recipe)
+                        .setCapacity(fixture.batch, activeBatch)
+                        .build();
+        FusionCompileConfig compileConfig =
+                FusionCompileConfig.builder().addShapeProfile(profile).build();
+
+        try (NDManager manager = engine.newBaseManager(device);
+                PtSingleQueryReadoutTestSupport.BoundSingleQueryReadouts bound =
+                        fixture.bind(manager);
+                NDArray memory =
+                        patternedArray(
+                                manager,
+                                DataType.FLOAT32,
+                                new Shape(maximumBatch, 151, 256),
+                                37,
+                                18,
+                                0.015f);
+                NDArray mask = legalReadoutMask(manager, DataType.FLOAT32, maximumBatch, 151);
+                FusionPlan plan =
+                        engine.newFusionCompiler(device).prepare(fixture.recipe, compileConfig);
+                FusionExecutable executable = plan.bind(bound.bindings);
+                FusionSession profileSession =
+                        executable.newSession(
+                                manager,
+                                FusionSessionConfig.builder()
+                                        .optRequestedShapeProfile(profile)
+                                        .optProfileFallback(
+                                                FusionSessionConfig.ProfileFallback.EXACT)
+                                        .build());
+                FusionSession maximumSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                FusionInvocation invocation = profileSession.acquire()) {
+            FusionCompilationReport maximumReport = plan.getCompilationReport();
+            FusionCompilationReport profileReport = plan.getCompilationReport(profile);
+            Assert.assertEquals(
+                    maximumReport.getExecutableStorageBytes(),
+                    PtFusionDescriptor.executableStorageBytes(fixture.recipe));
+            Assert.assertEquals(
+                    profileReport.getExecutableStorageBytes(),
+                    maximumReport.getExecutableStorageBytes());
+            Assert.assertTrue(
+                    profileReport.getExecutionStorageBytes()
+                            < maximumReport.getExecutionStorageBytes());
+            Assert.assertTrue(
+                    profileReport.getWorkspaceBytes() < maximumReport.getWorkspaceBytes());
+            Assert.assertTrue(
+                    profileReport.getExportedOutputBytes()
+                            < maximumReport.getExportedOutputBytes());
+            Assert.assertTrue(profileReport.getArenaBytes() < maximumReport.getArenaBytes());
+            Assert.assertEquals(profileSession.getCapacity(fixture.batch), activeBatch);
+            Assert.assertEquals(maximumSession.getCapacity(fixture.batch), maximumBatch);
+            invocation.setInput(fixture.memory, memory);
+            invocation.setInput(fixture.mask, mask);
+            invocation.setDimension(fixture.batch, activeBatch);
+            try (FusionOutputLease lease = invocation.submit()) {
+                lease.synchronize();
+                Assert.assertEquals(
+                        lease.get(fixture.policyOutput).getShape(), new Shape(activeBatch, 256));
+                Assert.assertEquals(
+                        lease.get(fixture.valueOutput).getShape(), new Shape(activeBatch, 256));
+                assertSingleQueryReadoutReference(
+                        lease.get(fixture.policyOutput),
+                        memory,
+                        mask,
+                        bound.readouts.get(0),
+                        fixture.queryIndex,
+                        activeBatch,
+                        DataType.FLOAT32,
+                        0,
+                        "profile-policy");
+                assertSingleQueryReadoutReference(
+                        lease.get(fixture.valueOutput),
+                        memory,
+                        mask,
+                        bound.readouts.get(1),
+                        fixture.queryIndex,
+                        activeBatch,
+                        DataType.FLOAT32,
+                        0,
+                        "profile-value");
+            }
+            try (FusionInvocation maximumInvocation = maximumSession.acquire()) {
+                maximumInvocation.setInput(fixture.memory, memory);
+                maximumInvocation.setInput(fixture.mask, mask);
+                maximumInvocation.setDimension(fixture.batch, activeBatch);
+                try (FusionOutputLease lease = maximumInvocation.submit()) {
+                    lease.synchronize();
+                    Assert.assertEquals(
+                            lease.get(fixture.policyOutput).getShape(),
+                            new Shape(maximumBatch, 256));
+                    Assert.assertEquals(
+                            lease.get(fixture.valueOutput).getShape(),
+                            new Shape(maximumBatch, 256));
+                    assertSingleQueryReadoutReference(
+                            lease.get(fixture.policyOutput),
+                            memory,
+                            mask,
+                            bound.readouts.get(0),
+                            fixture.queryIndex,
+                            activeBatch,
+                            DataType.FLOAT32,
+                            0,
+                            "maximum-policy");
+                    assertSingleQueryReadoutReference(
+                            lease.get(fixture.valueOutput),
+                            memory,
+                            mask,
+                            bound.readouts.get(1),
+                            fixture.queryIndex,
+                            activeBatch,
+                            DataType.FLOAT32,
+                            0,
+                            "maximum-value");
+                }
+            }
+        }
+    }
+
+    @Test
     public void fusionDescriptorRejectsPersistentStorageOverflow() {
         FusionRecipe.Builder builder = FusionRecipe.builder("storage-overflow-test");
         FusionRecipe.Dimension rows = builder.addDimension("rows", Long.MAX_VALUE);
@@ -1007,7 +1441,8 @@ public class PtFusionTest {
                         plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(2).build())) {
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(2).build())) {
             NDArray half =
                     manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2))
                             .toType(DataType.FLOAT16, false);
@@ -1146,7 +1581,7 @@ public class PtFusionTest {
                     FusionSession session =
                             executable.newSession(
                                     manager,
-                                    FusionSessionConfig.builder().optBufferCount(2).build())) {
+                                    FusionSessionConfig.builder().optOutputSlotCount(2).build())) {
                 FusionOutputLease firstLease;
                 try (FusionInvocation invocation = session.acquire()) {
                     invocation.setInput(roundInput, round);
@@ -1309,7 +1744,7 @@ public class PtFusionTest {
                     FusionSession session =
                             executable.newSession(
                                     manager,
-                                    FusionSessionConfig.builder().optBufferCount(2).build());
+                                    FusionSessionConfig.builder().optOutputSlotCount(2).build());
                     FusionInvocation invocation = session.acquire()) {
                 fixture.setInputs(invocation, candidate, tile, context, 2);
                 try (FusionOutputLease lease = invocation.submit()) {
@@ -1423,26 +1858,231 @@ public class PtFusionTest {
                                     fixture.bindings(
                                             firstWeight, secondWeight, fixed, fixedWeight, bias));
                     FusionSession session =
-                            executable.newSession(manager, FusionSessionConfig.defaults());
-                    FusionInvocation invocation = session.acquire()) {
+                            executable.newSession(
+                                    manager,
+                                    FusionSessionConfig.builder().optOutputSlotCount(2).build())) {
                 FusionCompilationReport report = plan.getCompilationReport();
                 Assert.assertEquals(report.getStoragePlannerVersion(), 4);
                 Assert.assertTrue(report.getArenaBytes() > 0);
-                Assert.assertTrue(
-                        report.getBackingAllocationCount() < report.getLogicalAllocationCount());
-                fixture.setInputs(invocation, first, second, 2);
-                try (FusionOutputLease lease = invocation.submit()) {
-                    lease.synchronize();
-                    try (NDArray floatOutput =
-                            lease.get(fixture.output).toType(DataType.FLOAT32, false)) {
-                        float[] actual = floatOutput.toFloatArray();
+                FusionOutputLease firstLease;
+                try (FusionInvocation invocation = session.acquire()) {
+                    fixture.setInputs(invocation, first, second, 2);
+                    firstLease = invocation.submit();
+                }
+                try (firstLease;
+                        FusionInvocation invocation = session.acquire()) {
+                    fixture.setInputs(invocation, first, second, 2);
+                    try (FusionOutputLease secondLease = invocation.submit()) {
+                        secondLease.synchronize();
+                        firstLease.synchronize();
                         float[] expected = {7.25f, 16f, -0.75f, -1.5f, 8.25f, 14.5f, 1.75f, -10f};
                         float tolerance = projectionDataType == DataType.FLOAT16 ? 2e-2f : 8e-2f;
-                        for (int index = 0; index < expected.length; ++index) {
-                            Assert.assertEquals(actual[index], expected[index], tolerance);
+                        for (FusionOutputLease lease :
+                                new FusionOutputLease[] {firstLease, secondLease}) {
+                            try (NDArray floatOutput =
+                                    lease.get(fixture.output).toType(DataType.FLOAT32, false)) {
+                                float[] actual = floatOutput.toFloatArray();
+                                for (int index = 0; index < expected.length; ++index) {
+                                    Assert.assertEquals(actual[index], expected[index], tolerance);
+                                }
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void gpuSessionsSharePlannerArenaOnOneStream() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        SharedExecutionLaneFixture fixture = new SharedExecutionLaneFixture();
+
+        try (PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                NDArray actualInput = manager.ones(new Shape(1, 1), DataType.FLOAT32);
+                NDArray actualExpansionWeight =
+                        manager.ones(
+                                new Shape(SharedExecutionLaneFixture.HIDDEN_SIZE, 1),
+                                DataType.FLOAT32);
+                NDArray actualProjectionWeight =
+                        manager.ones(
+                                new Shape(1, SharedExecutionLaneFixture.HIDDEN_SIZE),
+                                DataType.FLOAT32);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(fixture.bindings(actualExpansionWeight, actualProjectionWeight));
+                PtStream stream = engine.newStream(device);
+                FusionSession firstSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                FusionSession secondSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                PtStreamScope ignored = stream.openScope()) {
+            long arenaBytes = plan.getCompilationReport().getArenaBytes();
+            Assert.assertTrue(arenaBytes >= 32L * 1024 * 1024);
+
+            try (FusionInvocation invocation = firstSession.acquire()) {
+                fixture.setInput(invocation, actualInput, 1);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    lease.synchronize();
+                    Assert.assertEquals(
+                            lease.get(fixture.output).toFloatArray()[0],
+                            SharedExecutionLaneFixture.HIDDEN_SIZE,
+                            1e-4f);
+                }
+            }
+            long allocatedAfterFirst = engine.getMemoryStats(device).getAllocatedBytes();
+
+            try (FusionInvocation invocation = secondSession.acquire()) {
+                fixture.setInput(invocation, actualInput, 1);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    lease.synchronize();
+                    Assert.assertEquals(
+                            lease.get(fixture.output).toFloatArray()[0],
+                            SharedExecutionLaneFixture.HIDDEN_SIZE,
+                            1e-4f);
+                }
+            }
+            long allocatedAfterSecond = engine.getMemoryStats(device).getAllocatedBytes();
+            long allocatorTolerance = Math.max(1024L * 1024, arenaBytes / 8);
+            Assert.assertTrue(
+                    allocatedAfterSecond <= allocatedAfterFirst + allocatorTolerance,
+                    "The second session allocated another planner arena: first="
+                            + allocatedAfterFirst
+                            + ", second="
+                            + allocatedAfterSecond
+                            + ", arena="
+                            + arenaBytes);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void gpuSharedExecutionLanePreservesBackToBackSessionResultsWithoutHostSync() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        SharedExecutionLaneFixture fixture = new SharedExecutionLaneFixture();
+
+        try (PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                NDArray firstInput =
+                        manager.create(new float[] {2f}, new Shape(1, 1)).toDevice(device, false);
+                NDArray secondInput =
+                        manager.create(new float[] {-3f}, new Shape(1, 1)).toDevice(device, false);
+                NDArray expansionWeight =
+                        manager.ones(
+                                new Shape(SharedExecutionLaneFixture.HIDDEN_SIZE, 1),
+                                DataType.FLOAT32);
+                NDArray projectionWeight =
+                        manager.ones(
+                                new Shape(1, SharedExecutionLaneFixture.HIDDEN_SIZE),
+                                DataType.FLOAT32);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(fixture.bindings(expansionWeight, projectionWeight));
+                PtStream stream = engine.newStream(device);
+                FusionSession firstSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                FusionSession secondSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                PtStreamScope ignored = stream.openScope();
+                FusionOutputLease firstLease = fixture.submit(firstSession, firstInput, 1);
+                FusionOutputLease secondLease = fixture.submit(secondSession, secondInput, 1)) {
+            Assert.assertTrue(plan.getCompilationReport().getArenaBytes() >= 32L * 1024 * 1024);
+
+            secondLease.synchronize();
+            firstLease.synchronize();
+            Assert.assertEquals(
+                    firstLease.get(fixture.output).toFloatArray()[0],
+                    2f * SharedExecutionLaneFixture.HIDDEN_SIZE,
+                    1e-4f);
+            Assert.assertEquals(
+                    secondLease.get(fixture.output).toFloatArray()[0],
+                    -3f * SharedExecutionLaneFixture.HIDDEN_SIZE,
+                    1e-4f);
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void gpuSharedExecutionLaneGrowsAfterUnsynchronizedProfileSubmission() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        SharedExecutionLaneFixture fixture = new SharedExecutionLaneFixture();
+        FusionShapeProfile smallProfile =
+                FusionShapeProfile.builder(fixture.recipe).setCapacity(fixture.rows, 1).build();
+        FusionCompileConfig compileConfig =
+                FusionCompileConfig.builder().addShapeProfile(smallProfile).build();
+
+        try (PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                NDArray smallInput =
+                        manager.create(new float[] {2f}, new Shape(1, 1)).toDevice(device, false);
+                NDArray maximumInput =
+                        manager.create(new float[] {-3f}, new Shape(1, 1)).toDevice(device, false);
+                NDArray finalInput =
+                        manager.create(new float[] {4f}, new Shape(1, 1)).toDevice(device, false);
+                NDArray expansionWeight =
+                        manager.ones(
+                                new Shape(SharedExecutionLaneFixture.HIDDEN_SIZE, 1),
+                                DataType.FLOAT32);
+                NDArray projectionWeight =
+                        manager.ones(
+                                new Shape(1, SharedExecutionLaneFixture.HIDDEN_SIZE),
+                                DataType.FLOAT32);
+                FusionPlan plan =
+                        engine.newFusionCompiler(device).prepare(fixture.recipe, compileConfig);
+                FusionExecutable executable =
+                        plan.bind(fixture.bindings(expansionWeight, projectionWeight));
+                PtStream stream = engine.newStream(device);
+                FusionSession maximumSession =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                PtStreamScope ignored = stream.openScope()) {
+            FusionCompilationReport smallReport = plan.getCompilationReport(smallProfile);
+            FusionCompilationReport maximumReport = plan.getCompilationReport();
+            Assert.assertTrue(smallReport.getArenaBytes() < maximumReport.getArenaBytes());
+            Assert.assertTrue(maximumReport.getArenaBytes() >= 32L * 1024 * 1024);
+
+            FusionSession smallSession =
+                    executable.newSession(
+                            manager,
+                            FusionSessionConfig.builder()
+                                    .optRequestedShapeProfile(smallProfile)
+                                    .optProfileFallback(FusionSessionConfig.ProfileFallback.EXACT)
+                                    .build());
+            try {
+                try (FusionOutputLease smallLease = fixture.submit(smallSession, smallInput, 1);
+                        FusionOutputLease maximumLease =
+                                fixture.submit(maximumSession, maximumInput, 1)) {
+                    maximumLease.synchronize();
+                    smallLease.synchronize();
+                    Assert.assertEquals(
+                            smallLease.get(fixture.output).toFloatArray()[0],
+                            2f * SharedExecutionLaneFixture.HIDDEN_SIZE,
+                            1e-4f);
+                    Assert.assertEquals(
+                            maximumLease.get(fixture.output).toFloatArray()[0],
+                            -3f * SharedExecutionLaneFixture.HIDDEN_SIZE,
+                            1e-4f);
+                }
+            } finally {
+                smallSession.close();
+            }
+
+            try (FusionOutputLease lease = fixture.submit(maximumSession, finalInput, 1)) {
+                lease.synchronize();
+                Assert.assertEquals(
+                        lease.get(fixture.output).toFloatArray()[0],
+                        4f * SharedExecutionLaneFixture.HIDDEN_SIZE,
+                        1e-4f);
             }
         }
     }
@@ -1516,7 +2156,8 @@ public class PtFusionTest {
                                         .build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build())) {
             try (FusionInvocation invocation = session.acquire()) {
                 invocation.setInput(fixture.dynamic, dynamic);
                 invocation.setInput(fixture.fixedRuntime, fixedRuntime);
@@ -1646,7 +2287,7 @@ public class PtFusionTest {
                     FusionSession session =
                             executable.newSession(
                                     manager,
-                                    FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                    FusionSessionConfig.builder().optOutputSlotCount(1).build())) {
                 try (FusionInvocation invocation = session.acquire()) {
                     fixture.setInputs(invocation, indices, state, branch, 2, 6, 3);
                     try (FusionOutputLease lease = invocation.submit()) {
@@ -1750,7 +2391,8 @@ public class PtFusionTest {
                         plan.bind(fixture.bindings(hiddenWeight, outputWeight));
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build())) {
             try (FusionInvocation invocation = session.acquire()) {
                 fixture.setInputs(invocation, firstIndices, state, branch, 2);
                 try (FusionOutputLease lease = invocation.submit()) {
@@ -1879,7 +2521,7 @@ public class PtFusionTest {
 
     @Test
     @SuppressWarnings("try")
-    public void gpuSessionWaitsForAllocationAndReusesSlotAcrossStreams() {
+    public void gpuSessionBindsFirstSubmissionStream() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
             throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
@@ -1919,7 +2561,27 @@ public class PtFusionTest {
                     }
                 }
 
-                try (PtStreamScope ignored = allocationStream.openScope();
+                boolean rejectedDifferentStream = false;
+                for (int attempt = 0; attempt < 64 && !rejectedDifferentStream; ++attempt) {
+                    try (PtStream candidateStream = engine.newStream(device);
+                            PtStreamScope ignored = candidateStream.openScope();
+                            FusionInvocation invocation = session.acquire()) {
+                        setInputs(invocation, fixture, half, bfloat, single, 1);
+                        try (FusionOutputLease lease = invocation.submit()) {
+                            lease.synchronize();
+                        } catch (EngineException expected) {
+                            Assert.assertTrue(
+                                    expected.getMessage()
+                                            .contains("must use the same accelerator stream"));
+                            rejectedDifferentStream = true;
+                        }
+                    }
+                }
+                Assert.assertTrue(
+                        rejectedDifferentStream,
+                        "The accelerator backend did not provide a distinct stream.");
+
+                try (PtStreamScope ignored = submissionStream.openScope();
                         FusionInvocation invocation = session.acquire()) {
                     setInputs(invocation, fixture, half, bfloat, single, 1);
                     try (FusionOutputLease lease = invocation.submit()) {
@@ -1928,6 +2590,43 @@ public class PtFusionTest {
                                 lease.get(fixture.output).get(0).toFloatArray(),
                                 new float[] {1f, 2f, 3f, 4f, 5f, 6f});
                     }
+                }
+            }
+        }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void gpuValidationFailureDoesNotBindSubmissionStream() {
+        PtEngine engine = (PtEngine) Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
+        }
+        FusionFixture fixture = new FusionFixture();
+        Device device = Device.gpu(0);
+        try (PtNDManager manager = (PtNDManager) engine.newBaseManager(device);
+                FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
+                FusionExecutable executable =
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                FusionSession session =
+                        executable.newSession(manager, FusionSessionConfig.defaults());
+                PtStream invalidStream = engine.newStream(device);
+                PtStream validStream = engine.newStream(device)) {
+            NDArray half = manager.zeros(new Shape(1, 2), DataType.FLOAT16);
+            NDArray bfloat = manager.zeros(new Shape(1, 1), DataType.BFLOAT16);
+            NDArray single = manager.zeros(new Shape(1, 3), DataType.FLOAT32);
+
+            try (PtStreamScope ignored = invalidStream.openScope();
+                    FusionInvocation invocation = session.acquire()) {
+                setInputs(invocation, fixture, half, bfloat, single, 2);
+                Assert.assertThrows(EngineException.class, invocation::submit);
+            }
+
+            try (PtStreamScope ignored = validStream.openScope();
+                    FusionInvocation invocation = session.acquire()) {
+                setInputs(invocation, fixture, half, bfloat, single, 1);
+                try (FusionOutputLease lease = invocation.submit()) {
+                    lease.synchronize();
                 }
             }
         }
@@ -1947,7 +2646,8 @@ public class PtFusionTest {
                         plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build());
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build());
                 NDArray input = manager.create(new float[] {1f, 2f}, new Shape(2, 1));
                 FusionInvocation invocation = session.acquire()) {
             invocation.setInput(fixture.input, input);
@@ -1981,7 +2681,8 @@ public class PtFusionTest {
                                         .build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build());
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build());
                 NDArray input = manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2));
                 FusionInvocation invocation = session.acquire()) {
             invocation.setInput(fixture.input, input);
@@ -2030,7 +2731,8 @@ public class PtFusionTest {
                         plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build());
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build());
                 NDArray half =
                         manager.create(new float[] {1f, 2f}, new Shape(1, 2))
                                 .toType(DataType.FLOAT16, false);
@@ -2059,7 +2761,8 @@ public class PtFusionTest {
                         plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build());
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build());
                 NDArray half = manager.zeros(new Shape(5, 2), DataType.FLOAT16);
                 NDArray bfloat = manager.zeros(new Shape(2, 1), DataType.BFLOAT16);
                 NDArray single = manager.zeros(new Shape(2, 3), DataType.FLOAT32);
@@ -2083,7 +2786,8 @@ public class PtFusionTest {
                         plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build())) {
             NDArray zeros = manager.create(new float[] {0f, 0f}, new Shape(2, 1));
             try (FusionInvocation invocation = session.acquire()) {
                 fixture.setInputs(invocation, zeros, zeros, 2);
@@ -2109,6 +2813,7 @@ public class PtFusionTest {
     }
 
     @Test
+    @SuppressWarnings("try")
     public void gpuSessionSurvivesNdScopeAndSequentialThreadMigration() {
         PtEngine engine = (PtEngine) Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -2119,7 +2824,8 @@ public class PtFusionTest {
         try (NDManager manager = engine.newBaseManager(device);
                 FusionPlan plan = engine.newFusionCompiler(device).prepare(fixture.recipe);
                 FusionExecutable executable =
-                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build())) {
+                        plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
+                PtStream executionStream = engine.newStream(device)) {
             NDArray half =
                     manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2))
                             .toType(DataType.FLOAT16, false);
@@ -2134,12 +2840,14 @@ public class PtFusionTest {
                 scope.suppressNotUsedWarning();
                 session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build());
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build());
             }
             try {
                 runOnNewThread(
                         () -> {
-                            try (FusionInvocation invocation = session.acquire()) {
+                            try (PtStreamScope ignored = executionStream.openScope();
+                                    FusionInvocation invocation = session.acquire()) {
                                 setInputs(invocation, fixture, half, bfloat, single, 2);
                                 try (FusionOutputLease lease = invocation.submit()) {
                                     lease.synchronize();
@@ -2149,7 +2857,8 @@ public class PtFusionTest {
                         });
                 runOnNewThread(
                         () -> {
-                            try (FusionInvocation invocation = session.acquire()) {
+                            try (PtStreamScope ignored = executionStream.openScope();
+                                    FusionInvocation invocation = session.acquire()) {
                                 setInputs(invocation, fixture, half, bfloat, single, 2);
                                 try (FusionOutputLease lease = invocation.submit()) {
                                     lease.synchronize();
@@ -2179,7 +2888,8 @@ public class PtFusionTest {
                         plan.bind(FusionConstantBindings.builder(fixture.recipe).build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build())) {
             NDArray half =
                     manager.create(new float[] {1f, 2f, 3f, 4f}, new Shape(2, 2))
                             .toType(DataType.FLOAT16, false);
@@ -2774,12 +3484,28 @@ public class PtFusionTest {
 
     private static void assertPreparationFails(Device device, ByteBuffer descriptor) {
         try {
-            long handle = JniUtils.prepareFusionPlan(device, descriptor);
+            long handle =
+                    JniUtils.prepareFusionPlan(
+                            device, descriptor, emptyProfileDescriptor(descriptor));
             JniUtils.deleteFusionPlan(handle);
             Assert.fail("Malformed fusion descriptor unexpectedly prepared successfully.");
         } catch (EngineException expected) {
             // expected
         }
+    }
+
+    private static ByteBuffer emptyProfileDescriptor(ByteBuffer recipeDescriptor) {
+        long dimensionCount = recipeDescriptor.getLong(4 * Long.BYTES);
+        ByteBuffer descriptor =
+                ByteBuffer.allocateDirect(PtFusionProfileDescriptor.HEADER_WORDS * Long.BYTES)
+                        .order(ByteOrder.nativeOrder());
+        descriptor.putLong(PtFusionProfileDescriptor.MAGIC);
+        descriptor.putLong(PtFusionProfileDescriptor.VERSION);
+        descriptor.putLong(PtFusionProfileDescriptor.HEADER_WORDS);
+        descriptor.putLong(0);
+        descriptor.putLong(dimensionCount);
+        descriptor.flip();
+        return descriptor;
     }
 
     private static void runOnNewThread(Runnable task) {
@@ -2879,6 +3605,64 @@ public class PtFusionTest {
         }
     }
 
+    private static final class SharedExecutionLaneFixture {
+
+        private static final int MAXIMUM_ROWS = 4096;
+        private static final int HIDDEN_SIZE = 2048;
+
+        private final FusionRecipe.Dimension rows;
+        private final FusionRecipe.Input input;
+        private final FusionRecipe.Constant expansionWeight;
+        private final FusionRecipe.Constant projectionWeight;
+        private final FusionRecipe.Output output;
+        private final FusionRecipe recipe;
+
+        private SharedExecutionLaneFixture() {
+            FusionRecipe.Builder builder = FusionRecipe.builder("shared-execution-lane-test");
+            rows = builder.addDimension("rows", MAXIMUM_ROWS);
+            input =
+                    builder.addInput(
+                            "input", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 1));
+            expansionWeight =
+                    builder.addConstant(
+                            "expansionWeight",
+                            FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, HIDDEN_SIZE, 1));
+            projectionWeight =
+                    builder.addConstant(
+                            "projectionWeight",
+                            FusionRecipe.TensorSpec.fixed(DataType.FLOAT32, 1, HIDDEN_SIZE));
+            FusionRecipe.AffineSum expanded =
+                    builder.affineSum("expanded", HIDDEN_SIZE)
+                            .addTerm(input, expansionWeight)
+                            .build();
+            FusionRecipe.AffineSum projected =
+                    builder.affineSum("projected", 1).addTerm(expanded, projectionWeight).build();
+            output = builder.addOutput("output", projected);
+            recipe = builder.build();
+        }
+
+        private FusionConstantBindings bindings(
+                NDArray expansionWeightArray, NDArray projectionWeightArray) {
+            return FusionConstantBindings.builder(recipe)
+                    .bind(expansionWeight, expansionWeightArray)
+                    .bind(projectionWeight, projectionWeightArray)
+                    .build();
+        }
+
+        private void setInput(FusionInvocation invocation, NDArray inputArray, long activeRows) {
+            invocation.setInput(input, inputArray);
+            invocation.setDimension(rows, activeRows);
+        }
+
+        private FusionOutputLease submit(
+                FusionSession session, NDArray inputArray, long activeRows) {
+            try (FusionInvocation invocation = session.acquire()) {
+                setInput(invocation, inputArray, activeRows);
+                return invocation.submit();
+            }
+        }
+    }
+
     private static final class FusionFixture {
 
         private final FusionRecipe.Dimension rows;
@@ -2900,6 +3684,28 @@ public class PtFusionTest {
                             "single", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 3));
             FusionRecipe.OutputPack pack = builder.outputPack("packed", half, bfloat, single);
             output = builder.addOutput("scores", pack);
+            recipe = builder.build();
+        }
+    }
+
+    private static final class MultiDimensionCapacityFixture {
+
+        private final FusionRecipe.Dimension rows;
+        private final FusionRecipe.Dimension items;
+        private final FusionRecipe recipe;
+
+        private MultiDimensionCapacityFixture() {
+            FusionRecipe.Builder builder = FusionRecipe.builder("multi-dimension-capacity-profile");
+            rows = builder.addDimension("rows", 4);
+            items = builder.addDimension("items", 4);
+            FusionRecipe.Input rowInput =
+                    builder.addInput(
+                            "rowInput", FusionRecipe.TensorSpec.of(DataType.FLOAT32, rows, 1));
+            FusionRecipe.Input itemInput =
+                    builder.addInput(
+                            "itemInput", FusionRecipe.TensorSpec.of(DataType.FLOAT32, items, 1));
+            builder.addOutput("rowOutput", builder.outputPack("rowPack", rowInput));
+            builder.addOutput("itemOutput", builder.outputPack("itemPack", itemInput));
             recipe = builder.build();
         }
     }

@@ -296,7 +296,8 @@ public class ProjectedResidualMlpTest {
                         plan.bind(fixture.bindings(combinedWeight, combinedBias, outputWeight));
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build());
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build());
                 FusionInvocation invocation = session.acquire()) {
             invocation.setInput(fixture.input, input);
             invocation.setDimension(fixture.batch, batchSize);

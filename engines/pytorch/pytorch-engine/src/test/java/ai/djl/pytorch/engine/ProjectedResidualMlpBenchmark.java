@@ -86,7 +86,8 @@ public final class ProjectedResidualMlpBenchmark {
                                         .build());
                 FusionSession session =
                         executable.newSession(
-                                manager, FusionSessionConfig.builder().optBufferCount(1).build())) {
+                                manager,
+                                FusionSessionConfig.builder().optOutputSlotCount(1).build())) {
             runFunctional(input, combinedWeight, combinedBias, outputWeight, warmup);
             runFusion(session, recipe, input, batch, warmup);
             synchronize(device);

@@ -12,8 +12,13 @@
  */
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
+#include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
+
+#include <c10/core/InferenceMode.h>
+
+#include <utility>
 
 // The file is the implementation for PyTorch tensor pointwise ops
 
@@ -282,7 +287,17 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchMatmul(
   API_BEGIN()
   const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
   const auto* other_ptr = reinterpret_cast<torch::Tensor*>(jother);
-  const auto* result_ptr = new torch::Tensor(self_ptr->matmul(*other_ptr));
+  torch::Tensor result;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (c10::InferenceMode::is_enabled()) {
+    djl::pytorch::fusion::TryExecuteRocmInferenceMatmul(
+        result, *self_ptr, *other_ptr, nullptr);
+  }
+#endif
+  if (!result.defined()) {
+    result = self_ptr->matmul(*other_ptr);
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }
@@ -292,7 +307,19 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchBmm(
   API_BEGIN()
   const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
   const auto* other_ptr = reinterpret_cast<torch::Tensor*>(jother);
-  const auto* result_ptr = new torch::Tensor(self_ptr->bmm(*other_ptr));
+  torch::Tensor result;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (c10::InferenceMode::is_enabled() &&
+      self_ptr->dim() == 3 && other_ptr->dim() == 3 &&
+      self_ptr->size(0) == other_ptr->size(0)) {
+    djl::pytorch::fusion::TryExecuteRocmInferenceMatmul(
+        result, *self_ptr, *other_ptr, nullptr);
+  }
+#endif
+  if (!result.defined()) {
+    result = self_ptr->bmm(*other_ptr);
+  }
+  const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
   API_END_RETURN()
 }

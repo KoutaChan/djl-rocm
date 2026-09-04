@@ -15,6 +15,7 @@
 
 #include <torch/types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -28,16 +29,89 @@ inline constexpr int32_t kMaximumIndexedAffineSources = 32;
 inline constexpr int32_t kMaximumIndexedAffineOutputWidth = 32;
 inline constexpr int32_t kMaximumIndexedLocalTransformerSegments = 8;
 
-class LinearBiasSiluPlan;
+class FusionMatmulPlan;
+class FusionMatmulWorkspace;
+
+/** Returns whether this build can execute Fusion matrix products directly. */
+bool IsFusionMatmulSupported();
+
+/** Returns whether this build can execute the hipBLASLt linear bias-SiLU path. */
+bool IsLinearBiasSiluSupported();
+
+/** Returns the configured per-stream upper bound for hipBLASLt scratch storage. */
+std::size_t GetFusionMatmulWorkspaceUpperBoundBytes();
 
 /**
- * Creates a reusable accelerator linear epilogue plan.
+ * Pins the current ROCm stream's matrix-product context for a graph lifetime.
  *
- * <p>The ROCm backend caches shape-specific hipBLASLt descriptors and algorithms. Other backends
- * may use the ordinary PyTorch path. The plan owns only host-side metadata; inputs, weights,
- * outputs, and the PyTorch BLAS workspace remain externally owned.
+ * <p>Accelerator graphs call this immediately before capture. The call reserves
+ * the configured hipBLASLt workspace upper bound so captured nodes retain one
+ * stable workspace address until the matching unpin.
  */
-std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan();
+void PinCurrentRocmMatmulStreamContext(c10::Device device);
+
+/** Releases one graph-lifetime pin on the current ROCm stream context. */
+void UnpinCurrentRocmMatmulStreamContext(c10::Device device);
+
+/**
+ * Creates a reusable accelerator matrix-product plan.
+ *
+ * <p>The ROCm backend resolves shape- and stride-specific hipBLASLt descriptors
+ * and algorithms through the process-lifetime raw-stream context. Other
+ * backends may use the ordinary PyTorch path. This object preserves the Fusion
+ * plan API without owning tensors or accelerator scratch storage.
+ */
+std::shared_ptr<FusionMatmulPlan> CreateFusionMatmulPlan();
+
+/** Creates a lightweight binding to a process-lifetime device-stream context. */
+std::shared_ptr<FusionMatmulWorkspace> CreateFusionMatmulWorkspace();
+
+/**
+ * Tries an inference matrix product on the current ROCm stream.
+ *
+ * <p>On success, creates {@code output = left * right + bias}. Unsupported
+ * data types, layouts, devices, modes, and shapes return {@code false} without
+ * modifying {@code output}, so callers can preserve the ordinary ATen path.
+ * Matrix operands may carry broadcast-compatible leading batch dimensions.
+ */
+bool TryExecuteRocmInferenceMatmul(torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor* bias);
+
+/**
+ * Tries {@code linear(input, weight, bias)} for rank-two or higher input on
+ * the current ROCm stream. Rank-one input retains PyTorch's GEMV path.
+ * Autocast converts the weight before forming its transpose so that the
+ * transpose remains a metadata-only view.
+ */
+bool TryExecuteRocmInferenceLinear(torch::Tensor& output,
+    const torch::Tensor& input, const torch::Tensor& weight,
+    const torch::Tensor* bias);
+
+/**
+ * Executes a two-dimensional or strided-batched matrix product.
+ *
+ * <p>The ROCm implementation invokes hipBLASLt directly and therefore does not enter PyTorch's
+ * process-global, thread-handle-keyed workspace cache. It accepts row-major tensors, including
+ * interleaved read-only batches, and a right operand represented by a transpose view whose final
+ * two strides are {@code [1, K]}. A supported backend reports invalid layouts and unavailable
+ * algorithms as errors; {@code false} is reserved for builds without the direct backend.
+ */
+bool ExecuteFusionMatmul(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right);
+
+/** Executes {@code output = left * right + bias} using a plain bias epilogue. */
+bool ExecuteFusionMatmulBias(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right,
+    const torch::Tensor& bias);
+
+/** Executes {@code output += left * right} using hipBLASLt beta-one accumulation. */
+bool ExecuteFusionMatmulAccumulate(
+    const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace, torch::Tensor& output,
+    const torch::Tensor& left, const torch::Tensor& right);
 
 /**
  * Executes {@code output = silu(input * weight + bias)} with a backend epilogue when supported.
@@ -46,7 +120,8 @@ std::shared_ptr<LinearBiasSiluPlan> CreateLinearBiasSiluPlan();
  * weight is laid out as {@code [inputWidth, outputWidth]}. The method returns {@code false} for a
  * data type or shape that must use the ordinary PyTorch path.
  */
-bool ExecuteLinearBiasSilu(const std::shared_ptr<LinearBiasSiluPlan>& plan,
+bool ExecuteLinearBiasSilu(const std::shared_ptr<FusionMatmulPlan>& plan,
+    FusionMatmulWorkspace& workspace,
     torch::Tensor& output, const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias);
 
@@ -231,7 +306,8 @@ void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::T
 void LaunchMappedGroupedMaskedSoftmaxPool(const torch::Tensor& scores,
     const torch::Tensor& masks, const torch::Tensor& values,
     const torch::Tensor& destination_metadata, torch::Tensor& contexts,
-    torch::Tensor& presence, int64_t batch_count, int64_t candidate_count,
+    torch::Tensor& presence, int64_t batch_count,
+    int64_t output_batch_capacity, int64_t candidate_count,
     int64_t group_count, int64_t width, int64_t destination_count);
 
 }  // namespace djl::pytorch::fusion

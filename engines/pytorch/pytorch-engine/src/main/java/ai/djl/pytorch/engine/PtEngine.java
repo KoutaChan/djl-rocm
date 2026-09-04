@@ -270,7 +270,7 @@ public final class PtEngine extends Engine {
     }
 
     /**
-     * Creates a reusable device stream selected from PyTorch's stream pool.
+     * Creates a reusable device stream provided by the active accelerator backend.
      *
      * @param device device on which work is enqueued
      * @return a reusable device stream

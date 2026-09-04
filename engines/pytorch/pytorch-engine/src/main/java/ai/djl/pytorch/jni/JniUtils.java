@@ -179,13 +179,16 @@ public final class JniUtils {
         PyTorchLibrary.LIB.torchDeleteAcceleratorGraph(handle);
     }
 
-    public static long prepareFusionPlan(Device device, ByteBuffer descriptor) {
-        return PyTorchLibrary.LIB.torchPrepareFusionPlan(
-                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()}, descriptor);
+    public static long prepareFusionPlan(
+            Device device, ByteBuffer descriptor, ByteBuffer profileDescriptor) {
+        return PyTorchLibrary.LIB.torchPrepareFusionPlanWithProfiles(
+                new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()},
+                descriptor,
+                profileDescriptor);
     }
 
-    public static long[] getFusionPlanStats(long planHandle) {
-        return PyTorchLibrary.LIB.torchGetFusionPlanStats(planHandle);
+    public static long[] getFusionPlanStats(long planHandle, int variantIndex) {
+        return PyTorchLibrary.LIB.torchGetFusionPlanVariantStats(planHandle, variantIndex);
     }
 
     /**
@@ -201,27 +204,33 @@ public final class JniUtils {
         return PyTorchLibrary.LIB.torchBindFusionPlan(planHandle, constantHandles);
     }
 
-    public static long createFusionSession(long executableHandle, int bufferCount) {
-        return PyTorchLibrary.LIB.torchCreateFusionSession(executableHandle, bufferCount);
+    public static long createFusionSession(
+            long executableHandle, int variantIndex, int outputSlotCount) {
+        return PyTorchLibrary.LIB.torchCreateFusionProfileSession(
+                executableHandle, variantIndex, outputSlotCount);
     }
 
     public static PtNDArray getFusionSessionOutput(
-            PtNDManager manager, long sessionHandle, int bufferIndex, int outputIndex) {
+            PtNDManager manager, long sessionHandle, int outputSlotIndex, int outputIndex) {
         long outputHandle =
                 PyTorchLibrary.LIB.torchGetFusionSessionOutput(
-                        sessionHandle, bufferIndex, outputIndex);
+                        sessionHandle, outputSlotIndex, outputIndex);
         PtNDArray output = new PtNDArray(manager, outputHandle);
         NDScope.unregister(output);
         return output;
     }
 
     public static void submitFusion(
-            long sessionHandle, int bufferIndex, ByteBuffer inputHandles, ByteBuffer dimensions) {
-        PyTorchLibrary.LIB.torchSubmitFusion(sessionHandle, bufferIndex, inputHandles, dimensions);
+            long sessionHandle,
+            int outputSlotIndex,
+            ByteBuffer inputHandles,
+            ByteBuffer dimensions) {
+        PyTorchLibrary.LIB.torchSubmitFusion(
+                sessionHandle, outputSlotIndex, inputHandles, dimensions);
     }
 
-    public static void synchronizeFusionOutput(long sessionHandle, int bufferIndex) {
-        PyTorchLibrary.LIB.torchSynchronizeFusionOutput(sessionHandle, bufferIndex);
+    public static void synchronizeFusionOutput(long sessionHandle, int outputSlotIndex) {
+        PyTorchLibrary.LIB.torchSynchronizeFusionOutput(sessionHandle, outputSlotIndex);
     }
 
     public static void deleteFusionPlan(long handle) {

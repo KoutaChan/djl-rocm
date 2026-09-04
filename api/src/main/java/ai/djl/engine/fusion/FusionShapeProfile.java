@@ -15,15 +15,15 @@ package ai.djl.engine.fusion;
 import java.util.Arrays;
 import java.util.Objects;
 
-/** A preferred combination of active dimension extents for backend specialization. */
+/** A bounded combination of dimension capacities for backend storage specialization. */
 public final class FusionShapeProfile {
 
     private final FusionRecipe recipe;
-    private final long[] extents;
+    private final long[] capacities;
 
     private FusionShapeProfile(Builder builder) {
         recipe = builder.recipe;
-        extents = builder.extents.clone();
+        capacities = builder.capacities.clone();
     }
 
     /**
@@ -46,42 +46,61 @@ public final class FusionShapeProfile {
     }
 
     /**
-     * Returns whether this profile specifies an extent for a dimension.
+     * Returns whether this profile specifies a capacity for a dimension.
      *
      * @param dimension the recipe dimension
      * @return {@code true} if the dimension is specialized
      */
-    public boolean hasExtent(FusionRecipe.Dimension dimension) {
+    public boolean hasCapacity(FusionRecipe.Dimension dimension) {
         int index = checkedIndex(dimension);
-        return extents[index] >= 0;
+        return capacities[index] >= 0;
     }
 
     /**
-     * Returns the specialized extent for a dimension.
+     * Returns the specialized capacity for a dimension.
      *
      * @param dimension the recipe dimension
-     * @return the specialized extent
+     * @return the specialized capacity
      * @throws IllegalArgumentException if the profile does not specify the dimension
      */
-    public long getExtent(FusionRecipe.Dimension dimension) {
+    public long getCapacity(FusionRecipe.Dimension dimension) {
         int index = checkedIndex(dimension);
-        long extent = extents[index];
-        if (extent < 0) {
+        long capacity = capacities[index];
+        if (capacity < 0) {
             throw new IllegalArgumentException(
                     "The shape profile does not specify dimension: " + dimension.getName());
         }
-        return extent;
+        return capacity;
     }
 
     /**
-     * Returns the specialization extents in recipe dimension order.
+     * Returns the specialization capacities in recipe dimension order.
      *
      * <p>An unspecified dimension is represented by {@code -1}.
      *
-     * @return a copy of the specialization extents
+     * @return a copy of the specialization capacities
      */
-    public long[] getExtents() {
-        return extents.clone();
+    public long[] getCapacities() {
+        return capacities.clone();
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof FusionShapeProfile)) {
+            return false;
+        }
+        FusionShapeProfile profile = (FusionShapeProfile) other;
+        return recipe == profile.recipe && Arrays.equals(capacities, profile.capacities);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public int hashCode() {
+        return 31 * System.identityHashCode(recipe) + Arrays.hashCode(capacities);
     }
 
     private int checkedIndex(FusionRecipe.Dimension dimension) {
@@ -99,28 +118,28 @@ public final class FusionShapeProfile {
     public static final class Builder {
 
         private final FusionRecipe recipe;
-        private final long[] extents;
+        private final long[] capacities;
 
         private Builder(FusionRecipe recipe) {
             this.recipe = Objects.requireNonNull(recipe, "recipe");
-            extents = new long[recipe.getDimensions().size()];
-            Arrays.fill(extents, -1);
+            capacities = new long[recipe.getDimensions().size()];
+            Arrays.fill(capacities, -1);
         }
 
         /**
-         * Sets a preferred active extent.
+         * Sets a specialized storage capacity.
          *
          * @param dimension the recipe dimension
-         * @param extent the preferred active extent
+         * @param capacity the storage capacity
          * @return this builder
          */
-        public Builder set(FusionRecipe.Dimension dimension, long extent) {
+        public Builder setCapacity(FusionRecipe.Dimension dimension, long capacity) {
             int index = checkedIndex(dimension);
-            if (extent < 0 || extent > dimension.getMaximumExtent()) {
+            if (capacity <= 0 || capacity > dimension.getMaximumExtent()) {
                 throw new IllegalArgumentException(
-                        "The extent must be between zero and the dimension maximum.");
+                        "The capacity must be positive and not exceed the dimension maximum.");
             }
-            extents[index] = extent;
+            capacities[index] = capacity;
             return this;
         }
 

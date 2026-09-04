@@ -59,7 +59,8 @@ Either one should be set to the name of the desired default engine.
 Engines that implement `FusionCompiler` may reduce accelerator memory by sharing command scratch,
 reusing storage after a computed value's last consumer, and executing certified operations in place.
 These optimizations are enabled by default. They preserve public output storage until its output
-lease is released and never share storage between session buffer slots.
+lease is released. Temporary planner storage is shared across sessions that submit on the same
+device stream.
 
 The following environment variables control the planner phases:
 
@@ -74,16 +75,32 @@ performance comparison. Accepted enabled values are `1` and `true`; other values
 Disabling intermediate planning also disables in-place planning.
 
 Planner statistics are available through `FusionPlan.getCompilationReport()`, including persistent,
-workspace, exported-output, and arena bytes as well as logical allocation, backing allocation,
-alias-view, and in-place reuse counts.
+workspace, exported-output, arena, and backend-workspace-upper-bound bytes as well as logical
+allocation, backing allocation, alias-view, and in-place reuse counts.
 
-`getPersistentStorageBytes()` is the peak payload for an active slot. Only exported-output storage
-is pinned for the full slot lifetime. Planner arenas are acquired on the submission stream and
-released after work is enqueued, allowing the engine's device-wide caching allocator to reuse that
-workspace across plans and sessions once stream work completes. Consequently, idle Fusion plans do
-not each retain their reported arena capacity; concurrent submissions still receive independent
-storage. When scratch and intermediate planning are both enabled, temporary tensors of different
-data types share one alignment-safe byte arena according to their lifetimes.
+`FusionCompileConfig.addShapeProfile(...)` may additionally prepare smaller fixed storage-capacity
+variants without changing the recipe descriptor or its declared maxima. The maximum variant is
+always available. `FusionSessionConfig` either selects the maximum variant, requires an exact
+compiled capacity, or chooses the compiled component-wise fitting variant with the smallest
+isolated-session storage report and falls back to the maximum. A session never reallocates or
+changes variants after construction. `FusionPlan.getShapeProfileReports()` exposes the retained
+output, workspace, and lane-arena requirements of every compiled profile.
+
+`getExecutionStorageBytes()` is the logical tensor payload for one submission. Storage outside the
+planner arena, including named outputs, is retained separately for each session output slot;
+`getRetainedSessionStorageBytes(outputSlotCount)` reports that payload. The engine retains planner
+arenas on a device-stream execution lane, grows each data-type arena to the largest plan requirement
+seen by that lane, and reuses it across sessions without adding device synchronization.
+ROCm hipBLASLt scratch is likewise retained by the device-stream lane, allocated lazily to the
+largest selected-algorithm requirement, and released with the final session retaining that lane.
+It is not registered in PyTorch's process-global handle/stream workspace map.
+`getRequiredExecutionLaneStorageBytes()` reports the arena plus the backend-workspace upper bound,
+while
+`getSessionStorageBytes(outputSlotCount)` is a conservative isolated-session estimate that also
+counts that requirement once. All submissions in a session use the accelerator stream selected by
+the first submission. The stream's FIFO ordering makes arena reuse asynchronous and allocation-free
+in steady state. When scratch and intermediate planning are both enabled, temporary tensors of
+different data types share one alignment-safe byte arena according to their lifetimes.
 
 The settings are engine-neutral. Currently, the native planner is implemented by the PyTorch CUDA
 and ROCm Fusion backend. Other engines may adopt the same settings when they implement equivalent
