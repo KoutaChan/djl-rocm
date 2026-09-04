@@ -76,6 +76,8 @@ inline void MemsetAsync(
       cudaGetErrorString(error));
 }
 
+#if defined(__CUDACC__)
+
 template <typename T>
 __device__ inline T Shuffle(T value, int source_lane) {
   return __shfl_sync(__activemask(), value, source_lane);
@@ -95,6 +97,8 @@ __device__ inline T ShuffleDown(T value, unsigned int delta, int width) {
   (kernel)<<<grid, block, shared, stream>>>(__VA_ARGS__)
 #define __shfl ::djl::pytorch::fusion::backend::Shuffle
 #define __shfl_down ::djl::pytorch::fusion::backend::ShuffleDown
+
+#endif
 
 #endif
 
