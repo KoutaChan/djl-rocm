@@ -367,10 +367,12 @@ public abstract class Optimizer {
                 for (NDArray array : arrays) {
                     StateKey key = decodeName(array.getName());
                     NDManager source = array.getManager();
-                    NDArray stateArray = array.toDevice(key.device, true);
-                    if (stateArray == array) {
-                        stateArray = array.duplicate();
-                    }
+                    // Same-device conversion can return a new wrapper sharing the decoded
+                    // ByteBuffer. Copy its storage before the decoded arrays are closed.
+                    NDArray stateArray =
+                            array.getDevice().equals(key.device)
+                                    ? array.duplicate()
+                                    : array.toDevice(key.device, true);
                     NDManager owner = stateArray.getManager();
                     stateArray.detach();
                     // toDevice may allocate the copy in a temporary sub-manager
