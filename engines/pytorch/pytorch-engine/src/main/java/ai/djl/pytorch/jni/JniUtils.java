@@ -129,6 +129,10 @@ public final class JniUtils {
         return PyTorchLibrary.LIB.torchOpenDeviceStream(handle);
     }
 
+    public static long getDeviceStreamToken(long handle) {
+        return PyTorchLibrary.LIB.torchGetDeviceStreamToken(handle);
+    }
+
     public static void deleteDeviceStream(long handle) {
         PyTorchLibrary.LIB.torchDeleteDeviceStream(handle);
     }
@@ -344,6 +348,10 @@ public final class JniUtils {
 
     public static long[] getMemoryStats(int deviceId) {
         return PyTorchLibrary.LIB.torchGetMemoryStats(deviceId);
+    }
+
+    public static long[] getAllocatorSnapshot(int deviceId) {
+        return PyTorchLibrary.LIB.torchGetAllocatorSnapshot(deviceId);
     }
 
     public static void resetPeakMemoryStats(int deviceId) {

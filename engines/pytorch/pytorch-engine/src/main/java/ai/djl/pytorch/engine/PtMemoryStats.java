@@ -21,6 +21,9 @@ public final class PtMemoryStats {
     private final long peakReservedBytes;
     private final long activeBytes;
     private final long peakActiveBytes;
+    private final long inactiveSplitBytes;
+    private final long numAllocRetries;
+    private final long numOoms;
 
     PtMemoryStats(long[] values) {
         allocatedBytes = values[0];
@@ -29,6 +32,9 @@ public final class PtMemoryStats {
         peakReservedBytes = values[3];
         activeBytes = values[4];
         peakActiveBytes = values[5];
+        inactiveSplitBytes = values[6];
+        numAllocRetries = values[7];
+        numOoms = values[8];
     }
 
     /**
@@ -83,5 +89,32 @@ public final class PtMemoryStats {
      */
     public long getPeakActiveBytes() {
         return peakActiveBytes;
+    }
+
+    /**
+     * Returns bytes in inactive split blocks that cannot be returned independently to the device.
+     *
+     * @return the currently inactive split bytes
+     */
+    public long getInactiveSplitBytes() {
+        return inactiveSplitBytes;
+    }
+
+    /**
+     * Returns the cumulative number of failed device allocations that required cache flushes.
+     *
+     * @return allocator retry count, unaffected by resetting peak statistics
+     */
+    public long getNumAllocRetries() {
+        return numAllocRetries;
+    }
+
+    /**
+     * Returns the cumulative number of allocations that failed after cache flushes.
+     *
+     * @return allocator out-of-memory count, unaffected by resetting peak statistics
+     */
+    public long getNumOoms() {
+        return numOoms;
     }
 }

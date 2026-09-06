@@ -40,6 +40,8 @@ final class PyTorchLibrary {
 
     native long torchOpenDeviceStream(long handle);
 
+    native long torchGetDeviceStreamToken(long handle);
+
     native void torchDeleteDeviceStream(long handle);
 
     native long torchCreateDeviceEvent(int[] device);
@@ -128,6 +130,8 @@ final class PyTorchLibrary {
     native int torchGetGpuCount();
 
     native long[] torchGetMemoryStats(int deviceId);
+
+    native long[] torchGetAllocatorSnapshot(int deviceId);
 
     native void torchResetPeakMemoryStats(int deviceId);
 

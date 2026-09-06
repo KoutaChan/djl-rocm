@@ -33,14 +33,21 @@
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
 #if defined(USE_ROCM)
+#include <c10/hip/HIPCachingAllocator.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime_api.h>
+#elif defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #endif
 
+#include <algorithm>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -680,6 +687,55 @@ void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
 #endif
 }
 
+uint64_t GetDeviceStreamToken(DeviceStream* stream) {
+  TORCH_CHECK(stream != nullptr, "A native stream token requires a GPU stream");
+#if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
+  return reinterpret_cast<uintptr_t>(c10::cuda::CUDAStream(stream->stream).stream());
+#else
+  TORCH_CHECK(false, "Native stream tokens require a CUDA or ROCm build");
+#endif
+}
+
+std::vector<AllocatorStreamPool> GetAllocatorSnapshot(c10::DeviceIndex device) {
+  InitializeAccelerator();
+#if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
+  const auto snapshot = c10::cuda::CUDACachingAllocator::snapshot({0, 0}, false);
+  // Keep private pools and small/large pools separate: their inactive blocks
+  // are not interchangeable. No device synchronization or tensor data is read.
+  using Key = std::tuple<uint64_t, uint64_t, uint64_t, bool>;
+  std::map<Key, AllocatorStreamPool> pools;
+  for (const auto& segment : snapshot.segments) {
+    if (segment.device != device) {
+      continue;
+    }
+    const auto token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(segment.stream));
+    const auto high = static_cast<uint64_t>(segment.owner_private_pool_id.first);
+    const auto low = static_cast<uint64_t>(segment.owner_private_pool_id.second);
+    Key key{token, high, low, segment.is_large};
+    auto entry = pools.try_emplace(key, AllocatorStreamPool{token, high, low, segment.is_large});
+    auto& pool = entry.first->second;
+    pool.reserved_bytes += static_cast<int64_t>(segment.total_size);
+    pool.allocated_bytes += static_cast<int64_t>(segment.allocated_size);
+    pool.active_bytes += static_cast<int64_t>(segment.active_size);
+    ++pool.segment_count;
+    for (const auto& block : segment.blocks) {
+      if (!block.active) {
+        pool.largest_inactive_block_bytes =
+            std::max(pool.largest_inactive_block_bytes, static_cast<int64_t>(block.size));
+      }
+    }
+  }
+  std::vector<AllocatorStreamPool> result;
+  result.reserve(pools.size());
+  for (const auto& entry : pools) {
+    result.push_back(entry.second);
+  }
+  return result;
+#else
+  TORCH_CHECK(false, "Allocator snapshots require a CUDA or ROCm build");
+#endif
+}
+
 DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
   InitializeAccelerator();
   c10::CachingDeviceAllocator::DeviceStats stats;
@@ -692,7 +748,8 @@ DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device) {
   const auto& allocated = stats.allocated_bytes[aggregate];
   const auto& reserved = stats.reserved_bytes[aggregate];
   const auto& active = stats.active_bytes[aggregate];
-  return {allocated.current, allocated.peak, reserved.current, reserved.peak, active.current, active.peak};
+  return {allocated.current, allocated.peak, reserved.current, reserved.peak, active.current, active.peak,
+      stats.inactive_split_bytes[aggregate].current, stats.num_alloc_retries, stats.num_ooms};
 }
 
 void ResetPeakMemoryStats(c10::DeviceIndex device) {

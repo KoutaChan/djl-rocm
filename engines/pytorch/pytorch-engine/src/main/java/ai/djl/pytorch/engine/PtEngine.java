@@ -166,6 +166,26 @@ public final class PtEngine extends Engine {
     }
 
     /**
+     * Returns allocator metadata grouped by native stream and memory pool for a GPU device.
+     *
+     * <p>This diagnostic reads allocator metadata without device synchronization or tensor copies.
+     * It excludes allocation traces and holds allocator locks while collecting the snapshot. It is
+     * intended for phase boundaries, not the per-batch hot path. Values exclude allocations outside
+     * the PyTorch caching allocator and are not atomic with a separate {@link #getMemoryStats}
+     * call.
+     *
+     * @param device the GPU device
+     * @return an immutable snapshot of allocator stream and pool metadata
+     * @throws IllegalArgumentException if the device is not a GPU device
+     */
+    public PtAllocatorSnapshot getAllocatorSnapshot(Device device) {
+        if (!device.isGpu()) {
+            throw new IllegalArgumentException("Allocator snapshots require a GPU device.");
+        }
+        return new PtAllocatorSnapshot(device, JniUtils.getAllocatorSnapshot(device.getDeviceId()));
+    }
+
+    /**
      * Resets PyTorch caching allocator peak memory statistics for a GPU device.
      *
      * <p>Each peak is reset to the corresponding current value. This method does not synchronize

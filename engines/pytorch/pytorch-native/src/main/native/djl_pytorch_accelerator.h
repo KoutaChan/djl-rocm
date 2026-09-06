@@ -16,6 +16,7 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace djl_pytorch {
 namespace accel {
@@ -34,6 +35,21 @@ struct DeviceMemoryStats {
   int64_t peak_reserved_bytes;
   int64_t active_bytes;
   int64_t peak_active_bytes;
+  int64_t inactive_split_bytes;
+  int64_t num_alloc_retries;
+  int64_t num_ooms;
+};
+
+struct AllocatorStreamPool {
+  uint64_t stream_token;
+  uint64_t pool_id_high;
+  uint64_t pool_id_low;
+  bool is_large;
+  int64_t reserved_bytes = 0;
+  int64_t allocated_bytes = 0;
+  int64_t active_bytes = 0;
+  int64_t largest_inactive_block_bytes = 0;
+  int64_t segment_count = 0;
 };
 
 bool IsAvailable();
@@ -59,6 +75,7 @@ StreamScope* NewStreamScope(c10::Device device);
 DeviceStream* NewDeviceStream(c10::Device device);
 StreamScope* OpenDeviceStream(DeviceStream* stream);
 void DeleteDeviceStream(DeviceStream* stream);
+uint64_t GetDeviceStreamToken(DeviceStream* stream);
 void DeleteStreamScope(StreamScope* scope);
 
 DeviceEvent* NewDeviceEvent(c10::Device device);
@@ -75,6 +92,7 @@ void ReplayAcceleratorGraph(AcceleratorGraph* graph);
 void DeleteAcceleratorGraph(AcceleratorGraph* graph);
 
 DeviceMemoryStats GetMemoryStats(c10::DeviceIndex device);
+std::vector<AllocatorStreamPool> GetAllocatorSnapshot(c10::DeviceIndex device);
 void ResetPeakMemoryStats(c10::DeviceIndex device);
 void EmptyCache();
 

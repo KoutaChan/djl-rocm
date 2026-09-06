@@ -35,6 +35,8 @@ public class PtMemoryStatsTest {
                 IllegalArgumentException.class, () -> engine.getMemoryStats(Device.cpu()));
         Assert.assertThrows(
                 IllegalArgumentException.class, () -> engine.resetPeakMemoryStats(Device.cpu()));
+        Assert.assertThrows(
+                IllegalArgumentException.class, () -> engine.getAllocatorSnapshot(Device.cpu()));
     }
 
     @Test
@@ -58,12 +60,77 @@ public class PtMemoryStatsTest {
             Assert.assertTrue(allocated.getActiveBytes() >= allocated.getAllocatedBytes());
             Assert.assertTrue(allocated.getReservedBytes() >= allocated.getActiveBytes());
             assertPeakAtLeastCurrent(allocated);
+            Assert.assertTrue(allocated.getInactiveSplitBytes() >= 0);
+            Assert.assertTrue(allocated.getNumAllocRetries() >= before.getNumAllocRetries());
+            Assert.assertTrue(allocated.getNumOoms() >= before.getNumOoms());
 
             engine.resetPeakMemoryStats(device);
-            assertPeakEqualsCurrent(engine.getMemoryStats(device));
+            PtMemoryStats reset = engine.getMemoryStats(device);
+            assertPeakEqualsCurrent(reset);
+            Assert.assertEquals(reset.getNumAllocRetries(), allocated.getNumAllocRetries());
+            Assert.assertEquals(reset.getNumOoms(), allocated.getNumOoms());
         } finally {
             JniUtils.emptyCudaCache();
         }
+    }
+
+    @Test
+    @SuppressWarnings("try")
+    public void allocatorSnapshotMatchesNativeStreamAndReleasedBlocks() {
+        TestRequirements.gpu(PtEngine.ENGINE_NAME);
+        PtEngine engine = (PtEngine) Engine.getEngine(PtEngine.ENGINE_NAME);
+        Device device = Device.gpu(0);
+        try (NDManager manager = engine.newBaseManager(device);
+                PtStream first = engine.newStream(device);
+                PtStream second = engine.newStream(device);
+                PtEvent firstDone = first.newEvent();
+                PtEvent secondDone = second.newEvent()) {
+            long firstToken = first.getStreamToken();
+            long secondToken = second.getStreamToken();
+            Assert.assertNotEquals(firstToken, secondToken);
+            NDArray left;
+            NDArray right;
+            try (PtStreamScope ignored = first.openScope()) {
+                left = manager.zeros(new Shape(1024 * 1024), DataType.FLOAT32);
+                firstDone.record();
+            }
+            try (PtStreamScope ignored = second.openScope()) {
+                right = manager.zeros(new Shape(2 * 1024 * 1024), DataType.FLOAT32);
+                secondDone.record();
+            }
+            firstDone.synchronize();
+            secondDone.synchronize();
+            PtAllocatorSnapshot allocated = engine.getAllocatorSnapshot(device);
+            Assert.assertTrue(allocatedOnStream(allocated, firstToken) >= 4L * 1024 * 1024);
+            Assert.assertTrue(allocatedOnStream(allocated, secondToken) >= 8L * 1024 * 1024);
+            for (PtAllocatorSnapshot.StreamPool pool : allocated.getPools()) {
+                Assert.assertTrue(pool.getReservedBytes() >= pool.getActiveBytes());
+                Assert.assertTrue(pool.getActiveBytes() >= pool.getAllocatedBytes());
+                Assert.assertTrue(pool.getSegmentCount() > 0);
+            }
+            left.close();
+            right.close();
+            PtAllocatorSnapshot released = engine.getAllocatorSnapshot(device);
+            Assert.assertTrue(largestInactiveOnStream(released, firstToken) >= 4L * 1024 * 1024);
+            Assert.assertTrue(largestInactiveOnStream(released, secondToken) >= 8L * 1024 * 1024);
+            // Previously returned snapshots retain their values after allocator changes.
+            Assert.assertTrue(allocatedOnStream(allocated, firstToken) >= 4L * 1024 * 1024);
+        }
+    }
+
+    private static long allocatedOnStream(PtAllocatorSnapshot snapshot, long token) {
+        return snapshot.getPools().stream()
+                .filter(pool -> pool.getStreamToken() == token)
+                .mapToLong(PtAllocatorSnapshot.StreamPool::getAllocatedBytes)
+                .sum();
+    }
+
+    private static long largestInactiveOnStream(PtAllocatorSnapshot snapshot, long token) {
+        return snapshot.getPools().stream()
+                .filter(pool -> pool.getStreamToken() == token)
+                .mapToLong(PtAllocatorSnapshot.StreamPool::getLargestInactiveBlockBytes)
+                .max()
+                .orElse(0);
     }
 
     private static void assertPeakAtLeastCurrent(PtMemoryStats stats) {

@@ -214,6 +214,15 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchOpenDeviceStream(
   API_END_RETURN()
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetDeviceStreamToken(
+    JNIEnv* env, jobject jthis, jlong jhandle) {
+  API_BEGIN()
+  return static_cast<jlong>(djl_pytorch::accel::GetDeviceStreamToken(
+      reinterpret_cast<djl_pytorch::accel::DeviceStream*>(jhandle)));
+  API_END_RETURN()
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_ai_djl_pytorch_jni_PyTorchLibrary_torchDeleteDeviceStream(
     JNIEnv* env, jobject jthis, jlong jhandle) {
@@ -529,9 +538,31 @@ JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetMemo
   const jlong values[] = {static_cast<jlong>(stats.allocated_bytes),
       static_cast<jlong>(stats.peak_allocated_bytes), static_cast<jlong>(stats.reserved_bytes),
       static_cast<jlong>(stats.peak_reserved_bytes), static_cast<jlong>(stats.active_bytes),
-      static_cast<jlong>(stats.peak_active_bytes)};
-  jlongArray result = env->NewLongArray(6);
-  env->SetLongArrayRegion(result, 0, 6, values);
+      static_cast<jlong>(stats.peak_active_bytes), static_cast<jlong>(stats.inactive_split_bytes),
+      static_cast<jlong>(stats.num_alloc_retries), static_cast<jlong>(stats.num_ooms)};
+  jlongArray result = env->NewLongArray(9);
+  env->SetLongArrayRegion(result, 0, 9, values);
+  return result;
+  API_END_RETURN()
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetAllocatorSnapshot(
+    JNIEnv* env, jobject jthis, jint jdevice_id) {
+  API_BEGIN()
+  const auto pools = djl_pytorch::accel::GetAllocatorSnapshot(static_cast<c10::DeviceIndex>(jdevice_id));
+  std::vector<jlong> values;
+  values.reserve(pools.size() * 9);
+  for (const auto& pool : pools) {
+    values.insert(values.end(), {static_cast<jlong>(pool.stream_token), static_cast<jlong>(pool.pool_id_high),
+        static_cast<jlong>(pool.pool_id_low), static_cast<jlong>(pool.is_large),
+        static_cast<jlong>(pool.reserved_bytes), static_cast<jlong>(pool.allocated_bytes),
+        static_cast<jlong>(pool.active_bytes), static_cast<jlong>(pool.largest_inactive_block_bytes),
+        static_cast<jlong>(pool.segment_count)});
+  }
+  jlongArray result = env->NewLongArray(static_cast<jsize>(values.size()));
+  if (!values.empty()) {
+    env->SetLongArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+  }
   return result;
   API_END_RETURN()
 }
