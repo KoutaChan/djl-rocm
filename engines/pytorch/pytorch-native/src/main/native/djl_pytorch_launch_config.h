@@ -18,6 +18,19 @@ namespace djl::pytorch::launch_environment {
 inline constexpr char kFusionScratchPlanner[] = "DJL_FUSION_SCRATCH_PLANNER";
 inline constexpr char kFusionIntermediatePlanner[] = "DJL_FUSION_INTERMEDIATE_PLANNER";
 inline constexpr char kFusionInPlacePlanner[] = "DJL_FUSION_INPLACE_PLANNER";
+inline constexpr char kRocmMatmulContextDiagnostics[] = "DJL_ROCM_MATMUL_CONTEXT_DIAGNOSTICS";
+inline constexpr char kRocmMatmulGeometryDiagnostics[] = "DJL_ROCM_MATMUL_GEOMETRY_DIAGNOSTICS";
+
+struct RocmMatmulDiagnosticsConfig {
+  bool context;
+  bool geometry;
+};
+
+/**
+ * Returns default-off diagnostics loaded once from the process environment.
+ * Accepts 0/1, false/true, or FALSE/TRUE, matching the planner settings.
+ */
+const RocmMatmulDiagnosticsConfig& GetRocmMatmulDiagnosticsConfig();
 
 /** Returns a default-on boolean setting loaded from the process environment. */
 bool IsPlannerEnabled(const char* name);

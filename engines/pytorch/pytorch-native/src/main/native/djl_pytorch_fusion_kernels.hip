@@ -12,6 +12,7 @@
  */
 #include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_fusion_backend.h"
+#include "djl_pytorch_launch_config.h"
 
 #include <ATen/Context.h>
 #include <ATen/TensorSubclassLikeUtils.h>
@@ -34,7 +35,6 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <list>
@@ -132,23 +132,9 @@ struct FusionMatmulKeyHash {
   }
 };
 
-bool FusionMatmulDiagnosticsEnabled() {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("DJL_ROCM_MATMUL_CONTEXT_DIAGNOSTICS");
-    return value != nullptr && value[0] != '\0';
-  }();
-  return enabled;
-}
-
 void LogFusionMatmulGeometry(const FusionMatmulKey& key,
     const char* result, std::size_t workspace_size) {
-  static const bool enabled = [] {
-    const char* value =
-        std::getenv("DJL_ROCM_MATMUL_GEOMETRY_DIAGNOSTICS");
-    return value != nullptr && value[0] != '\0';
-  }();
-  if (!enabled) {
+  if (!launch_environment::GetRocmMatmulDiagnosticsConfig().geometry) {
     return;
   }
   std::fprintf(stderr,
@@ -2141,6 +2127,7 @@ class FusionMatmulStreamContext {
  public:
   FusionMatmulStreamContext(int32_t device, backend::Stream stream)
       : device_(device), stream_(FusionMatmulStreamIdentity(stream)) {
+    const auto& diagnostics = launch_environment::GetRocmMatmulDiagnosticsConfig();
     c10::DeviceGuard device_guard(
         c10::Device(c10::DeviceType::CUDA, device_));
     bias_placeholder_ = torch::empty({1},
@@ -2148,7 +2135,7 @@ class FusionMatmulStreamContext {
             .device(c10::Device(c10::DeviceType::CUDA, device_))
             .dtype(torch::kUInt8));
     CheckHipBlasLt(hipblasLtCreate(&handle_), "hipblasLtCreate");
-    if (FusionMatmulDiagnosticsEnabled()) {
+    if (diagnostics.context) {
       std::fprintf(stderr,
           "[djl-rocm-matmul] create device=%d stream=%p\n",
           device_, reinterpret_cast<void*>(stream));
@@ -2225,7 +2212,7 @@ class FusionMatmulStreamContext {
     const backend::Stream previous_stream = BoundStreamLocked();
     stream_.store(
         FusionMatmulStreamIdentity(stream), std::memory_order_release);
-    if (FusionMatmulDiagnosticsEnabled()) {
+    if (launch_environment::GetRocmMatmulDiagnosticsConfig().context) {
       std::fprintf(stderr,
           "[djl-rocm-matmul] rebind device=%d old_stream=%p "
           "new_stream=%p\n",
@@ -2256,7 +2243,7 @@ class FusionMatmulStreamContext {
       return (*descriptors)->SelectAlgorithm(
           handle_, key, bias_placeholder_.const_data_ptr());
     });
-    if (algorithm_created && FusionMatmulDiagnosticsEnabled() &&
+    if (algorithm_created && launch_environment::GetRocmMatmulDiagnosticsConfig().context &&
         (algorithms_.Misses() <= 4 || algorithms_.Misses() % 4096 == 0)) {
       LogCacheStatsLocked();
     }
@@ -2339,7 +2326,7 @@ class FusionMatmulStreamContext {
       TORCH_CHECK(pin_count_ == 0,
           "direct ROCm matmul workspace cannot grow while an accelerator "
           "graph retains its address");
-      if (FusionMatmulDiagnosticsEnabled()) {
+      if (launch_environment::GetRocmMatmulDiagnosticsConfig().context) {
         std::fprintf(stderr,
             "[djl-rocm-matmul] workspace-grow device=%d stream=%p "
             "previous=%zu required=%zu\n",

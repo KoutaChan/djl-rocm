@@ -17,19 +17,34 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "djl_pytorch_launch_config.h"
-
 namespace djl::pytorch::launch_environment {
+namespace {
 
-bool IsPlannerEnabled(const char* name) {
+bool ReadBoolean(const char* name, bool default_value) {
   const char* value = std::getenv(name);
-  if (value == nullptr || std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
       std::strcmp(value, "TRUE") == 0) {
     return true;
   }
   TORCH_CHECK(std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0,
       name, " must be 0, 1, false, or true, but was '", value, "'");
   return false;
+}
+
+}  // namespace
+
+bool IsPlannerEnabled(const char* name) {
+  return ReadBoolean(name, true);
+}
+
+const RocmMatmulDiagnosticsConfig& GetRocmMatmulDiagnosticsConfig() {
+  static const RocmMatmulDiagnosticsConfig config{
+      ReadBoolean(kRocmMatmulContextDiagnostics, false),
+      ReadBoolean(kRocmMatmulGeometryDiagnostics, false)};
+  return config;
 }
 
 }  // namespace djl::pytorch::launch_environment
