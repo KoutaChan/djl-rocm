@@ -22,8 +22,8 @@ public final class PtMemoryStats {
     private final long activeBytes;
     private final long peakActiveBytes;
     private final long inactiveSplitBytes;
-    private final long numAllocRetries;
-    private final long numOoms;
+    private final long allocationRetries;
+    private final long outOfMemoryCount;
 
     PtMemoryStats(long[] values) {
         allocatedBytes = values[0];
@@ -33,8 +33,8 @@ public final class PtMemoryStats {
         activeBytes = values[4];
         peakActiveBytes = values[5];
         inactiveSplitBytes = values[6];
-        numAllocRetries = values[7];
-        numOoms = values[8];
+        allocationRetries = values[7];
+        outOfMemoryCount = values[8];
     }
 
     /**
@@ -105,8 +105,8 @@ public final class PtMemoryStats {
      *
      * @return allocator retry count, unaffected by resetting peak statistics
      */
-    public long getNumAllocRetries() {
-        return numAllocRetries;
+    public long getAllocationRetries() {
+        return allocationRetries;
     }
 
     /**
@@ -114,7 +114,7 @@ public final class PtMemoryStats {
      *
      * @return allocator out-of-memory count, unaffected by resetting peak statistics
      */
-    public long getNumOoms() {
-        return numOoms;
+    public long getOutOfMemoryCount() {
+        return outOfMemoryCount;
     }
 }

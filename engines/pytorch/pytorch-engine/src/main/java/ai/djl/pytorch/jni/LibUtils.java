@@ -115,14 +115,13 @@ public final class LibUtils {
                 throw new EngineException("Unexpected version: " + library.version);
             }
             NativeLibraryBundle bundle = new NativeLibraryBundle(source);
-            bundle.checkCompatibility(
+            bundle.validate(
                     version.group(1), library.apiVersion, library.flavor, library.classifier);
-            File root = findRocmRoot(library.flavor, bundle.rocmVersion());
+            String rocmVersion = bundle.getRocmVersion();
+            File root = findRocmRoot(library.flavor, rocmVersion);
             if (root == null) {
                 throw new EngineException(
-                        "Bundled hipBLASLt needs ROCm SDK "
-                                + bundle.rocmVersion()
-                                + "; set ROCM_PATH.");
+                        "Bundled hipBLASLt needs ROCm SDK " + rocmVersion + "; set ROCM_PATH.");
             }
             return bundle.extract(Utils.getEngineCacheDir("pytorch"), root.toPath(), library.dir);
         } catch (IOException e) {
@@ -178,9 +177,9 @@ public final class LibUtils {
         Set<String> preloaded = new HashSet<>();
         if ((bundle != null || libTorch.flavor.startsWith("rocm10.")) && !isWindowsRocm) {
             File sdkRoot = bundle == null ? findRocmRoot(libTorch.flavor) : null;
-            for (Path path : rocmPreloadLibraries(sourceDir, sdkRoot, bundle)) {
+            for (Path path : getRocmLoadOrder(sourceDir, sdkRoot, bundle)) {
                 loadTorchLibrary(bundle, path.toString());
-                preloaded.add(sharedLibraryName(path.getFileName().toString()));
+                preloaded.add(getLibraryName(path.toFile().getName()));
             }
         }
         List<String> deferred =
@@ -211,7 +210,7 @@ public final class LibUtils {
                                 String name = path.getFileName().toString();
                                 if (!LIB_PATTERN.matcher(name).matches()
                                         || exclusion.contains(name)
-                                        || preloaded.contains(sharedLibraryName(name))) {
+                                        || preloaded.contains(getLibraryName(name))) {
                                     return false;
                                 } else if (!isCuda
                                         && name.contains("nvrtc")
@@ -329,13 +328,9 @@ public final class LibUtils {
         return libraries;
     }
 
-    static List<Path> rocmPreloadLibraries(Path libDir, File root, Path bundle) {
+    static List<Path> getRocmLoadOrder(Path libDir, File root, Path bundle) {
         List<Path> directories = new ArrayList<>(6);
-        if (bundle != null) {
-            directories.add(bundle);
-        } else {
-            directories.add(libDir);
-        }
+        directories.add(bundle == null ? libDir : bundle);
         if (root != null) {
             directories.add(root.toPath().resolve("lib"));
             directories.add(root.toPath().resolve("lib64"));
@@ -390,7 +385,7 @@ public final class LibUtils {
         return paths;
     }
 
-    static String sharedLibraryName(String name) {
+    static String getLibraryName(String name) {
         int extension = name.indexOf(".so");
         return extension < 0 ? name : name.substring(0, extension + 3);
     }
@@ -404,7 +399,12 @@ public final class LibUtils {
             try (Stream<Path> paths = Files.list(directory)) {
                 Path match =
                         paths.filter(Files::isRegularFile)
-                                .filter(path -> path.getFileName().toString().startsWith(prefix))
+                                .filter(
+                                        path -> {
+                                            String name = path.getFileName().toString();
+                                            return prefix.equals(getLibraryName(name))
+                                                    && LIB_PATTERN.matcher(name).matches();
+                                        })
                                 .sorted()
                                 .findFirst()
                                 .orElse(null);
@@ -423,7 +423,7 @@ public final class LibUtils {
         if (override != null && !override.isEmpty()) {
             return "rocm" + override;
         }
-        if (!System.getProperty("os.name", "").toLowerCase().startsWith("linux")) {
+        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("linux")) {
             return null;
         }
         File root = findRocmRoot(null);

@@ -12,6 +12,7 @@
  */
 package ai.djl.pytorch.jni;
 
+import ai.djl.util.Hex;
 import ai.djl.util.Utils;
 
 import java.io.ByteArrayInputStream;
@@ -51,34 +52,34 @@ final class NativeLibraryBundle {
         }
         properties = new Properties();
         properties.load(new ByteArrayInputStream(manifest));
-        hipblasltLibrary = required("hipblasltLibrary");
-        require("rocmLoaderLibrary", RocmLibraryLoader.LIBRARY_NAME);
-        if (relativePath(hipblasltLibrary).getNameCount() != 1) {
+        hipblasltLibrary = getProperty("hipblasltLibrary");
+        validateProperty("rocmLoaderLibrary", RocmLibraryLoader.LIBRARY_NAME);
+        if (getRelativePath(hipblasltLibrary).getNameCount() != 1) {
             throw new IOException("hipBLASLt must be a library file at the bundle root");
         }
     }
 
-    void checkCompatibility(String pytorch, String djl, String flavor, String classifier)
+    void validate(String pytorchVersion, String djlVersion, String flavor, String classifier)
             throws IOException {
-        require("schemaVersion", "1");
-        require("pytorchVersion", pytorch);
-        require("djlVersion", djl);
-        require("flavor", flavor);
-        require("classifier", classifier);
-        require(
+        validateProperty("schemaVersion", "1");
+        validateProperty("pytorchVersion", pytorchVersion);
+        validateProperty("djlVersion", djlVersion);
+        validateProperty("flavor", flavor);
+        validateProperty("classifier", classifier);
+        validateProperty(
                 "libraries",
                 "libdjl_torch.so," + hipblasltLibrary + ',' + RocmLibraryLoader.LIBRARY_NAME);
-        require("hipblasltSoname", hipblasltLibrary);
+        validateProperty("hipblasltSoname", hipblasltLibrary);
     }
 
-    String rocmVersion() throws IOException {
-        return required("rocmVersion");
+    String getRocmVersion() throws IOException {
+        return getProperty("rocmVersion");
     }
 
     Path extract(Path cacheRoot, Path sdkRoot, Path libTorchRoot) throws IOException {
         Path sdk = sdkRoot.toRealPath();
         Path torch = libTorchRoot.toRealPath();
-        verifyKernelMetadata(sdk);
+        validateSdk(sdk);
         String contentKey = hash(manifest);
         // The host library locates kernels relative to itself. A distinct SDK link must never
         // be substituted underneath a bundle already in use by another JVM.
@@ -107,10 +108,13 @@ final class NativeLibraryBundle {
             }
             Path temporary = Files.createTempDirectory(cache, "extract-");
             try {
-                String files = required("files");
+                String files = getProperty("files");
                 for (String file : files.split(",")) {
-                    Path target = temporary.resolve(relativePath(file));
-                    Files.createDirectories(target.getParent());
+                    Path target = temporary.resolve(getRelativePath(file));
+                    Path parent = target.getParent();
+                    if (parent != null) {
+                        Files.createDirectories(parent);
+                    }
                     MessageDigest digest = newDigest();
                     // Resolve siblings from this manifest's JAR, never from another JAR's
                     // resource of the same name on the classpath.
@@ -118,7 +122,7 @@ final class NativeLibraryBundle {
                             new DigestInputStream(Utils.openUrl(new URL(source, file)), digest)) {
                         Files.copy(input, target);
                     }
-                    if (!hex(digest.digest()).equals(required("sha256." + file))) {
+                    if (!Hex.toHexString(digest.digest()).equals(getProperty("sha256." + file))) {
                         throw new IOException("Native bundle checksum mismatch: " + file);
                     }
                 }
@@ -128,16 +132,16 @@ final class NativeLibraryBundle {
                                 temporary.resolve(RocmLibraryLoader.LIBRARY_NAME))) {
                     throw new IOException("Native bundle is missing a required native library");
                 }
-                Path kernels = temporary.resolve("hipblaslt/library");
-                Files.createDirectories(kernels.getParent());
+                Path kernels =
+                        Files.createDirectories(temporary.resolve("hipblaslt")).resolve("library");
                 Files.createSymbolicLink(kernels, sdk.resolve("lib/hipblaslt/library"));
                 // Older LibTorch archives depend on unversioned library names. Their $ORIGIN
                 // must resolve to this private runtime, not to their original hipBLASLt copy.
-                linkRuntimeDirectory(temporary, sdk.resolve("lib"));
-                linkRuntimeDirectory(temporary, sdk.resolve("lib64"));
-                linkRuntimeDirectory(temporary, sdk.resolve("lib/host-math/lib"));
-                linkRuntimeDirectory(temporary, sdk.resolve("lib/rocm_sysdeps/lib"));
-                linkRuntimeDirectory(temporary, torch);
+                linkLibraries(temporary, sdk.resolve("lib"));
+                linkLibraries(temporary, sdk.resolve("lib64"));
+                linkLibraries(temporary, sdk.resolve("lib/host-math/lib"));
+                linkLibraries(temporary, sdk.resolve("lib/rocm_sysdeps/lib"));
+                linkLibraries(temporary, torch);
                 Files.write(temporary.resolve(MANIFEST), manifest);
                 // A crash cannot expose a partly extracted library as a usable cache entry.
                 Files.move(temporary, directory, StandardCopyOption.ATOMIC_MOVE);
@@ -148,17 +152,17 @@ final class NativeLibraryBundle {
         }
     }
 
-    private void linkRuntimeDirectory(Path destination, Path sourceDirectory) throws IOException {
-        if (!Files.isDirectory(sourceDirectory)) {
+    private void linkLibraries(Path destination, Path sourceDir) throws IOException {
+        if (!Files.isDirectory(sourceDir)) {
             return;
         }
-        try (Stream<Path> paths = Files.list(sourceDirectory)) {
+        try (Stream<Path> paths = Files.list(sourceDir)) {
             for (Path entry : (Iterable<Path>) paths::iterator) {
-                String name = entry.getFileName().toString();
+                String name = entry.toFile().getName();
                 Path link = destination.resolve(name);
                 if (!Files.exists(link, LinkOption.NOFOLLOW_LINKS)) {
                     Path target =
-                            "libhipblaslt.so".equals(LibUtils.sharedLibraryName(name))
+                            "libhipblaslt.so".equals(LibUtils.getLibraryName(name))
                                     ? Paths.get(hipblasltLibrary)
                                     : entry;
                     Files.createSymbolicLink(link, target);
@@ -167,19 +171,19 @@ final class NativeLibraryBundle {
         }
     }
 
-    private void verifyKernelMetadata(Path sdk) throws IOException {
+    private void validateSdk(Path sdk) throws IOException {
         String version = LibUtils.readRocmSdkVersion(sdk.toFile());
         if (version == null) {
             throw new IOException(
                     "Unrecognized ROCm SDK version in " + sdk.resolve(".info/version"));
         }
-        require("rocmVersion", version);
+        validateProperty("rocmVersion", version);
         boolean found = false;
         for (String key : properties.stringPropertyNames()) {
             if (key.startsWith(KERNEL_METADATA)) {
                 found = true;
                 String name = key.substring(KERNEL_METADATA.length());
-                Path path = sdk.resolve(relativePath(name));
+                Path path = sdk.resolve(getRelativePath(name));
                 MessageDigest digest = newDigest();
                 try (InputStream input = Files.newInputStream(path)) {
                     byte[] buffer = new byte[65536];
@@ -188,10 +192,10 @@ final class NativeLibraryBundle {
                         digest.update(buffer, 0, read);
                     }
                 }
-                if (!hex(digest.digest()).equals(properties.getProperty(key))) {
+                if (!Hex.toHexString(digest.digest()).equals(properties.getProperty(key))) {
                     throw new IOException(
                             "Bundled hipBLASLt requires its matching ROCm "
-                                    + required("rocmVersion")
+                                    + getRocmVersion()
                                     + " SDK kernel metadata: "
                                     + path);
                 }
@@ -202,8 +206,8 @@ final class NativeLibraryBundle {
         }
     }
 
-    private void require(String key, String expected) throws IOException {
-        String actual = required(key);
+    private void validateProperty(String key, String expected) throws IOException {
+        String actual = getProperty(key);
         if (!expected.equals(actual)) {
             throw new IOException(
                     "Incompatible native bundle "
@@ -215,7 +219,7 @@ final class NativeLibraryBundle {
         }
     }
 
-    private String required(String key) throws IOException {
+    private String getProperty(String key) throws IOException {
         String value = properties.getProperty(key);
         if (value == null || value.isEmpty()) {
             throw new IOException("Missing native bundle property: " + key);
@@ -223,7 +227,7 @@ final class NativeLibraryBundle {
         return value;
     }
 
-    private static Path relativePath(String name) throws IOException {
+    private static Path getRelativePath(String name) throws IOException {
         Path path = Paths.get(name);
         if (path.isAbsolute()
                 || name.isEmpty()
@@ -236,7 +240,7 @@ final class NativeLibraryBundle {
     }
 
     private static String hash(byte[] bytes) {
-        return hex(newDigest().digest(bytes));
+        return Hex.toHexString(newDigest().digest(bytes));
     }
 
     private static MessageDigest newDigest() {
@@ -245,14 +249,5 @@ final class NativeLibraryBundle {
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError(e);
         }
-    }
-
-    private static String hex(byte[] bytes) {
-        StringBuilder result = new StringBuilder(bytes.length * 2);
-        for (byte value : bytes) {
-            result.append(Character.forDigit((value & 0xff) >>> 4, 16));
-            result.append(Character.forDigit(value & 0xf, 16));
-        }
-        return result.toString();
     }
 }

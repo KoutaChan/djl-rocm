@@ -27,6 +27,7 @@ import java.util.List;
 public final class PtAllocatorSnapshot {
 
     private static final int POOL_FIELDS = 9;
+
     private final Device device;
     private final List<StreamPool> pools;
 
@@ -52,7 +53,7 @@ public final class PtAllocatorSnapshot {
      * Returns immutable per-stream pool summaries.
      *
      * <p>A stream can occur more than once because private pools and small/large pools are
-     * distinct. Stream tokens have the same meaning as {@link PtStream#getStreamToken()}.
+     * distinct. Stream identifiers have the same meaning as {@link PtStream#getId()}.
      *
      * @return the pool summaries
      */
@@ -63,7 +64,7 @@ public final class PtAllocatorSnapshot {
     /** Aggregated segments belonging to one allocation stream and one allocator pool. */
     public static final class StreamPool {
 
-        private final long streamToken;
+        private final long streamId;
         private final long poolIdHigh;
         private final long poolIdLow;
         private final boolean large;
@@ -74,7 +75,7 @@ public final class PtAllocatorSnapshot {
         private final long segmentCount;
 
         private StreamPool(long[] values, int offset) {
-            streamToken = values[offset];
+            streamId = values[offset];
             poolIdHigh = values[offset + 1];
             poolIdLow = values[offset + 2];
             large = values[offset + 3] != 0;
@@ -86,14 +87,15 @@ public final class PtAllocatorSnapshot {
         }
 
         /**
-         * Returns the underlying CUDA/HIP allocation stream pointer as an opaque token.
+         * Returns the native allocation stream identifier.
          *
-         * <p>This is not a JNI handle or PyTorch stream ID. Zero is the native default stream.
+         * <p>This opaque CUDA/HIP stream pointer is not a JNI handle or PyTorch stream ID. Zero is
+         * the native default stream.
          *
-         * @return the native stream token, comparable within the same process and device
+         * @return the native stream identifier, comparable within the same process and device
          */
-        public long getStreamToken() {
-            return streamToken;
+        public long getStreamId() {
+            return streamId;
         }
 
         /**

@@ -30,10 +30,10 @@ public class PtAllocatorSnapshotMetadataTest {
         PtAllocatorSnapshot snapshot = new PtAllocatorSnapshot(Device.gpu(1), packed);
         Assert.assertEquals(snapshot.getDevice(), Device.gpu(1));
         Assert.assertEquals(snapshot.getPools().size(), 3);
-        Assert.assertEquals(snapshot.getPools().get(0).getStreamToken(), 0L);
+        Assert.assertEquals(snapshot.getPools().get(0).getStreamId(), 0L);
         Assert.assertFalse(snapshot.getPools().get(0).isLarge());
         PtAllocatorSnapshot.StreamPool pool = snapshot.getPools().get(1);
-        Assert.assertEquals(pool.getStreamToken(), stream);
+        Assert.assertEquals(pool.getStreamId(), stream);
         Assert.assertEquals(pool.getPoolIdHigh(), 7L);
         Assert.assertEquals(pool.getPoolIdLow(), 0L);
         Assert.assertTrue(pool.isLarge());
@@ -67,7 +67,7 @@ public class PtAllocatorSnapshotMetadataTest {
         Assert.assertEquals(stats.getActiveBytes(), 30L);
         Assert.assertEquals(stats.getPeakActiveBytes(), 35L);
         Assert.assertEquals(stats.getInactiveSplitBytes(), 8L);
-        Assert.assertEquals(stats.getNumAllocRetries(), counter);
-        Assert.assertEquals(stats.getNumOoms(), counter + 1);
+        Assert.assertEquals(stats.getAllocationRetries(), counter);
+        Assert.assertEquals(stats.getOutOfMemoryCount(), counter + 1);
     }
 }

@@ -257,13 +257,15 @@ pushd "$WORK_DIR"
 # CMake tracks source/header changes. Reuse objects within a compatible build,
 # and let ccache reuse them across fresh CI workers. Switching SDKs or flavors
 # starts a clean tree so JNI staging cannot pick up a previous target.
-build_identity=$(printf '%s\n' "$VERSION" "$FLAVOR" "$ARCH" "$CXX11ABI_ARG" "$BUILD_TYPE" \
+build_identity=$(
+  printf '%s\n' "$VERSION" "$FLAVOR" "$ARCH" "$CXX11ABI_ARG" "$BUILD_TYPE" \
     "$TORCH_ROOT" "${ROCM_PATH:-}" "${PYTORCH_ROCM_ARCH:-}" "${TORCH_CUDA_ARCH_LIST:-}" \
     "${CC:-}" "${CXX:-}" "${CMAKE_GENERATOR:-}" "${REQUIRE_DISTRIBUTED_NCCL:-OFF}" \
     "${CFLAGS:-}" "${CXXFLAGS:-}" "${HIPFLAGS:-}" "${CUDAFLAGS:-}" "${LDFLAGS:-}" "${JAVA_HOME:-}"
-    if [[ -n "${ROCM_PATH:-}" && -f "$ROCM_PATH/.info/version" ]]; then
-      cat "$ROCM_PATH/.info/version"
-    fi)
+  if [[ -n "${ROCM_PATH:-}" && -f "$ROCM_PATH/.info/version" ]]; then
+    cat "$ROCM_PATH/.info/version"
+  fi
+)
 if [[ -d build && ( ! -f build/.build-identity || "$(cat build/.build-identity)" != "$build_identity" ) ]]; then
   rm -rf build
 fi
@@ -289,16 +291,19 @@ if [[ -z "${JAVA_HOME:-}" ]] && command -v javac >/dev/null 2>&1; then
   echo "note: auto-detected JAVA_HOME=${JAVA_HOME}"
 fi
 
-launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER= -DCMAKE_HIP_COMPILER_LAUNCHER=)
+compiler_launcher=""
 if command -v ccache >/dev/null 2>&1; then
-  launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache)
+  compiler_launcher=ccache
 fi
 cmake -DCMAKE_PREFIX_PATH="${TORCH_ROOT}${ROCM_PATH:+;${ROCM_PATH}}" \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
       -DPT_VERSION="${PT_VERSION_MACRO}" \
       -DUSE_CUDA="$USE_CUDA" \
       -DUSE_ROCM="$USE_ROCM" \
-      -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" "${launcher[@]}" ..
+      -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" \
+      -DCMAKE_CXX_COMPILER_LAUNCHER="$compiler_launcher" \
+      -DCMAKE_CUDA_COMPILER_LAUNCHER="$compiler_launcher" \
+      -DCMAKE_HIP_COMPILER_LAUNCHER="$compiler_launcher" ..
 cmake --build . --config "${BUILD_TYPE}" --parallel "${NUM_PROC}"
 
 if [[ $PLATFORM == 'darwin' ]]; then
@@ -308,12 +313,14 @@ if [[ $PLATFORM == 'darwin' ]]; then
 fi
 
 classifier_arch=x86_64
-[[ "$ARCH" == aarch64 ]] && classifier_arch=aarch64
+if [[ "$ARCH" == aarch64 ]]; then
+  classifier_arch=aarch64
+fi
 classifier_os=$PLATFORM
-[[ "$PLATFORM" == darwin ]] && classifier_os=osx
 library=libdjl_torch.so
-[[ "$PLATFORM" == darwin ]] && library=libdjl_torch.dylib
 if [[ "$PLATFORM" == darwin ]]; then
+  classifier_os=osx
+  library=libdjl_torch.dylib
   library_sha=$(shasum -a 256 "$library" | cut -d ' ' -f 1)
 else
   library_sha=$(sha256sum "$library" | cut -d ' ' -f 1)

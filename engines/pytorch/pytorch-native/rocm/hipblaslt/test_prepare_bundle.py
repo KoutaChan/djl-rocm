@@ -1,10 +1,9 @@
 """CPU-only producer checks: python3 -m unittest discover -s rocm/hipblaslt."""
 
 import importlib.util
-from pathlib import Path
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("bundle", ROOT / "prepare-bundle.py")
@@ -20,7 +19,9 @@ class BundleProfilesTest(unittest.TestCase):
         headers.mkdir(parents=True)
         fields = dict(zip(("MAJOR", "MINOR", "PATCH"), profile["hipblaslt_version"].split(".")))
         fields["TWEAK"] = profile["source_revision"][:10]
-        (headers / "hipblaslt-version.h").write_text("".join(f"#define HIPBLASLT_VERSION_{key} {value}\n" for key, value in fields.items()))
+        (headers / "hipblaslt-version.h").write_text(
+            "".join(f"#define HIPBLASLT_VERSION_{key} {value}\n" for key, value in fields.items())
+        )
 
     def test_select_every_pinned_sdk_and_reject_cross_flavor(self):
         for flavor, settings in bundle.PROFILES.items():
@@ -40,7 +41,9 @@ class BundleProfilesTest(unittest.TestCase):
             profile = bundle.PROFILES["rocm7.2"]["sdk_versions"]["7.2.2"]
             self.write_sdk(root, "7.2.2", profile)
             header = root / "include/hipblaslt/hipblaslt-version.h"
-            header.write_text(header.read_text().replace(profile["source_revision"][:10], "0123456789"))
+            header.write_text(
+                header.read_text().replace(profile["source_revision"][:10], "0123456789")
+            )
             with self.assertRaisesRegex(RuntimeError, "source differs"):
                 bundle.sdk_profile(root, "rocm7.2")
 
@@ -49,8 +52,12 @@ class BundleProfilesTest(unittest.TestCase):
             root = Path(directory)
             libraries = root / "lib/hipblaslt/library"
             libraries.mkdir(parents=True)
-            names = ("TensileLibrary_lazy_gfx1100.dat", "TensileLibrary_lazy_gfx942.dat",
-                     "TensileLiteLibrary_lazy_Mapping.dat", "hipblasltExtOpLibrary.dat")
+            names = (
+                "TensileLibrary_lazy_gfx1100.dat",
+                "TensileLibrary_lazy_gfx942.dat",
+                "TensileLiteLibrary_lazy_Mapping.dat",
+                "hipblasltExtOpLibrary.dat",
+            )
             for name in names:
                 (libraries / name).write_text(name)
             targets, metadata = bundle.sdk_metadata(root)
@@ -73,7 +80,9 @@ class BundleProfilesTest(unittest.TestCase):
                 (kernels / "device.co").write_bytes(b"not-metadata")
             targets, metadata = bundle.sdk_metadata(root, "gfx942")
             self.assertEqual(targets, ["gfx942"])
-            self.assertEqual(list(metadata), ["lib/hipblaslt/library/gfx942/TensileLibrary.dat.zlib"])
+            self.assertEqual(
+                list(metadata), ["lib/hipblaslt/library/gfx942/TensileLibrary.dat.zlib"]
+            )
 
 
 if __name__ == "__main__":

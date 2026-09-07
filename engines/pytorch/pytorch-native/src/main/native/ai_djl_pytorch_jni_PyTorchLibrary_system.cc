@@ -215,10 +215,10 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchOpenDeviceStream(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetDeviceStreamToken(
+Java_ai_djl_pytorch_jni_PyTorchLibrary_torchGetStreamId(
     JNIEnv* env, jobject jthis, jlong jhandle) {
   API_BEGIN()
-  return static_cast<jlong>(djl_pytorch::accel::GetDeviceStreamToken(
+  return static_cast<jlong>(djl_pytorch::accel::GetStreamId(
       reinterpret_cast<djl_pytorch::accel::DeviceStream*>(jhandle)));
   API_END_RETURN()
 }
@@ -553,7 +553,7 @@ extern "C" JNIEXPORT jlongArray JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_t
   std::vector<jlong> values;
   values.reserve(pools.size() * 9);
   for (const auto& pool : pools) {
-    values.insert(values.end(), {static_cast<jlong>(pool.stream_token), static_cast<jlong>(pool.pool_id_high),
+    values.insert(values.end(), {static_cast<jlong>(pool.stream_id), static_cast<jlong>(pool.pool_id_high),
         static_cast<jlong>(pool.pool_id_low), static_cast<jlong>(pool.is_large),
         static_cast<jlong>(pool.reserved_bytes), static_cast<jlong>(pool.allocated_bytes),
         static_cast<jlong>(pool.active_bytes), static_cast<jlong>(pool.largest_inactive_block_bytes),

@@ -14,10 +14,7 @@ val ptVersion: String = when {
     else -> libs.versions.pytorch.get()
 }
 
-// `flavor` covers everything published under download.pytorch.org/libtorch/:
-// cpu, cu121, cu124, cu128, rocm6.4, rocm7.0, rocm7.1, rocm7.2, rocm10.0, ... The
-// legacy `rocm_flavor` property is kept as a fallback for callers still
-// passing the ROCm-specific name.
+// Accept CPU, CUDA and ROCm flavors, retaining rocm_flavor as a legacy fallback.
 val flavor: String = when {
     project.hasProperty("flavor") && project.property("flavor") != "" ->
         project.property("flavor").toString()
@@ -43,16 +40,9 @@ val jniLibFileName: String = when {
     else -> "libdjl_torch.so"
 }
 
-// GitHub Packages Maven registry mangles maven-metadata.xml whenever a
-// Maven classifier containing dashes / digits is uploaded (linux-x86_64
-// -> classifier="linux-x", extension="6_64.jar"; see
-// github.com/orgs/community/discussions/49682). The corrupted metadata
-// makes snapshot resolution fail client-side even though the jar itself
-// is served correctly. Fold the OS classifier into the artifactId and
-// drop the Maven classifier entirely so every publish lands in its own
-// artifactId and never needs metadata classifier parsing. The jar's
-// internal layout (jnilib/<classifier>/<flavor>/<lib>) is unchanged so
-// DJL's runtime LibUtils still finds the native untouched.
+// Include the platform in the artifact ID to avoid GitHub Packages corrupting
+// classifiers with dashes or digits (github.com/orgs/community/discussions/49682).
+// The JAR retains DJL's jnilib/<classifier>/<flavor>/<library> layout.
 val artifactSlug = "pytorch-jni-$flavor-$classifier"
 
 group = "ai.djl.pytorch"
@@ -145,7 +135,7 @@ val stageJniLib = tasks.register("stageJniLib") {
             return digest.digest().joinToString("") { "%02x".format(it) }
         }
 
-        fun properties(file: File): Properties = Properties().apply {
+        fun loadProperties(file: File): Properties = Properties().apply {
             file.inputStream().use { load(it) }
         }
 
@@ -172,7 +162,7 @@ val stageJniLib = tasks.register("stageJniLib") {
         if (suppliedJni == null && source == freshFile) {
             val identityFile = nativeRoot / "build/native-build.properties"
             if (withHipblaslt || identityFile.exists()) {
-                val identity = properties(identityFile)
+                val identity = loadProperties(identityFile)
                 val expected = mapOf(
                     "pt_version" to pytorchVersion,
                     "flavor" to flavorName,
@@ -194,11 +184,10 @@ val stageJniLib = tasks.register("stageJniLib") {
         }
 
         val contentHash = if (withHipblaslt) {
-            val vendorRoot = vendorDir
-            val vendor = properties(vendorRoot / "hipblaslt.properties")
+            val vendor = loadProperties(vendorDir / "hipblaslt.properties")
             for ((key, value) in mapOf("flavor" to flavorName, "classifier" to classifierName)) {
                 check(vendor.getProperty(key) == value) {
-                    "hipBLASLt bundle $key mismatch: expected $value in $vendorRoot/hipblaslt.properties"
+                    "hipBLASLt bundle $key mismatch: expected $value in $vendorDir/hipblaslt.properties"
                 }
             }
             val rocmVersion = vendor.getProperty("rocm_version")
@@ -213,28 +202,33 @@ val stageJniLib = tasks.register("stageJniLib") {
                 }
             }
             val vendorName = requireNotNull(vendor.getProperty("library")) {
-                "Missing library in $vendorRoot/hipblaslt.properties"
+                "Missing library in $vendorDir/hipblaslt.properties"
             }
-            val vendorLibrary = vendorRoot / vendorName
-            check(vendorName.matches(Regex("libhipblaslt\\.so\\.[0-9]+(?:\\.[0-9]+)*")) &&
-                    vendor.getProperty("soname") == vendorName) {
-                "Unexpected hipBLASLt library name in $vendorRoot"
+            val vendorLibrary = vendorDir / vendorName
+            check(
+                vendorName.matches(Regex("libhipblaslt\\.so\\.[0-9]+(?:\\.[0-9]+)*")) &&
+                        vendor.getProperty("soname") == vendorName
+            ) {
+                "Unexpected hipBLASLt library name in $vendorDir"
             }
             check(vendor.getProperty("sha256") == sha256(vendorLibrary)) {
-                "hipBLASLt library does not match $vendorRoot/hipblaslt.properties"
+                "hipBLASLt library does not match $vendorDir/hipblaslt.properties"
             }
             check(loaderLibrary.isFile) { "ROCm runtime loader is missing: $loaderLibrary" }
             injected.fs.copy {
                 from(vendorLibrary)
                 from(loaderLibrary) { rename { loaderName } }
-                from(vendorRoot / "licenses") { into("licenses") }
+                from(vendorDir / "licenses") { into("licenses") }
                 into(targetFile.parent)
             }
             val bundleRoot = targetFile.parentFile
-            val files = bundleRoot.walkTopDown().filter { it.isFile }
-                .map { it.relativeTo(bundleRoot).invariantSeparatorsPath }.sorted().toList()
+            val files = bundleRoot.walkTopDown()
+                .filter { it.isFile }
+                .map { it.relativeTo(bundleRoot).invariantSeparatorsPath }
+                .sorted()
+                .toList()
             check(files.any { it.startsWith("licenses/") }) {
-                "hipBLASLt redistribution notices are missing in $vendorRoot/licenses"
+                "hipBLASLt redistribution notices are missing in $vendorDir/licenses"
             }
             val metadata = sortedMapOf(
                 "schemaVersion" to "1",
@@ -261,19 +255,25 @@ val stageJniLib = tasks.register("stageJniLib") {
             )
             for ((key, manifestKey) in vendorFields) {
                 metadata[manifestKey] = requireNotNull(vendor.getProperty(key)) {
-                    "Missing $key in $vendorRoot/hipblaslt.properties"
+                    "Missing $key in $vendorDir/hipblaslt.properties"
                 }
             }
             val kernelMetadata = vendor.stringPropertyNames().filter { it.startsWith("kernel_metadata.") }
-            check(kernelMetadata.isNotEmpty()) { "SDK kernel metadata is missing in $vendorRoot/hipblaslt.properties" }
+            check(kernelMetadata.isNotEmpty()) {
+                "SDK kernel metadata is missing in $vendorDir/hipblaslt.properties"
+            }
             for (key in kernelMetadata) {
                 metadata["hipblasltKernelMetadata." + key.removePrefix("kernel_metadata.")] = vendor.getProperty(key)
             }
-            for (file in files) metadata["sha256.$file"] = sha256(bundleRoot / file)
+            for (file in files) {
+                metadata["sha256.$file"] = sha256(bundleRoot / file)
+            }
             val manifest = bundleRoot / "native-bundle.properties"
             manifest.writeText(metadata.entries.joinToString("") { "${it.key}=${it.value}\n" })
             sha256(manifest)
-        } else sha256(targetFile)
+        } else {
+            sha256(targetFile)
+        }
 
         (stageDir.get().asFile / "pytorch.properties").text =
                 "jni_version=$publishedVersion\n" +
@@ -310,7 +310,7 @@ publishing {
                 description =
                         "DJL PyTorch JNI ($jniLibFileName) for the $flavor libtorch flavor on" +
                                 " $classifier. Supported Linux ROCm flavors include the patched hipBLASLt host" +
-                                " library and requires its matching ROCm SDK. LibTorch is resolved" +
+                                " library and require the matching ROCm SDK. LibTorch is resolved" +
                                 " separately at runtime."
                 url = "http://www.djl.ai/engines/pytorch/${project.name}"
             }

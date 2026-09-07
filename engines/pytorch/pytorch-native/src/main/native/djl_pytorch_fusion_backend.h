@@ -98,9 +98,9 @@ __device__ inline T ShuffleDown(T value, unsigned int delta, int width) {
 #define __shfl ::djl::pytorch::fusion::backend::Shuffle
 #define __shfl_down ::djl::pytorch::fusion::backend::ShuffleDown
 
-#endif
+#endif  // defined(__CUDACC__)
 
-#endif
+#endif  // defined(DJL_USE_ROCM_KERNELS)
 
 }  // namespace djl::pytorch::fusion::backend
 

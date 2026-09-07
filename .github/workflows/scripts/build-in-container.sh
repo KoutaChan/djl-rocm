@@ -15,7 +15,7 @@
 # runner's tight root filesystem.
 set -euo pipefail
 
-timed() {
+run_phase() {
     local label=$1 start=$SECONDS
     shift
     printf '::group::%s\n' "$label"
@@ -90,21 +90,23 @@ ensure_rocm_cmake() {
 }
 
 finish_build() {
+    local directory
     if command -v ccache >/dev/null 2>&1; then
         ccache --show-stats || true
     fi
     if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
-        # Only these small caches leave the container. Do not walk /ws and its
-        # multi-GiB libtorch/SDK trees merely to change file ownership.
+        # Restore ownership only for caches persisted by the host runner.
         for directory in /djl-cache/ccache /djl-cache/gradle /djl-cache/hipblaslt/artifacts; do
-            [[ ! -d "$directory" ]] || chown -R "${HOST_UID}:${HOST_GID}" "$directory" || true
+            if [[ -d "$directory" ]]; then
+                chown -R "${HOST_UID}:${HOST_GID}" "$directory" || true
+            fi
         done
     fi
 }
 trap finish_build EXIT
 
-timed packages install_base_packages
-timed ccache-install bash .github/workflows/scripts/install-ccache.sh
+run_phase packages install_base_packages
+run_phase ccache-install bash .github/workflows/scripts/install-ccache.sh
 export CCACHE_DIR=/djl-cache/ccache
 export CCACHE_BASEDIR=/ws
 export CCACHE_COMPILERCHECK=content
@@ -114,20 +116,20 @@ export HIPBLASLT_CACHE_DIR=/djl-cache/hipblaslt
 ccache --zero-stats
 case "$FLAVOR" in
     cu*)
-        timed cuda-sdk install_cuda_packages
+        run_phase cuda-sdk install_cuda_packages
         ;;
     rocm*)
-        timed rocm-sdk install_rocm_packages
-        timed rocm-cmake ensure_rocm_cmake
+        run_phase rocm-sdk install_rocm_packages
+        run_phase rocm-cmake ensure_rocm_cmake
         ;;
 esac
 
 cd engines/pytorch/pytorch-native
-timed native-build ./build.sh "$PT_VERSION" "$FLAVOR" cxx11 amd64
+run_phase native-build ./build.sh "$PT_VERSION" "$FLAVOR" cxx11 amd64
 test -f build/libdjl_torch.so
 
 cd /ws
-timed publish ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
+run_phase publish ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
     -Ppt_version="$PT_VERSION" \
     -Pflavor="$FLAVOR" \
     -Pclassifier="$CLASSIFIER" \

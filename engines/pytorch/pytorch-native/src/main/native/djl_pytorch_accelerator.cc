@@ -477,6 +477,15 @@ StreamScope* OpenDeviceStream(DeviceStream* stream) {
   return new StreamScope(stream->stream);
 }
 
+uint64_t GetStreamId(DeviceStream* stream) {
+  TORCH_CHECK(stream != nullptr, "A native stream identifier requires a GPU stream");
+#if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
+  return reinterpret_cast<uintptr_t>(c10::cuda::CUDAStream(stream->stream).stream());
+#else
+  TORCH_CHECK(false, "Native stream identifiers require a CUDA or ROCm build");
+#endif
+}
+
 void DeleteDeviceStream(DeviceStream* stream) {
 #if defined(USE_ROCM)
   if (stream != nullptr) {
@@ -687,32 +696,23 @@ void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
 #endif
 }
 
-uint64_t GetDeviceStreamToken(DeviceStream* stream) {
-  TORCH_CHECK(stream != nullptr, "A native stream token requires a GPU stream");
-#if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
-  return reinterpret_cast<uintptr_t>(c10::cuda::CUDAStream(stream->stream).stream());
-#else
-  TORCH_CHECK(false, "Native stream tokens require a CUDA or ROCm build");
-#endif
-}
-
 std::vector<AllocatorStreamPool> GetAllocatorSnapshot(c10::DeviceIndex device) {
   InitializeAccelerator();
 #if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
   const auto snapshot = c10::cuda::CUDACachingAllocator::snapshot({0, 0}, false);
-  // Keep private pools and small/large pools separate: their inactive blocks
-  // are not interchangeable. No device synchronization or tensor data is read.
-  using Key = std::tuple<uint64_t, uint64_t, uint64_t, bool>;
-  std::map<Key, AllocatorStreamPool> pools;
+  // Inactive blocks cannot be shared across streams, private pools, or size classes.
+  using PoolKey = std::tuple<uint64_t, uint64_t, uint64_t, bool>;
+  std::map<PoolKey, AllocatorStreamPool> pools;
   for (const auto& segment : snapshot.segments) {
     if (segment.device != device) {
       continue;
     }
-    const auto token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(segment.stream));
-    const auto high = static_cast<uint64_t>(segment.owner_private_pool_id.first);
-    const auto low = static_cast<uint64_t>(segment.owner_private_pool_id.second);
-    Key key{token, high, low, segment.is_large};
-    auto entry = pools.try_emplace(key, AllocatorStreamPool{token, high, low, segment.is_large});
+    const auto stream_id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(segment.stream));
+    const auto pool_id_high = static_cast<uint64_t>(segment.owner_private_pool_id.first);
+    const auto pool_id_low = static_cast<uint64_t>(segment.owner_private_pool_id.second);
+    PoolKey key{stream_id, pool_id_high, pool_id_low, segment.is_large};
+    auto entry = pools.try_emplace(
+        key, AllocatorStreamPool{stream_id, pool_id_high, pool_id_low, segment.is_large});
     auto& pool = entry.first->second;
     pool.reserved_bytes += static_cast<int64_t>(segment.total_size);
     pool.allocated_bytes += static_cast<int64_t>(segment.allocated_size);

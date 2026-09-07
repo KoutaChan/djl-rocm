@@ -1,8 +1,8 @@
 # Bounded hipBLASLt solution cache
 
-Each Linux x86_64 native JAR builds the patched host library for its matching
-SDK and reuses that SDK's existing Tensile kernels. `profiles.json` is the
-shared source of build and packaging compatibility information:
+Each supported Linux x86_64 ROCm native JAR includes the patched host library
+for its matching SDK and reuses that SDK's existing Tensile kernels.
+`profiles.json` defines build and packaging compatibility:
 
 | JAR flavor | SDK versions | hipBLASLt | Exact vendor revision | ELF SONAME |
 | --- | --- | --- | --- | --- |
@@ -113,9 +113,9 @@ python3 -m unittest discover -s engines/pytorch/pytorch-native/rocm/hipblaslt
 
 ## GitHub Actions build time
 
-The latest successful pre-change run was
-[33941245727](https://github.com/KoutaChan/djl-rocm/actions/runs/33941245727),
-which took 52m47s overall. ROCm 7.2's native compilation alone took 37m12s on
+Before compiler caching was added,
+[run 33941245727](https://github.com/KoutaChan/djl-rocm/actions/runs/33941245727)
+took 52m47s overall. ROCm 7.2's native compilation alone took 37m12s on
 two CPUs. ROCm 10 spent 9m56s compiling, about 2m35s installing/initializing
 the SDK, 2m56s in Gradle, and 3m11s in disk cleanup.
 

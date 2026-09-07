@@ -7,8 +7,8 @@
  * http://aws.amazon.com/apache2.0/
  *
  * or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
- * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing
- * permissions and limitations under the License.
+ * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
+ * and limitations under the License.
  */
 package ai.djl.pytorch.engine;
 
@@ -29,7 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /** Verifies descriptor reuse through actual inference matmul submissions and graph replay. */
-@SuppressWarnings("try")
+@SuppressWarnings("try") // The scopes select inference mode and device streams.
 public class PtRocmMatmulCacheTest {
 
     private static final DataType[] DATA_TYPES = {
@@ -44,8 +44,7 @@ public class PtRocmMatmulCacheTest {
                 try (NDManager manager = engine.newBaseManager(Device.gpu(deviceIndex));
                         InferenceMode ignored = engine.newInferenceMode()) {
                     for (boolean transposeRight : new boolean[] {false, true}) {
-                        List<MatmulCase> cases =
-                                alternatingCases(manager, dataType, transposeRight);
+                        List<MatmulCase> cases = createCases(manager, dataType, transposeRight);
                         // Enqueue all shapes before reading any output. The last two cases revisit
                         // cached algorithms after their descriptor family has changed geometry.
                         List<NDArray> outputs = new ArrayList<>();
@@ -80,7 +79,7 @@ public class PtRocmMatmulCacheTest {
                 cases.add(first);
                 for (MatmulCase value : cases) {
                     try (NDArray warmup = value.run()) {
-                        floats(warmup);
+                        toFloatArray(warmup);
                     }
                 }
 
@@ -115,8 +114,8 @@ public class PtRocmMatmulCacheTest {
                     PtStream secondStream = engine.newStream(device);
                     PtEvent firstDone = firstStream.newEvent();
                     PtEvent secondDone = secondStream.newEvent()) {
-                List<MatmulCase> firstCases = alternatingCases(manager, dataType, false);
-                List<MatmulCase> secondCases = alternatingCases(manager, dataType, true);
+                List<MatmulCase> firstCases = createCases(manager, dataType, false);
+                List<MatmulCase> secondCases = createCases(manager, dataType, true);
                 List<NDArray> firstOutputs = new ArrayList<>();
                 List<NDArray> secondOutputs = new ArrayList<>();
                 for (int index = 0; index < firstCases.size(); ++index) {
@@ -139,7 +138,7 @@ public class PtRocmMatmulCacheTest {
         }
     }
 
-    private static List<MatmulCase> alternatingCases(
+    private static List<MatmulCase> createCases(
             NDManager manager, DataType dataType, boolean transposeRight) {
         List<MatmulCase> cases = new ArrayList<>();
         cases.add(createCase(manager, dataType, 4, 9, 16, 0, transposeRight, false, false));
@@ -164,13 +163,13 @@ public class PtRocmMatmulCacheTest {
             boolean matrixOnly) {
         int reduction = 32;
         NDArray left =
-                patterned(manager, dataType, new Shape(batch, rows + padding, reduction), 3)
+                createInput(manager, dataType, new Shape(batch, rows + padding, reduction), 3)
                         .get(":, :" + rows + ", :");
         int rightBatch = broadcastRight ? 1 : batch;
         NDArray right;
         if (transposeRight) {
             right =
-                    patterned(
+                    createInput(
                                     manager,
                                     dataType,
                                     new Shape(rightBatch, columns + padding, reduction),
@@ -179,7 +178,7 @@ public class PtRocmMatmulCacheTest {
                             .swapAxes(1, 2);
         } else {
             right =
-                    patterned(
+                    createInput(
                                     manager,
                                     dataType,
                                     new Shape(rightBatch, reduction + padding, columns),
@@ -192,8 +191,8 @@ public class PtRocmMatmulCacheTest {
         }
         // The binary-fraction inputs are exactly representable in FP16 and BF16. Compute an
         // independent CPU FP32 reference, including logical views and broadcast batch selection.
-        float[] leftValues = floats(left);
-        float[] rightValues = floats(right);
+        float[] leftValues = toFloatArray(left);
+        float[] rightValues = toFloatArray(right);
         float[] expected = new float[batch * rows * columns];
         for (int b = 0; b < batch; ++b) {
             int rightOffset = (broadcastRight ? 0 : b) * reduction * columns;
@@ -213,7 +212,8 @@ public class PtRocmMatmulCacheTest {
         return new MatmulCase(left, right, outputShape, expected);
     }
 
-    private static NDArray patterned(NDManager manager, DataType dataType, Shape shape, int seed) {
+    private static NDArray createInput(
+            NDManager manager, DataType dataType, Shape shape, int seed) {
         float[] values = new float[Math.toIntExact(shape.size())];
         for (int index = 0; index < values.length; ++index) {
             values[index] = ((index * seed + 5) % 29 - 14) / 32f;
@@ -221,7 +221,7 @@ public class PtRocmMatmulCacheTest {
         return manager.create(values, shape).toType(dataType, false);
     }
 
-    private static float[] floats(NDArray value) {
+    private static float[] toFloatArray(NDArray value) {
         if (value.getDataType() == DataType.FLOAT32) {
             return value.toFloatArray();
         }
@@ -231,13 +231,13 @@ public class PtRocmMatmulCacheTest {
     }
 
     private static void assertResult(
-            NDArray actual, MatmulCase expected, DataType dataType, float scale) {
-        Assert.assertEquals(actual.getShape(), expected.outputShape);
+            NDArray actual, MatmulCase testCase, DataType dataType, float scale) {
+        Assert.assertEquals(actual.getShape(), testCase.outputShape);
         Assert.assertEquals(actual.getDataType(), dataType);
-        float[] values = floats(actual);
+        float[] values = toFloatArray(actual);
         float tolerance = dataType == DataType.FLOAT32 ? 1e-5f : 1e-2f;
         for (int index = 0; index < values.length; ++index) {
-            Assert.assertEquals(values[index], expected.expected[index] * scale, tolerance);
+            Assert.assertEquals(values[index], testCase.expected[index] * scale, tolerance);
         }
     }
 
@@ -252,10 +252,11 @@ public class PtRocmMatmulCacheTest {
     }
 
     private static final class MatmulCase {
-        private final NDArray left;
-        private final NDArray right;
-        private final Shape outputShape;
-        private final float[] expected;
+
+        private NDArray left;
+        private NDArray right;
+        private Shape outputShape;
+        private float[] expected;
 
         private MatmulCase(NDArray left, NDArray right, Shape outputShape, float[] expected) {
             this.left = left;

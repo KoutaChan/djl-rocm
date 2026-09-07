@@ -129,8 +129,8 @@ public final class JniUtils {
         return PyTorchLibrary.LIB.torchOpenDeviceStream(handle);
     }
 
-    public static long getDeviceStreamToken(long handle) {
-        return PyTorchLibrary.LIB.torchGetDeviceStreamToken(handle);
+    public static long getStreamId(long handle) {
+        return PyTorchLibrary.LIB.torchGetStreamId(handle);
     }
 
     public static void deleteDeviceStream(long handle) {

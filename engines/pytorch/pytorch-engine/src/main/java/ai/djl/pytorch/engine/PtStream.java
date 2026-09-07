@@ -39,21 +39,21 @@ public final class PtStream extends NativeResource<Long> {
     }
 
     /**
-     * Returns the underlying CUDA/HIP stream token used by {@link PtAllocatorSnapshot}.
+     * Returns the native stream identifier used by {@link PtAllocatorSnapshot}.
      *
      * <p>This opaque value is the native stream pointer, not this object's JNI handle or a PyTorch
-     * stream ID. Compare tokens only within the same process and device. Zero identifies the native
-     * default stream, not an unavailable value.
+     * stream ID. Compare identifiers only within the same process and device. Zero identifies the
+     * native default stream, not an unavailable value.
      *
-     * @return the native stream token as a 64-bit bit pattern
+     * @return the native stream identifier as a 64-bit bit pattern
      * @throws IllegalArgumentException if this is not a GPU stream
      * @throws IllegalStateException if this stream is closed
      */
-    public synchronized long getStreamToken() {
+    public synchronized long getId() {
         if (!device.isGpu()) {
-            throw new IllegalArgumentException("Native stream tokens require a GPU stream.");
+            throw new IllegalArgumentException("Native stream identifiers require a GPU stream.");
         }
-        return JniUtils.getDeviceStreamToken(getHandle());
+        return JniUtils.getStreamId(getHandle());
     }
 
     /**

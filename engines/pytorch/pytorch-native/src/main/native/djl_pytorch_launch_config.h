@@ -21,16 +21,15 @@ inline constexpr char kFusionInPlacePlanner[] = "DJL_FUSION_INPLACE_PLANNER";
 inline constexpr char kRocmMatmulContextDiagnostics[] = "DJL_ROCM_MATMUL_CONTEXT_DIAGNOSTICS";
 inline constexpr char kRocmMatmulGeometryDiagnostics[] = "DJL_ROCM_MATMUL_GEOMETRY_DIAGNOSTICS";
 
-struct RocmMatmulDiagnosticsConfig {
+struct MatmulDiagnostics {
   bool context;
   bool geometry;
 };
 
 /**
- * Returns default-off diagnostics loaded once from the process environment.
- * Accepts 0/1, false/true, or FALSE/TRUE, matching the planner settings.
+ * Returns matmul diagnostics loaded once from the process environment, disabled by default.
  */
-const RocmMatmulDiagnosticsConfig& GetRocmMatmulDiagnosticsConfig();
+const MatmulDiagnostics& GetMatmulDiagnostics();
 
 /** Returns a default-on boolean setting loaded from the process environment. */
 bool IsPlannerEnabled(const char* name);

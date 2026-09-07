@@ -6,7 +6,7 @@
 set -euo pipefail
 
 if (( $# < 2 )); then
-    printf 'Usage: ROCM_PATH=/path/to/sdk %s <rocm-libraries-source> <build-dir> [cmake-options...]\n' "$0" >&2
+    printf 'Usage: ROCM_PATH=/path/to/sdk %s <source> <build-dir> [--flavor rocmX.Y] [cmake-options...]\n' "$0" >&2
     exit 2
 fi
 : "${ROCM_PATH:?Set ROCM_PATH to the installed ROCm SDK}"
@@ -22,22 +22,29 @@ if [[ "${1:-}" == --flavor ]]; then
     shift 2
 fi
 profile_info=$(python3 - "$script_dir" "$source_root" "$flavor" <<'PY'
-import importlib.util, os, pathlib, subprocess, sys
-spec = importlib.util.spec_from_file_location('bundle', pathlib.Path(sys.argv[1]) / 'prepare-bundle.py')
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("bundle", Path(sys.argv[1]) / "prepare-bundle.py")
 bundle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bundle)
-sdk = pathlib.Path(os.environ['ROCM_PATH'])
-flavor, version, profile = bundle.sdk_profile(sdk, sys.argv[3] or None)
-source = pathlib.Path(sys.argv[2])
-head = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-if head != profile['source_revision']:
-    raise RuntimeError('Expected ' + profile['source_repository'] + ' revision ' + profile['source_revision'])
+sdk = Path(os.environ["ROCM_PATH"])
+_, _, profile = bundle.sdk_profile(sdk, sys.argv[3] or None)
+source = Path(sys.argv[2])
+head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+if head != profile["source_revision"]:
+    raise RuntimeError(
+        f"Expected {profile['source_repository']} revision {profile['source_revision']}"
+    )
 bundle.apply_patches(source, profile)
-dynamic = subprocess.check_output(['readelf', '-d', str(sdk / 'lib/libhipblaslt.so')], text=True)
-print(profile['source_dir'])
-print(profile['build_family'])
-print('ON' if 'librocroller.so' in dynamic else 'OFF')
-print('ON' if 'libroctx' in dynamic else 'OFF')
+dynamic = subprocess.check_output(["readelf", "-d", str(sdk / "lib/libhipblaslt.so")], text=True)
+print(profile["source_dir"])
+print(profile["build_family"])
+print("ON" if "librocroller.so" in dynamic else "OFF")
+print("ON" if "libroctx" in dynamic else "OFF")
 PY
 )
 mapfile -t profile_values <<< "$profile_info"
@@ -114,9 +121,9 @@ if [[ "$rocroller" == ON ]]; then
     fi
 fi
 
-launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER=)
+compiler_launcher=""
 if command -v ccache >/dev/null 2>&1; then
-    launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+    compiler_launcher=ccache
 fi
 
 if [[ "$build_family" == legacy ]]; then
@@ -149,7 +156,7 @@ cmake -S "$project_root" -B "$build_dir" -G 'Unix Makefiles' \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     "${family_options[@]}" \
     -DBUILD_TESTING=OFF \
-    "${launcher[@]}" \
+    -DCMAKE_CXX_COMPILER_LAUNCHER="$compiler_launcher" \
     "$@"
 cmake --build "$build_dir" --target hipblaslt --parallel "${BUILD_JOBS:-8}"
 

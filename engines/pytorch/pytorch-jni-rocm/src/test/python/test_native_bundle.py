@@ -3,18 +3,18 @@
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def properties(data):
+def read_properties(data):
     return dict(line.split("=", 1) for line in data.decode().splitlines() if line)
 
 
@@ -22,7 +22,9 @@ class NativeBundlePackagingTest(unittest.TestCase):
     def test_bundle_integrity_and_flavor_isolation(self):
         repo = Path(__file__).resolve().parents[6]
         gradle = repo / ("gradlew.bat" if os.name == "nt" else "gradlew")
-        profiles = json.loads((repo / "engines/pytorch/pytorch-native/rocm/hipblaslt/profiles.json").read_text())
+        profiles = json.loads(
+            (repo / "engines/pytorch/pytorch-native/rocm/hipblaslt/profiles.json").read_text()
+        )
         self.assertEqual(set(profiles), {"rocm6.4", "rocm7.0", "rocm7.1", "rocm7.2", "rocm10.0"})
         with tempfile.TemporaryDirectory(prefix="djl-native-bundle-") as temporary:
             root = Path(temporary)
@@ -46,7 +48,17 @@ class NativeBundlePackagingTest(unittest.TestCase):
 
             def select_profile(flavor, sdk_version):
                 profile = profiles[flavor]["sdk_versions"][sdk_version]
-                metadata.update({key: profile[key] for key in ("source_repository", "source_revision", "hipblaslt_version", "soname")})
+                metadata.update(
+                    {
+                        key: profile[key]
+                        for key in (
+                            "source_repository",
+                            "source_revision",
+                            "hipblaslt_version",
+                            "soname",
+                        )
+                    }
+                )
                 metadata.update(flavor=flavor, rocm_version=sdk_version, library=profile["soname"])
                 library = vendor / metadata["library"]
                 library.write_bytes(b"synthetic hipBLASLt host library v1")
@@ -54,14 +66,14 @@ class NativeBundlePackagingTest(unittest.TestCase):
 
             vendor_library = select_profile("rocm10.0", "10.0.0")
 
-            def save_vendor_metadata():
+            def write_metadata():
                 metadata["sha256"] = sha256(vendor_library.read_bytes())
                 (vendor / "hipblaslt.properties").write_text(
                     "".join(f"{key}={value}\n" for key, value in sorted(metadata.items())),
                     encoding="utf-8",
                 )
 
-            save_vendor_metadata()
+            write_metadata()
             init_script = root / "isolated-build.gradle"
             output = root / "build"
             init_script.write_text(
@@ -99,14 +111,18 @@ class NativeBundlePackagingTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout)
                 artifact = next((output / "libs").glob(f"pytorch-jni-{flavor}-linux-x86_64-*.jar"))
                 with zipfile.ZipFile(artifact) as jar:
-                    entries = {name: jar.read(name) for name in jar.namelist() if not name.endswith("/")}
+                    entries = {
+                        name: jar.read(name) for name in jar.namelist() if not name.endswith("/")
+                    }
                 return artifact.read_bytes(), entries
 
             def assert_bundle(entries):
                 prefix = f"jnilib/linux-x86_64/{metadata['flavor']}/"
                 manifest_data = entries[prefix + "native-bundle.properties"]
-                manifest = properties(manifest_data)
-                self.assertEqual(manifest["libraries"], f"libdjl_torch.so,{vendor_library.name},{loader.name}")
+                manifest = read_properties(manifest_data)
+                self.assertEqual(
+                    manifest["libraries"], f"libdjl_torch.so,{vendor_library.name},{loader.name}"
+                )
                 self.assertEqual(manifest["rocmLoaderLibrary"], loader.name)
                 self.assertEqual(entries[prefix + loader.name], loader.read_bytes())
                 self.assertEqual(manifest["hipblasltLibrary"], vendor_library.name)
@@ -116,8 +132,15 @@ class NativeBundlePackagingTest(unittest.TestCase):
                 self.assertEqual(manifest["hipblasltSoname"], metadata["soname"])
                 self.assertEqual(manifest["rocmVersion"], metadata["rocm_version"])
                 self.assertEqual(manifest["hipblasltRevision"], metadata["source_revision"])
-                self.assertEqual(manifest["hipblasltSourceRepository"], metadata["source_repository"])
-                self.assertEqual(manifest["hipblasltKernelMetadata.lib/hipblaslt/library/TensileLibrary_lazy_gfx1100.dat"], "5" * 64)
+                self.assertEqual(
+                    manifest["hipblasltSourceRepository"], metadata["source_repository"]
+                )
+                self.assertEqual(
+                    manifest[
+                        "hipblasltKernelMetadata.lib/hipblaslt/library/TensileLibrary_lazy_gfx1100.dat"
+                    ],
+                    "5" * 64,
+                )
                 for name in manifest["files"].split(","):
                     self.assertEqual(manifest[f"sha256.{name}"], sha256(entries[prefix + name]))
                 self.assertEqual(
@@ -126,7 +149,7 @@ class NativeBundlePackagingTest(unittest.TestCase):
                     | {prefix + name for name in manifest["files"].split(",")},
                     "Only the current flavor and its selected SONAME must enter the JAR",
                 )
-                cache_key = properties(entries["jnilib/pytorch.properties"])["jni_cache_key"]
+                cache_key = read_properties(entries["jnilib/pytorch.properties"])["jni_cache_key"]
                 self.assertTrue(cache_key.endswith("-" + sha256(manifest_data)))
                 return cache_key
 
@@ -134,17 +157,19 @@ class NativeBundlePackagingTest(unittest.TestCase):
                 for sdk_version in family["sdk_versions"]:
                     with self.subTest(flavor=flavor, sdk=sdk_version):
                         vendor_library = select_profile(flavor, sdk_version)
-                        save_vendor_metadata()
+                        write_metadata()
                         assert_bundle(build(flavor)[1])
 
             vendor_library = select_profile("rocm10.0", "10.0.0")
-            save_vendor_metadata()
+            write_metadata()
             prefix = "jnilib/linux-x86_64/rocm10.0/"
             original_jar, entries = build()
             original_key = assert_bundle(entries)
             self.assertEqual(entries[prefix + native.name], native.read_bytes())
             self.assertEqual(entries[prefix + vendor_library.name], vendor_library.read_bytes())
-            self.assertEqual(build()[0], original_jar, "Identical input must produce identical JAR bytes")
+            self.assertEqual(
+                build()[0], original_jar, "Identical input must produce identical JAR bytes"
+            )
 
             self.assertIn("hipBLASLt bundle flavor mismatch", build("rocm7.2", succeeds=False))
             for key, invalid, message in (
@@ -157,10 +182,10 @@ class NativeBundlePackagingTest(unittest.TestCase):
                 with self.subTest(invalid_metadata=key):
                     original = metadata[key]
                     metadata[key] = invalid
-                    save_vendor_metadata()
+                    write_metadata()
                     self.assertIn(message, build(succeeds=False))
                     metadata[key] = original
-            save_vendor_metadata()
+            write_metadata()
 
             native.write_bytes(b"synthetic JNI library v2")
             jni_key = assert_bundle(build()[1])
@@ -172,7 +197,7 @@ class NativeBundlePackagingTest(unittest.TestCase):
 
             vendor_library.write_bytes(b"synthetic hipBLASLt host library v2")
             self.assertIn("hipBLASLt library does not match", build(succeeds=False))
-            save_vendor_metadata()
+            write_metadata()
             vendor_key = assert_bundle(build()[1])
             self.assertNotEqual(vendor_key, loader_key)
 
@@ -181,7 +206,7 @@ class NativeBundlePackagingTest(unittest.TestCase):
             self.assertNotEqual(notice_key, vendor_key)
 
             metadata["sdk_library_sha256"] = "4" * 64
-            save_vendor_metadata()
+            write_metadata()
             self.assertNotEqual(assert_bundle(build()[1]), notice_key)
 
             _, cpu_entries = build("cpu")
@@ -190,7 +215,9 @@ class NativeBundlePackagingTest(unittest.TestCase):
                 {"jnilib/pytorch.properties", "jnilib/linux-x86_64/cpu/libdjl_torch.so"},
             )
             self.assertEqual(
-                properties(cpu_entries["jnilib/pytorch.properties"])["jni_cache_key"].split("-")[-1],
+                read_properties(cpu_entries["jnilib/pytorch.properties"])["jni_cache_key"].split(
+                    "-"
+                )[-1],
                 sha256(native.read_bytes()),
             )
 

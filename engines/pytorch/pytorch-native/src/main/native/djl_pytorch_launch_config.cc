@@ -36,15 +36,15 @@ bool ReadBoolean(const char* name, bool default_value) {
 
 }  // namespace
 
-bool IsPlannerEnabled(const char* name) {
-  return ReadBoolean(name, true);
-}
-
-const RocmMatmulDiagnosticsConfig& GetRocmMatmulDiagnosticsConfig() {
-  static const RocmMatmulDiagnosticsConfig config{
+const MatmulDiagnostics& GetMatmulDiagnostics() {
+  static const MatmulDiagnostics diagnostics{
       ReadBoolean(kRocmMatmulContextDiagnostics, false),
       ReadBoolean(kRocmMatmulGeometryDiagnostics, false)};
-  return config;
+  return diagnostics;
+}
+
+bool IsPlannerEnabled(const char* name) {
+  return ReadBoolean(name, true);
 }
 
 }  // namespace djl::pytorch::launch_environment

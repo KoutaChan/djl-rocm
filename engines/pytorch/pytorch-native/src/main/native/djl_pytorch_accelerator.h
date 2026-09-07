@@ -41,7 +41,7 @@ struct DeviceMemoryStats {
 };
 
 struct AllocatorStreamPool {
-  uint64_t stream_token;
+  uint64_t stream_id;
   uint64_t pool_id_high;
   uint64_t pool_id_low;
   bool is_large;
@@ -74,8 +74,8 @@ StreamScope* NewStreamScope();
 StreamScope* NewStreamScope(c10::Device device);
 DeviceStream* NewDeviceStream(c10::Device device);
 StreamScope* OpenDeviceStream(DeviceStream* stream);
+uint64_t GetStreamId(DeviceStream* stream);
 void DeleteDeviceStream(DeviceStream* stream);
-uint64_t GetDeviceStreamToken(DeviceStream* stream);
 void DeleteStreamScope(StreamScope* scope);
 
 DeviceEvent* NewDeviceEvent(c10::Device device);

@@ -4,7 +4,11 @@
  * Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance
  * with the License. A copy of the License is located at
  *
- * http://aws.amazon.com/apache2.0
+ * http://aws.amazon.com/apache2.0/
+ *
+ * or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+ * OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions
+ * and limitations under the License.
  */
 package ai.djl.pytorch.jni;
 
@@ -12,6 +16,7 @@ import ai.djl.util.Utils;
 
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.io.File;
@@ -19,13 +24,23 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.stream.Stream;
 
 public class LibUtilsTest {
 
+    private String rocmVersion;
+
+    @BeforeMethod
+    public void setUp() {
+        rocmVersion = System.getProperty("DJL_ROCM_VERSION");
+    }
+
     @AfterMethod
-    public void clearOverrides() {
-        System.clearProperty("DJL_ROCM_VERSION");
+    public void tearDown() {
+        if (rocmVersion == null) {
+            System.clearProperty("DJL_ROCM_VERSION");
+        } else {
+            System.setProperty("DJL_ROCM_VERSION", rocmVersion);
+        }
     }
 
     @Test
@@ -45,22 +60,12 @@ public class LibUtilsTest {
 
             Assert.assertEquals(LibUtils.readRocmVersion(Path.of("core-10.0").toFile()), "10.0");
         } finally {
-            try (Stream<Path> paths = Files.walk(root)) {
-                paths.sorted((left, right) -> right.compareTo(left))
-                        .forEach(
-                                path -> {
-                                    try {
-                                        Files.delete(path);
-                                    } catch (IOException ignored) {
-                                        // Best effort cleanup of the temporary test tree.
-                                    }
-                                });
-            }
+            Utils.deleteQuietly(root);
         }
     }
 
     @Test
-    public void testExactSdkSelectionWithinFlavor() throws IOException {
+    public void testSdkSelection() throws IOException {
         Path root = Files.createTempDirectory("rocm-sdk-selection");
         try {
             File newer = root.resolve("rocm-7.2.2").toFile();
@@ -76,6 +81,19 @@ public class LibUtilsTest {
             Assert.assertEquals(LibUtils.selectRocmRoot(candidates, "rocm7.2", "7.2.2"), newer);
             Assert.assertNull(LibUtils.selectRocmRoot(candidates, "rocm7.2", "7.2.1"));
             Assert.assertNull(LibUtils.selectRocmRoot(candidates, "rocm7.1", "7.2.0"));
+        } finally {
+            Utils.deleteQuietly(root);
+        }
+    }
+
+    @Test
+    public void testRocmLibraryNames() throws IOException {
+        Path root = Files.createTempDirectory("rocm-libraries");
+        try {
+            Files.createFile(root.resolve("libamdhip64.so.backup"));
+            Files.createFile(root.resolve("libamdhip64.something"));
+            Path library = Files.createFile(root.resolve("libhipblaslt.so.1"));
+            Assert.assertEquals(LibUtils.getRocmLoadOrder(root, null, null), List.of(library));
         } finally {
             Utils.deleteQuietly(root);
         }

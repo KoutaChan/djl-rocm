@@ -40,7 +40,7 @@ final class PyTorchLibrary {
 
     native long torchOpenDeviceStream(long handle);
 
-    native long torchGetDeviceStreamToken(long handle);
+    native long torchGetStreamId(long handle);
 
     native void torchDeleteDeviceStream(long handle);
 

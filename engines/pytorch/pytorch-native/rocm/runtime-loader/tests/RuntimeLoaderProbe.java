@@ -21,6 +21,12 @@ public final class RuntimeLoaderProbe {
 
     private RuntimeLoaderProbe() {}
 
+    /**
+     * Loads the fixture libraries and checks their resolved dependencies.
+     *
+     * @param args the loading mode, fixture directory, patched library and overlay library
+     * @throws Exception if the fixture cannot be loaded or inspected
+     */
     public static void main(String[] args) throws Exception {
         boolean canonical = "canonical".equals(args[0]);
         if (canonical) {
@@ -39,17 +45,17 @@ public final class RuntimeLoaderProbe {
                 }
             }
         }
-        List<String> mapped =
+        List<String> libraries =
                 Files.readAllLines(Path.of("/proc/self/maps")).stream()
                         .filter(line -> line.contains("/libdjl_loader_sample.so"))
                         .map(line -> line.substring(line.indexOf('/')))
                         .distinct()
                         .toList();
-        boolean original = mapped.stream().anyMatch(path -> path.contains("/original/"));
-        boolean patched = mapped.stream().anyMatch(path -> path.contains("/patched/"));
-        if (!patched || original != canonical || mapped.size() != (canonical ? 2 : 1)) {
-            throw new AssertionError(args[0] + " loaded unexpected dependencies: " + mapped);
+        boolean original = libraries.stream().anyMatch(path -> path.contains("/original/"));
+        boolean patched = libraries.stream().anyMatch(path -> path.contains("/patched/"));
+        if (!patched || original != canonical || libraries.size() != (canonical ? 2 : 1)) {
+            throw new AssertionError(args[0] + " loaded unexpected dependencies: " + libraries);
         }
-        System.out.println("PASS " + args[0] + ": " + mapped);
+        System.out.println("PASS " + args[0] + ": " + libraries);
     }
 }

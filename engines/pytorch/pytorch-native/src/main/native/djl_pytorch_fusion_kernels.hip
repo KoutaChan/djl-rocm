@@ -134,7 +134,7 @@ struct FusionMatmulKeyHash {
 
 void LogFusionMatmulGeometry(const FusionMatmulKey& key,
     const char* result, std::size_t workspace_size) {
-  if (!launch_environment::GetRocmMatmulDiagnosticsConfig().geometry) {
+  if (!launch_environment::GetMatmulDiagnostics().geometry) {
     return;
   }
   std::fprintf(stderr,
@@ -222,9 +222,8 @@ struct FusionMatmulDescriptorKeyHash {
   }
 };
 
-// Entries own their key once. The index points into list nodes, which remain
-// stable across both LRU moves and unordered_map rehashes. Callers serialize
-// lookup and use with the stream context's existing mutex.
+// List nodes keep indexed keys stable across LRU moves and map rehashes.
+// Callers hold the stream context's mutex during lookup and use.
 template <typename Key, typename Value, typename Hash>
 class FusionMatmulCache {
  public:
@@ -257,21 +256,37 @@ class FusionMatmulCache {
     return entries_.front().value;
   }
 
-  std::size_t Size() const { return entries_.size(); }
-  std::size_t Lookups() const { return lookups_; }
-  std::size_t Misses() const { return misses_; }
-  std::size_t Evictions() const { return evictions_; }
+  std::size_t Size() const {
+    return entries_.size();
+  }
+
+  std::size_t Lookups() const {
+    return lookups_;
+  }
+
+  std::size_t Misses() const {
+    return misses_;
+  }
+
+  std::size_t Evictions() const {
+    return evictions_;
+  }
 
  private:
   struct Entry {
     Key key;
     Value value;
+
     Entry(const Key& entry_key, Value&& entry_value)
         : key(entry_key), value(std::move(entry_value)) {}
   };
+
   struct PointerHash {
-    std::size_t operator()(const Key* key) const { return Hash{}(*key); }
+    std::size_t operator()(const Key* key) const {
+      return Hash{}(*key);
+    }
   };
+
   struct PointerEqual {
     bool operator()(const Key* left, const Key* right) const {
       return *left == *right;
@@ -2127,7 +2142,7 @@ class FusionMatmulStreamContext {
  public:
   FusionMatmulStreamContext(int32_t device, backend::Stream stream)
       : device_(device), stream_(FusionMatmulStreamIdentity(stream)) {
-    const auto& diagnostics = launch_environment::GetRocmMatmulDiagnosticsConfig();
+    const auto& diagnostics = launch_environment::GetMatmulDiagnostics();
     c10::DeviceGuard device_guard(
         c10::Device(c10::DeviceType::CUDA, device_));
     bias_placeholder_ = torch::empty({1},
@@ -2212,7 +2227,7 @@ class FusionMatmulStreamContext {
     const backend::Stream previous_stream = BoundStreamLocked();
     stream_.store(
         FusionMatmulStreamIdentity(stream), std::memory_order_release);
-    if (launch_environment::GetRocmMatmulDiagnosticsConfig().context) {
+    if (launch_environment::GetMatmulDiagnostics().context) {
       std::fprintf(stderr,
           "[djl-rocm-matmul] rebind device=%d old_stream=%p "
           "new_stream=%p\n",
@@ -2222,7 +2237,7 @@ class FusionMatmulStreamContext {
     }
   }
 
-  FusionMatmulExecutionResult ResolveExecutableLocked(
+  FusionMatmulExecutionResult ResolvePlanLocked(
       backend::Stream stream, const FusionMatmulKey& key,
       FusionMatmulAlgorithm** algorithm,
       FusionMatmulDescriptors** descriptors) {
@@ -2243,7 +2258,7 @@ class FusionMatmulStreamContext {
       return (*descriptors)->SelectAlgorithm(
           handle_, key, bias_placeholder_.const_data_ptr());
     });
-    if (algorithm_created && launch_environment::GetRocmMatmulDiagnosticsConfig().context &&
+    if (algorithm_created && launch_environment::GetMatmulDiagnostics().context &&
         (algorithms_.Misses() <= 4 || algorithms_.Misses() % 4096 == 0)) {
       LogCacheStatsLocked();
     }
@@ -2253,7 +2268,7 @@ class FusionMatmulStreamContext {
     return FusionMatmulExecutionResult::kExecuted;
   }
 
-  FusionMatmulExecutionResult ExecuteResolvedLocked(
+  FusionMatmulExecutionResult ExecutePlanLocked(
       backend::Stream stream, const FusionMatmulKey& key,
       const FusionMatmulAlgorithm& algorithm,
       FusionMatmulDescriptors& descriptors, torch::Tensor& output,
@@ -2263,7 +2278,7 @@ class FusionMatmulStreamContext {
       return FusionMatmulExecutionResult::kRetry;
     }
     TORCH_CHECK(algorithm.supported,
-        "direct ROCm matmul executable became unsupported");
+        "direct ROCm matmul algorithm became unsupported");
     if (!output.defined()) {
       TORCH_CHECK(beta == 0.0f,
           "deferred direct ROCm matmul output requires an overwrite");
@@ -2326,7 +2341,7 @@ class FusionMatmulStreamContext {
       TORCH_CHECK(pin_count_ == 0,
           "direct ROCm matmul workspace cannot grow while an accelerator "
           "graph retains its address");
-      if (launch_environment::GetRocmMatmulDiagnosticsConfig().context) {
+      if (launch_environment::GetMatmulDiagnostics().context) {
         std::fprintf(stderr,
             "[djl-rocm-matmul] workspace-grow device=%d stream=%p "
             "previous=%zu required=%zu\n",
@@ -2358,9 +2373,8 @@ class FusionMatmulStreamContext {
   std::atomic<std::uintptr_t> stream_;
   hipblasLtHandle_t handle_ = nullptr;
   std::mutex mutex_;
-  // Exact heuristics are compact and cheap to retain. Descriptor families
-  // contain opaque library allocations, so keep only the active model's
-  // matrix families. Both caches remain bounded across changing models.
+  // Descriptors retain opaque library allocations, so cache fewer families
+  // than compact algorithms. Bound both caches across model changes.
   FusionMatmulCache<FusionMatmulKey, FusionMatmulAlgorithm,
       FusionMatmulKeyHash> algorithms_{262144};
   FusionMatmulCache<FusionMatmulDescriptorKey,
@@ -2678,7 +2692,7 @@ FusionMatmulStreamContextLease ResolveMatmulStreamContextLease(
   }
 }
 
-struct FusionMatmulExecutableLease {
+struct FusionMatmulPlanLease {
   FusionMatmulStreamContext* context;
   backend::Stream stream;
   FusionMatmulAlgorithm* algorithm;
@@ -2687,7 +2701,7 @@ struct FusionMatmulExecutableLease {
   std::unique_lock<std::mutex> lock;
 };
 
-FusionMatmulExecutableLease ResolveMatmulExecutableLease(
+FusionMatmulPlanLease ResolveMatmulPlan(
     const FusionMatmulKey& key) {
   const c10::Device device(c10::DeviceType::CUDA, key.device);
   c10::DeviceGuard device_guard(device);
@@ -2709,13 +2723,13 @@ FusionMatmulExecutableLease ResolveMatmulExecutableLease(
     FusionMatmulAlgorithm* algorithm = nullptr;
     FusionMatmulDescriptors* descriptors = nullptr;
     const FusionMatmulExecutionResult result =
-        context->ResolveExecutableLocked(
+        context->ResolvePlanLocked(
             stream, key, &algorithm, &descriptors);
     if (result == FusionMatmulExecutionResult::kRetry) {
       current_matmul_stream_context = nullptr;
       continue;
     }
-    return FusionMatmulExecutableLease{context, stream, algorithm, descriptors,
+    return FusionMatmulPlanLease{context, stream, algorithm, descriptors,
         result, std::move(context_lock)};
   }
 }
@@ -2724,12 +2738,11 @@ FusionMatmulExecutionResult TryExecuteOnCurrentMatmulStream(
     const FusionMatmulKey& key, torch::Tensor& output,
     const torch::Tensor& left, const torch::Tensor& right,
     const torch::Tensor* bias, float beta) {
-  FusionMatmulExecutableLease lease =
-      ResolveMatmulExecutableLease(key);
+  FusionMatmulPlanLease lease = ResolveMatmulPlan(key);
   if (lease.result != FusionMatmulExecutionResult::kExecuted) {
     return lease.result;
   }
-  return lease.context->ExecuteResolvedLocked(lease.stream, key,
+  return lease.context->ExecutePlanLocked(lease.stream, key,
       *lease.algorithm, *lease.descriptors, output, left, right, bias, beta);
 }
 
@@ -3438,14 +3451,13 @@ bool TryExecuteRocmInferenceMatmul(torch::Tensor& output,
   const FusionMatmulKey key = BuildRocmInferenceMatmulKey(
       left_plan, right_plan, operation_left.device(),
       operation_left.scalar_type(), epilogue);
-  FusionMatmulExecutableLease lease =
-      ResolveMatmulExecutableLease(key);
+  FusionMatmulPlanLease lease = ResolveMatmulPlan(key);
   if (lease.result == FusionMatmulExecutionResult::kUnsupported) {
     return false;
   }
   TORCH_CHECK(lease.result == FusionMatmulExecutionResult::kExecuted &&
           lease.algorithm != nullptr,
-      "direct ROCm matmul failed to reserve a supported executable");
+      "direct ROCm matmul failed to reserve a supported algorithm");
 
   const torch::Tensor batched_left =
       PrepareBatchedMatmulOperand(left_plan);
@@ -3458,7 +3470,7 @@ bool TryExecuteRocmInferenceMatmul(torch::Tensor& output,
           batched_left, batched_right, epilogue) == key,
       "direct ROCm batched matmul preparation changed its planned geometry");
   torch::Tensor batched_result;
-  TORCH_CHECK(lease.context->ExecuteResolvedLocked(lease.stream, key,
+  TORCH_CHECK(lease.context->ExecutePlanLocked(lease.stream, key,
           *lease.algorithm, *lease.descriptors, batched_result, batched_left,
           batched_right, operation_bias_ptr, 0.0f) ==
           FusionMatmulExecutionResult::kExecuted,

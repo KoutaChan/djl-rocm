@@ -12,6 +12,7 @@
  */
 package ai.djl.pytorch.jni;
 
+import ai.djl.util.Hex;
 import ai.djl.util.Utils;
 
 import org.testng.Assert;
@@ -28,21 +29,24 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
+import java.util.stream.Stream;
 
 public class NativeLibraryBundleTest {
 
     private static final String JNI = "libdjl_torch.so";
     private static final String HIPBLASLT = "libhipblaslt.so.1";
-    private static final String METADATA =
-            "lib/hipblaslt/library/gfx1100/TensileLibrary_lazy_gfx1100.dat.zlib";
+    private static final String METADATA_DIR = "lib/hipblaslt/library/gfx1100";
+    private static final String METADATA = METADATA_DIR + "/TensileLibrary_lazy_gfx1100.dat.zlib";
 
     private Path root;
     private Path sdk;
@@ -60,7 +64,7 @@ public class NativeLibraryBundleTest {
         cache = root.resolve("cache");
         Files.createDirectories(sdk.resolve(".info"));
         Files.writeString(sdk.resolve(".info/version"), "10.0.0\n");
-        Files.createDirectories(sdk.resolve(METADATA).getParent());
+        Files.createDirectories(sdk.resolve(METADATA_DIR));
         Files.writeString(sdk.resolve(METADATA), "mapping");
         files = new LinkedHashMap<>();
         files.put(JNI, "jni binary");
@@ -88,24 +92,20 @@ public class NativeLibraryBundleTest {
 
     @Test
     public void testBundleCompatibility() throws IOException {
-        NativeLibraryBundle bundle = bundle();
-        bundle.checkCompatibility("2.11.0", "0.40.1-rocm", "rocm10.0", "linux-x86_64");
+        NativeLibraryBundle bundle = createBundle();
+        bundle.validate("2.11.0", "0.40.1-rocm", "rocm10.0", "linux-x86_64");
         Assert.expectThrows(
                 IOException.class,
-                () ->
-                        bundle.checkCompatibility(
-                                "2.10.0", "0.40.1-rocm", "rocm10.0", "linux-x86_64"));
+                () -> bundle.validate("2.10.0", "0.40.1-rocm", "rocm10.0", "linux-x86_64"));
         Assert.expectThrows(
                 IOException.class,
-                () ->
-                        bundle.checkCompatibility(
-                                "2.11.0", "0.40.2-rocm", "rocm10.0", "linux-x86_64"));
+                () -> bundle.validate("2.11.0", "0.40.2-rocm", "rocm10.0", "linux-x86_64"));
     }
 
     @Test
     public void testWholeBundleAndKernelLink() throws IOException {
         requireSymbolicLinks();
-        NativeLibraryBundle bundle = bundle();
+        NativeLibraryBundle bundle = createBundle();
         Path extracted = bundle.extract(cache, sdk, torch);
         Assert.assertEquals(Files.readString(extracted.resolve(JNI)), files.get(JNI));
         Assert.assertEquals(Files.readString(extracted.resolve(HIPBLASLT)), files.get(HIPBLASLT));
@@ -139,10 +139,9 @@ public class NativeLibraryBundleTest {
         requireSymbolicLinks();
         Files.writeString(sdk.resolve(".info/version"), sdkVersion + "-test-build\n");
         String metadata =
-                flavor.equals("rocm10.0")
+                "rocm10.0".equals(flavor)
                         ? METADATA
                         : "lib/hipblaslt/library/TensileLibrary_lazy_gfx1100.dat";
-        Files.createDirectories(sdk.resolve(metadata).getParent());
         Files.writeString(sdk.resolve(metadata), "mapping");
         files.remove(HIPBLASLT);
         files.put(soname, "patched hipblaslt binary");
@@ -159,8 +158,8 @@ public class NativeLibraryBundleTest {
         Files.writeString(torch.resolve("libamdhip64.so"), "Torch HIP runtime");
         Files.writeString(sdk.resolve("lib/libamdhip64.so"), "matching SDK HIP runtime");
 
-        NativeLibraryBundle bundle = bundle();
-        bundle.checkCompatibility(pytorchVersion, "0.40.1-rocm", flavor, "linux-x86_64");
+        NativeLibraryBundle bundle = createBundle();
+        bundle.validate(pytorchVersion, "0.40.1-rocm", flavor, "linux-x86_64");
         Path runtime = bundle.extract(cache, sdk, torch);
         Assert.assertEquals(
                 Files.readString(runtime.resolve("libhipblaslt.so")), "patched hipblaslt binary");
@@ -175,27 +174,27 @@ public class NativeLibraryBundleTest {
     }
 
     @Test
-    public void testCacheSeparatesLibTorchInstallations() throws IOException {
+    public void testLibTorchCacheIsolation() throws IOException {
         requireSymbolicLinks();
-        NativeLibraryBundle bundle = bundle();
+        NativeLibraryBundle bundle = createBundle();
         Path first = bundle.extract(cache, sdk, torch);
         Path otherTorch = Files.createDirectories(root.resolve("other-torch"));
         Assert.assertNotEquals(bundle.extract(cache, sdk, otherTorch), first);
     }
 
     @Test
-    public void testCacheSeparatesLibraryContentsAndSdkLocations() throws IOException {
+    public void testBundleCacheIsolation() throws IOException {
         requireSymbolicLinks();
-        Path first = bundle().extract(cache, sdk, torch);
+        Path first = createBundle().extract(cache, sdk, torch);
         files.put(HIPBLASLT, "next patched hipblaslt binary");
         properties.remove("sha256." + HIPBLASLT);
-        NativeLibraryBundle next = bundle();
+        NativeLibraryBundle next = createBundle();
         Path changed = next.extract(cache, sdk, torch);
         Assert.assertNotEquals(changed, first);
         Path otherSdk = root.resolve("other-sdk");
         Files.createDirectories(otherSdk.resolve(".info"));
         Files.copy(sdk.resolve(".info/version"), otherSdk.resolve(".info/version"));
-        Files.createDirectories(otherSdk.resolve(METADATA).getParent());
+        Files.createDirectories(otherSdk.resolve(METADATA_DIR));
         Files.copy(sdk.resolve(METADATA), otherSdk.resolve(METADATA));
         Assert.assertNotEquals(next.extract(cache, otherSdk, torch), changed);
         Assert.assertEquals(Files.readString(first.resolve(HIPBLASLT)), "patched hipblaslt binary");
@@ -204,33 +203,33 @@ public class NativeLibraryBundleTest {
     @Test
     public void testConcurrentExtraction() throws Exception {
         requireSymbolicLinks();
-        NativeLibraryBundle first = bundle();
-        NativeLibraryBundle second = bundle();
+        NativeLibraryBundle first = createBundle();
+        NativeLibraryBundle second = createBundle();
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try {
             Future<Path> left = executor.submit(() -> first.extract(cache, sdk, torch));
             Future<Path> right = executor.submit(() -> second.extract(cache, sdk, torch));
-            Assert.assertEquals(left.get(), right.get());
+            Assert.assertEquals(left.get(30, TimeUnit.SECONDS), right.get(30, TimeUnit.SECONDS));
         } finally {
             executor.shutdownNow();
         }
     }
 
     @Test
-    public void testRejectsCorruptPayloadBeforePublishingCache() throws IOException {
+    public void testChecksumMismatch() throws IOException {
         properties.put("sha256." + HIPBLASLT, hash("wrong binary"));
-        NativeLibraryBundle bundle = bundle();
+        NativeLibraryBundle bundle = createBundle();
         IOException failure =
                 Assert.expectThrows(IOException.class, () -> bundle.extract(cache, sdk, torch));
         Assert.assertTrue(failure.getMessage().contains("checksum mismatch"));
-        try (java.util.stream.Stream<Path> paths = Files.walk(cache)) {
+        try (Stream<Path> paths = Files.walk(cache)) {
             Assert.assertFalse(paths.anyMatch(path -> path.getFileName().toString().equals(JNI)));
         }
     }
 
     @Test
-    public void testRejectsIncompatibleKernelMetadata() throws IOException {
-        NativeLibraryBundle bundle = bundle();
+    public void testKernelMetadataMismatch() throws IOException {
+        NativeLibraryBundle bundle = createBundle();
         Files.writeString(sdk.resolve(METADATA), "different SDK mapping");
         IOException failure =
                 Assert.expectThrows(IOException.class, () -> bundle.extract(cache, sdk, torch));
@@ -239,8 +238,8 @@ public class NativeLibraryBundleTest {
     }
 
     @Test
-    public void testRejectsDifferentSdkVersionWithIdenticalKernels() throws IOException {
-        NativeLibraryBundle bundle = bundle();
+    public void testSdkVersionMismatch() throws IOException {
+        NativeLibraryBundle bundle = createBundle();
         Files.writeString(sdk.resolve(".info/version"), "10.1.0\n");
         IOException failure =
                 Assert.expectThrows(IOException.class, () -> bundle.extract(cache, sdk, torch));
@@ -251,7 +250,7 @@ public class NativeLibraryBundleTest {
     @Test
     public void testRejectsTraversal() throws IOException {
         files.put("../outside", "escape");
-        NativeLibraryBundle bundle = bundle();
+        NativeLibraryBundle bundle = createBundle();
         IOException failure =
                 Assert.expectThrows(IOException.class, () -> bundle.extract(cache, sdk, torch));
         Assert.assertTrue(failure.getMessage().contains("Invalid native bundle path"));
@@ -259,26 +258,23 @@ public class NativeLibraryBundleTest {
     }
 
     @Test
-    public void testPreloadUsesBundleBeforeBlasAndTorchDependencies() throws IOException {
-        Path libtorch = torch;
+    public void testRocmLoadOrder() throws IOException {
         Path bundle = Files.createDirectories(root.resolve("bundle"));
         Path hip = Files.createFile(sdk.resolve("lib/libamdhip64.so.7"));
-        Files.createFile(libtorch.resolve("libamdhip64.so.7"));
-        Path zlib = sdk.resolve("lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1");
-        Files.createDirectories(zlib.getParent());
-        Files.createFile(zlib);
+        Files.createFile(torch.resolve("libamdhip64.so.7"));
+        Path sysdeps = Files.createDirectories(sdk.resolve("lib/rocm_sysdeps/lib"));
+        Path zlib = Files.createFile(sysdeps.resolve("librocm_sysdeps_z.so.1"));
         Path origami = Files.createFile(sdk.resolve("lib/liborigami.so.1"));
         Path patched = Files.createFile(bundle.resolve(HIPBLASLT));
         Files.createFile(sdk.resolve("lib/" + HIPBLASLT));
-        Files.createFile(libtorch.resolve(HIPBLASLT));
+        Files.createFile(torch.resolve(HIPBLASLT));
         Path blas = Files.createFile(sdk.resolve("lib/libhipblas.so.3"));
         Path rocblas = Files.createFile(sdk.resolve("lib/librocblas.so.4"));
-        List<Path> order = LibUtils.rocmPreloadLibraries(libtorch, sdk.toFile(), bundle);
-        Assert.assertEquals(
-                order, java.util.Arrays.asList(hip, zlib, origami, patched, rocblas, blas));
+        List<Path> order = LibUtils.getRocmLoadOrder(torch, sdk.toFile(), bundle);
+        Assert.assertEquals(order, Arrays.asList(hip, zlib, origami, patched, rocblas, blas));
     }
 
-    private NativeLibraryBundle bundle() throws IOException {
+    private NativeLibraryBundle createBundle() throws IOException {
         properties.put("files", String.join(",", files.keySet()));
         for (Map.Entry<String, String> file : files.entrySet()) {
             properties.putIfAbsent("sha256." + file.getKey(), hash(file.getValue()));
@@ -321,11 +317,7 @@ public class NativeLibraryBundleTest {
             byte[] digest =
                     MessageDigest.getInstance("SHA-256")
                             .digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder text = new StringBuilder();
-            for (byte item : digest) {
-                text.append(String.format("%02x", item));
-            }
-            return text.toString();
+            return Hex.toHexString(digest);
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError(e);
         }
