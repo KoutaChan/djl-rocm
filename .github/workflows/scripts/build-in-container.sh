@@ -13,7 +13,16 @@
 # The caller mounts the repo at /ws and bind-mounts the libtorch extraction
 # directory from runner temp space so the ~10GB zip unpack does not crowd the
 # runner's tight root filesystem.
-set -euxo pipefail
+set -euo pipefail
+
+timed() {
+    local label=$1 start=$SECONDS
+    shift
+    printf '::group::%s\n' "$label"
+    "$@"
+    printf 'DJL_BUILD_PHASE %s seconds=%d\n' "$label" "$((SECONDS - start))"
+    printf '::endgroup::\n'
+}
 
 install_base_packages() {
     local packages=(git curl unzip cmake g++ make ca-certificates python3 python3-pip python3-venv)
@@ -52,8 +61,7 @@ install_rocm_packages() {
     if [[ "$FLAVOR" == rocm10.* ]]; then
         python3 -m venv /opt/djl-rocm-build
         source /opt/djl-rocm-build/bin/activate
-        python -m pip install --upgrade pip
-        python -m pip install \
+        python -m pip install --no-cache-dir \
             --index-url https://stable.repo.amd.com/rocm/whl-next/ \
             "torch[device-gfx1100]==${PT_VERSION}+rocm10.0.0" \
             "rocm[libraries,devel,device-gfx1100]==10.0.0"
@@ -70,32 +78,60 @@ install_rocm_packages() {
     export REQUIRE_DISTRIBUTED_NCCL=ON
 }
 
-restore_workspace_owner() {
-    if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
-        chown -R "${HOST_UID}:${HOST_GID}" /ws || true
+ensure_rocm_cmake() {
+    local version
+    version=$(cmake --version | awk 'NR == 1 { print $3 }')
+    # ROCm 6.4's host sources require 3.25.2, while Ubuntu 22.04 supplies 3.22.
+    if dpkg --compare-versions "$version" lt 3.25.2; then
+        python3 -m venv /opt/djl-cmake
+        /opt/djl-cmake/bin/python -m pip install --no-cache-dir cmake==3.30.8
+        export PATH="/opt/djl-cmake/bin:${PATH}"
     fi
 }
-trap restore_workspace_owner EXIT
 
-install_base_packages
+finish_build() {
+    if command -v ccache >/dev/null 2>&1; then
+        ccache --show-stats || true
+    fi
+    if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+        # Only these small caches leave the container. Do not walk /ws and its
+        # multi-GiB libtorch/SDK trees merely to change file ownership.
+        for directory in /djl-cache/ccache /djl-cache/gradle /djl-cache/hipblaslt/artifacts; do
+            [[ ! -d "$directory" ]] || chown -R "${HOST_UID}:${HOST_GID}" "$directory" || true
+        done
+    fi
+}
+trap finish_build EXIT
+
+timed packages install_base_packages
+timed ccache-install bash .github/workflows/scripts/install-ccache.sh
+export CCACHE_DIR=/djl-cache/ccache
+export CCACHE_BASEDIR=/ws
+export CCACHE_COMPILERCHECK=content
+export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-512Mi}
+export GRADLE_USER_HOME=/djl-cache/gradle
+export HIPBLASLT_CACHE_DIR=/djl-cache/hipblaslt
+ccache --zero-stats
 case "$FLAVOR" in
     cu*)
-        install_cuda_packages
+        timed cuda-sdk install_cuda_packages
         ;;
     rocm*)
-        install_rocm_packages
+        timed rocm-sdk install_rocm_packages
+        timed rocm-cmake ensure_rocm_cmake
         ;;
 esac
 
 cd engines/pytorch/pytorch-native
-./build.sh "$PT_VERSION" "$FLAVOR" cxx11 amd64
+timed native-build ./build.sh "$PT_VERSION" "$FLAVOR" cxx11 amd64
 test -f build/libdjl_torch.so
 
 cd /ws
-./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
+timed publish ./gradlew :engines:pytorch:pytorch-jni-rocm:publish \
     -Ppt_version="$PT_VERSION" \
     -Pflavor="$FLAVOR" \
     -Pclassifier="$CLASSIFIER" \
     -Pgithub \
     -PgithubRepo="$GITHUB_REPOSITORY" \
+    --build-cache \
     -x test

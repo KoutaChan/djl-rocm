@@ -8,13 +8,17 @@
  */
 package ai.djl.pytorch.jni;
 
+import ai.djl.util.Utils;
+
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.Test;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.stream.Stream;
 
 public class LibUtilsTest {
@@ -52,6 +56,28 @@ public class LibUtilsTest {
                                     }
                                 });
             }
+        }
+    }
+
+    @Test
+    public void testExactSdkSelectionWithinFlavor() throws IOException {
+        Path root = Files.createTempDirectory("rocm-sdk-selection");
+        try {
+            File newer = root.resolve("rocm-7.2.2").toFile();
+            File matching = root.resolve("rocm-7.2.0").toFile();
+            Files.createDirectories(newer.toPath().resolve(".info"));
+            Files.createDirectories(matching.toPath().resolve(".info"));
+            Files.writeString(newer.toPath().resolve(".info/version"), "7.2.2-build\n");
+            Files.writeString(matching.toPath().resolve(".info/version"), "7.2.0-build\n");
+            List<File> candidates = List.of(newer, matching);
+            Assert.assertEquals(LibUtils.readRocmSdkVersion(newer), "7.2.2");
+            Assert.assertEquals(LibUtils.readRocmVersion(newer), "7.2");
+            Assert.assertEquals(LibUtils.selectRocmRoot(candidates, "rocm7.2", "7.2.0"), matching);
+            Assert.assertEquals(LibUtils.selectRocmRoot(candidates, "rocm7.2", "7.2.2"), newer);
+            Assert.assertNull(LibUtils.selectRocmRoot(candidates, "rocm7.2", "7.2.1"));
+            Assert.assertNull(LibUtils.selectRocmRoot(candidates, "rocm7.1", "7.2.0"));
+        } finally {
+            Utils.deleteQuietly(root);
         }
     }
 }

@@ -1,0 +1,114 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -227,20 +227,11 @@
+       set( Tensile_ROOT "${CMAKE_BINARY_DIR}/virtualenv/Lib/site-packages/Tensile" )
+     endif()
+ 
+-    include(virtualenv)
+-    if (Tensile_TEST_LOCAL_PATH)
+-      virtualenv_install(${Tensile_TEST_LOCAL_PATH})
+-      message (STATUS "using local Tensile from ${Tensile_TEST_LOCAL_PATH}, copied to ${Tensile_ROOT}")
+-    else()
+-      virtualenv_install(${CMAKE_SOURCE_DIR}/tensilelite)
+-    endif()
+-    message(STATUS "Adding ${VIRTUALENV_HOME_DIR} to CMAKE_PREFIX_PATH")
+-    list(APPEND CMAKE_PREFIX_PATH ${VIRTUALENV_HOME_DIR})
+-    if (TENSILE_VERSION)
+-      find_package(Tensile ${TENSILE_VERSION} EXACT REQUIRED HIP LLVM OpenMP PATHS "${INSTALLED_TENSILE_PATH}")
+-    else()
+-      find_package(Tensile 4.33.0 EXACT REQUIRED HIP LLVM OpenMP PATHS "${INSTALLED_TENSILE_PATH}")
+-    endif()
++    # The private DJL host runtime reuses the installed SDK device libraries.
++    # Build TensileHost directly; no Python environment or kernel generator.
++    set(Tensile_ROOT "${CMAKE_SOURCE_DIR}/tensilelite/Tensile")
++    set(TENSILE_BUILD_CLIENT OFF CACHE BOOL "Build client" FORCE)
++    add_subdirectory("${Tensile_ROOT}/Source" "Tensile")
+     endif()
+ 
+     # setup hipblaslt defines used for both the library and clients
+--- a/library/src/amd_detail/rocblaslt/src/CMakeLists.txt
++++ b/library/src/amd_detail/rocblaslt/src/CMakeLists.txt
+@@ -70,44 +70,13 @@
+     set(Tensile_Options ${Tensile_Options} EXPERIMENTAL)
+   endif()
+ 
+-  # Add a build target for Tensile kernel library
+-  # Runtime language is HIP by default
+-  # warning our Tensile_ variables may shadow variable in TensileCreateLibraryFiles
+-  # thus bypassing the function argument parameter system (mainly the options list) and CPU_THREADS
+-  if(Tensile_CPU_THREADS MATCHES "^[0-9]+$")
+-    # only including threads argument if number
+-    TensileCreateLibraryFiles(
+-      "${CMAKE_CURRENT_SOURCE_DIR}/src/amd_detail/rocblaslt/src/Tensile/Logic/${Tensile_LOGIC}"
+-      "${PROJECT_BINARY_DIR}/Tensile"
+-      ARCHITECTURE        ${Tensile_ARCHITECTURE}
+-      CODE_OBJECT_VERSION ${Tensile_CODE_OBJECT_VERSION}
+-      COMPILER            ${Tensile_COMPILER}
+-      LIBRARY_FORMAT      ${Tensile_LIBRARY_FORMAT}
+-      CPU_THREADS         ${Tensile_CPU_THREADS}
+-      ${Tensile_Options}
+-    )
+-  else()
+-    TensileCreateLibraryFiles(
+-      "${CMAKE_CURRENT_SOURCE_DIR}/src/amd_detail/rocblaslt/src/Tensile/Logic/${Tensile_LOGIC}"
+-      "${PROJECT_BINARY_DIR}/Tensile"
+-      ARCHITECTURE        ${Tensile_ARCHITECTURE}
+-      CODE_OBJECT_VERSION ${Tensile_CODE_OBJECT_VERSION}
+-      COMPILER            ${Tensile_COMPILER}
+-      LIBRARY_FORMAT      ${Tensile_LIBRARY_FORMAT}
+-      ${Tensile_Options}
+-    )
+-  endif()
+-
+-  TensileCreateExtOpLibraries("${PROJECT_BINARY_DIR}/Tensile/library" "${Tensile_ARCHITECTURE}")
++  # Device and extension kernels are loaded from the matching installed SDK.
+ 
+   # Create a unique name for TensileHost compiled for rocBLAS
+   set_target_properties( TensileHost PROPERTIES OUTPUT_NAME rocblaslt-tensile CXX_EXTENSIONS NO )
+ 
+   set_target_properties( TensileHost PROPERTIES CXX_VISIBILITY_PRESET hidden)
+   set_target_properties( TensileHost PROPERTIES C_VISIBILITY_PRESET hidden)
+-
+-  # Tensile host depends on libs build target
+-  add_dependencies( TensileHost TENSILE_LIBRARY_TARGET )
+ 
+   if( ROCBLASLT_SHARED_LIBS )
+     set( BUILD_SHARED_LIBS ON )
+@@ -124,9 +93,6 @@
+ 
+ endif( ) # BUILD_WITH_TENSILE
+ 
+-include(${CMAKE_CURRENT_SOURCE_DIR}/src/amd_detail/rocblaslt/src/kernels/CompileSourceKernel.cmake)
+-
+-CompileSourceKernel(${CMAKE_CURRENT_SOURCE_DIR}/src/amd_detail/rocblaslt/src/kernels/matrix_transform.cpp "${Tensile_ARCHITECTURE}" "${Tensile_BUILD_ID}" ${PROJECT_BINARY_DIR}/Tensile/library)
+ 
+ set(DL_LIB dl)
+ 
+--- a/tensilelite/Tensile/Source/lib/CMakeLists.txt
++++ b/tensilelite/Tensile/Source/lib/CMakeLists.txt
+@@ -96,22 +96,9 @@
+ endif()
+ 
+ if(TENSILE_USE_MSGPACK)
+-    find_package(msgpack REQUIRED)
+-    target_compile_definitions(TensileHost PUBLIC -DTENSILE_MSGPACK=1)
+-
+-    if(TARGET msgpackc-cxx)
+-        get_target_property(msgpack_inc msgpackc-cxx INTERFACE_INCLUDE_DIRECTORIES)
+-    elseif(TARGET msgpackc)
+-        get_target_property(msgpack_inc msgpackc INTERFACE_INCLUDE_DIRECTORIES)
+-    endif()
+-
+-    if(DEFINED msgpack_inc)
+-        # include C++ headers manually
+-        # External header includes included as system files
+-        target_include_directories(TensileHost
+-            SYSTEM PRIVATE $<BUILD_INTERFACE:${msgpack_inc}>
+-        )
+-    endif()
++    find_package(msgpack-cxx CONFIG REQUIRED)
++    target_compile_definitions(TensileHost PUBLIC TENSILE_MSGPACK=1)
++    target_link_libraries(TensileHost PUBLIC msgpack-cxx)
+ endif()
+ 
+ if(TENSILE_USE_LLVM)

@@ -1,84 +1,142 @@
 # Bounded hipBLASLt solution cache
 
-This patch targets **hipBLASLt 1.4.1**, ROCm/rocm-libraries revision
-[`8d1ae90eff7d022f26019ec55b2ec6a7674b3112`](https://github.com/ROCm/rocm-libraries/tree/8d1ae90eff7d022f26019ec55b2ec6a7674b3112/projects/hipblaslt).
-It rebuilds the host library and reuses the matching SDK's existing Tensile
-kernel files. PyTorch, model parameters, and device kernels are unchanged.
+Each Linux x86_64 native JAR builds the patched host library for its matching
+SDK and reuses that SDK's existing Tensile kernels. `profiles.json` is the
+shared source of build and packaging compatibility information:
 
-## Why both cache layers need bounds
+| JAR flavor | SDK versions | hipBLASLt | Exact vendor revision | ELF SONAME |
+| --- | --- | --- | --- | --- |
+| `rocm6.4` | 6.4.0 | 0.12.0 | `5051e24def137fb02672e20bb8248305ae0cf784` | `libhipblaslt.so.0` |
+| `rocm7.0` | 7.0.0 | 1.0.0 | `976b9c4a87a60a862ffb0e88e1fc0016e93c9961` | `libhipblaslt.so.1` |
+| `rocm7.1` | 7.1.0 | 1.1.0 | `de5c1aebb641af098d9310a9fcca5591a7c066c8` | `libhipblaslt.so.1` |
+| `rocm7.2` | 7.2.0 | 1.2.1 | `5b515cf1bca9959fb434c2414cf79b42fe25e93b` | `libhipblaslt.so.1` |
+| `rocm7.2` | 7.2.1, 7.2.2 | 1.2.2 | `dabb6df2b988f8eabed1e2fecefaaf4e818bc7ef` | `libhipblaslt.so.1` |
+| `rocm10.0` | 10.0.0 | 1.4.1 | `8d1ae90eff7d022f26019ec55b2ec6a7674b3112` | `libhipblaslt.so.1` |
 
-DJL's ROCm matmul path now separates compact, exact-geometry algorithm results
-from reusable matrix descriptor families. That removes heavyweight hipBLASLt
-descriptors for every observed row count and batch shape.
+ROCm 6.4 uses [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt); the other
+profiles use [ROCm/rocm-libraries](https://github.com/ROCm/rocm-libraries).
+The producer verifies the installed version header, including its source
+revision suffix, and actual ELF SONAME before compiling. In particular, the
+standalone repository's `rocm-7.0.0` tag is not the source shipped by SDK 7.0.0.
+An unlisted SDK patch release fails with its version instead of receiving
+another release's binary; add and verify its profile before publishing it.
 
-The matching vendor library also retains each complete `ContractionProblemGemm`
-in its process-wide `CachingLibrary`. `findTopSolutions` inserts the problem
-into both the solution-vector cache and the all-solutions flag cache. Those
-copies survive descriptor destruction. The loader installs the caching wrapper
-unconditionally, and this revision exposes no cache-capacity or bypass setting.
+## Cache behavior
 
-Relevant upstream sources:
+DJL separates compact exact-geometry algorithm results from reusable matrix
+descriptor families. The vendor's process-wide `CachingLibrary` also owns
+complete `ContractionProblemGemm` keys, so bounding DJL descriptors alone
+cannot bound host memory retention.
 
-- [CacheMap and findTopSolutions](https://github.com/ROCm/rocm-libraries/blob/8d1ae90eff7d022f26019ec55b2ec6a7674b3112/projects/hipblaslt/tensilelite/include/Tensile/CachingLibrary.hpp)
-- [Library loader](https://github.com/ROCm/rocm-libraries/blob/8d1ae90eff7d022f26019ec55b2ec6a7674b3112/projects/hipblaslt/tensilelite/include/Tensile/Serialization/SolutionLibrary.hpp)
+All profile patches limit each `CacheMap` to **4096 outer problem keys** with
+LRU eviction. Hardware-specific values remain grouped under their problem
+key. The owning hash map stores each problem once; the recency list holds
+stable pointers to those keys. The existing mutex protects lookup, insertion
+and eviction; returned values remain valid after eviction.
 
-The patch limits each vendor `CacheMap` to **4096 outer problem keys** with LRU
-eviction. Hardware-specific values remain grouped under their problem key.
-The owning hash map stores the problem once; the recency list holds pointers
-to those stable keys. The existing mutex protects map and recency changes,
-and returned values are copied while locked so eviction cannot invalidate them.
-Solutions and their completion flag share one cache entry, so concurrent access
-or eviction cannot separate them. Completion is derived from the current
-result count rather than another caller's shared last-result flag.
+ROCm 10's solutions and completion flag share one entry so concurrent access
+or eviction cannot separate them. Completion comes from the current result
+count. ROCm 6.4 and 7.x have no separate completion-flag cache; their patch
+changes only `CacheMap` retention and preserves their lookup contract.
+Repeated insertion in those versions keeps the first cached value, as in
+the original SDK, while refreshing its recency.
 
-Eviction changes only whether an exact heuristic result is cached. It does not
-change the heuristic, ranking, supported algorithms, arithmetic, or GPU work.
-DJL retains a much larger bounded cache of compact algorithm results, so its
-repeated shapes do not need to repeat vendor selection after vendor eviction.
+Eviction changes whether an exact heuristic result is cached. It does not
+change ranking, supported algorithms, arithmetic, model parameters or device
+kernels. DJL's larger bounded cache of compact algorithm results avoids
+repeating vendor selection for its common shapes.
 
-## Build
+## Build and distribution
 
-Use a separate checkout of the pinned vendor revision:
+All listed Linux x86_64 ROCm flavors automatically prepare the vendor bundle
+from the native build and again as a dependency of JAR packaging:
 
 ```bash
-git clone --filter=blob:none --no-checkout https://github.com/ROCm/rocm-libraries.git rocm-libraries
-git -C rocm-libraries sparse-checkout init --cone
-git -C rocm-libraries sparse-checkout set projects/hipblaslt shared/origami
-git -C rocm-libraries checkout 8d1ae90eff7d022f26019ec55b2ec6a7674b3112
-
-ROCM_PATH=/path/to/matching/sdk bash build.sh \
-    /absolute/path/to/rocm-libraries /absolute/path/to/hipblaslt-host-build
+export ROCM_PATH=/path/to/matching/sdk
+engines/pytorch/pytorch-native/build.sh 2.11.0 rocm7.2 cxx11 amd64
+./gradlew :engines:pytorch:pytorch-jni-rocm:jar \
+    -Ppt_version=2.11.0 -Pflavor=rocm7.2 -Pclassifier=linux-x86_64
 ```
 
-`build.sh` verifies the revision, applies the patch once, and builds only the
-host library. It does not install or replace the SDK. `GPU_TARGET` defaults to
-`gfx1100`; `BUILD_JOBS` defaults to `8`. Additional arguments are forwarded to
-CMake. The default host build disables RocRoller and profiling markers; the
-validated gfx1100 path uses the SDK's Tensile kernels. Builds needing other
-backends can override the corresponding CMake options and provide their
-dependencies.
+For only the host runtime:
 
-The script fetches the header-only MessagePack C++ 6.1.0 dependency at revision
-`8c602e8579c7e7d65d6f9c6703c9699db3fb0488` into the build directory's `deps`
-subdirectory and installs its headers and CMake package there. Boost, tests,
-examples, and documentation are disabled. No system packages or SDK files are
-changed. Set `HIPBLASLT_DEPS_DIR` to reuse a separate private dependency directory.
-The build also exposes the SDK headers to Origami's standalone C++ header
-checks, which intentionally omit normal target compiler flags.
+```bash
+ROCM_PATH=/path/to/matching/sdk \
+    engines/pytorch/pytorch-native/rocm/hipblaslt/prepare-bundle.sh \
+    /absolute/output/directory --flavor rocm7.2
+```
 
-Run validation against the private library before selecting it for an
-application. Point `HIPBLASLT_TENSILE_LIBPATH` at the matching SDK's existing
-`lib/hipblaslt/library/gfx1100` directory. Keep that SDK's other runtime
-libraries available through the existing launch environment.
-Place the rebuilt library and its SONAME symlink in `PYTORCH_LIBRARY_PATH`.
-The ROCm 10 loader prefers libraries in that directory and preloads hipBLASLt
-before hipBLAS/rocBLAS, preventing their SDK RPATH from selecting another copy.
-Verify the running process maps only the intended hipBLASLt file before
-accepting memory or throughput results.
+The producer stages the library under its actual SONAME, provenance, and
+required license notices. The SDK is never overwritten. The JAR loader
+extracts the private runtime and resolves the matching SDK kernel files;
+users do not apply patches, rebuild libraries, or configure Tensile paths.
+The corresponding SDK is still required. The multi-gigabyte GPU kernel set
+is not duplicated in the JAR.
+
+ROCm 6.4 and 7.0 use separate host-only CMake patches. They bypass Python and
+Tensile/device generation while compiling the original host sources,
+including extension and matrix-transform APIs. ROCm 7.1 onward has native
+host-only switches. When the installed hipBLASLt depends on RocRoller or
+profiling markers, the build preserves these dependencies and links the
+SDK's existing runtime. The RocRoller development interface requires fmt
+11.1.3 and yaml-cpp 0.8.0; pinned private copies satisfy this interface when
+needed. yaml-cpp remains static, and dependency notices are included.
+
+The producer supports flat ROCm 6/7 kernel layouts and architecture-specific
+ROCm 10 directories. It records hashes for metadata, compressed tables, and
+global mapping tables. By default it retains every architecture present in
+the SDK metadata. `GPU_TARGET` explicitly selects a semicolon-separated
+subset; the JNI's architecture list is not narrowed. `BUILD_JOBS` defaults
+to 8. CMake 3.25.2 or newer and the matching development SDK are required.
+
+`HIPBLASLT_CACHE_DIR` selects the private source/build/artifact cache, default
+`pytorch-native/build/hipblaslt-cache`. A hit requires matching profile,
+patches, scripts, compiler, SDK library, metadata, build flags, and output
+hashes. A process lock serializes preparation; the completion manifest is
+published after the referenced files. SDK discovery also supports
+`ROCM_HOME`, `rocm-sdk path --root`, and `/opt/rocm`.
+
+Source fetching configures Git's promisor remote before sparse checkout,
+selects only host sources and required build files, and excludes generated
+kernel logic. It does not fetch or cache the entire rocm-libraries monorepo.
+MessagePack C++ 6.1.0 uses pinned revision
+`8c602e8579c7e7d65d6f9c6703c9699db3fb0488`; fmt 11.1.3 uses
+`9cf9f38eded63e5e0fb95cd536ba51be601d7fa2`; yaml-cpp 0.8.0 uses
+`f7320141120f720aecc4c32be25586e7da9eb978`. All are built privately.
+
+CPU producer checks cover exact SDK/source selection, cross-flavor rejection,
+and both kernel metadata layouts:
+
+```bash
+python3 -m unittest discover -s engines/pytorch/pytorch-native/rocm/hipblaslt
+```
+
+## GitHub Actions build time
+
+The latest successful pre-change run was
+[33941245727](https://github.com/KoutaChan/djl-rocm/actions/runs/33941245727),
+which took 52m47s overall. ROCm 7.2's native compilation alone took 37m12s on
+two CPUs. ROCm 10 spent 9m56s compiling, about 2m35s installing/initializing
+the SDK, 2m56s in Gradle, and 3m11s in disk cleanup.
+
+The Linux matrix now uses pinned ccache 4.13.3 with compiler-content checks,
+1 GiB per ROCm flavor (512 MiB per CPU/CUDA flavor), and a shared container
+Gradle cache. The small patched hipBLASLt host artifact has its own cache;
+multi-GiB SDK wheels and device kernels are not duplicated in Actions caches.
+Pip's redundant download cache is disabled, CPU jobs skip accelerator disk
+cleanup, and the container no longer recursively changes ownership throughout
+the workspace and libtorch tree. CMake retains compatible local objects instead
+of deleting its build tree every invocation; target/SDK changes invalidate it.
+
+`DJL_BUILD_PHASE` timings and ccache statistics are emitted on each run. These
+changes primarily improve repeated builds. A new SDK/toolchain or changed kernel
+still requires compilation; no GPU target, optimization level or distributed
+training feature was removed to reduce build time. A post-change Actions run
+is required before assigning a measured overall speedup.
 
 ## Regression coverage
 
-The patch adds `CacheMap_test.cpp` to the vendor test target. It checks the
+The ROCm 10 patch adds `CacheMap_test.cpp` to the vendor test target. It checks the
 4096-entry bound, recency updates on hits and writes, shared capacity across
 hardware keys, returned-value lifetime after eviction, concurrent access,
 and consistent solution/completion snapshots through eviction and updates.

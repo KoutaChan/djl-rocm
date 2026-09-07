@@ -82,10 +82,52 @@ public final class LibUtils {
             return;
         }
         libTorch = getLibTorch();
-        loadLibTorch(libTorch);
+        Path bundle = findNativeBundle(libTorch);
+        if (bundle != null) {
+            RocmLibraryLoader.initialize(bundle);
+        }
+        loadLibTorch(libTorch, bundle);
 
-        Path path = findJniLibrary(libTorch).toAbsolutePath();
+        Path path =
+                bundle == null
+                        ? findJniLibrary(libTorch).toAbsolutePath()
+                        : bundle.resolve(JNI_LIB_NAME);
         loadNativeLibrary(path.toString());
+    }
+
+    private static Path findNativeBundle(LibTorch library) {
+        if (!library.flavor.startsWith("rocm") || !"linux-x86_64".equals(library.classifier)) {
+            return null;
+        }
+        try {
+            URL source =
+                    ClassLoaderUtils.getResource(
+                            "jnilib/"
+                                    + library.classifier
+                                    + '/'
+                                    + library.flavor
+                                    + "/native-bundle.properties");
+            if (source == null) {
+                return null;
+            }
+            Matcher version = VERSION_PATTERN.matcher(library.version);
+            if (!version.matches()) {
+                throw new EngineException("Unexpected version: " + library.version);
+            }
+            NativeLibraryBundle bundle = new NativeLibraryBundle(source);
+            bundle.checkCompatibility(
+                    version.group(1), library.apiVersion, library.flavor, library.classifier);
+            File root = findRocmRoot(library.flavor, bundle.rocmVersion());
+            if (root == null) {
+                throw new EngineException(
+                        "Bundled hipBLASLt needs ROCm SDK "
+                                + bundle.rocmVersion()
+                                + "; set ROCM_PATH.");
+            }
+            return bundle.extract(Utils.getEngineCacheDir("pytorch"), root.toPath(), library.dir);
+        } catch (IOException e) {
+            throw new EngineException("Cannot prepare bundled ROCm native libraries", e);
+        }
     }
 
     private static LibTorch getLibTorch() {
@@ -108,8 +150,9 @@ public final class LibUtils {
         return libTorch.dir.toString();
     }
 
-    private static void loadLibTorch(LibTorch libTorch) {
-        Path libDir = libTorch.dir.toAbsolutePath();
+    private static void loadLibTorch(LibTorch libTorch, Path bundle) {
+        Path sourceDir = libTorch.dir.toAbsolutePath();
+        Path libDir = bundle == null ? sourceDir : bundle;
         if (Files.exists(libDir.resolve("libstdc++.so.6"))) {
             String libstd = Utils.getEnvOrSystemProperty("LIBSTDCXX_LIBRARY_PATH");
             if (libstd != null) {
@@ -127,8 +170,18 @@ public final class LibUtils {
         boolean isCuda = libTorch.flavor.startsWith("cu");
         boolean isRocm = libTorch.flavor.startsWith("rocm");
         boolean isWindowsRocm = isRocm && libTorch.classifier.startsWith("win");
-        if (libTorch.flavor.startsWith("rocm10.") && !isWindowsRocm) {
-            preloadRocmLibraries(libTorch.flavor, libDir);
+        if (isRocm && !isWindowsRocm) {
+            // This Android backend depends on libtorch_python. The Java engine does not
+            // initialize Python, so loading it would fail on unresolved Python symbols.
+            exclusion.add("libnnapi_backend.so");
+        }
+        Set<String> preloaded = new HashSet<>();
+        if ((bundle != null || libTorch.flavor.startsWith("rocm10.")) && !isWindowsRocm) {
+            File sdkRoot = bundle == null ? findRocmRoot(libTorch.flavor) : null;
+            for (Path path : rocmPreloadLibraries(sourceDir, sdkRoot, bundle)) {
+                loadTorchLibrary(bundle, path.toString());
+                preloaded.add(sharedLibraryName(path.getFileName().toString()));
+            }
         }
         List<String> deferred =
                 Arrays.asList(
@@ -150,13 +203,15 @@ public final class LibUtils {
                 loadLater.add(path.toFile().getName());
             }
         }
-        try (Stream<Path> paths = Files.walk(libDir)) {
+        try (Stream<Path> paths = Files.walk(sourceDir)) {
             Map<Path, Integer> rank = new ConcurrentHashMap<>();
-            paths.filter(
+            paths.map(path -> libDir.resolve(sourceDir.relativize(path)))
+                    .filter(
                             path -> {
                                 String name = path.getFileName().toString();
                                 if (!LIB_PATTERN.matcher(name).matches()
-                                        || exclusion.contains(name)) {
+                                        || exclusion.contains(name)
+                                        || preloaded.contains(sharedLibraryName(name))) {
                                     return false;
                                 } else if (!isCuda
                                         && name.contains("nvrtc")
@@ -184,7 +239,7 @@ public final class LibUtils {
                             })
                     .sorted(Comparator.comparingInt(rank::get))
                     .map(Path::toString)
-                    .forEach(LibUtils::loadNativeLibrary);
+                    .forEach(path -> loadTorchLibrary(bundle, path));
 
             if (Files.exists((libDir.resolve("cudnn64_8.dll")))) {
                 loadNativeLibrary(libDir.resolve("cudnn64_8.dll").toString());
@@ -228,11 +283,20 @@ public final class LibUtils {
             for (String dep : deferred) {
                 Path path = libDir.resolve(dep);
                 if (Files.exists(path)) {
-                    loadNativeLibrary(path.toString());
+                    loadTorchLibrary(bundle, path.toString());
                 }
             }
         } catch (IOException e) {
             throw new EngineException("Folder not exist! " + libDir, e);
+        }
+    }
+
+    private static void loadTorchLibrary(Path bundle, String path) {
+        if (bundle == null) {
+            loadNativeLibrary(path);
+        } else {
+            logger.debug("Loading ROCm native library: {}", path);
+            RocmLibraryLoader.load(path);
         }
     }
 
@@ -265,44 +329,70 @@ public final class LibUtils {
         return libraries;
     }
 
-    private static void preloadRocmLibraries(String flavor, Path libDir) {
-        File root = findRocmRoot(flavor);
-        List<Path> directories = new ArrayList<>(4);
-        directories.add(libDir);
+    static List<Path> rocmPreloadLibraries(Path libDir, File root, Path bundle) {
+        List<Path> directories = new ArrayList<>(6);
+        if (bundle != null) {
+            directories.add(bundle);
+        } else {
+            directories.add(libDir);
+        }
         if (root != null) {
             directories.add(root.toPath().resolve("lib"));
+            directories.add(root.toPath().resolve("lib64"));
             directories.add(root.toPath().resolve("lib/host-math/lib"));
             directories.add(root.toPath().resolve("lib/rocm_sysdeps/lib"));
+        }
+        if (bundle != null) {
+            // A bundled host library uses the matching SDK's dependencies. Legacy LibTorch
+            // archives also contain ROCm libraries; use those only when absent from the SDK.
+            directories.add(libDir);
         }
         List<String> libraries =
                 Arrays.asList(
                         "amd_comgr",
+                        "hsa-runtime64",
                         "amdhip64",
                         "rocprofiler-sdk",
                         "rocprofiler-sdk-roctx",
                         "roctracer64",
                         "roctx64",
+                        "hiprtc-builtins",
                         "hiprtc",
+                        "rocm_sysdeps_z",
+                        "origami",
+                        "rocroller",
                         // rocBLAS reaches hipBLASLt through its SDK RPATH. Load the
                         // selected runtime's override before loading hipBLAS/rocBLAS.
                         "hipblaslt",
+                        "rocblas",
                         "hipblas",
+                        "rocfft",
                         "hipfft",
+                        "rocrand",
                         "hiprand",
+                        "rocsparse",
                         "hipsparse",
                         "hipsparselt",
+                        "rocsolver",
                         "hipsolver",
                         "rccl",
                         "MIOpen",
                         "hipdnn",
                         "rocm-openblas",
                         "rocm_smi64");
+        List<Path> paths = new ArrayList<>(libraries.size());
         for (String library : libraries) {
             Path path = findVersionedLibrary(directories, library);
             if (path != null) {
-                loadNativeLibrary(path.toString());
+                paths.add(path);
             }
         }
+        return paths;
+    }
+
+    static String sharedLibraryName(String name) {
+        int extension = name.indexOf(".so");
+        return extension < 0 ? name : name.substring(0, extension + 3);
     }
 
     private static Path findVersionedLibrary(List<Path> directories, String shortName) {
@@ -700,6 +790,83 @@ public final class LibUtils {
         }
     }
 
+    private static File findRocmRoot(String flavor) {
+        return findRocmRoot(flavor, null);
+    }
+
+    private static File findRocmRoot(String flavor, String sdkVersion) {
+        String configured = Utils.getEnvOrSystemProperty("ROCM_PATH");
+        if (configured == null || configured.isEmpty()) {
+            configured = Utils.getEnvOrSystemProperty("ROCM_HOME");
+        }
+        if (configured != null && !configured.isEmpty()) {
+            File root = new File(configured);
+            if (readRocmVersion(root) != null) {
+                return root;
+            }
+        }
+
+        File opt = new File("/opt");
+        File rocm = new File(opt, "rocm");
+        List<File> candidates = new ArrayList<>();
+        candidates.add(rocm);
+        File[] cores =
+                rocm.listFiles(file -> file.isDirectory() && file.getName().startsWith("core-"));
+        if (cores != null) {
+            candidates.addAll(Arrays.asList(cores));
+        }
+        File[] siblings =
+                opt.listFiles(file -> file.isDirectory() && file.getName().startsWith("rocm-"));
+        if (siblings != null) {
+            candidates.addAll(Arrays.asList(siblings));
+        }
+        return selectRocmRoot(candidates, flavor, sdkVersion);
+    }
+
+    static File selectRocmRoot(List<File> candidates, String flavor, String sdkVersion) {
+        String requested = flavor == null ? null : flavor.substring("rocm".length());
+        return candidates.stream()
+                .filter(file -> readRocmVersion(file) != null)
+                .filter(file -> requested == null || requested.equals(readRocmVersion(file)))
+                .filter(file -> sdkVersion == null || sdkVersion.equals(readRocmSdkVersion(file)))
+                .max(Comparator.comparing(file -> new Version(readRocmVersion(file))))
+                .orElse(null);
+    }
+
+    static String readRocmVersion(File root) {
+        String text = readRocmVersionFile(root);
+        if (text != null) {
+            Matcher matcher = Pattern.compile("(\\d+\\.\\d+)(?:\\.\\d+)?").matcher(text);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+        }
+        Matcher matcher = Pattern.compile("(?:rocm-|core-)(\\d+\\.\\d+)").matcher(root.getName());
+        return matcher.matches() ? matcher.group(1) : null;
+    }
+
+    static String readRocmSdkVersion(File root) {
+        String text = readRocmVersionFile(root);
+        if (text == null) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("^(\\d+\\.\\d+\\.\\d+)").matcher(text);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private static String readRocmVersionFile(File root) {
+        File versionFile = new File(root, ".info/version");
+        if (versionFile.isFile()) {
+            try {
+                return new String(Files.readAllBytes(versionFile.toPath()), StandardCharsets.UTF_8)
+                        .trim();
+            } catch (IOException ignored) {
+                // Flavor detection can still fall back to the directory name.
+            }
+        }
+        return null;
+    }
+
     private static final class LibTorch {
 
         Path dir;
@@ -739,58 +906,5 @@ public final class LibUtils {
             this.classifier = platform.getClassifier();
             this.flavor = flavor;
         }
-    }
-
-    private static File findRocmRoot(String flavor) {
-        String configured = Utils.getEnvOrSystemProperty("ROCM_PATH");
-        if (configured == null || configured.isEmpty()) {
-            configured = Utils.getEnvOrSystemProperty("ROCM_HOME");
-        }
-        if (configured != null && !configured.isEmpty()) {
-            File root = new File(configured);
-            if (readRocmVersion(root) != null) {
-                return root;
-            }
-        }
-
-        String requested = flavor == null ? null : flavor.substring("rocm".length());
-        File opt = new File("/opt");
-        File rocm = new File(opt, "rocm");
-        List<File> candidates = new ArrayList<>();
-        candidates.add(rocm);
-        File[] cores =
-                rocm.listFiles(file -> file.isDirectory() && file.getName().startsWith("core-"));
-        if (cores != null) {
-            candidates.addAll(Arrays.asList(cores));
-        }
-        File[] siblings =
-                opt.listFiles(file -> file.isDirectory() && file.getName().startsWith("rocm-"));
-        if (siblings != null) {
-            candidates.addAll(Arrays.asList(siblings));
-        }
-        return candidates.stream()
-                .filter(file -> readRocmVersion(file) != null)
-                .filter(file -> requested == null || readRocmVersion(file).startsWith(requested))
-                .max(Comparator.comparing(file -> new Version(readRocmVersion(file))))
-                .orElse(null);
-    }
-
-    static String readRocmVersion(File root) {
-        File versionFile = new File(root, ".info/version");
-        if (versionFile.isFile()) {
-            try {
-                String text =
-                        new String(Files.readAllBytes(versionFile.toPath()), StandardCharsets.UTF_8)
-                                .trim();
-                Matcher matcher = Pattern.compile("(\\d+\\.\\d+)(?:\\.\\d+)?").matcher(text);
-                if (matcher.find()) {
-                    return matcher.group(1);
-                }
-            } catch (IOException ignored) {
-                // Try the directory name below.
-            }
-        }
-        Matcher matcher = Pattern.compile("(?:rocm-|core-)(\\d+\\.\\d+)").matcher(root.getName());
-        return matcher.matches() ? matcher.group(1) : null;
     }
 }

@@ -13,6 +13,7 @@ set -ex
 
 WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export WORK_DIR
+cd "$WORK_DIR"
 
 PLATFORM=$(uname | tr '[:upper:]' '[:lower:]')
 VERSION=$1
@@ -33,6 +34,7 @@ if command -v nproc >/dev/null 2>&1; then
 elif command -v sysctl >/dev/null 2>&1; then
   NUM_PROC=$(sysctl -n hw.ncpu)
 fi
+NUM_PROC=${BUILD_JOBS:-$NUM_PROC}
 
 # Derive cxx11-abi suffix used in older libtorch filenames.
 AARCH64_CXX11ABI="-cxx11"
@@ -250,12 +252,33 @@ fi
 
 BUILD_TYPE=${DJL_NATIVE_BUILD_TYPE:-Release}
 
-pushd .
+pushd "$WORK_DIR"
 
-rm -rf build
-mkdir build && cd build
-mkdir classes
-javac -sourcepath ../../pytorch-engine/src/main/java/ ../../pytorch-engine/src/main/java/ai/djl/pytorch/jni/PyTorchLibrary.java -h include -d classes
+# CMake tracks source/header changes. Reuse objects within a compatible build,
+# and let ccache reuse them across fresh CI workers. Switching SDKs or flavors
+# starts a clean tree so JNI staging cannot pick up a previous target.
+build_identity=$(printf '%s\n' "$VERSION" "$FLAVOR" "$ARCH" "$CXX11ABI_ARG" "$BUILD_TYPE" \
+    "$TORCH_ROOT" "${ROCM_PATH:-}" "${PYTORCH_ROCM_ARCH:-}" "${TORCH_CUDA_ARCH_LIST:-}" \
+    "${CC:-}" "${CXX:-}" "${CMAKE_GENERATOR:-}" "${REQUIRE_DISTRIBUTED_NCCL:-OFF}" \
+    "${CFLAGS:-}" "${CXXFLAGS:-}" "${HIPFLAGS:-}" "${CUDAFLAGS:-}" "${LDFLAGS:-}" "${JAVA_HOME:-}"
+    if [[ -n "${ROCM_PATH:-}" && -f "$ROCM_PATH/.info/version" ]]; then
+      cat "$ROCM_PATH/.info/version"
+    fi)
+if [[ -d build && ( ! -f build/.build-identity || "$(cat build/.build-identity)" != "$build_identity" ) ]]; then
+  rm -rf build
+fi
+mkdir -p build/classes
+printf '%s\n' "$build_identity" > build/.build-identity
+cd build
+mkdir -p include include-generated
+javac -sourcepath ../../pytorch-engine/src/main/java/ ../../pytorch-engine/src/main/java/ai/djl/pytorch/jni/PyTorchLibrary.java -h include-generated -d classes
+for header in include-generated/*.h; do
+  # javac rewrites identical headers. Preserve their timestamps so a second
+  # local build does not recompile every JNI translation unit unnecessarily.
+  if ! cmp -s "$header" "include/$(basename "$header")"; then
+    cp "$header" include/
+  fi
+done
 
 # Some rocm/dev-ubuntu images (e.g. :6.4-complete) install the JDK under a
 # non-standard path that CMake's FindJNI cannot discover. Derive JAVA_HOME
@@ -266,16 +289,40 @@ if [[ -z "${JAVA_HOME:-}" ]] && command -v javac >/dev/null 2>&1; then
   echo "note: auto-detected JAVA_HOME=${JAVA_HOME}"
 fi
 
+launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_CUDA_COMPILER_LAUNCHER= -DCMAKE_HIP_COMPILER_LAUNCHER=)
+if command -v ccache >/dev/null 2>&1; then
+  launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache)
+fi
 cmake -DCMAKE_PREFIX_PATH="${TORCH_ROOT}${ROCM_PATH:+;${ROCM_PATH}}" \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
       -DPT_VERSION="${PT_VERSION_MACRO}" \
       -DUSE_CUDA="$USE_CUDA" \
       -DUSE_ROCM="$USE_ROCM" \
-      -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" ..
-cmake --build . --config "${BUILD_TYPE}" -- -j "${NUM_PROC}"
+      -DREQUIRE_DISTRIBUTED_NCCL="${REQUIRE_DISTRIBUTED_NCCL:-OFF}" "${launcher[@]}" ..
+cmake --build . --config "${BUILD_TYPE}" --parallel "${NUM_PROC}"
 
 if [[ $PLATFORM == 'darwin' ]]; then
-  install_name_tool -add_rpath @loader_path libdjl_torch.dylib
+  if ! otool -l libdjl_torch.dylib | grep -Fq 'path @loader_path ('; then
+    install_name_tool -add_rpath @loader_path libdjl_torch.dylib
+  fi
+fi
+
+classifier_arch=x86_64
+[[ "$ARCH" == aarch64 ]] && classifier_arch=aarch64
+classifier_os=$PLATFORM
+[[ "$PLATFORM" == darwin ]] && classifier_os=osx
+library=libdjl_torch.so
+[[ "$PLATFORM" == darwin ]] && library=libdjl_torch.dylib
+if [[ "$PLATFORM" == darwin ]]; then
+  library_sha=$(shasum -a 256 "$library" | cut -d ' ' -f 1)
+else
+  library_sha=$(sha256sum "$library" | cut -d ' ' -f 1)
+fi
+printf 'pt_version=%s\nflavor=%s\nclassifier=%s-%s\nsha256=%s\n' \
+  "$VERSION" "$FLAVOR" "$classifier_os" "$classifier_arch" "$library_sha" > native-build.properties
+
+if [[ "$PLATFORM" == linux && "$classifier_arch" == x86_64 && "$FLAVOR" == rocm* ]]; then
+  bash "$WORK_DIR/rocm/hipblaslt/prepare-bundle.sh" "$WORK_DIR/build/rocm-runtime" --flavor "$FLAVOR"
 fi
 
 popd

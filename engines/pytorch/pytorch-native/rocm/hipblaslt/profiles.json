@@ -1,0 +1,85 @@
+{
+  "rocm6.4": {
+    "sdk_versions": {
+      "6.4.0": {
+        "source_repository": "ROCm/hipBLASLt",
+        "source_revision": "5051e24def137fb02672e20bb8248305ae0cf784",
+        "source_dir": ".",
+        "hipblaslt_version": "0.12.0",
+        "soname": "libhipblaslt.so.0",
+        "build_family": "legacy",
+        "patches": ["0001-bound-legacy-tensile-cache.patch", "0002-rocm64-host-only-build.patch"]
+      }
+    }
+  },
+  "rocm7.0": {
+    "sdk_versions": {
+      "7.0.0": {
+        "source_repository": "ROCm/rocm-libraries",
+        "source_revision": "976b9c4a87a60a862ffb0e88e1fc0016e93c9961",
+        "source_dir": "projects/hipblaslt",
+        "hipblaslt_version": "1.0.0",
+        "soname": "libhipblaslt.so.1",
+        "build_family": "legacy",
+        "patches": ["0001-bound-legacy-tensile-cache.patch", "0002-rocm70-host-only-build.patch"]
+      }
+    }
+  },
+  "rocm7.1": {
+    "sdk_versions": {
+      "7.1.0": {
+        "source_repository": "ROCm/rocm-libraries",
+        "source_revision": "de5c1aebb641af098d9310a9fcca5591a7c066c8",
+        "source_dir": "projects/hipblaslt",
+        "hipblaslt_version": "1.1.0",
+        "soname": "libhipblaslt.so.1",
+        "build_family": "modern",
+        "patches": ["0001-bound-rocm7-tensile-cache.patch"]
+      }
+    }
+  },
+  "rocm7.2": {
+    "sdk_versions": {
+      "7.2.0": {
+        "source_repository": "ROCm/rocm-libraries",
+        "source_revision": "5b515cf1bca9959fb434c2414cf79b42fe25e93b",
+        "source_dir": "projects/hipblaslt",
+        "hipblaslt_version": "1.2.1",
+        "soname": "libhipblaslt.so.1",
+        "build_family": "modern",
+        "patches": ["0001-bound-rocm7-tensile-cache.patch"]
+      },
+      "7.2.1": {
+        "source_repository": "ROCm/rocm-libraries",
+        "source_revision": "dabb6df2b988f8eabed1e2fecefaaf4e818bc7ef",
+        "source_dir": "projects/hipblaslt",
+        "hipblaslt_version": "1.2.2",
+        "soname": "libhipblaslt.so.1",
+        "build_family": "modern",
+        "patches": ["0001-bound-rocm7-tensile-cache.patch"]
+      },
+      "7.2.2": {
+        "source_repository": "ROCm/rocm-libraries",
+        "source_revision": "dabb6df2b988f8eabed1e2fecefaaf4e818bc7ef",
+        "source_dir": "projects/hipblaslt",
+        "hipblaslt_version": "1.2.2",
+        "soname": "libhipblaslt.so.1",
+        "build_family": "modern",
+        "patches": ["0001-bound-rocm7-tensile-cache.patch"]
+      }
+    }
+  },
+  "rocm10.0": {
+    "sdk_versions": {
+      "10.0.0": {
+        "source_repository": "ROCm/rocm-libraries",
+        "source_revision": "8d1ae90eff7d022f26019ec55b2ec6a7674b3112",
+        "source_dir": "projects/hipblaslt",
+        "hipblaslt_version": "1.4.1",
+        "soname": "libhipblaslt.so.1",
+        "build_family": "modern",
+        "patches": ["0001-bound-tensile-solution-cache.patch"]
+      }
+    }
+  }
+}

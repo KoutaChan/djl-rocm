@@ -6,6 +6,7 @@
 *.iml
 .ipynb_checkpoints
 build
+/target/
 libs
 *.gz
 *.params

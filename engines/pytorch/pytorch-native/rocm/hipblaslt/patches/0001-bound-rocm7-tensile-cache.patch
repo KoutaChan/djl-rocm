@@ -1,0 +1,144 @@
+--- a/tensilelite/include/Tensile/CachingLibrary.hpp
++++ b/tensilelite/include/Tensile/CachingLibrary.hpp
+@@ -27,6 +27,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <list>
+ #include <shared_mutex>
+ #include <unordered_map>
+ 
+@@ -67,7 +68,19 @@
+     template <typename Value, typename... Keys>
+     class CacheMap
+     {
+-        using Map = typename MultiLevelMap<Value, Keys...>::type;
++        using Map        = typename MultiLevelMap<Value, Keys...>::type;
++        using ProblemKey = typename Map::key_type;
++        using Recency    = std::list<ProblemKey const*>;
++
++        // Each outer key is an owning ContractionProblem, including its tensor
++        // metadata. Bound those keys, not just the small solution vectors.
++        static constexpr size_t MaxCachedProblems = 4096;
++
++        struct Entry
++        {
++            typename Map::mapped_type value;
++            typename Recency::iterator recency;
++        };
+ 
+     public:
+         CacheMap(Value const& nullValue)
+@@ -86,12 +99,19 @@
+                           << std::endl;
+         }
+ 
+-        template <typename... Ks>
+-        Value find(Ks const&... keys)
+-        {
+-            std::shared_lock<std::shared_timed_mutex> lock(m_mutex);
+-
+-            auto rv = find_impl(m_map, keys...);
++        template <typename K, typename... Ks>
++        Value find(K const& key, Ks const&... keys)
++        {
++            // Recency and the owning map change together. Return the value by
++            // copy while locked so later eviction cannot invalidate a caller.
++            std::lock_guard<std::shared_timed_mutex> lock(m_mutex);
++            auto found = m_map.find(key);
++            auto rv    = m_nullValue;
++            if(found != m_map.end())
++            {
++                m_recency.splice(m_recency.begin(), m_recency, found->second.recency);
++                rv = find_impl(found->second.value, keys...);
++            }
+ 
+             if(m_lookupEfficiency)
+             {
+@@ -103,15 +123,51 @@
+             return rv;
+         }
+ 
+-        template <typename... Ks>
+-        void add(Value const& value, Ks const&... ks)
++        template <typename K, typename... Ks>
++        void add(Value value, K const& key, Ks const&... keys)
+         {
+             std::lock_guard<std::shared_timed_mutex> lock(m_mutex);
+-
+-            add_impl(m_map, value, ks...);
++            auto inserted = m_map.try_emplace(key);
++            auto entry    = inserted.first;
++            try
++            {
++                if(inserted.second || sizeof...(Ks) != 0)
++                    add_impl(entry->second.value, std::move(value), keys...);
++                if(inserted.second)
++                {
++                    m_recency.push_front(&entry->first);
++                    entry->second.recency = m_recency.begin();
++                }
++                else
++                {
++                    m_recency.splice(m_recency.begin(), m_recency, entry->second.recency);
++                }
++            }
++            catch(...)
++            {
++                if(inserted.second)
++                    m_map.erase(entry);
++                throw;
++            }
++
++            if(m_map.size() > MaxCachedProblems)
++            {
++                m_map.erase(*m_recency.back());
++                m_recency.pop_back();
++            }
+         }
+ 
+     private:
++        Value find_impl(Value const& value)
++        {
++            return value;
++        }
++
++        void add_impl(Value& target, Value&& value)
++        {
++            target = std::move(value);
++        }
++
+         template <typename SubMap, typename K>
+         Value find_impl(SubMap const& map, K const& key)
+         {
+@@ -135,18 +190,21 @@
+         }
+ 
+         template <typename SubMap, typename K>
+-        void add_impl(SubMap& map, Value const& value, K const& key)
+-        {
+-            map.emplace(key, value);
++        void add_impl(SubMap& map, Value&& value, K const& key)
++        {
++            map.emplace(key, std::move(value));
+         }
+ 
+         template <typename SubMap, typename K, typename... Ks>
+-        void add_impl(SubMap& map, Value const& value, K const& key, Ks const&... ks)
+-        {
+-            add_impl(map[key], value, ks...);
+-        }
+-
+-        Map                     m_map;
++        void add_impl(SubMap& map, Value&& value, K const& key, Ks const&... ks)
++        {
++            add_impl(map[key], std::move(value), ks...);
++        }
++
++        // unordered_map owns each problem once. Pointers remain stable across
++        // rehashes; remove the map entry and its recency node under one lock.
++        std::unordered_map<ProblemKey, Entry> m_map;
++        Recency                              m_recency;
+         std::shared_timed_mutex m_mutex;
+         Value                   m_nullValue;
+ 
