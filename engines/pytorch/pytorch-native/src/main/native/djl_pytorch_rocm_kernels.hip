@@ -3908,7 +3908,8 @@ std::optional<GroupedPackedAttentionLaunchPlan> grouped_packed_attention_launch_
       static_cast<size_t>(key_features + value_features) * sizeof(float);
   const size_t mask_bytes = static_cast<size_t>(key_tokens) * sizeof(unsigned char);
   const size_t shared_memory_bytes = key_value_bytes + mask_bytes;
-  if (shared_memory_bytes > static_cast<size_t>(properties.sharedMemPerBlock)) {
+  if (shared_memory_bytes + sizeof(uint32_t) >
+      static_cast<size_t>(properties.sharedMemPerBlock)) {
     return std::nullopt;
   }
   return GroupedPackedAttentionLaunchPlan{block_threads, shared_memory_bytes};
@@ -3934,6 +3935,7 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     int query_tokens, int groups, int key_tokens, int heads,
     int key_features, int value_features, float scale) {
   extern __shared__ unsigned char shared_storage[];
+  __shared__ uint32_t present_key_bits;
   const int lane = threadIdx.x % query_group_width;
   const int query_group = threadIdx.x / query_group_width;
   const int query_groups_per_block = blockDim.x / query_group_width;
@@ -3977,6 +3979,14 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
        key_token += blockDim.x) {
     shared_mask[key_token] = static_cast<unsigned char>(grouped_attention_mask_present(
         mask[matrix * key_tokens + key_token]));
+  }
+  // The first logical group reads its own mask stores, then publishes the ballot.
+  if (threadIdx.x < query_group_width) {
+    const auto present = __ballot(
+        threadIdx.x < key_tokens && shared_mask[threadIdx.x] != 0);
+    if (threadIdx.x == 0) {
+      present_key_bits = static_cast<uint32_t>(present);
+    }
   }
   __syncthreads();
 
@@ -4032,10 +4042,13 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
          feature_base += query_group_width) {
       const int feature = feature_base + lane;
       float context = 0.0f;
-      for (int key_token = 0; key_token < key_tokens; ++key_token) {
+      uint32_t remaining = present_key_bits;
+      while (remaining != 0) {
+        const int key_token = __ffs(remaining) - 1;
+        remaining &= remaining - 1;
         const float token_probability =
             __shfl(probability, key_token, query_group_width);
-        if (feature < value_features && shared_mask[key_token] != 0) {
+        if (feature < value_features) {
           context += token_probability *
               shared_values[key_token * value_features + feature];
         }

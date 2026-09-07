@@ -128,7 +128,7 @@ public final class LibUtils {
         boolean isRocm = libTorch.flavor.startsWith("rocm");
         boolean isWindowsRocm = isRocm && libTorch.classifier.startsWith("win");
         if (libTorch.flavor.startsWith("rocm10.") && !isWindowsRocm) {
-            preloadRocmLibraries(libTorch.flavor);
+            preloadRocmLibraries(libTorch.flavor, libDir);
         }
         List<String> deferred =
                 Arrays.asList(
@@ -265,16 +265,15 @@ public final class LibUtils {
         return libraries;
     }
 
-    private static void preloadRocmLibraries(String flavor) {
+    private static void preloadRocmLibraries(String flavor, Path libDir) {
         File root = findRocmRoot(flavor);
-        if (root == null) {
-            return;
+        List<Path> directories = new ArrayList<>(4);
+        directories.add(libDir);
+        if (root != null) {
+            directories.add(root.toPath().resolve("lib"));
+            directories.add(root.toPath().resolve("lib/host-math/lib"));
+            directories.add(root.toPath().resolve("lib/rocm_sysdeps/lib"));
         }
-        List<Path> directories =
-                Arrays.asList(
-                        root.toPath().resolve("lib"),
-                        root.toPath().resolve("lib/host-math/lib"),
-                        root.toPath().resolve("lib/rocm_sysdeps/lib"));
         List<String> libraries =
                 Arrays.asList(
                         "amd_comgr",
@@ -284,6 +283,9 @@ public final class LibUtils {
                         "roctracer64",
                         "roctx64",
                         "hiprtc",
+                        // rocBLAS reaches hipBLASLt through its SDK RPATH. Load the
+                        // selected runtime's override before loading hipBLAS/rocBLAS.
+                        "hipblaslt",
                         "hipblas",
                         "hipfft",
                         "hiprand",
@@ -291,7 +293,6 @@ public final class LibUtils {
                         "hipsparselt",
                         "hipsolver",
                         "rccl",
-                        "hipblaslt",
                         "MIOpen",
                         "hipdnn",
                         "rocm-openblas",

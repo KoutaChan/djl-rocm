@@ -430,6 +430,31 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    public void groupedPackedAttentionSupportsSharedMemoryBoundary() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        // With one key, the second shape exceeds 64 KiB only after the static ballot word.
+        for (int valueFeatures : new int[] {16381, 16382}) {
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                NDArray query = manager.zeros(new Shape(1, 1, 1));
+                NDArray packed = manager.ones(new Shape(1, 1, 1, 1 + valueFeatures));
+                NDArray mask = manager.ones(new Shape(1, 1, 1), DataType.BOOLEAN);
+
+                NDArray output =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packed, mask, 1, 1.0);
+
+                Assert.assertEquals(output.getShape(), new Shape(1, 1, 1, valueFeatures));
+                for (float value : output.toFloatArray()) {
+                    Assert.assertEquals(value, 1.0f);
+                }
+            }
+        }
+    }
+
+    @Test
     public void groupedPackedAttentionNonContiguousGpuInputsUsePortableFallback() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {

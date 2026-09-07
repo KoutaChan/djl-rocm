@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -142,7 +143,12 @@ bool FusionMatmulDiagnosticsEnabled() {
 
 void LogFusionMatmulGeometry(const FusionMatmulKey& key,
     const char* result, std::size_t workspace_size) {
-  if (!FusionMatmulDiagnosticsEnabled()) {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("DJL_ROCM_MATMUL_GEOMETRY_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0';
+  }();
+  if (!enabled) {
     return;
   }
   std::fprintf(stderr,
@@ -169,10 +175,7 @@ void LogFusionMatmulGeometry(const FusionMatmulKey& key,
 
 void ConfigureBatchLayout(hipblasLtMatrixLayout_t layout,
     int64_t batch_count, int64_t batch_stride, const char* name) {
-  if (batch_count == 1) {
-    return;
-  }
-  TORCH_CHECK(batch_count > 1 &&
+  TORCH_CHECK(batch_count >= 1 &&
           batch_count <= std::numeric_limits<int32_t>::max(),
       name, " batch count exceeds the hipBLASLt range");
   const int32_t count = static_cast<int32_t>(batch_count);
@@ -183,13 +186,132 @@ void ConfigureBatchLayout(hipblasLtMatrixLayout_t layout,
       sizeof(batch_stride)), name);
 }
 
-class FusionMatmulExecutable {
+struct FusionMatmulAlgorithm {
+  hipblasLtMatmulAlgo_t value{};
+  std::size_t workspace_size = 0;
+  bool supported = false;
+};
+
+struct FusionMatmulDescriptorKey {
+  torch::ScalarType data_type;
+  int64_t columns;
+  int64_t reduction;
+  int64_t left_row_stride;
+  int64_t right_leading_dimension;
+  int64_t output_row_stride;
+  bool right_transposed;
+  FusionMatmulEpilogue epilogue;
+
+  explicit FusionMatmulDescriptorKey(const FusionMatmulKey& key)
+      : data_type(key.data_type), columns(key.columns),
+        reduction(key.reduction), left_row_stride(key.left_row_stride),
+        right_leading_dimension(key.right_leading_dimension),
+        output_row_stride(key.output_row_stride),
+        right_transposed(key.right_transposed), epilogue(key.epilogue) {}
+
+  bool operator==(const FusionMatmulDescriptorKey& other) const {
+    return data_type == other.data_type && columns == other.columns &&
+        reduction == other.reduction &&
+        left_row_stride == other.left_row_stride &&
+        right_leading_dimension == other.right_leading_dimension &&
+        output_row_stride == other.output_row_stride &&
+        right_transposed == other.right_transposed &&
+        epilogue == other.epilogue;
+  }
+};
+
+struct FusionMatmulDescriptorKeyHash {
+  std::size_t operator()(const FusionMatmulDescriptorKey& key) const {
+    std::size_t hash =
+        std::hash<int>{}(static_cast<int>(key.data_type));
+    HashCombine(hash, std::hash<int64_t>{}(key.columns));
+    HashCombine(hash, std::hash<int64_t>{}(key.reduction));
+    HashCombine(hash, std::hash<int64_t>{}(key.left_row_stride));
+    HashCombine(hash,
+        std::hash<int64_t>{}(key.right_leading_dimension));
+    HashCombine(hash, std::hash<int64_t>{}(key.output_row_stride));
+    HashCombine(hash, std::hash<bool>{}(key.right_transposed));
+    HashCombine(hash, std::hash<int>{}(static_cast<int>(key.epilogue)));
+    return hash;
+  }
+};
+
+// Entries own their key once. The index points into list nodes, which remain
+// stable across both LRU moves and unordered_map rehashes. Callers serialize
+// lookup and use with the stream context's existing mutex.
+template <typename Key, typename Value, typename Hash>
+class FusionMatmulCache {
  public:
-  FusionMatmulExecutable(
-      hipblasLtHandle_t handle, const FusionMatmulKey& key,
+  explicit FusionMatmulCache(std::size_t capacity) : capacity_(capacity) {}
+
+  FusionMatmulCache(const FusionMatmulCache&) = delete;
+  FusionMatmulCache& operator=(const FusionMatmulCache&) = delete;
+
+  template <typename Factory>
+  Value& GetOrCreate(const Key& key, Factory&& factory) {
+    ++lookups_;
+    const auto found = index_.find(&key);
+    if (found != index_.end()) {
+      entries_.splice(entries_.begin(), entries_, found->second);
+      return found->second->value;
+    }
+    entries_.emplace_front(key, factory());
+    try {
+      index_.emplace(&entries_.front().key, entries_.begin());
+    } catch (...) {
+      entries_.pop_front();
+      throw;
+    }
+    ++misses_;
+    if (entries_.size() > capacity_) {
+      index_.erase(&entries_.back().key);
+      entries_.pop_back();
+      ++evictions_;
+    }
+    return entries_.front().value;
+  }
+
+  std::size_t Size() const { return entries_.size(); }
+  std::size_t Lookups() const { return lookups_; }
+  std::size_t Misses() const { return misses_; }
+  std::size_t Evictions() const { return evictions_; }
+
+ private:
+  struct Entry {
+    Key key;
+    Value value;
+    Entry(const Key& entry_key, Value&& entry_value)
+        : key(entry_key), value(std::move(entry_value)) {}
+  };
+  struct PointerHash {
+    std::size_t operator()(const Key* key) const { return Hash{}(*key); }
+  };
+  struct PointerEqual {
+    bool operator()(const Key* left, const Key* right) const {
+      return *left == *right;
+    }
+  };
+
+  std::size_t capacity_;
+  std::list<Entry> entries_;
+  std::unordered_map<const Key*, typename std::list<Entry>::iterator,
+      PointerHash, PointerEqual> index_;
+  std::size_t lookups_ = 0;
+  std::size_t misses_ = 0;
+  std::size_t evictions_ = 0;
+};
+
+// Opaque hipBLASLt descriptors own Tensile problem state. Retain that state
+// per matrix family, not per observed row count or batch geometry.
+class FusionMatmulDescriptors {
+ public:
+  FusionMatmulDescriptors(const FusionMatmulKey& key,
       const void* heuristic_bias_pointer)
-      : epilogue_(key.epilogue) {
-    hipblasLtMatmulPreference_t preference = nullptr;
+      : rows_(key.rows), batch_count_(key.batch_count),
+        left_batch_stride_(key.left_batch_stride),
+        right_batch_stride_(key.right_batch_stride),
+        output_batch_stride_(key.output_batch_stride),
+        epilogue_(key.epilogue) {
     try {
       const hipDataType data_type = HipBlasLtDataType(key.data_type);
       CheckHipBlasLt(hipblasLtMatmulDescCreate(
@@ -251,6 +373,60 @@ class FusionMatmulExecutable {
           "hipblasLtMatrixLayoutSetAttribute(left batch)");
       ConfigureBatchLayout(output_, key.batch_count, key.output_batch_stride,
           "hipblasLtMatrixLayoutSetAttribute(output batch)");
+    } catch (...) {
+      Reset();
+      throw;
+    }
+  }
+
+  ~FusionMatmulDescriptors() {
+    Reset();
+  }
+
+  FusionMatmulDescriptors(const FusionMatmulDescriptors&) = delete;
+  FusionMatmulDescriptors& operator=(const FusionMatmulDescriptors&) = delete;
+
+  void Configure(const FusionMatmulKey& key) {
+    if (rows_ != key.rows) {
+      const uint64_t rows = static_cast<uint64_t>(key.rows);
+      CheckHipBlasLt(hipblasLtMatrixLayoutSetAttribute(left_,
+          HIPBLASLT_MATRIX_LAYOUT_COLS, &rows, sizeof(rows)),
+          "hipblasLtMatrixLayoutSetAttribute(left columns)");
+      CheckHipBlasLt(hipblasLtMatrixLayoutSetAttribute(output_,
+          HIPBLASLT_MATRIX_LAYOUT_COLS, &rows, sizeof(rows)),
+          "hipblasLtMatrixLayoutSetAttribute(output columns)");
+    }
+    if (batch_count_ != key.batch_count ||
+        left_batch_stride_ != key.left_batch_stride) {
+      ConfigureBatchLayout(left_, key.batch_count, key.left_batch_stride,
+          "hipblasLtMatrixLayoutSetAttribute(left batch)");
+    }
+    if (batch_count_ != key.batch_count ||
+        right_batch_stride_ != key.right_batch_stride) {
+      ConfigureBatchLayout(right_, key.batch_count, key.right_batch_stride,
+          "hipblasLtMatrixLayoutSetAttribute(right batch)");
+    }
+    if (batch_count_ != key.batch_count ||
+        output_batch_stride_ != key.output_batch_stride) {
+      ConfigureBatchLayout(output_, key.batch_count, key.output_batch_stride,
+          "hipblasLtMatrixLayoutSetAttribute(output batch)");
+    }
+    rows_ = key.rows;
+    batch_count_ = key.batch_count;
+    left_batch_stride_ = key.left_batch_stride;
+    right_batch_stride_ = key.right_batch_stride;
+    output_batch_stride_ = key.output_batch_stride;
+  }
+
+  FusionMatmulAlgorithm SelectAlgorithm(hipblasLtHandle_t handle,
+      const FusionMatmulKey& key, const void* heuristic_bias_pointer) {
+    hipblasLtMatmulPreference_t preference = nullptr;
+    try {
+      // The previous invocation's bias may already have been released.
+      // Heuristics use the context's stable placeholder instead.
+      if (epilogue_ != FusionMatmulEpilogue::kNone) {
+        SetBiasPointer(heuristic_bias_pointer);
+      }
 
       CheckHipBlasLt(hipblasLtMatmulPreferenceCreate(&preference),
           "hipblasLtMatmulPreferenceCreate");
@@ -273,7 +449,7 @@ class FusionMatmulExecutable {
       if (heuristic_status == HIPBLAS_STATUS_NOT_SUPPORTED) {
         LogFusionMatmulGeometry(
             key, "heuristic-not-supported", 0);
-        return;
+        return {};
       }
       CheckHipBlasLt(
           heuristic_status, "hipblasLtMatmulAlgoGetHeuristic");
@@ -285,69 +461,55 @@ class FusionMatmulExecutable {
         LogFusionMatmulGeometry(key,
             result_count == 0 ? "no-algorithm" : "algorithm-not-supported",
             0);
-        return;
+        return {};
       }
       CheckHipBlasLt(
           result.state, "hipblasLtMatmulAlgoGetHeuristic result");
       TORCH_CHECK(result.workspaceSize <= workspace_bound,
           "hipblasLt heuristic exceeded the requested workspace bound");
-      algorithm_ = result.algo;
-      workspace_size_ = result.workspaceSize;
-      supported_ = true;
-      LogFusionMatmulGeometry(key, "supported", workspace_size_);
+      LogFusionMatmulGeometry(key, "supported", result.workspaceSize);
+      return {result.algo, result.workspaceSize, true};
     } catch (...) {
       if (preference != nullptr) {
         hipblasLtMatmulPreferenceDestroy(preference);
       }
-      Reset();
       throw;
     }
   }
 
-  ~FusionMatmulExecutable() {
-    Reset();
-  }
-
-  FusionMatmulExecutable(const FusionMatmulExecutable&) = delete;
-  FusionMatmulExecutable& operator=(const FusionMatmulExecutable&) = delete;
-
   void Run(hipblasLtHandle_t handle, backend::Stream stream,
+      const FusionMatmulAlgorithm& algorithm,
       torch::Tensor& output, const torch::Tensor& left,
       const torch::Tensor& right, const torch::Tensor* bias,
       void* workspace, std::size_t workspace_capacity, float beta) {
     constexpr float alpha = 1.0f;
-    TORCH_CHECK(supported_,
+    TORCH_CHECK(algorithm.supported,
         "cannot run an unsupported direct ROCm matmul geometry");
-    TORCH_CHECK(workspace_size_ <= workspace_capacity,
+    TORCH_CHECK(algorithm.workspace_size <= workspace_capacity,
         "Fusion matmul workspace is smaller than the selected algorithm requires");
-    TORCH_CHECK(workspace_size_ == 0 || workspace != nullptr,
+    TORCH_CHECK(algorithm.workspace_size == 0 || workspace != nullptr,
         "Fusion matmul workspace must not be null");
     if (epilogue_ != FusionMatmulEpilogue::kNone) {
       TORCH_CHECK(bias != nullptr,
           "Fusion matmul bias epilogue requires a bias tensor");
-      const void* bias_pointer = bias->const_data_ptr();
-      CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
-          HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
-          sizeof(bias_pointer)),
-          "hipblasLtMatmulDescSetAttribute(bias)");
+      SetBiasPointer(bias->const_data_ptr());
     }
     CheckHipBlasLt(hipblasLtMatmul(
         handle, operation_, &alpha,
         right.const_data_ptr(), right_, left.const_data_ptr(), left_,
         &beta, output.const_data_ptr(), output_, output.data_ptr(), output_,
-        &algorithm_, workspace, workspace_size_, stream),
+        &algorithm.value, workspace, algorithm.workspace_size, stream),
         "hipblasLtMatmul(Fusion)");
   }
 
-  std::size_t WorkspaceSize() const {
-    return workspace_size_;
-  }
-
-  bool IsSupported() const {
-    return supported_;
-  }
-
  private:
+  void SetBiasPointer(const void* bias_pointer) {
+    CheckHipBlasLt(hipblasLtMatmulDescSetAttribute(operation_,
+        HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_pointer,
+        sizeof(bias_pointer)),
+        "hipblasLtMatmulDescSetAttribute(bias)");
+  }
+
   void Reset() noexcept {
     if (output_ != nullptr) {
       hipblasLtMatrixLayoutDestroy(output_);
@@ -371,10 +533,12 @@ class FusionMatmulExecutable {
   hipblasLtMatrixLayout_t right_ = nullptr;
   hipblasLtMatrixLayout_t left_ = nullptr;
   hipblasLtMatrixLayout_t output_ = nullptr;
-  hipblasLtMatmulAlgo_t algorithm_{};
-  size_t workspace_size_ = 0;
+  int64_t rows_;
+  int64_t batch_count_;
+  int64_t left_batch_stride_;
+  int64_t right_batch_stride_;
+  int64_t output_batch_stride_;
   FusionMatmulEpilogue epilogue_ = FusionMatmulEpilogue::kNone;
-  bool supported_ = false;
 };
 
 #endif
@@ -1293,6 +1457,10 @@ __global__ void single_query_attention_kernel(
   __shared__ float direction[kSingleQueryHiddenWidth];
   __shared__ float probabilities[kSingleQueryMaximumTokens];
   __shared__ float pooled[kSingleQueryHiddenWidth];
+  __shared__ float softmax_maximum;
+  __shared__ float softmax_denominator;
+  __shared__ int64_t softmax_valid_count;
+  __shared__ uint8_t valid_tokens[kSingleQueryMaximumTokens];
   const int64_t seed_offset =
       (batch * readout_count + readout) * kSingleQueryHiddenWidth;
   const int64_t state_offset =
@@ -1364,42 +1532,45 @@ __global__ void single_query_attention_kernel(
         maximum = isnan(maximum) || isnan(score)
             ? NAN
             : fmaxf(maximum, score);
-        ++valid_count;
+        valid_tokens[valid_count++] = static_cast<uint8_t>(token);
       }
     }
-    if (valid_count == 0) {
-      for (int64_t token = 0; token < token_count; ++token) {
-        probabilities[token] = 0.0f;
-      }
-    } else {
-      float denominator = 0.0f;
-      for (int64_t token = 0; token < token_count; ++token) {
-        const float probability = single_query_valid(
-                valid_mask, batch * token_count + token)
-            ? expf(probabilities[token] - maximum)
-            : 0.0f;
-        probabilities[token] = probability;
-        denominator += probability;
-      }
-      for (int64_t token = 0; token < token_count; ++token) {
-        probabilities[token] /= denominator;
-      }
+    softmax_maximum = maximum;
+    softmax_valid_count = valid_count;
+  }
+  __syncthreads();
+  if (threadIdx.x < token_count) {
+    const int64_t token = threadIdx.x;
+    probabilities[token] = softmax_valid_count != 0 && single_query_valid(
+            valid_mask, batch * token_count + token)
+        ? expf(probabilities[token] - softmax_maximum)
+        : 0.0f;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // Preserve the original token-by-token addition order.
+    float denominator = 0.0f;
+    for (int64_t token = 0; token < token_count; ++token) {
+      denominator += probabilities[token];
     }
+    softmax_denominator = denominator;
+  }
+  __syncthreads();
+  if (threadIdx.x < token_count && softmax_valid_count != 0) {
+    probabilities[threadIdx.x] /= softmax_denominator;
   }
   __syncthreads();
 
   for (int32_t feature = threadIdx.x; feature < kSingleQueryHiddenWidth;
        feature += blockDim.x) {
     float value = 0.0f;
-    for (int64_t token = 0; token < token_count; ++token) {
+    for (int64_t index = 0; index < softmax_valid_count; ++index) {
+      const int64_t token = valid_tokens[index];
       const float probability = probabilities[token];
-      if (single_query_valid(
-              valid_mask, batch * token_count + token)) {
-        value += probability * static_cast<float>(
-            static_cast<scalar_t>(memory[
-                (batch * token_count + token) * kSingleQueryHiddenWidth +
-                feature]));
-      }
+      value += probability * static_cast<float>(
+          static_cast<scalar_t>(memory[
+              (batch * token_count + token) * kSingleQueryHiddenWidth +
+              feature]));
     }
     pooled[feature] = value;
   }
@@ -1734,7 +1905,7 @@ __global__ void indexed_local_attention_kernel(
   }
   __shared__ int64_t group_begin;
   __shared__ int64_t group_end;
-  __shared__ float probabilities[kIndexedLocalAttentionHeads * kIndexedLocalMaximumTokens];
+  __shared__ float probabilities[(kThreadsPerBlock / 32) * kIndexedLocalMaximumTokens];
   if (threadIdx.x == 0) {
     group_begin = indexed_local_lower_bound(indices, active_rows, group * token_count);
     group_end = indexed_local_lower_bound(indices, active_rows, (group + 1) * token_count);
@@ -1746,17 +1917,21 @@ __global__ void indexed_local_attention_kernel(
   }
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
-  const bool active_head = wave < kIndexedLocalAttentionHeads;
+  const int32_t head = wave % kIndexedLocalAttentionHeads;
+  const int32_t query_slot = wave / kIndexedLocalAttentionHeads;
+  const int32_t queries_per_block = blockDim.x / (warpSize * kIndexedLocalAttentionHeads);
   constexpr float scale = 0.25f;
-  for (int64_t query = 0; query < selected_tokens; ++query) {
+  for (int64_t query_base = 0; query_base < selected_tokens; query_base += queries_per_block) {
+    const int64_t query = query_base + query_slot;
+    const bool active_head = query < selected_tokens;
     if (active_head) {
       for (int64_t key = 0; key < selected_tokens; ++key) {
         float product = 0.0f;
         if (lane < kIndexedLocalHeadWidth) {
           const int64_t query_offset =
-              (group_begin + query) * (3 * kIndexedLocalAttentionWidth) + wave * kIndexedLocalHeadWidth + lane;
+              (group_begin + query) * (3 * kIndexedLocalAttentionWidth) + head * kIndexedLocalHeadWidth + lane;
           const int64_t key_offset = (group_begin + key) * (3 * kIndexedLocalAttentionWidth) +
-                                     kIndexedLocalAttentionWidth + wave * kIndexedLocalHeadWidth + lane;
+                                     kIndexedLocalAttentionWidth + head * kIndexedLocalHeadWidth + lane;
           product = static_cast<float>(query_key_value[query_offset]) * static_cast<float>(query_key_value[key_offset]);
         }
         for (int32_t offset = kIndexedLocalHeadWidth / 2; offset > 0; offset /= 2) {
@@ -1789,11 +1964,11 @@ __global__ void indexed_local_attention_kernel(
       float value = 0.0f;
       for (int64_t key = 0; key < selected_tokens; ++key) {
         const int64_t value_offset = (group_begin + key) * (3 * kIndexedLocalAttentionWidth) +
-                                     2 * kIndexedLocalAttentionWidth + wave * kIndexedLocalHeadWidth + lane;
+                                     2 * kIndexedLocalAttentionWidth + head * kIndexedLocalHeadWidth + lane;
         value +=
             probabilities[wave * kIndexedLocalMaximumTokens + key] * static_cast<float>(query_key_value[value_offset]);
       }
-      query_key_value[(group_begin + query) * (3 * kIndexedLocalAttentionWidth) + wave * kIndexedLocalHeadWidth +
+      query_key_value[(group_begin + query) * (3 * kIndexedLocalAttentionWidth) + head * kIndexedLocalHeadWidth +
                       lane] = static_cast<scalar_t>(value);
     }
     __syncthreads();
@@ -2056,40 +2231,51 @@ class FusionMatmulStreamContext {
           "new_stream=%p\n",
           device_, reinterpret_cast<void*>(previous_stream),
           reinterpret_cast<void*>(stream));
+      LogCacheStatsLocked();
     }
   }
 
   FusionMatmulExecutionResult ResolveExecutableLocked(
       backend::Stream stream, const FusionMatmulKey& key,
-      FusionMatmulExecutable** executable) {
-    TORCH_CHECK(executable != nullptr,
-        "direct ROCm matmul executable output must not be null");
-    *executable = nullptr;
+      FusionMatmulAlgorithm** algorithm,
+      FusionMatmulDescriptors** descriptors) {
+    *algorithm = nullptr;
+    *descriptors = nullptr;
     if (!MatchesLocked(key.device, stream)) {
       return FusionMatmulExecutionResult::kRetry;
     }
-    auto found = executables_.find(key);
-    if (found == executables_.end()) {
-      auto created = std::make_unique<FusionMatmulExecutable>(
+    *descriptors = descriptors_.GetOrCreate(
+        FusionMatmulDescriptorKey(key), [&] {
+          return std::make_unique<FusionMatmulDescriptors>(
+              key, bias_placeholder_.const_data_ptr());
+        }).get();
+    (*descriptors)->Configure(key);
+    bool algorithm_created = false;
+    *algorithm = &algorithms_.GetOrCreate(key, [&] {
+      algorithm_created = true;
+      return (*descriptors)->SelectAlgorithm(
           handle_, key, bias_placeholder_.const_data_ptr());
-      found = executables_.emplace(key, std::move(created)).first;
+    });
+    if (algorithm_created && FusionMatmulDiagnosticsEnabled() &&
+        (algorithms_.Misses() <= 4 || algorithms_.Misses() % 4096 == 0)) {
+      LogCacheStatsLocked();
     }
-    if (!found->second->IsSupported()) {
+    if (!(*algorithm)->supported) {
       return FusionMatmulExecutionResult::kUnsupported;
     }
-    *executable = found->second.get();
     return FusionMatmulExecutionResult::kExecuted;
   }
 
   FusionMatmulExecutionResult ExecuteResolvedLocked(
       backend::Stream stream, const FusionMatmulKey& key,
-      FusionMatmulExecutable& executable, torch::Tensor& output,
+      const FusionMatmulAlgorithm& algorithm,
+      FusionMatmulDescriptors& descriptors, torch::Tensor& output,
       const torch::Tensor& left, const torch::Tensor& right,
       const torch::Tensor* bias, float beta) {
     if (!MatchesLocked(key.device, stream)) {
       return FusionMatmulExecutionResult::kRetry;
     }
-    TORCH_CHECK(executable.IsSupported(),
+    TORCH_CHECK(algorithm.supported,
         "direct ROCm matmul executable became unsupported");
     if (!output.defined()) {
       TORCH_CHECK(beta == 0.0f,
@@ -2103,14 +2289,28 @@ class FusionMatmulStreamContext {
             left.options().requires_grad(false));
       }
     }
-    const std::size_t required_workspace = executable.WorkspaceSize();
+    const std::size_t required_workspace = algorithm.workspace_size;
     void* workspace = AcquireWorkspace(required_workspace, left.device());
-    executable.Run(handle_, stream, output, left, right, bias, workspace,
-        WorkspaceCapacity(), beta);
+    descriptors.Run(handle_, stream, algorithm, output, left, right,
+        bias, workspace, WorkspaceCapacity(), beta);
     return FusionMatmulExecutionResult::kExecuted;
   }
 
  private:
+  void LogCacheStatsLocked() const {
+    std::fprintf(stderr,
+        "[djl-rocm-matmul] cache device=%d stream=%p "
+        "algorithms=%zu algorithm_lookups=%zu algorithm_misses=%zu "
+        "algorithm_evictions=%zu algorithm_bytes=%zu "
+        "descriptor_families=%zu descriptor_misses=%zu "
+        "descriptor_evictions=%zu\n",
+        device_, reinterpret_cast<void*>(BoundStreamLocked()),
+        algorithms_.Size(), algorithms_.Lookups(), algorithms_.Misses(),
+        algorithms_.Evictions(), sizeof(FusionMatmulAlgorithm),
+        descriptors_.Size(), descriptors_.Misses(),
+        descriptors_.Evictions());
+  }
+
   backend::Stream BoundStreamLocked() const {
     return reinterpret_cast<backend::Stream>(
         stream_.load(std::memory_order_relaxed));
@@ -2171,9 +2371,14 @@ class FusionMatmulStreamContext {
   std::atomic<std::uintptr_t> stream_;
   hipblasLtHandle_t handle_ = nullptr;
   std::mutex mutex_;
-  std::unordered_map<FusionMatmulKey,
-      std::unique_ptr<FusionMatmulExecutable>, FusionMatmulKeyHash>
-      executables_;
+  // Exact heuristics are compact and cheap to retain. Descriptor families
+  // contain opaque library allocations, so keep only the active model's
+  // matrix families. Both caches remain bounded across changing models.
+  FusionMatmulCache<FusionMatmulKey, FusionMatmulAlgorithm,
+      FusionMatmulKeyHash> algorithms_{262144};
+  FusionMatmulCache<FusionMatmulDescriptorKey,
+      std::unique_ptr<FusionMatmulDescriptors>,
+      FusionMatmulDescriptorKeyHash> descriptors_{256};
   torch::Tensor bias_placeholder_;
   torch::Tensor workspace_;
   std::size_t pin_count_ = 0;
@@ -2489,7 +2694,8 @@ FusionMatmulStreamContextLease ResolveMatmulStreamContextLease(
 struct FusionMatmulExecutableLease {
   FusionMatmulStreamContext* context;
   backend::Stream stream;
-  FusionMatmulExecutable* executable;
+  FusionMatmulAlgorithm* algorithm;
+  FusionMatmulDescriptors* descriptors;
   FusionMatmulExecutionResult result;
   std::unique_lock<std::mutex> lock;
 };
@@ -2513,14 +2719,16 @@ FusionMatmulExecutableLease ResolveMatmulExecutableLease(
       context = context_lease.context;
       context_lock = std::move(context_lease.lock);
     }
-    FusionMatmulExecutable* executable = nullptr;
+    FusionMatmulAlgorithm* algorithm = nullptr;
+    FusionMatmulDescriptors* descriptors = nullptr;
     const FusionMatmulExecutionResult result =
-        context->ResolveExecutableLocked(stream, key, &executable);
+        context->ResolveExecutableLocked(
+            stream, key, &algorithm, &descriptors);
     if (result == FusionMatmulExecutionResult::kRetry) {
       current_matmul_stream_context = nullptr;
       continue;
     }
-    return FusionMatmulExecutableLease{context, stream, executable,
+    return FusionMatmulExecutableLease{context, stream, algorithm, descriptors,
         result, std::move(context_lock)};
   }
 }
@@ -2535,7 +2743,7 @@ FusionMatmulExecutionResult TryExecuteOnCurrentMatmulStream(
     return lease.result;
   }
   return lease.context->ExecuteResolvedLocked(lease.stream, key,
-      *lease.executable, output, left, right, bias, beta);
+      *lease.algorithm, *lease.descriptors, output, left, right, bias, beta);
 }
 
 }  // namespace
@@ -3249,7 +3457,7 @@ bool TryExecuteRocmInferenceMatmul(torch::Tensor& output,
     return false;
   }
   TORCH_CHECK(lease.result == FusionMatmulExecutionResult::kExecuted &&
-          lease.executable != nullptr,
+          lease.algorithm != nullptr,
       "direct ROCm matmul failed to reserve a supported executable");
 
   const torch::Tensor batched_left =
@@ -3264,7 +3472,7 @@ bool TryExecuteRocmInferenceMatmul(torch::Tensor& output,
       "direct ROCm batched matmul preparation changed its planned geometry");
   torch::Tensor batched_result;
   TORCH_CHECK(lease.context->ExecuteResolvedLocked(lease.stream, key,
-          *lease.executable, batched_result, batched_left,
+          *lease.algorithm, *lease.descriptors, batched_result, batched_left,
           batched_right, operation_bias_ptr, 0.0f) ==
           FusionMatmulExecutionResult::kExecuted,
       "direct ROCm matmul stream changed while its context was leased");
