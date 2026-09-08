@@ -1,3 +1,4 @@
+import ai.djl.pytorch.PrepareHipblaslt
 import groovy.json.JsonSlurper
 import java.security.MessageDigest
 import java.util.Properties
@@ -79,24 +80,14 @@ val prepareRocmLoader = tasks.register("prepareRocmLoader") {
     }
 }
 
-val prepareHipblaslt = tasks.register("prepareHipblaslt") {
+val prepareHipblaslt = tasks.register<PrepareHipblaslt>("prepareHipblaslt") {
     val enabled = bundleHipblaslt
     val suppliedBundle = providers.gradleProperty("hipblaslt_bundle_dir").isPresent
-    val script = nativeDir / "rocm/hipblaslt/prepare-bundle.sh"
-    val outputDir = hipblasltBundleDir
-    val flavorName = flavor
-    val injected = project.objects.newInstance<InjectedOps>()
 
+    sourceDir.set(nativeDir / "rocm/hipblaslt")
+    outputDir.set(hipblasltBundleDir)
+    flavorName.set(flavor)
     onlyIf { enabled && !suppliedBundle }
-    outputs.dir(outputDir)
-    // The producer checks its content-addressed cache, including SDK inputs.
-    // Do not let Gradle reuse a bundle after ROCM_PATH or the installed SDK changes.
-    outputs.upToDateWhen { false }
-    doLast {
-        injected.exec.exec {
-            commandLine("bash", script.absolutePath, outputDir.absolutePath, "--flavor", flavorName)
-        }
-    }
 }
 
 val stageJniLib = tasks.register("stageJniLib") {

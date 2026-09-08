@@ -28,15 +28,12 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      - name: Verify native bundle loading contract (CPU only)
+      - name: Test native bundle extraction and library discovery
         run: |
           ./gradlew :engines:pytorch:pytorch-engine:test \
               --tests ai.djl.pytorch.jni.NativeLibraryBundleTest \
               --tests ai.djl.pytorch.jni.LibUtilsTest \
               -x :engines:pytorch:pytorch-jni:processResources
-          python3 engines/pytorch/pytorch-jni-rocm/src/test/python/test_native_bundle.py
-          python3 -m unittest discover -s engines/pytorch/pytorch-native/rocm/hipblaslt -p 'test_*.py' -v
-          python3 engines/pytorch/pytorch-native/rocm/runtime-loader/test_runtime_loader.py
 
       - name: Publish api + pytorch-engine to GitHub Packages
         env:

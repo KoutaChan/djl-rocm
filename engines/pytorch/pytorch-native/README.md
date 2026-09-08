@@ -115,6 +115,30 @@ For a native ROCm 10 SDK installation, set `ROCM_PATH` to its development root (
 official wheel packages installed and set `PYTORCH_LIBRARY_PATH` to the wheel's `torch/lib`
 directory. This preserves AMD's version-locked ROCm libraries and per-device `.kpack` packages.
 
+### ROCm native JAR packaging
+
+After building JNI, run the packaging task from the repository root:
+
+```sh
+ROCM_PATH=/path/to/matching/sdk ./gradlew :engines:pytorch:pytorch-jni-rocm:jar \
+    -Ppt_version=2.11.0 -Pflavor=rocm10.0 -Pclassifier=linux-x86_64
+```
+
+The JAR task prepares the patched hipBLASLt host library and native loader. It checks the exact
+SDK version, source revision, and kernel metadata against
+[`profiles.json`](rocm/hipblaslt/profiles.json). The matching SDK and its GPU kernels remain runtime
+requirements; the build does not modify the SDK or copy its GPU kernels into the JAR.
+
+`HIPBLASLT_CACHE_DIR` selects the private build cache (default: `pytorch-native/build/hipblaslt-cache`).
+`GPU_TARGET` optionally selects a semicolon-separated subset of the SDK's GPU architectures, and
+`BUILD_JOBS` controls host-library build parallelism. Library contents, SDK inputs, and build settings
+are checked before reusing cached output.
+
+For packaging prebuilt inputs, use `-Pjni_library=/path/to/libdjl_torch.so`,
+`-Phipblaslt_bundle_dir=/path/to/rocm-runtime`, and
+`-Procm_loader_library=/path/to/libdjl_rocm_loader.so`. Supplied bundles are validated before packaging.
+CPU, CUDA, macOS, and Windows artifacts retain JNI-only packaging.
+
 ### Format C++ code
 It uses clang-format to format the code.
 

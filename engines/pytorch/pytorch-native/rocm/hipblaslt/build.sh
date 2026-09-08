@@ -1,55 +1,37 @@
 #!/usr/bin/env bash
 # Build the patched hipBLASLt host library against the installed ROCm SDK.
 # Existing Tensile kernel libraries are reused; this script does not install them.
-# Usage: ROCM_PATH=/path/to/sdk bash build.sh <source> <build-dir> [--flavor rocmX.Y] [cmake-options...]
+# Called by the prepareHipblaslt Gradle task after SDK validation and patching.
 
 set -euo pipefail
 
-if (( $# < 2 )); then
-    printf 'Usage: ROCM_PATH=/path/to/sdk %s <source> <build-dir> [--flavor rocmX.Y] [cmake-options...]\n' "$0" >&2
+if (( $# < 3 )); then
+    printf 'Usage: ROCM_PATH=/path/to/sdk %s <project-root> <build-dir> <legacy|modern> [cmake-options...]\n' "$0" >&2
     exit 2
 fi
 : "${ROCM_PATH:?Set ROCM_PATH to the installed ROCm SDK}"
+: "${MSGPACK_REVISION:?Run the prepareHipblaslt Gradle task}"
+: "${FMT_REVISION:?Run the prepareHipblaslt Gradle task}"
+: "${YAML_REVISION:?Run the prepareHipblaslt Gradle task}"
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source_root="$(cd -- "$1" && pwd)"
+project_root="$(cd -- "$1" && pwd)"
 build_dir="$2"
-shift 2
-
-flavor=""
-if [[ "${1:-}" == --flavor ]]; then
-    flavor="$2"
-    shift 2
+build_family="$3"
+shift 3
+if [[ "$build_family" != legacy && "$build_family" != modern ]]; then
+    printf 'Unsupported hipBLASLt build family: %s\n' "$build_family" >&2
+    exit 2
 fi
-profile_info=$(python3 - "$script_dir" "$source_root" "$flavor" <<'PY'
-import importlib.util
-import os
-import subprocess
-import sys
-from pathlib import Path
 
-spec = importlib.util.spec_from_file_location("bundle", Path(sys.argv[1]) / "prepare-bundle.py")
-bundle = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bundle)
-sdk = Path(os.environ["ROCM_PATH"])
-_, _, profile = bundle.sdk_profile(sdk, sys.argv[3] or None)
-source = Path(sys.argv[2])
-head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-if head != profile["source_revision"]:
-    raise RuntimeError(
-        f"Expected {profile['source_repository']} revision {profile['source_revision']}"
-    )
-bundle.apply_patches(source, profile)
-dynamic = subprocess.check_output(["readelf", "-d", str(sdk / "lib/libhipblaslt.so")], text=True)
-print(profile["source_dir"])
-print(profile["build_family"])
-print("ON" if "librocroller.so" in dynamic else "OFF")
-print("ON" if "libroctx" in dynamic else "OFF")
-PY
-)
-mapfile -t profile_values <<< "$profile_info"
-project_root="$source_root/${profile_values[0]}"
-build_family="${profile_values[1]}"
+dependencies=$(readelf -d "$ROCM_PATH/lib/libhipblaslt.so")
+rocroller=OFF
+marker=OFF
+if [[ "$dependencies" == *librocroller.so* ]]; then
+    rocroller=ON
+fi
+if [[ "$dependencies" == *libroctx* ]]; then
+    marker=ON
+fi
 
 export PATH="$ROCM_PATH/bin:$PATH"
 # Origami's standalone header checks clear CMAKE_CXX_FLAGS and compile as C++.
@@ -75,8 +57,7 @@ fetch_dependency() {
 msgpack_root="$deps_dir/msgpack-cxx-6.1.0"
 msgpack_prefix="$msgpack_root/install"
 if [[ ! -f "$msgpack_prefix/lib/cmake/msgpack-cxx/msgpack-cxx-config.cmake" ]]; then
-    msgpack_revision=8c602e8579c7e7d65d6f9c6703c9699db3fb0488
-    fetch_dependency "$msgpack_root/source" https://github.com/msgpack/msgpack-c.git "$msgpack_revision"
+    fetch_dependency "$msgpack_root/source" https://github.com/msgpack/msgpack-c.git "$MSGPACK_REVISION"
     cmake -S "$msgpack_root/source" -B "$msgpack_root/build" -G 'Unix Makefiles' \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -94,12 +75,10 @@ fi
 # exported CMake interface requires fmt and yaml-cpp development packages even
 # though the SDK includes neither; install the upstream-pinned dependencies
 # privately and keep yaml-cpp static with position-independent code.
-rocroller="${profile_values[2]}"
-marker="${profile_values[3]}"
 dependency_prefix="$deps_dir/install"
 if [[ "$rocroller" == ON ]]; then
-    fetch_dependency "$deps_dir/fmt/source" https://github.com/fmtlib/fmt.git 9cf9f38eded63e5e0fb95cd536ba51be601d7fa2
-    fetch_dependency "$deps_dir/yaml-cpp/source" https://github.com/jbeder/yaml-cpp.git f7320141120f720aecc4c32be25586e7da9eb978
+    fetch_dependency "$deps_dir/fmt/source" https://github.com/fmtlib/fmt.git "$FMT_REVISION"
+    fetch_dependency "$deps_dir/yaml-cpp/source" https://github.com/jbeder/yaml-cpp.git "$YAML_REVISION"
     if [[ ! -f "$dependency_prefix/lib/cmake/fmt/fmt-config.cmake" ]]; then
         cmake -S "$deps_dir/fmt/source" -B "$deps_dir/fmt/build" \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$dependency_prefix" \

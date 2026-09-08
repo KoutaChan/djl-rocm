@@ -328,8 +328,4 @@ fi
 printf 'pt_version=%s\nflavor=%s\nclassifier=%s-%s\nsha256=%s\n' \
   "$VERSION" "$FLAVOR" "$classifier_os" "$classifier_arch" "$library_sha" > native-build.properties
 
-if [[ "$PLATFORM" == linux && "$classifier_arch" == x86_64 && "$FLAVOR" == rocm* ]]; then
-  bash "$WORK_DIR/rocm/hipblaslt/prepare-bundle.sh" "$WORK_DIR/build/rocm-runtime" --flavor "$FLAVOR"
-fi
-
 popd
