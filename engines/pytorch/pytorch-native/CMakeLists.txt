@@ -60,6 +60,7 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_rocm_attention.h"
     "src/main/native/djl_pytorch_rocm_attention.cc"
     "src/main/native/djl_pytorch_single_query_attention.h"
+    "src/main/native/djl_pytorch_short_attention.h"
     "src/main/native/djl_pytorch_masked_categorical.h"
     "src/main/native/djl_pytorch_masked_categorical.cc"
     "src/main/native/djl_pytorch_routing_masks.h"
@@ -121,12 +122,14 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         "src/main/native/djl_pytorch_single_query_attention.hip"
+        "src/main/native/djl_pytorch_short_attention.hip"
         "src/main/native/djl_pytorch_packed_relation_attention.hip"
         "src/main/native/djl_pytorch_rocm_launch_config.cc")
     set_source_files_properties(
         "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         "src/main/native/djl_pytorch_single_query_attention.hip"
+        "src/main/native/djl_pytorch_short_attention.hip"
         "src/main/native/djl_pytorch_packed_relation_attention.hip"
         PROPERTIES LANGUAGE HIP)
 endif()

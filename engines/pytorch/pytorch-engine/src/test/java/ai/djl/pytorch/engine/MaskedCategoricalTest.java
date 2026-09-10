@@ -174,6 +174,15 @@ public class MaskedCategoricalTest {
     }
 
     @Test
+    public void logSumExpGradientIsInvariantToLargeCommonOffsets() {
+        Engine engine = Engine.getInstance();
+        verifyLogSumExpLargeOffsets(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyLogSumExpLargeOffsets(engine, Device.gpu());
+        }
+    }
+
+    @Test
     public void backwardNonFiniteMaskSemanticsMatchPortableReference() {
         Engine engine = Engine.getInstance();
         verifyBackwardNonFiniteMaskSemantics(engine, Device.cpu());
@@ -602,6 +611,46 @@ public class MaskedCategoricalTest {
             assertClose(normalizers.toFloatArray(), cpuNormalizers, tolerance);
             try (NDArray gradient = logits.getGradient().toType(DataType.FLOAT32, false)) {
                 assertClose(gradient.toFloatArray(), cpuGradients, tolerance);
+            }
+        }
+    }
+
+    private static void verifyLogSumExpLargeOffsets(Engine engine, Device device) {
+        for (DataType dataType : new DataType[] {DataType.FLOAT32, DataType.BFLOAT16}) {
+            for (int width : new int[] {3, 34}) {
+                for (float offset : new float[] {0f, 1e8f, 1e20f}) {
+                    try (NDManager manager = engine.newBaseManager(device);
+                            GradientCollector collector = engine.newGradientCollector()) {
+                        float[] values = new float[3 * width];
+                        boolean[] maskValues = new boolean[values.length];
+                        float[] expected = new float[values.length];
+                        for (int column = 0; column < width; column++) {
+                            values[column] = offset;
+                            values[width + column] = -offset;
+                            values[2 * width + column] = offset;
+                            maskValues[column] = column == 0 || column == width - 1;
+                            maskValues[width + column] = true;
+                            expected[column] = maskValues[column] ? 1f : 0f;
+                            expected[width + column] = -3f / width;
+                        }
+                        NDArray logits =
+                                manager.create(values, new Shape(3, width)).toType(dataType, false);
+                        logits.setRequiresGradient(true);
+                        NDArray mask = manager.create(maskValues, logits.getShape());
+                        NDArray normalizers = NDArrays.maskedLogSumExp(logits, mask, -1);
+                        NDArray upstream =
+                                manager.create(new float[] {2f, -3f, 4f}, new Shape(3, 1));
+                        collector.backward(normalizers.mul(upstream).sum());
+                        Assert.assertEquals(normalizers.toFloatArray()[2], 0f);
+                        try (NDArray gradient =
+                                logits.getGradient().toType(DataType.FLOAT32, false)) {
+                            assertClose(
+                                    gradient.toFloatArray(),
+                                    expected,
+                                    dataType == DataType.BFLOAT16 ? 1e-3f : 1e-6f);
+                        }
+                    }
+                }
             }
         }
     }

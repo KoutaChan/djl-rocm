@@ -86,6 +86,72 @@ public class StructuredAttentionTest {
         }
     }
 
+    @Test
+    public void groupedAttentionLargeCommonScorePreservesGradientMass() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType : new DataType[] {DataType.FLOAT32, DataType.BFLOAT16}) {
+            for (float magnitude : new float[] {1f, 8192f}) {
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    NDArray query =
+                            requiringGradient(
+                                    manager.create(new float[] {magnitude}, new Shape(1, 1, 1))
+                                            .toType(dataType, false));
+                    NDArray shared =
+                            requiringGradient(
+                                    manager.create(
+                                                    new float[] {magnitude, 2f, magnitude, 6f},
+                                                    new Shape(1, 2, 2))
+                                            .toType(dataType, false));
+                    NDArray sharedDeltas =
+                            requiringGradient(manager.zeros(new Shape(1, 2, 2), dataType));
+                    NDArray indexedDeltas =
+                            requiringGradient(manager.zeros(new Shape(1, 1, 2), dataType));
+                    NDArray ids = manager.zeros(new Shape(1, 1), DataType.INT32);
+                    NDArray output;
+                    try (GradientCollector collector = engine.newGradientCollector()) {
+                        output =
+                                NDArrays.groupedIndexedScaledDotProductAttention(
+                                        query, shared, sharedDeltas, indexedDeltas, ids, 1, 1.0);
+                        collector.backward(output.sum());
+                    }
+
+                    // Equal scores must give each valid value gradient one half even when
+                    // the common score is 2^26 and an FP32 absolute LSE loses log(2).
+                    try (NDArray queryGradient = query.getGradient();
+                            NDArray sharedGradient = shared.getGradient();
+                            NDArray deltaGradient = sharedDeltas.getGradient();
+                            NDArray indexedGradient = indexedDeltas.getGradient()) {
+                        float[] actual =
+                                sharedGradient.toType(DataType.FLOAT32, false).toFloatArray();
+                        System.out.printf(
+                                "GROUPED_ATTENTION_GRADIENT_MASS dtype=%s magnitude=%g values=%g,%g"
+                                        + " mass=%g%n",
+                                dataType, magnitude, actual[1], actual[3], actual[1] + actual[3]);
+                        assertClose(
+                                output.toType(DataType.FLOAT32, false).toFloatArray(),
+                                new float[] {4f},
+                                1e-6f);
+                        float[] expected = {-magnitude, 0.5f, magnitude, 0.5f};
+                        assertClose(actual, expected, 1e-6f);
+                        assertClose(
+                                deltaGradient.toType(DataType.FLOAT32, false).toFloatArray(),
+                                expected,
+                                1e-6f);
+                        assertClose(
+                                queryGradient.toType(DataType.FLOAT32, false).toFloatArray(),
+                                new float[] {0f},
+                                1e-6f);
+                        assertAllZero(
+                                indexedGradient.toType(DataType.FLOAT32, false).toFloatArray());
+                    }
+                }
+            }
+        }
+    }
+
     private static void verifyGroupedAttentionStrictPadding(Engine engine, Device device) {
         try (NDManager manager = engine.newBaseManager(device)) {
             NDArray query = requiringGradient(manager.create(new float[] {1f}, new Shape(1, 1, 1)));
@@ -302,6 +368,127 @@ public class StructuredAttentionTest {
                 new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
             engine.setRandomSeed(20260918);
             verifyGroupedPackedAttentionGradients(engine, Device.gpu(), dataType, true, true);
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionProductionPrefixesMatchPortableReference() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType : new DataType[] {DataType.FLOAT32, DataType.BFLOAT16}) {
+            for (int presentTokens : new int[] {29, 2, 4, 8, 16}) {
+                engine.setRandomSeed(20260923);
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    NDArray queryValues = manager.randomNormal(new Shape(2, 34, 64), dataType);
+                    NDArray packedValues = manager.randomNormal(new Shape(2, 4, 29, 128), dataType);
+                    NDArray mask = manager.zeros(new Shape(2, 4, 29), DataType.INT32);
+                    mask.set(new ai.djl.ndarray.index.NDIndex("..., :{}", presentTokens), 1);
+                    NDArray outputGradient =
+                            manager.randomNormal(new Shape(2, 4, 34, 64), dataType).mul(0.125f);
+                    NDArray query = requiringGradient(queryValues.duplicate());
+                    NDArray packed = requiringGradient(packedValues.duplicate());
+                    NDArray output;
+                    try (GradientCollector collector = engine.newGradientCollector()) {
+                        output =
+                                NDArrays.groupedPackedScaledDotProductAttention(
+                                        query, packed, mask, 4, 0.25);
+                        collector.backward(output.mul(outputGradient).sum());
+                    }
+                    NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+                    NDArray referencePacked = requiringGradient(packedValues.duplicate());
+                    NDArray referenceOutput;
+                    try (GradientCollector collector = engine.newGradientCollector()) {
+                        referenceOutput =
+                                groupedPackedAttentionReference(
+                                        referenceQuery, referencePacked, mask, 4, 0.25);
+                        collector.backward(referenceOutput.mul(outputGradient).sum());
+                    }
+
+                    float tolerance = gradientTolerance(dataType);
+                    assertClose(
+                            output.toType(DataType.FLOAT32, false).toFloatArray(),
+                            referenceOutput.toType(DataType.FLOAT32, false).toFloatArray(),
+                            tolerance);
+                    assertGradientClose(query, referenceQuery, tolerance);
+                    assertGradientClose(packed, referencePacked, tolerance);
+                    if (presentTokens < 29) {
+                        try (NDArray gradient = packed.getGradient();
+                                NDArray masked = gradient.get("..., {}:, :", presentTokens)) {
+                            assertAllZero(masked.toType(DataType.FLOAT32, false).toFloatArray());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionMaskedKeyLaneStillSuppliesQueryFeature() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType : new DataType[] {DataType.FLOAT32, DataType.BFLOAT16}) {
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                float[] queryValues = new float[16];
+                queryValues[5] = 4f;
+                float[] packedValues = new float[29 * 32];
+                packedValues[27 * 32 + 5] = 1f;
+                packedValues[28 * 32 + 5] = -1f;
+                packedValues[27 * 32 + 16] = 1f;
+                packedValues[28 * 32 + 16] = -1f;
+                int[] maskValues = new int[29];
+                maskValues[27] = 1;
+                maskValues[28] = 1;
+                NDArray query =
+                        requiringGradient(
+                                manager.create(queryValues, new Shape(1, 1, 16))
+                                        .toType(dataType, false));
+                NDArray packed =
+                        requiringGradient(
+                                manager.create(packedValues, new Shape(1, 1, 29, 32))
+                                        .toType(dataType, false));
+                NDArray mask = manager.create(maskValues, new Shape(1, 1, 29));
+                NDArray output;
+                try (GradientCollector collector = engine.newGradientCollector()) {
+                    output =
+                            NDArrays.groupedPackedScaledDotProductAttention(
+                                    query, packed, mask, 1, 0.25);
+                    collector.backward(output.get("..., 0").sum());
+                }
+
+                // Only key lanes 27/28 are present, but their dot products require lane 5.
+                // Scores are +1/-1, so the first output is tanh(1).
+                float probability = (float) (1.0 / (1.0 + Math.exp(-2.0)));
+                float variance = probability * (1f - probability);
+                float[] expectedOutput = new float[16];
+                expectedOutput[0] = (float) Math.tanh(1.0);
+                float[] expectedQueryGradient = new float[16];
+                expectedQueryGradient[5] = variance;
+                float[] expectedPackedGradient = new float[29 * 32];
+                expectedPackedGradient[27 * 32 + 5] = 2f * variance;
+                expectedPackedGradient[28 * 32 + 5] = -2f * variance;
+                expectedPackedGradient[27 * 32 + 16] = probability;
+                expectedPackedGradient[28 * 32 + 16] = 1f - probability;
+                float tolerance = dataType == DataType.BFLOAT16 ? 1e-2f : 1e-6f;
+                assertClose(
+                        output.toType(DataType.FLOAT32, false).toFloatArray(),
+                        expectedOutput,
+                        tolerance);
+                try (NDArray queryGradient = query.getGradient();
+                        NDArray packedGradient = packed.getGradient()) {
+                    assertClose(
+                            queryGradient.toType(DataType.FLOAT32, false).toFloatArray(),
+                            expectedQueryGradient,
+                            tolerance);
+                    assertClose(
+                            packedGradient.toType(DataType.FLOAT32, false).toFloatArray(),
+                            expectedPackedGradient,
+                            tolerance);
+                }
+            }
         }
     }
 

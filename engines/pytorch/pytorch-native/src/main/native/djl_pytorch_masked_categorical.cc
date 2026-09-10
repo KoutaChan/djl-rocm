@@ -197,8 +197,9 @@ class MaskedLogSumExpFunction : public torch::autograd::Function<MaskedLogSumExp
  public:
   static torch::Tensor forward(torch::autograd::AutogradContext* context,
       const torch::Tensor& logits, const torch::Tensor& mask) {
-    auto normalizers = rocm::masked_log_sum_exp_forward(logits, mask);
-    context->save_for_backward({logits, mask, normalizers});
+    torch::Tensor normalization;
+    auto normalizers = rocm::masked_log_sum_exp_forward(logits, mask, &normalization);
+    context->save_for_backward({logits, mask, normalization});
     return normalizers;
   }
 

@@ -242,7 +242,7 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
     auto result = rocm::grouped_indexed_attention_forward(query, shared_key_values, shared_deltas, indexed_deltas,
         indexed_shared_ids, queries_per_group, static_cast<float>(scale), true);
     context->save_for_backward(
-        {query, shared_key_values, shared_deltas, indexed_deltas, indexed_shared_ids, result.log_sum_exp});
+        {query, shared_key_values, shared_deltas, indexed_deltas, indexed_shared_ids, result.probabilities});
     context->saved_data["queries_per_group"] = queries_per_group;
     context->saved_data["scale"] = scale;
     return result.output;
