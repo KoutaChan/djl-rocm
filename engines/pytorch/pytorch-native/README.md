@@ -53,6 +53,32 @@ state. On ROCm, the lane also owns one lazy, grow-only hipBLASLt workspace sized
 selected fused linear algorithm. This avoids PyTorch's process-lifetime handle/stream workspace
 registry while preserving the selected algorithm and adding no submission synchronization.
 
+### Fusion transformer dimensions
+
+Transformer stacks, indexed local transformers, and single-query readouts accept independently
+chosen positive hidden width `H`, attention width `A`, and feed-forward width `F`. The attention
+head count must be positive and divide `A`; `H` and `F` need not be multiples of the head count or
+the GPU wave size. Parameter tensor shapes must match the selected dimensions. Widths belong to
+the prepared recipe, so changing them requires matching parameters and a new plan.
+
+The CUDA and ROCm backends expose the same Fusion recipe API and share these implementations.
+The backend selects existing optimized shape specializations internally and uses dimension-aware
+kernels for other supported shapes. Callers do not select a model-specific kernel or API.
+
+The remaining limits describe kernel storage and indexing requirements. Here `T` is the token
+count, `N` is the attention head count, and `R` is the number of readouts in a group.
+
+| Operation | Additional dimension limits |
+| --- | --- |
+| Transformer stack with ordinary attention | `1 <= T <= 12288`; attention probabilities use `4 * T` bytes of shared memory per block. |
+| Transformer stack with indexed-relation attention | `1 <= T <= 512` and a positive relation count no greater than `32767`, matching the signed 16-bit relation representation. |
+| Indexed local transformer | Positive group and token counts; dense input or up to eight input segments sharing batch size, group count, hidden width, and data type. The general attention kernel does not allocate shared memory proportional to `T`. |
+| Single-query readout group | `1 <= R <= 8`, `R * N <= 65535`, and `4 * (2 * H + A / N + 2 * T) + 32 <= 49152`. The last expression accounts for dynamic shared memory and a reserve for static softmax scalars within a 48 KiB per-block budget. |
+
+Native tensor-size, allocation, matrix-operation, and launch limits also apply. The planner
+validates the dimension requirements above before execution. Feed-forward width is sized
+independently in the workspace, including indexed local transformers where `F` exceeds `3 * A`.
+
 ### NVIDIA CUDA
 
 Install a CUDA toolkit compatible with the selected libtorch flavor and make `nvcc` available to

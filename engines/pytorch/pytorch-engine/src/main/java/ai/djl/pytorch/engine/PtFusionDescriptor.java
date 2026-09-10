@@ -532,9 +532,10 @@ final class PtFusionDescriptor {
             long readoutCount = group.getReadouts().size();
             long regionElements =
                     Math.max(
-                            Math.multiplyExact(maximumBatch, 2L * hiddenWidth),
+                            Math.multiplyExact(maximumBatch, Math.multiplyExact(2L, hiddenWidth)),
                             Math.multiplyExact(
-                                    Math.multiplyExact(readoutCount, maximumBatch), hiddenWidth));
+                                    Math.multiplyExact(readoutCount, maximumBatch),
+                                    Math.max(hiddenWidth, group.getAttentionWidth())));
             long stateElements =
                     Math.multiplyExact(Math.multiplyExact(readoutCount, maximumBatch), hiddenWidth);
             long tailElements =
@@ -594,12 +595,17 @@ final class PtFusionDescriptor {
             long tokens = shape[1];
             long hidden = shape[2];
             long rows = Math.multiplyExact(batch, tokens);
-            long elements = Math.multiplyExact(rows, hidden); // normalized
+            long attentionWidth = stack.getAttentionWidth();
+            long queryKeyValueWidth = Math.multiplyExact(3L, attentionWidth);
+            long elements = Math.multiplyExact(rows, Math.max(hidden, attentionWidth));
             elements =
                     Math.addExact(
                             elements,
                             Math.multiplyExact(
-                                    rows, Math.multiplyExact(3L, stack.getAttentionWidth())));
+                                    rows,
+                                    stack.hasIndexedRelationAttention()
+                                            ? queryKeyValueWidth
+                                            : Math.max(queryKeyValueWidth, hidden)));
             long tailWidth = stack.getFeedForwardWidth();
             if (stack.hasIndexedRelationAttention()) {
                 long relationCount = relationCount(stack);
@@ -640,9 +646,24 @@ final class PtFusionDescriptor {
             long activeRows =
                     encoder.getIndices().getSpec().getLeadingDimension().getMaximumExtent();
             long hiddenWidth = encoder.getSpec().getInnerShape()[2];
+            long tokens = encoder.getSpec().getInnerShape()[1];
+            long attentionWidth = encoder.getAttentionWidth();
+            long queryKeyValueWidth = Math.multiplyExact(3L, attentionWidth);
             long tileRows = Math.min(activeRows, INDEXED_LOCAL_TRANSFORMER_TILE_ROWS);
-            long elements = Math.multiplyExact(activeRows, 3L * encoder.getAttentionWidth());
+            long elements = Math.multiplyExact(activeRows, queryKeyValueWidth);
             elements = Math.addExact(elements, Math.multiplyExact(tileRows, hiddenWidth));
+            // Match the native in-place attention specialization's scratch layout.
+            boolean inPlaceAttention =
+                    tokens <= 32 && encoder.getAttentionHeads() == 4 && attentionWidth == 64;
+            if (!inPlaceAttention) {
+                elements = Math.addExact(elements, Math.multiplyExact(activeRows, attentionWidth));
+            }
+            if (encoder.getFeedForwardWidth() > queryKeyValueWidth) {
+                elements =
+                        Math.addExact(
+                                elements,
+                                Math.multiplyExact(tileRows, encoder.getFeedForwardWidth()));
+            }
             bytes =
                     Math.addExact(
                             bytes,

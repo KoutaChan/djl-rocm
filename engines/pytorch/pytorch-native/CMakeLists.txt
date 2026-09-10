@@ -52,6 +52,9 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_launch_config.cc"
     "src/main/native/djl_pytorch_structured_attention.h"
     "src/main/native/djl_pytorch_structured_attention.cc"
+    "src/main/native/djl_pytorch_packed_relation_attention.h"
+    "src/main/native/djl_pytorch_packed_relation_attention_kernels.h"
+    "src/main/native/djl_pytorch_packed_relation_attention.cc"
     "src/main/native/djl_pytorch_attention.h"
     "src/main/native/djl_pytorch_attention.cc"
     "src/main/native/djl_pytorch_rocm_attention.h"
@@ -69,6 +72,9 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_projected_residual_mlp.cc"
     "src/main/native/djl_pytorch_flat_gradient.h"
     "src/main/native/djl_pytorch_flat_gradient.cc"
+    "src/main/native/djl_pytorch_tensor_copy.h"
+    "src/main/native/djl_pytorch_tensor_copy.cc"
+    "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_tensor_copy.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_fusion.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_autocast.cc"
@@ -115,11 +121,13 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
         "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         "src/main/native/djl_pytorch_single_query_attention.hip"
+        "src/main/native/djl_pytorch_packed_relation_attention.hip"
         "src/main/native/djl_pytorch_rocm_launch_config.cc")
     set_source_files_properties(
         "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         "src/main/native/djl_pytorch_single_query_attention.hip"
+        "src/main/native/djl_pytorch_packed_relation_attention.hip"
         PROPERTIES LANGUAGE HIP)
 endif()
 

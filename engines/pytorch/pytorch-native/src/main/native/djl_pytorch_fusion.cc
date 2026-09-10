@@ -389,6 +389,8 @@ struct IndexedLocalTransformerCommandSpec {
   int32_t active_extent_index;
   int32_t normalized_storage_index;
   int32_t query_key_value_storage_index;
+  int32_t context_storage_index = -1;
+  int32_t expanded_storage_index = -1;
   int32_t query_key_value_weight_binding_index;
   int32_t attention_output_weight_binding_index;
   int32_t feed_forward_expansion_weight_binding_index;
@@ -2225,25 +2227,22 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
   command.maximum_batches = plan.dimensions[input.dimension_index].maximum_extent;
   command.token_count = input.inner_shape[0];
   command.hidden_width = input.inner_shape[1];
+  TORCH_CHECK(command.hidden_width > 0 && command.attention_heads > 0 && command.attention_width > 0 &&
+                  command.attention_width % command.attention_heads == 0 && command.feed_forward_width > 0,
+      command_name, " requires positive widths and attention width divisible by its head count");
+  const int64_t query_key_value_width = CheckedMultiply(3, command.attention_width, "transformer QKV width");
   if (indexed_relation) {
-    TORCH_CHECK(command.token_count > 0 && command.token_count <= 512 &&
-            command.hidden_width == 256 && command.attention_heads > 0 &&
-            command.attention_width > 0 &&
-            command.attention_width % command.attention_heads == 0 &&
-            command.feed_forward_width > 0 && command.relation_count > 0 &&
-            command.relation_count <= std::numeric_limits<int16_t>::max(),
+    TORCH_CHECK(command.token_count > 0 && command.token_count <= 512 && command.relation_count > 0 &&
+                    command.relation_count <= std::numeric_limits<int16_t>::max(),
         command_name,
-        " requires tokens<=512, hidden=256, divisible attention width, and "
+        " requires tokens<=512 and "
         "INT16-addressable relations");
     command.padded_token_count = CheckedRoundUp(
         command.token_count, 8, "indexed-relation attention padded tokens");
   } else {
-    TORCH_CHECK(command.token_count > 0 && command.token_count <= 8 &&
-            command.hidden_width == 256 && command.attention_heads == 4 &&
-            command.attention_width == 128 &&
-            command.feed_forward_width > 0,
-        "TRANSFORMER_ENCODER_STACK_V1 native lowering requires tokens<=8, "
-        "hidden=256, heads=4, and attention width=128");
+    TORCH_CHECK(command.token_count > 0 &&
+                    command.token_count <= kFusionAttentionSharedMemoryBytes / static_cast<int64_t>(sizeof(float)),
+        "TRANSFORMER_ENCODER_STACK_V1 attention probabilities exceed the per-block shared-memory budget");
   }
   TORCH_CHECK(command.maximum_batches <= std::numeric_limits<uint32_t>::max() / command.token_count,
       "TRANSFORMER_ENCODER_STACK_V1 maximum batch exceeds the native "
@@ -2296,7 +2295,7 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
     TORCH_CHECK(plan.values[block.value_indices[0]].data_type ==
             plan.values[block.value_indices[1]].data_type,
         "TRANSFORMER_ENCODER_STACK_V1 attention-input norm types must match");
-    require_projection(block.value_indices[2], 3 * command.attention_width, command.hidden_width, "QKV weight");
+    require_projection(block.value_indices[2], query_key_value_width, command.hidden_width, "QKV weight");
     require_projection(
         block.value_indices[3], command.hidden_width, command.attention_width, "attention output weight");
     require_vector(block.value_indices[4], command.hidden_width, false, "attention output bias");
@@ -2359,10 +2358,14 @@ TransformerEncoderStackCommandSpec BuildTransformerEncoderStackCommand(
 #endif
 
   command.normalized_storage_index = NextStorageIndex(plan);
-  plan.storages.push_back(StorageSpec{result.data_type, result.maximum_shape, -1, 0, command_index});
+  plan.storages.push_back(StorageSpec{result.data_type,
+      {command.maximum_batches, command.token_count, std::max(command.hidden_width, command.attention_width)}, -1, 0,
+      command_index});
   command.query_key_value_storage_index = NextStorageIndex(plan);
   plan.storages.push_back(StorageSpec{result.data_type,
-      {command.maximum_batches, command.token_count, 3 * command.attention_width}, -1, 0, command_index});
+      {command.maximum_batches, command.token_count,
+          indexed_relation ? query_key_value_width : std::max(query_key_value_width, command.hidden_width)},
+      -1, 0, command_index});
   command.expanded_storage_index = NextStorageIndex(plan);
   const int64_t tail_width =
       indexed_relation
@@ -2455,16 +2458,19 @@ IndexedLocalTransformerCommandSpec BuildIndexedLocalTransformerCommand(FusionPla
           result.inner_shape == expected_result_shape,
       operation_name, " result metadata does not match the logical concatenation");
   command.index_data_type = indices.data_type;
-  TORCH_CHECK(command.hidden_width == 256 && command.group_count == 4 && command.token_count > 0 &&
-                  command.token_count <= 32 && command.attention_heads == 4 && command.attention_width == 64 &&
-                  command.feed_forward_width == 128,
-      operation_name, " native lowering requires hidden=256, "
-      "groups=4, tokens<=32, heads=4, attention=64, and feed-forward=128");
+  TORCH_CHECK(command.hidden_width > 0 && command.group_count > 0 && command.token_count > 0 &&
+                  command.attention_heads > 0 && command.attention_width > 0 &&
+                  command.attention_width % command.attention_heads == 0 && command.feed_forward_width > 0,
+      operation_name, " requires positive dimensions and attention width divisible by its head count");
+  const int64_t query_key_value_width =
+      CheckedMultiply(3, command.attention_width, "indexed local transformer QKV width");
   const int64_t maximum_dense_rows = CheckedMultiply(command.maximum_batches,
       CheckedMultiply(command.group_count, command.token_count, "indexed local transformer rows per batch"),
       "indexed local transformer dense row capacity");
   TORCH_CHECK(command.maximum_active_rows <= maximum_dense_rows,
       operation_name, " active capacity exceeds dense rows");
+  TORCH_CHECK(command.maximum_active_rows <= std::numeric_limits<int64_t>::max() / command.attention_heads,
+      operation_name, " attention query capacity exceeds the native indexing range");
 
   const auto require_vector = [&](int32_t value_index, int64_t width, bool allow_float32, const char* name) {
     const ValueSpec& value = plan.values[value_index];
@@ -2492,7 +2498,7 @@ IndexedLocalTransformerCommandSpec BuildIndexedLocalTransformerCommand(FusionPla
   TORCH_CHECK(plan.values[command.value_indices[0]].data_type == plan.values[command.value_indices[1]].data_type &&
                   plan.values[command.value_indices[2]].data_type == plan.values[command.value_indices[3]].data_type,
       operation_name, " norm pair types must match");
-  require_projection(command.value_indices[4], 3 * command.attention_width, command.hidden_width, "QKV weight");
+  require_projection(command.value_indices[4], query_key_value_width, command.hidden_width, "QKV weight");
   require_projection(
       command.value_indices[5], command.hidden_width, command.attention_width, "attention output weight");
   require_vector(command.value_indices[6], command.hidden_width, false, "attention output bias");
@@ -2526,7 +2532,18 @@ IndexedLocalTransformerCommandSpec BuildIndexedLocalTransformerCommand(FusionPla
       StorageSpec{result.data_type, {command.tile_rows, command.hidden_width}, -1, 0, command_index});
   command.query_key_value_storage_index = NextStorageIndex(plan);
   plan.storages.push_back(
-      StorageSpec{result.data_type, {command.maximum_active_rows, 3 * command.attention_width}, -1, 0, command_index});
+      StorageSpec{result.data_type, {command.maximum_active_rows, query_key_value_width}, -1, 0, command_index});
+  if (!UsesIndexedLocalAttentionInPlace(command.token_count, command.attention_heads, command.attention_width)) {
+    command.context_storage_index = NextStorageIndex(plan);
+    plan.storages.push_back(
+        StorageSpec{result.data_type, {command.maximum_active_rows, command.attention_width}, -1, 0, command_index});
+  }
+  // A wider expansion must not overwrite compact rows that later tiles still consume.
+  if (command.feed_forward_width > query_key_value_width) {
+    command.expanded_storage_index = NextStorageIndex(plan);
+    plan.storages.push_back(
+        StorageSpec{result.data_type, {command.tile_rows, command.feed_forward_width}, -1, 0, command_index});
+  }
   return command;
 }
 
@@ -2611,15 +2628,20 @@ SingleQueryReadoutGroupCommandSpec BuildSingleQueryReadoutGroupCommand(FusionPla
         "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 result metadata "
         "does not match the group");
   }
-  TORCH_CHECK(command.hidden_width == 256 && command.token_count > 0 && command.token_count <= 256 &&
-                  command.attention_heads > 0 && command.attention_heads <= 8 && command.attention_width > 0 &&
-                  command.attention_width <= 128 && command.attention_width % command.attention_heads == 0 &&
-                  command.attention_width / command.attention_heads <= 32 && command.maximum_feed_forward_width > 0 &&
-                  command.maximum_feed_forward_width <= 512,
-      "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 native lowering "
-      "requires hidden=256, "
-      "tokens<=256, heads<=8, head width<=32, attention<=128, and "
-      "feed-forward<=512");
+  TORCH_CHECK(command.hidden_width > 0 && command.token_count > 0 && command.attention_heads > 0 &&
+                  command.attention_width > 0 && command.attention_width % command.attention_heads == 0 &&
+                  command.maximum_feed_forward_width > 0,
+      "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 requires positive dimensions and divisible attention width");
+  TORCH_CHECK(command.attention_heads <= 65535 / readout_count,
+      "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 exceeds the native grid-y limit");
+  const int64_t attention_shared_elements =
+      CheckedAdd(CheckedAdd(CheckedMultiply(2, command.hidden_width, "readout hidden scratch"),
+                     command.attention_width / command.attention_heads, "readout query scratch"),
+          CheckedMultiply(2, command.token_count, "readout token scratch"), "readout attention scratch");
+  TORCH_CHECK(
+      attention_shared_elements <= (kFusionAttentionSharedMemoryBytes - kSingleQueryReadoutSharedMemoryReserve) /
+                                       static_cast<int64_t>(sizeof(float)),
+      "SINGLE_QUERY_CROSS_ATTENTION_READOUT_GROUP_V1 exceeds the per-block shared-memory budget");
 
   const auto require_projection = [&](int32_t value_index, int64_t rows,
                                       int64_t columns, const char* name) {
@@ -2731,7 +2753,8 @@ SingleQueryReadoutGroupCommandSpec BuildSingleQueryReadoutGroupCommand(FusionPla
       CheckedMultiply(readout_count, command.maximum_batches, "single-query readout batch capacity");
   const int64_t shared_region =
       std::max(CheckedMultiply(command.maximum_batches, 2 * command.hidden_width, "single-query seed-input capacity"),
-          CheckedMultiply(readout_batch, command.hidden_width, "single-query normalized capacity"));
+          CheckedMultiply(readout_batch, std::max(command.hidden_width, command.attention_width),
+              "single-query normalized and context capacity"));
   const int64_t state_elements = CheckedMultiply(readout_batch, command.hidden_width, "single-query state capacity");
   const int64_t tail_elements = CheckedMultiply(
       readout_batch, std::max(command.hidden_width, command.maximum_feed_forward_width), "single-query tail capacity");
@@ -4741,21 +4764,19 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
   const int64_t active_rows = CheckedMultiply(batch_count,
       command.token_count, "TRANSFORMER_ENCODER_STACK_V1 active rows");
   const bool indexed_relation = command.relation_ids_value_index >= 0;
-  torch::Tensor normalized_matrix = normalized.narrow(0, 0, batch_count).view(
-      {active_rows, command.hidden_width});
-  torch::Tensor query_key_value_matrix =
-      query_key_value.narrow(0, 0, batch_count).view(
-          {active_rows, 3 * command.attention_width});
-  torch::Tensor attention_context_matrix = normalized.narrow(0, 0, batch_count)
-      .view({active_rows * command.hidden_width})
-      .narrow(0, 0, active_rows * command.attention_width)
-      .view({active_rows, command.attention_width});
+  torch::Tensor normalized_matrix =
+      normalized.flatten().narrow(0, 0, active_rows * command.hidden_width).view({active_rows, command.hidden_width});
+  torch::Tensor query_key_value_matrix = query_key_value.flatten()
+                                             .narrow(0, 0, active_rows * 3 * command.attention_width)
+                                             .view({active_rows, 3 * command.attention_width});
+  torch::Tensor attention_context_matrix = normalized.flatten()
+                                               .narrow(0, 0, active_rows * command.attention_width)
+                                               .view({active_rows, command.attention_width});
   torch::Tensor attention_output_matrix;
   if (!indexed_relation) {
-    attention_output_matrix = query_key_value.narrow(0, 0, batch_count)
-        .view({active_rows * 3 * command.attention_width})
-        .narrow(0, 0, active_rows * command.hidden_width)
-        .view({active_rows, command.hidden_width});
+    attention_output_matrix = query_key_value.flatten()
+                                  .narrow(0, 0, active_rows * command.hidden_width)
+                                  .view({active_rows, command.hidden_width});
   }
   torch::Tensor expanded_matrix = expanded.narrow(0, 0, batch_count)
       .view({-1})
@@ -4829,7 +4850,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
       const int64_t head_width =
           command.attention_width / command.attention_heads;
       torch::Tensor active_query_key_value =
-          query_key_value.narrow(0, 0, batch_count);
+          query_key_value_matrix.view({batch_count, command.token_count, 3 * command.attention_width});
       torch::Tensor queries = active_query_key_value
           .narrow(2, 0, command.attention_width)
           .view({batch_count, command.token_count,
@@ -4868,7 +4889,9 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index,
 #if defined(DJL_USE_ROCM_KERNELS)
       djl::pytorch::prepare_rocm_attention_backend();
 #endif
-      if (query_key_value.scalar_type() == torch::kFloat32) {
+      // The efficient kernel requires aligned head widths. Let SDPA select a
+      // compatible backend for other shapes, including odd head widths.
+      if (query_key_value.scalar_type() == torch::kFloat32 || head_width % 8 != 0 || head_width > 128) {
         attention_context = at::scaled_dot_product_attention(
             queries.transpose(1, 2), keys.transpose(1, 2),
             values.transpose(1, 2), prepared_attention_bias, 0.0, false,
@@ -4955,12 +4978,22 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
   torch::Tensor& result = session.storages[buffer_index][command.result_storage_index];
   torch::Tensor& normalized = session.storages[buffer_index][command.normalized_storage_index];
   torch::Tensor& query_key_value = session.storages[buffer_index][command.query_key_value_storage_index];
+  torch::Tensor* attention_context =
+      command.context_storage_index < 0 ? nullptr : &session.storages[buffer_index][command.context_storage_index];
+  torch::Tensor* expansion_storage =
+      command.expanded_storage_index < 0 ? nullptr : &session.storages[buffer_index][command.expanded_storage_index];
   const auto& weights = session.executable->indexed_local_transformer_weights[command_index];
 
   RecordCurrentStream(indices);
   RecordCurrentStream(result);
   RecordCurrentStream(normalized);
   RecordCurrentStream(query_key_value);
+  if (attention_context != nullptr) {
+    RecordCurrentStream(*attention_context);
+  }
+  if (expansion_storage != nullptr) {
+    RecordCurrentStream(*expansion_storage);
+  }
   for (const torch::Tensor& weight : weights) {
     RecordCurrentStream(weight);
   }
@@ -4996,7 +5029,7 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
 
   if (active_rows != 0) {
     LaunchIndexedLocalTransformerAttention(query_key_value, indices, command.index_data_type, active_rows, dense_rows,
-        command.token_count, command.attention_heads, command.attention_width);
+        command.token_count, command.attention_heads, command.attention_width, attention_context);
 
     const torch::Tensor& attention_output_bias =
         ResolveValue(session, buffer_index, input_handles, command.value_indices[6]);
@@ -5014,25 +5047,26 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
     for (int64_t active_offset = 0; active_offset < active_rows; active_offset += command.tile_rows) {
       const int64_t tile_rows = std::min(command.tile_rows, active_rows - active_offset);
       torch::Tensor normalized_matrix = normalized.narrow(0, 0, tile_rows);
-      // Attention replaces each compact Q row with its context. Preserve the
-      // 192-element leading dimension so rocBLAS can consume the view without
-      // packing it.
-      torch::Tensor context = query_key_value.narrow(0, active_offset, tile_rows)
-                                  .as_strided({tile_rows, command.attention_width}, {3 * command.attention_width, 1});
+      // The in-place specialization keeps the QKV leading dimension; the
+      // general kernel writes contiguous contexts without overwriting queries.
+      torch::Tensor context = attention_context == nullptr ? query_key_value.narrow(0, active_offset, tile_rows)
+                                                                 .as_strided({tile_rows, command.attention_width},
+                                                                     {3 * command.attention_width, 1})
+                                                           : attention_context->narrow(0, active_offset, tile_rows);
       ExecuteSessionMatmul(
           session, normalized_matrix, context, weights[1]);
       LaunchIndexedLocalTransformerResidualLayerNorm(result, normalized_matrix, attention_output_bias, indices,
           command.index_data_type, feed_forward_norm_weight, feed_forward_norm_bias, normalized, active_offset,
           tile_rows, dense_rows, command.hidden_width, command.epsilon);
 
-      // All attention groups have completed before this loop. The consumed QKV
-      // prefix can therefore back the narrower feed-forward expansion without
-      // another persistent tensor.
-      torch::Tensor expanded_matrix = query_key_value.flatten()
-                                          .narrow(0, 0,
-                                              CheckedMultiply(tile_rows, command.feed_forward_width,
-                                                  "indexed local transformer expansion elements"))
-                                          .view({tile_rows, command.feed_forward_width});
+      // Reuse only the consumed QKV prefix when the expansion fits it.
+      torch::Tensor expanded_matrix = expansion_storage == nullptr
+                                          ? query_key_value.flatten()
+                                                .narrow(0, 0,
+                                                    CheckedMultiply(tile_rows, command.feed_forward_width,
+                                                        "indexed local transformer expansion elements"))
+                                                .view({tile_rows, command.feed_forward_width})
+                                          : expansion_storage->narrow(0, 0, tile_rows);
       ExecuteSessionMatmul(
           session, expanded_matrix, normalized_matrix, weights[2]);
       LaunchIndexedLocalTransformerBiasSilu(expanded_matrix, expansion_bias, tile_rows, command.feed_forward_width);
@@ -5070,11 +5104,10 @@ void ExecuteCommand(FusionSession& session, int32_t buffer_index, const int64_t*
 
   const int64_t maximum_readout_batch = CheckedMultiply(readout_count,
       command.maximum_batches, "single-query readout batch capacity");
-  const int64_t shared_region_elements = std::max(
-      CheckedMultiply(command.maximum_batches, 2 * command.hidden_width,
-          "single-query seed-input capacity"),
-      CheckedMultiply(maximum_readout_batch, command.hidden_width,
-          "single-query normalized capacity"));
+  const int64_t shared_region_elements =
+      std::max(CheckedMultiply(command.maximum_batches, 2 * command.hidden_width, "single-query seed-input capacity"),
+          CheckedMultiply(maximum_readout_batch, std::max(command.hidden_width, command.attention_width),
+              "single-query normalized and context capacity"));
   const int64_t state_capacity = CheckedMultiply(maximum_readout_batch,
       command.hidden_width, "single-query state capacity");
   const int64_t tail_offset = CheckedAdd(shared_region_elements,

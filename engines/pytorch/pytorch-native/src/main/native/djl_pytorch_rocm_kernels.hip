@@ -1787,11 +1787,18 @@ __global__ void mapped_grouped_indexed_attention_backward_kernel(
     const scalar_t* gradient_output, scalar_t* query_gradient,
     float* shared_key_value_gradient, float* shared_delta_table_gradient,
     scalar_t* indexed_delta_gradient, int64_t query_head_count,
+    int64_t delta_gradient_shards, int64_t delta_gradient_elements,
     MappedGroupedIndexedAttentionLayout layout, float scale) {
   extern __shared__ unsigned char shared_storage[];
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
   const int waves_per_block = blockDim.x / warpSize;
+  // Queries often share the same relation code. Spread their atomic writes over
+  // independent tables, then reduce those FP32 partials once after this kernel.
+  if (shared_delta_table_gradient != nullptr) {
+    shared_delta_table_gradient +=
+        (blockIdx.x % delta_gradient_shards) * delta_gradient_elements;
+  }
   const int64_t total_tokens = layout.shared_tokens + layout.indexed_tokens;
   float* all_probabilities = reinterpret_cast<float*>(shared_storage);
   float* all_score_gradients = all_probabilities + waves_per_block * total_tokens;
@@ -6193,9 +6200,17 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
       needs_shared_key_value_gradient
           ? torch::zeros(shared_key_values.sizes(), gradient_options.dtype(torch::kFloat32))
           : torch::Tensor();
+  const int64_t delta_gradient_elements = shared_delta_table.numel();
+  constexpr int64_t maximum_delta_gradient_bytes = 32 * 1024 * 1024;
+  const int64_t delta_gradient_shards = needs_shared_delta_table_gradient
+      ? std::max<int64_t>(1, std::min<int64_t>({32, (query_count + 255) / 256,
+            maximum_delta_gradient_bytes /
+                (delta_gradient_elements * static_cast<int64_t>(sizeof(float)))}))
+      : 1;
   torch::Tensor shared_delta_table_accumulator =
       needs_shared_delta_table_gradient
-          ? torch::zeros(shared_delta_table.sizes(), gradient_options.dtype(torch::kFloat32))
+          ? torch::zeros({delta_gradient_shards, shared_delta_table.size(0), packed_width},
+                gradient_options.dtype(torch::kFloat32))
           : torch::Tensor();
   torch::Tensor indexed_delta_gradient =
       needs_indexed_delta_gradient ? torch::empty(indexed_deltas.sizes(), gradient_options)
@@ -6230,7 +6245,7 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
                 ? shared_delta_table_accumulator.data_ptr<float>()
                 : nullptr,
             needs_indexed_delta_gradient ? indexed_delta_gradient.data_ptr<scalar_t>() : nullptr,
-            query_head_count, layout, scale);
+            query_head_count, delta_gradient_shards, delta_gradient_elements, layout, scale);
       });
   check_hip_kernel_launch("mapped_grouped_indexed_attention_backward");
   torch::Tensor shared_key_value_gradient =
@@ -6239,7 +6254,9 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
           : torch::Tensor();
   torch::Tensor shared_delta_table_gradient =
       needs_shared_delta_table_gradient
-          ? shared_delta_table_accumulator.to(query.scalar_type())
+          ? (delta_gradient_shards == 1 ? shared_delta_table_accumulator.select(0, 0)
+                                       : shared_delta_table_accumulator.sum(0))
+                .to(query.scalar_type())
           : torch::Tensor();
   return {query_gradient, shared_key_value_gradient, shared_delta_table_gradient,
       indexed_delta_gradient};

@@ -1743,6 +1743,130 @@ public interface NDArrayEx {
     }
 
     /**
+     * Applies packed relation attention; the portable CPU decomposition preserves gradients.
+     *
+     * <p>See NDArrays.packedRelationScaledDotProductAttention for the public layout contract. The
+     * default implementation rejects GPU execution to prevent accidental expanded-memory fallback.
+     * Engines should implement a native GPU kernel.
+     *
+     * @param packedKeyValue shared packed key/value memory
+     * @param mask nonzero valid-key mask
+     * @param packedCodes unsigned nibble codes packed into INT16 words
+     * @param relationTable floating-point relation biases and relative values
+     * @param heads attention head count
+     * @param entriesPerSegment maximum rows per relation segment
+     * @param scale query-key score scale
+     * @return attended values with the query shape
+     */
+    default NDArray packedRelationScaledDotProductAttention(
+            NDArray packedKeyValue,
+            NDArray mask,
+            NDArray packedCodes,
+            NDArray relationTable,
+            long heads,
+            long entriesPerSegment,
+            double scale) {
+        NDArray query = getArray();
+        if (query.getDevice().isGpu()) {
+            throw new UnsupportedOperationException(
+                    "packed relation attention requires an engine GPU kernel");
+        }
+        NDManager outputManager = query.getManager();
+        try (NDManager scope = outputManager.newSubManager()) {
+            scope.tempAttachAll(query, packedKeyValue, mask, packedCodes, relationTable);
+            NDArray floatQuery = query.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            NDArray floatMemory =
+                    packedKeyValue.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            NDArray floatTable =
+                    relationTable.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+            long batch = query.getShape().get(0);
+            long queries = query.getShape().get(1);
+            long width = query.getShape().get(2);
+            long keys = packedKeyValue.getShape().get(1);
+            long features = width / heads;
+            int entries = Math.toIntExact(entriesPerSegment);
+            int rows = Math.toIntExact(relationTable.getShape().get(0));
+            int segments = (rows + entries - 1) / entries;
+            int words = (segments + 3) / 4;
+            short[] packed = packedCodes.toShortArray();
+            int pairs = Math.toIntExact(batch * queries * keys);
+            NDArray relation = null;
+            for (int segment = 0; segment < segments; segment++) {
+                int[] indices = new int[pairs];
+                for (int pair = 0; pair < pairs; pair++) {
+                    int code =
+                            (Short.toUnsignedInt(packed[pair * words + segment / 4])
+                                            >>> ((segment % 4) * 4))
+                                    & 15;
+                    int index = segment * entries + code;
+                    if (code >= entries || index >= rows) {
+                        throw new IllegalArgumentException(
+                                "packed relation code exceeds its segment");
+                    }
+                    indices[pair] = index;
+                }
+                NDArray gathered =
+                        Embedding.embedding(
+                                        scope.create(indices, new Shape(batch, queries, keys)),
+                                        floatTable,
+                                        SparseFormat.DENSE)
+                                .singletonOrThrow();
+                relation = relation == null ? gathered : relation.add(gathered);
+            }
+            NDArray valid = mask.neq(0).reshape(batch, 1, 1, keys).stopGradient();
+            NDArray validMemory = mask.neq(0).expandDims(2).broadcast(packedKeyValue.getShape());
+            NDArray safeMemory = NDArrays.where(validMemory, floatMemory, floatMemory.zerosLike());
+            NDArray q = floatQuery.reshape(batch, queries, heads, features).swapAxes(1, 2);
+            NDArray k =
+                    safeMemory
+                            .get("...,0:{}", width)
+                            .reshape(batch, keys, heads, features)
+                            .swapAxes(1, 2);
+            NDArray v =
+                    safeMemory
+                            .get("...,{}:", width)
+                            .reshape(batch, keys, heads, features)
+                            .swapAxes(1, 2);
+            NDArray bias = relation.get("...,0:{}", heads).transpose(0, 3, 1, 2);
+            NDArray scores = q.matMul(k.swapAxes(2, 3)).mul(scale).add(bias);
+            NDArray fullValid = valid.broadcast(scores.getShape());
+            NDArray present = valid.sum(new int[] {3}, true).gt(0).broadcast(scores.getShape());
+            NDArray safeScores = NDArrays.where(fullValid, scores, scores.zerosLike());
+            NDArray attentionValid = NDArrays.where(present, fullValid, fullValid.onesLike());
+            NDArray probabilities =
+                    NDArrays.where(
+                            fullValid,
+                            NDArrays.where(
+                                            attentionValid,
+                                            safeScores,
+                                            scores.zerosLike().add(Float.NEGATIVE_INFINITY))
+                                    .softmax(3),
+                            scores.zerosLike());
+            NDArray relativeValues =
+                    relation.get("...,{}:", heads)
+                            .reshape(batch, queries, keys, heads, features)
+                            .transpose(0, 3, 1, 2, 4);
+            NDArray values = v.expandDims(2).add(relativeValues);
+            values =
+                    NDArrays.where(
+                            fullValid.expandDims(4).broadcast(values.getShape()),
+                            values,
+                            values.zerosLike());
+            NDArray result =
+                    probabilities
+                            .expandDims(4)
+                            .mul(values)
+                            .sum(new int[] {3})
+                            .swapAxes(1, 2)
+                            .reshape(batch, queries, width)
+                            .getNDArrayInternal()
+                            .differentiableCast(query.getDataType());
+            outputManager.attachAll(result);
+            return result;
+        }
+    }
+
+    /**
      * Applies grouped packed attention in canonical engine layout.
      *
      * <p>Query uses {@code [batch, queryTokens, heads * keyFeatures]}. Packed memory uses {@code
