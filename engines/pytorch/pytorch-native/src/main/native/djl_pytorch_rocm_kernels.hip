@@ -25,6 +25,9 @@ constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
 constexpr int kLayerNormAffinePartialMaximumBlocks = 1024;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
+constexpr int kMaskedEmbeddingGroupWidth = 32;
+constexpr int kMaskedEmbeddingGroupsPerBlock =
+    kMaskedEmbeddingThreadsPerBlock / kMaskedEmbeddingGroupWidth;
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
 constexpr int kMaximumIndexedPoolChoices = 16;
@@ -1089,59 +1092,66 @@ __global__ void masked_embedding_residual_to_owned_tokens_kernel(
   auto* tokens = static_cast<scalar_t*>(arguments.tokens);
   const auto* embedding_table = static_cast<const scalar_t*>(arguments.embedding_table);
   auto* converted_valid_mask = static_cast<scalar_t*>(arguments.converted_valid_mask);
-  __shared__ int64_t table_rows[kMaskedEmbeddingMaximumIndices];
-  __shared__ int64_t valid_mask_value;
-  __shared__ int32_t valid_index_count;
-  __shared__ bool invalid_index;
-  for (int64_t row = blockIdx.x; row < arguments.row_count; row += gridDim.x) {
-    const int64_t batch = row / arguments.tokens_per_batch;
-    const int64_t token = row - batch * arguments.tokens_per_batch;
-    if (threadIdx.x == 0) {
-      valid_mask_value = padded_batch_gather_index_value(arguments.valid_mask,
+  const int lane = threadIdx.x % kMaskedEmbeddingGroupWidth;
+  const int group = threadIdx.x / kMaskedEmbeddingGroupWidth;
+  __shared__ int64_t table_rows[kMaskedEmbeddingGroupsPerBlock][kMaskedEmbeddingMaximumIndices];
+  __shared__ int64_t valid_mask_values[kMaskedEmbeddingGroupsPerBlock];
+  __shared__ int32_t valid_index_counts[kMaskedEmbeddingGroupsPerBlock];
+  __shared__ bool invalid_indices[kMaskedEmbeddingGroupsPerBlock];
+  for (int64_t first_row = static_cast<int64_t>(blockIdx.x) * kMaskedEmbeddingGroupsPerBlock;
+       first_row < arguments.row_count;
+       first_row += static_cast<int64_t>(gridDim.x) * kMaskedEmbeddingGroupsPerBlock) {
+    const int64_t row = first_row + group;
+    if (lane == 0 && row < arguments.row_count) {
+      const int64_t batch = row / arguments.tokens_per_batch;
+      const int64_t token = row - batch * arguments.tokens_per_batch;
+      valid_mask_values[group] = padded_batch_gather_index_value(arguments.valid_mask,
           batch * arguments.valid_mask_row_stride + token * arguments.valid_mask_token_stride,
           arguments.valid_mask_type);
-      valid_index_count = 0;
-      invalid_index = false;
+      valid_index_counts[group] = 0;
+      invalid_indices[group] = false;
       for (int32_t source = 0; source < arguments.index_count; ++source) {
         const int64_t table_row = padded_batch_gather_index_value(arguments.stored_indices[source],
             batch * arguments.index_row_strides[source] + token * arguments.index_token_strides[source],
             arguments.index_types[source]);
-        table_rows[source] = table_row;
+        table_rows[group][source] = table_row;
         if (table_row != arguments.padding_index) {
-          ++valid_index_count;
-          invalid_index |= table_row < 0 || table_row >= arguments.vocabulary_size;
+          ++valid_index_counts[group];
+          invalid_indices[group] |= table_row < 0 || table_row >= arguments.vocabulary_size;
         }
       }
-      converted_valid_mask[row] = static_cast<scalar_t>(valid_mask_value);
+      converted_valid_mask[row] = static_cast<scalar_t>(valid_mask_values[group]);
     }
     __syncthreads();
-    const int64_t row_offset = row * arguments.width;
-    for (int64_t column = threadIdx.x; column < arguments.width; column += blockDim.x) {
-      if (invalid_index) {
-        tokens[row_offset + column] = static_cast<scalar_t>(NAN);
-        continue;
-      }
-      if (valid_mask_value == 0) {
-        tokens[row_offset + column] = static_cast<scalar_t>(0.0f);
-        continue;
-      }
-      float identity = 0.0f;
-      for (int32_t source = 0; source < arguments.index_count; ++source) {
-        const int64_t table_row = table_rows[source];
-        if (table_row == arguments.padding_index || invalid_index) {
+    if (row < arguments.row_count) {
+      const int64_t row_offset = row * arguments.width;
+      for (int64_t column = lane; column < arguments.width; column += kMaskedEmbeddingGroupWidth) {
+        if (invalid_indices[group]) {
+          tokens[row_offset + column] = static_cast<scalar_t>(NAN);
           continue;
         }
-        identity = round_masked_embedding_value<scalar_t>(identity +
-            static_cast<float>(embedding_table[table_row * arguments.width + column]));
+        if (valid_mask_values[group] == 0) {
+          tokens[row_offset + column] = static_cast<scalar_t>(0.0f);
+          continue;
+        }
+        float identity = 0.0f;
+        for (int32_t source = 0; source < arguments.index_count; ++source) {
+          const int64_t table_row = table_rows[group][source];
+          if (table_row == arguments.padding_index) {
+            continue;
+          }
+          identity = round_masked_embedding_value<scalar_t>(identity +
+              static_cast<float>(embedding_table[table_row * arguments.width + column]));
+        }
+        if (arguments.mean_valid && valid_index_counts[group] > 0) {
+          identity = round_masked_embedding_value<scalar_t>(
+              identity / static_cast<float>(valid_index_counts[group]));
+        }
+        const float updated = round_masked_embedding_value<scalar_t>(
+            static_cast<float>(tokens[row_offset + column]) + identity);
+        tokens[row_offset + column] =
+            static_cast<scalar_t>(updated * static_cast<float>(valid_mask_values[group]));
       }
-      if (arguments.mean_valid && valid_index_count > 0) {
-        identity = round_masked_embedding_value<scalar_t>(
-            identity / static_cast<float>(valid_index_count));
-      }
-      const float updated = round_masked_embedding_value<scalar_t>(
-          static_cast<float>(tokens[row_offset + column]) + identity);
-      tokens[row_offset + column] =
-          static_cast<scalar_t>(updated * static_cast<float>(valid_mask_value));
     }
     __syncthreads();
   }
@@ -4634,8 +4644,9 @@ torch::Tensor add_masked_embedding_residual_to_owned_tokens(torch::Tensor& token
     arguments.index_types[index] = padded_batch_gather_index_type(stored_indices[index]);
   }
 
+  const int64_t required_blocks = (row_count - 1) / kMaskedEmbeddingGroupsPerBlock + 1;
   const uint32_t block_count =
-      static_cast<uint32_t>(std::min<int64_t>(row_count, 65535));
+      static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
   const hipStream_t stream = c10::hip::getCurrentHIPStream(tokens.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, tokens.scalar_type(), "masked_embedding_residual_to_owned_tokens", [&] {

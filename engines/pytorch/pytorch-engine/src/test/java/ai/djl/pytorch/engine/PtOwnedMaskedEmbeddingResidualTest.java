@@ -24,6 +24,7 @@ import ai.djl.ndarray.types.EmbeddingReduction;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.ndarray.types.SparseFormat;
 import ai.djl.nn.core.Embedding;
+import ai.djl.pytorch.jni.JniUtils;
 
 import org.testng.Assert;
 import org.testng.SkipException;
@@ -121,22 +122,8 @@ public class PtOwnedMaskedEmbeddingResidualTest {
             NDArray first = raw.get("...,0");
             NDArray second = raw.get("...,1");
             NDArray validMask = raw.get("...,2");
-            NDArray firstPresent = first.neq(0).toType(dataType, false);
-            NDArray secondPresent = second.neq(0).toType(dataType, false);
-            NDArray identity =
-                    Embedding.embedding(first, table, SparseFormat.DENSE)
-                            .singletonOrThrow()
-                            .mul(firstPresent.expandDims(2))
-                            .add(
-                                    Embedding.embedding(second, table, SparseFormat.DENSE)
-                                            .singletonOrThrow()
-                                            .mul(secondPresent.expandDims(2)));
-            if (reduction == EmbeddingReduction.MEAN_VALID) {
-                identity = identity.div(firstPresent.add(secondPresent).maximum(1).expandDims(2));
-            }
             float[] expected =
-                    tokens.add(identity)
-                            .mul(validMask.toType(dataType, false).expandDims(2))
+                    referenceResidual(tokens, first, second, table, validMask, reduction)
                             .toType(DataType.FLOAT32, false)
                             .toFloatArray();
             // Rounding only once after the residual changes these halfway cases by one ULP.
@@ -149,6 +136,114 @@ public class PtOwnedMaskedEmbeddingResidualTest {
                     mask.toType(DataType.FLOAT32, false).toFloatArray(),
                     new float[] {1, 1, 0, 1, 1, 1});
         }
+    }
+
+    @DataProvider
+    public Object[][] rowLayouts() {
+        return new Object[][] {
+            {1, 1, 3, DataType.FLOAT16, EmbeddingReduction.SUM},
+            {1, 7, 33, DataType.FLOAT32, EmbeddingReduction.MEAN_VALID},
+            {3, 3, 64, DataType.BFLOAT16, EmbeddingReduction.SUM},
+            {1, 17, 513, DataType.FLOAT16, EmbeddingReduction.MEAN_VALID},
+            {3, 174763, 3, DataType.BFLOAT16, EmbeddingReduction.MEAN_VALID},
+        };
+    }
+
+    @Test(dataProvider = "rowLayouts")
+    public void irregularWidthsAndRowTailsMatchEagerResidual(
+            int batches,
+            int tokenCount,
+            int width,
+            DataType dataType,
+            EmbeddingReduction reduction) {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("GPU is unavailable");
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            int rows = batches * tokenCount;
+            float[] tableValues = new float[5 * width];
+            for (int i = 0; i < tableValues.length; i++) {
+                tableValues[i] = (i % 13 + 1) * 0.03125f;
+            }
+            float[] tokenValues = new float[rows * width];
+            for (int i = 0; i < tokenValues.length; i++) {
+                tokenValues[i] = (i % 17 + 1) * 0.0625f;
+            }
+            int[] indexValues = new int[rows * 3];
+            for (int row = 0; row < rows; row++) {
+                indexValues[row * 3] = row % 5;
+                indexValues[row * 3 + 1] = row % 7 < 3 ? 0 : (row + 2) % 5;
+                indexValues[row * 3 + 2] = row % 3 == 1 ? 0 : 1;
+            }
+            NDArray table =
+                    manager.create(tableValues, new Shape(5, width)).toType(dataType, false);
+            NDArray tokens =
+                    manager.create(tokenValues, new Shape(batches, tokenCount, width))
+                            .toType(dataType, false);
+            NDArray indices = manager.create(indexValues, new Shape(batches, tokenCount, 3));
+            NDArray first = indices.get("...,0");
+            NDArray second = indices.get("...,1");
+            NDArray validMask = indices.get("...,2");
+            float[] expected =
+                    referenceResidual(tokens, first, second, table, validMask, reduction)
+                            .toType(DataType.FLOAT32, false)
+                            .toFloatArray();
+            NDArray mask =
+                    NDArrays.addMaskedEmbeddingResidualToOwnedTokens(
+                            tokens, new NDList(first, second), table, validMask, 0, reduction);
+            Assert.assertEquals(tokens.toType(DataType.FLOAT32, false).toFloatArray(), expected);
+            Assert.assertEquals(
+                    mask.toType(DataType.FLOAT32, false).toFloatArray(),
+                    validMask.toType(DataType.FLOAT32, false).toFloatArray());
+        }
+    }
+
+    @Test
+    public void invalidEmbeddingIndexRemainsNanWhenTokenIsMasked() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 2) {
+            throw new SkipException("This test requires the ROCm masked embedding kernel.");
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray tokens = manager.ones(new Shape(1, 3, 33));
+            NDArray table = manager.ones(new Shape(2, 33));
+            NDArray first = manager.create(new int[] {1, 1, 0}, new Shape(1, 3));
+            NDArray second = manager.create(new int[] {2, 0, 0}, new Shape(1, 3));
+            NDArray validMask = manager.create(new int[] {0, 0, 1}, new Shape(1, 3));
+            NDArrays.addMaskedEmbeddingResidualToOwnedTokens(
+                    tokens, new NDList(first, second), table, validMask, 0, EmbeddingReduction.SUM);
+            float[] actual = tokens.toFloatArray();
+            for (int column = 0; column < 33; column++) {
+                Assert.assertTrue(Float.isNaN(actual[column]));
+                Assert.assertEquals(actual[33 + column], 0f);
+                Assert.assertEquals(actual[66 + column], 1f);
+            }
+        }
+    }
+
+    private static NDArray referenceResidual(
+            NDArray tokens,
+            NDArray first,
+            NDArray second,
+            NDArray table,
+            NDArray validMask,
+            EmbeddingReduction reduction) {
+        DataType dataType = tokens.getDataType();
+        NDArray firstPresent = first.neq(0).toType(dataType, false);
+        NDArray secondPresent = second.neq(0).toType(dataType, false);
+        NDArray identity =
+                Embedding.embedding(first, table, SparseFormat.DENSE)
+                        .singletonOrThrow()
+                        .mul(firstPresent.expandDims(2))
+                        .add(
+                                Embedding.embedding(second, table, SparseFormat.DENSE)
+                                        .singletonOrThrow()
+                                        .mul(secondPresent.expandDims(2)));
+        if (reduction == EmbeddingReduction.MEAN_VALID) {
+            identity = identity.div(firstPresent.add(secondPresent).maximum(1).expandDims(2));
+        }
+        return tokens.add(identity).mul(validMask.toType(dataType, false).expandDims(2));
     }
 
     private static void verify(
