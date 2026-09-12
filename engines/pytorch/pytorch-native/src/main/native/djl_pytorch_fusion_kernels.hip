@@ -1098,13 +1098,10 @@ __global__ void indexed_affine_finalize_kernel(
   }
 }
 
-constexpr int kTransformerHiddenWidth = 256;
 constexpr int kTransformerMaximumTokens = 8;
 constexpr int kTransformerAttentionHeads = 4;
 constexpr int kTransformerAttentionWidth = 128;
 constexpr int kTransformerHeadWidth = 32;
-constexpr int kTransformerCachedValuesPerLane =
-    kTransformerHiddenWidth / 32;
 
 template <typename scalar_t>
 __global__ void indexed_relation_attention_bias_kernel(
@@ -1148,28 +1145,24 @@ __device__ float TransformerWaveSum(float value) {
   return value;
 }
 
-template <typename scalar_t, typename norm_t>
-__global__ void transformer_copy_layer_norm_kernel(
-    const scalar_t* input, scalar_t* state, scalar_t* normalized,
-    const norm_t* weight, const norm_t* bias, int64_t active_rows,
-    float epsilon, bool copy_input) {
+template <typename scalar_t, typename norm_t, int hidden_width>
+__global__ void transformer_copy_layer_norm_kernel(const scalar_t* input, scalar_t* state, scalar_t* normalized,
+    const norm_t* weight, const norm_t* bias, int64_t active_rows, float epsilon, bool copy_input) {
+  constexpr int cached_values_per_lane = hidden_width / 32;
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
   const int32_t waves_per_block = blockDim.x / warpSize;
-  for (int64_t row =
-           static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
-       row < active_rows;
-       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
-    float values[kTransformerCachedValuesPerLane];
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave; row < active_rows;
+      row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    float values[cached_values_per_lane];
     float mean = 0.0f;
     float moment = 0.0f;
     int32_t count = 0;
-    const int64_t row_offset = row * kTransformerHiddenWidth;
+    const int64_t row_offset = row * hidden_width;
 #pragma unroll
-    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
-         ++index) {
+    for (int32_t index = 0; index < cached_values_per_lane; ++index) {
       const int32_t feature = lane + index * warpSize;
-      if (feature < kTransformerHiddenWidth) {
+      if (feature < hidden_width) {
         const int64_t offset = row_offset + feature;
         const float value = static_cast<float>(input[offset]);
         values[index] = value;
@@ -1189,23 +1182,19 @@ __global__ void transformer_copy_layer_norm_kernel(
       if (lane + offset < warpSize && other_count > 0) {
         const int32_t combined_count = count + other_count;
         const float delta = other_mean - mean;
-        moment += other_moment + delta * delta * count * other_count /
-            combined_count;
+        moment += other_moment + delta * delta * count * other_count / combined_count;
         mean += delta * other_count / combined_count;
         count = combined_count;
       }
     }
     mean = __shfl(mean, 0);
-    const float inverse_standard_deviation =
-        rsqrtf(__shfl(moment, 0) / kTransformerHiddenWidth + epsilon);
+    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / hidden_width + epsilon);
 #pragma unroll
-    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
-         ++index) {
+    for (int32_t index = 0; index < cached_values_per_lane; ++index) {
       const int32_t feature = lane + index * warpSize;
-      if (feature < kTransformerHiddenWidth) {
+      if (feature < hidden_width) {
         normalized[row_offset + feature] = static_cast<scalar_t>(
-            (values[index] - mean) * inverse_standard_deviation *
-                static_cast<float>(weight[feature]) +
+            (values[index] - mean) * inverse_standard_deviation * static_cast<float>(weight[feature]) +
             static_cast<float>(bias[feature]));
       }
     }
@@ -1429,43 +1418,36 @@ __global__ void transformer_bias_silu_kernel(
   }
 }
 
-template <typename scalar_t, typename norm_t>
-__global__ void transformer_residual_layer_norm_kernel(
-    scalar_t* state, const scalar_t* update, const scalar_t* update_bias,
-    const norm_t* norm_weight, const norm_t* norm_bias, scalar_t* normalized,
+template <typename scalar_t, typename norm_t, int hidden_width>
+__global__ void transformer_residual_layer_norm_kernel(scalar_t* state, const scalar_t* update,
+    const scalar_t* update_bias, const norm_t* norm_weight, const norm_t* norm_bias, scalar_t* normalized,
     int64_t active_rows, float epsilon, bool round_update_before_residual) {
+  constexpr int cached_values_per_lane = hidden_width / 32;
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
   const int32_t waves_per_block = blockDim.x / warpSize;
-  for (int64_t row =
-           static_cast<int64_t>(blockIdx.x) * waves_per_block + wave;
-       row < active_rows;
-       row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
-    float values[kTransformerCachedValuesPerLane];
+  for (int64_t row = static_cast<int64_t>(blockIdx.x) * waves_per_block + wave; row < active_rows;
+      row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
+    float values[cached_values_per_lane];
     float mean = 0.0f;
     float moment = 0.0f;
     int32_t count = 0;
-    const int64_t row_offset = row * kTransformerHiddenWidth;
+    const int64_t row_offset = row * hidden_width;
 #pragma unroll
-    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
-         ++index) {
+    for (int32_t index = 0; index < cached_values_per_lane; ++index) {
       const int32_t feature = lane + index * warpSize;
-      if (feature < kTransformerHiddenWidth) {
+      if (feature < hidden_width) {
         const int64_t offset = row_offset + feature;
-        float update_value = static_cast<float>(update[offset]) +
-            static_cast<float>(update_bias[feature]);
+        float update_value = static_cast<float>(update[offset]) + static_cast<float>(update_bias[feature]);
         if (round_update_before_residual) {
-          update_value =
-              static_cast<float>(static_cast<scalar_t>(update_value));
+          update_value = static_cast<float>(static_cast<scalar_t>(update_value));
         }
-        const float value =
-            static_cast<float>(state[offset]) + update_value;
+        const float value = static_cast<float>(state[offset]) + update_value;
         const scalar_t rounded = static_cast<scalar_t>(value);
         state[offset] = rounded;
         values[index] = static_cast<float>(rounded);
         ++count;
-        const float statistics_value =
-            round_update_before_residual ? value : values[index];
+        const float statistics_value = round_update_before_residual ? value : values[index];
         const float delta = statistics_value - mean;
         mean += delta / count;
         moment += delta * (statistics_value - mean);
@@ -1478,23 +1460,19 @@ __global__ void transformer_residual_layer_norm_kernel(
       if (lane + offset < warpSize && other_count > 0) {
         const int32_t combined_count = count + other_count;
         const float delta = other_mean - mean;
-        moment += other_moment + delta * delta * count * other_count /
-            combined_count;
+        moment += other_moment + delta * delta * count * other_count / combined_count;
         mean += delta * other_count / combined_count;
         count = combined_count;
       }
     }
     mean = __shfl(mean, 0);
-    const float inverse_standard_deviation =
-        rsqrtf(__shfl(moment, 0) / kTransformerHiddenWidth + epsilon);
+    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / hidden_width + epsilon);
 #pragma unroll
-    for (int32_t index = 0; index < kTransformerCachedValuesPerLane;
-         ++index) {
+    for (int32_t index = 0; index < cached_values_per_lane; ++index) {
       const int32_t feature = lane + index * warpSize;
-      if (feature < kTransformerHiddenWidth) {
+      if (feature < hidden_width) {
         normalized[row_offset + feature] = static_cast<scalar_t>(
-            (values[index] - mean) * inverse_standard_deviation *
-                static_cast<float>(norm_weight[feature]) +
+            (values[index] - mean) * inverse_standard_deviation * static_cast<float>(norm_weight[feature]) +
             static_cast<float>(norm_bias[feature]));
       }
     }
@@ -1863,7 +1841,6 @@ __global__ void single_query_bias_silu_kernel(scalar_t* values,
   }
 }
 
-constexpr int kIndexedLocalHiddenWidth = 256;
 constexpr int kIndexedLocalMaximumTokens = 32;
 constexpr int kIndexedLocalAttentionHeads = 4;
 constexpr int kIndexedLocalAttentionWidth = 64;
@@ -1900,12 +1877,13 @@ struct IndexedLocalSegmentedInput {
   }
 };
 
-template <typename scalar_t, typename index_t, typename input_t>
+template <typename scalar_t, typename index_t, typename input_t, int hidden_width>
 __global__ void indexed_local_gather_normalize_kernel(input_t input, const index_t* indices,
     const void* input_norm_weight, const void* input_norm_bias, int32_t input_norm_data_type,
     const void* attention_norm_weight, const void* attention_norm_bias, int32_t attention_norm_data_type,
     scalar_t* output, scalar_t* normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows,
     float epsilon) {
+  constexpr int cached_values_per_lane = hidden_width / 32;
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
   const int32_t waves_per_block = blockDim.x / warpSize;
@@ -1915,7 +1893,7 @@ __global__ void indexed_local_gather_normalize_kernel(input_t input, const index
     if (dense_row < 0 || dense_row >= dense_rows) {
       continue;
     }
-    float values[kTransformerCachedValuesPerLane];
+    float values[cached_values_per_lane];
     float mean = 0.0f;
     float moment = 0.0f;
     int32_t count = 0;
@@ -1923,12 +1901,12 @@ __global__ void indexed_local_gather_normalize_kernel(input_t input, const index
     if (input_row == nullptr) {
       continue;
     }
-    const int64_t output_offset = dense_row * kIndexedLocalHiddenWidth;
-    const int64_t normalized_offset = row * kIndexedLocalHiddenWidth;
+    const int64_t output_offset = dense_row * hidden_width;
+    const int64_t normalized_offset = row * hidden_width;
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         const float value = static_cast<float>(input_row[feature]);
         values[item] = value;
         ++count;
@@ -1950,15 +1928,15 @@ __global__ void indexed_local_gather_normalize_kernel(input_t input, const index
       }
     }
     mean = __shfl(mean, 0);
-    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / kIndexedLocalHiddenWidth + epsilon);
+    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / hidden_width + epsilon);
 
     float second_mean = 0.0f;
     float second_moment = 0.0f;
     count = 0;
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         const float value = (values[item] - mean) * inverse_standard_deviation *
                                 load_fusion_float(input_norm_weight, feature, input_norm_data_type) +
                             load_fusion_float(input_norm_bias, feature, input_norm_data_type);
@@ -1984,12 +1962,11 @@ __global__ void indexed_local_gather_normalize_kernel(input_t input, const index
       }
     }
     second_mean = __shfl(second_mean, 0);
-    const float second_inverse_standard_deviation =
-        rsqrtf(__shfl(second_moment, 0) / kIndexedLocalHiddenWidth + epsilon);
+    const float second_inverse_standard_deviation = rsqrtf(__shfl(second_moment, 0) / hidden_width + epsilon);
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         normalized[normalized_offset + feature] =
             static_cast<scalar_t>((values[item] - second_mean) * second_inverse_standard_deviation *
                                       load_fusion_float(attention_norm_weight, feature, attention_norm_data_type) +
@@ -2253,11 +2230,12 @@ __global__ void indexed_local_attention_dynamic_kernel(const scalar_t* query_key
   }
 }
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename index_t, int hidden_width>
 __global__ void indexed_local_residual_normalize_kernel(scalar_t* output, const scalar_t* update,
     const index_t* indices, const scalar_t* update_bias, const void* norm_weight, const void* norm_bias,
     int32_t norm_data_type, scalar_t* normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows,
     float epsilon) {
+  constexpr int cached_values_per_lane = hidden_width / 32;
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
   const int32_t waves_per_block = blockDim.x / warpSize;
@@ -2267,16 +2245,16 @@ __global__ void indexed_local_residual_normalize_kernel(scalar_t* output, const 
     if (dense_row < 0 || dense_row >= dense_rows) {
       continue;
     }
-    float values[kTransformerCachedValuesPerLane];
+    float values[cached_values_per_lane];
     float mean = 0.0f;
     float moment = 0.0f;
     int32_t count = 0;
-    const int64_t compact_offset = row * kIndexedLocalHiddenWidth;
-    const int64_t output_offset = dense_row * kIndexedLocalHiddenWidth;
+    const int64_t compact_offset = row * hidden_width;
+    const int64_t output_offset = dense_row * hidden_width;
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         const float value = static_cast<float>(output[output_offset + feature]) +
                             static_cast<float>(update[compact_offset + feature]) +
                             static_cast<float>(update_bias[feature]);
@@ -2302,11 +2280,11 @@ __global__ void indexed_local_residual_normalize_kernel(scalar_t* output, const 
       }
     }
     mean = __shfl(mean, 0);
-    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / kIndexedLocalHiddenWidth + epsilon);
+    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / hidden_width + epsilon);
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         normalized[compact_offset + feature] =
             static_cast<scalar_t>((values[item] - mean) * inverse_standard_deviation *
                                       load_fusion_float(norm_weight, feature, norm_data_type) +
@@ -2316,10 +2294,11 @@ __global__ void indexed_local_residual_normalize_kernel(scalar_t* output, const 
   }
 }
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename index_t, int hidden_width>
 __global__ void indexed_local_finalize_kernel(scalar_t* output, const scalar_t* update, const index_t* indices,
     const scalar_t* update_bias, const void* norm_weight, const void* norm_bias, int32_t norm_data_type,
     int64_t active_offset, int64_t active_rows, int64_t dense_rows, float epsilon) {
+  constexpr int cached_values_per_lane = hidden_width / 32;
   const int32_t lane = threadIdx.x % warpSize;
   const int32_t wave = threadIdx.x / warpSize;
   const int32_t waves_per_block = blockDim.x / warpSize;
@@ -2329,16 +2308,16 @@ __global__ void indexed_local_finalize_kernel(scalar_t* output, const scalar_t* 
     if (dense_row < 0 || dense_row >= dense_rows) {
       continue;
     }
-    float values[kTransformerCachedValuesPerLane];
+    float values[cached_values_per_lane];
     float mean = 0.0f;
     float moment = 0.0f;
     int32_t count = 0;
-    const int64_t compact_offset = row * kIndexedLocalHiddenWidth;
-    const int64_t output_offset = dense_row * kIndexedLocalHiddenWidth;
+    const int64_t compact_offset = row * hidden_width;
+    const int64_t output_offset = dense_row * hidden_width;
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         const float value = static_cast<float>(output[output_offset + feature]) +
                             static_cast<float>(update[compact_offset + feature]) +
                             static_cast<float>(update_bias[feature]);
@@ -2362,11 +2341,11 @@ __global__ void indexed_local_finalize_kernel(scalar_t* output, const scalar_t* 
       }
     }
     mean = __shfl(mean, 0);
-    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / kIndexedLocalHiddenWidth + epsilon);
+    const float inverse_standard_deviation = rsqrtf(__shfl(moment, 0) / hidden_width + epsilon);
 #pragma unroll
-    for (int32_t item = 0; item < kTransformerCachedValuesPerLane; ++item) {
+    for (int32_t item = 0; item < cached_values_per_lane; ++item) {
       const int32_t feature = lane + item * warpSize;
-      if (feature < kIndexedLocalHiddenWidth) {
+      if (feature < hidden_width) {
         output[output_offset + feature] =
             static_cast<scalar_t>((values[item] - mean) * inverse_standard_deviation *
                                       load_fusion_float(norm_weight, feature, norm_data_type) +
@@ -4435,17 +4414,22 @@ void LaunchTransformerCopyAndLayerNormTyped(const torch::Tensor& input, torch::T
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>((active_rows - 1) / maximum_waves_per_block + 1, 65535));
-  if (hidden_width == kTransformerHiddenWidth) {
-    DJL_FUSION_LAUNCH_KERNEL((transformer_copy_layer_norm_kernel<scalar_t, norm_t>), dim3(block_count),
-        dim3(kThreadsPerBlock), 0, stream, input.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
-        normalized.data_ptr<scalar_t>(), weight.data_ptr<norm_t>(), bias.data_ptr<norm_t>(), active_rows, epsilon,
-        copy_input);
+#define LAUNCH_TRANSFORMER_COPY_LAYER_NORM_WIDTH(width)                                                          \
+  DJL_FUSION_LAUNCH_KERNEL((transformer_copy_layer_norm_kernel<scalar_t, norm_t, width>), dim3(block_count),     \
+      dim3(kThreadsPerBlock), 0, stream, input.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),                 \
+      normalized.data_ptr<scalar_t>(), weight.data_ptr<norm_t>(), bias.data_ptr<norm_t>(), active_rows, epsilon, \
+      copy_input)
+  if (hidden_width == 128) {
+    LAUNCH_TRANSFORMER_COPY_LAYER_NORM_WIDTH(128);
+  } else if (hidden_width == 256) {
+    LAUNCH_TRANSFORMER_COPY_LAYER_NORM_WIDTH(256);
   } else {
     DJL_FUSION_LAUNCH_KERNEL((transformer_dynamic_layer_norm_kernel<scalar_t, norm_t, false>), dim3(block_count),
         dim3(kThreadsPerBlock), 0, stream, input.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
         normalized.data_ptr<scalar_t>(), nullptr, weight.data_ptr<norm_t>(), bias.data_ptr<norm_t>(), active_rows,
         hidden_width, epsilon, copy_input, false);
   }
+#undef LAUNCH_TRANSFORMER_COPY_LAYER_NORM_WIDTH
 }
 
 void LaunchTransformerCopyAndLayerNorm(const torch::Tensor& input,
@@ -4628,17 +4612,22 @@ void LaunchTransformerResidualLayerNormTyped(torch::Tensor& state, const torch::
   constexpr int64_t maximum_waves_per_block = kThreadsPerBlock / 32;
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>((active_rows - 1) / maximum_waves_per_block + 1, 65535));
-  if (hidden_width == kTransformerHiddenWidth) {
-    DJL_FUSION_LAUNCH_KERNEL((transformer_residual_layer_norm_kernel<scalar_t, norm_t>), dim3(block_count),
-        dim3(kThreadsPerBlock), 0, stream, state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
-        update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(), norm_bias.data_ptr<norm_t>(),
-        normalized.data_ptr<scalar_t>(), active_rows, epsilon, round_update_before_residual);
+#define LAUNCH_TRANSFORMER_RESIDUAL_LAYER_NORM_WIDTH(width)                                                      \
+  DJL_FUSION_LAUNCH_KERNEL((transformer_residual_layer_norm_kernel<scalar_t, norm_t, width>), dim3(block_count), \
+      dim3(kThreadsPerBlock), 0, stream, state.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),                \
+      update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(), norm_bias.data_ptr<norm_t>(),            \
+      normalized.data_ptr<scalar_t>(), active_rows, epsilon, round_update_before_residual)
+  if (hidden_width == 128) {
+    LAUNCH_TRANSFORMER_RESIDUAL_LAYER_NORM_WIDTH(128);
+  } else if (hidden_width == 256) {
+    LAUNCH_TRANSFORMER_RESIDUAL_LAYER_NORM_WIDTH(256);
   } else {
     DJL_FUSION_LAUNCH_KERNEL((transformer_dynamic_layer_norm_kernel<scalar_t, norm_t, true>), dim3(block_count),
         dim3(kThreadsPerBlock), 0, stream, update.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(),
         normalized.data_ptr<scalar_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr<norm_t>(),
         norm_bias.data_ptr<norm_t>(), active_rows, hidden_width, epsilon, false, round_update_before_residual);
   }
+#undef LAUNCH_TRANSFORMER_RESIDUAL_LAYER_NORM_WIDTH
 }
 
 void LaunchTransformerResidualLayerNorm(torch::Tensor& state,
@@ -5011,7 +5000,19 @@ void LaunchIndexedLocalGatherNormalizeTyped(const torch::Tensor& input, const to
     torch::Tensor& normalized, int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t hidden_width,
     float epsilon, uint32_t block_count, backend::Stream stream) {
   const IndexedLocalDenseInput<scalar_t> dense_input{input.data_ptr<scalar_t>(), hidden_width};
-  if (hidden_width != kIndexedLocalHiddenWidth) {
+#define LAUNCH_INDEXED_LOCAL_GATHER_NORM_WIDTH(width)                                                                  \
+  DJL_FUSION_LAUNCH_KERNEL(                                                                                            \
+      (indexed_local_gather_normalize_kernel<scalar_t, index_t, IndexedLocalDenseInput<scalar_t>, width>),             \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, dense_input, indices.data_ptr<index_t>(),                  \
+      input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()), \
+      attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),                                                \
+      static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),                          \
+      normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, epsilon)
+  if (hidden_width == 128) {
+    LAUNCH_INDEXED_LOCAL_GATHER_NORM_WIDTH(128);
+  } else if (hidden_width == 256) {
+    LAUNCH_INDEXED_LOCAL_GATHER_NORM_WIDTH(256);
+  } else {
     DJL_FUSION_LAUNCH_KERNEL(
         (indexed_local_gather_normalize_dynamic_kernel<scalar_t, index_t, IndexedLocalDenseInput<scalar_t>>),
         dim3(block_count), dim3(kThreadsPerBlock), 0, stream, dense_input, indices.data_ptr<index_t>(),
@@ -5019,15 +5020,8 @@ void LaunchIndexedLocalGatherNormalizeTyped(const torch::Tensor& input, const to
         attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),
         static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),
         normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, hidden_width, epsilon);
-    return;
   }
-  DJL_FUSION_LAUNCH_KERNEL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
-                         IndexedLocalDenseInput<scalar_t>>),
-      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, dense_input, indices.data_ptr<index_t>(),
-      input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()),
-      attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),
-      static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),
-      normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, epsilon);
+#undef LAUNCH_INDEXED_LOCAL_GATHER_NORM_WIDTH
 }
 
 template <typename scalar_t, typename index_t>
@@ -5046,7 +5040,19 @@ void LaunchIndexedLocalGatherNormalizeSegmentsTyped(const IndexedLocalTransforme
     segmented_input.token_offsets[segment] = input_segments[segment].token_offset;
     segmented_input.token_counts[segment] = input_segments[segment].token_count;
   }
-  if (hidden_width != kIndexedLocalHiddenWidth) {
+#define LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER_NORM_WIDTH(width)                                                        \
+  DJL_FUSION_LAUNCH_KERNEL(                                                                                            \
+      (indexed_local_gather_normalize_kernel<scalar_t, index_t, IndexedLocalSegmentedInput<scalar_t>, width>),         \
+      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, segmented_input, indices.data_ptr<index_t>(),              \
+      input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()), \
+      attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),                                                \
+      static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),                          \
+      normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, epsilon)
+  if (hidden_width == 128) {
+    LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER_NORM_WIDTH(128);
+  } else if (hidden_width == 256) {
+    LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER_NORM_WIDTH(256);
+  } else {
     DJL_FUSION_LAUNCH_KERNEL(
         (indexed_local_gather_normalize_dynamic_kernel<scalar_t, index_t, IndexedLocalSegmentedInput<scalar_t>>),
         dim3(block_count), dim3(kThreadsPerBlock), 0, stream, segmented_input, indices.data_ptr<index_t>(),
@@ -5054,15 +5060,8 @@ void LaunchIndexedLocalGatherNormalizeSegmentsTyped(const IndexedLocalTransforme
         attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),
         static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),
         normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, hidden_width, epsilon);
-    return;
   }
-  DJL_FUSION_LAUNCH_KERNEL((indexed_local_gather_normalize_kernel<scalar_t, index_t,
-                         IndexedLocalSegmentedInput<scalar_t>>),
-      dim3(block_count), dim3(kThreadsPerBlock), 0, stream, segmented_input, indices.data_ptr<index_t>(),
-      input_norm_weight.data_ptr(), input_norm_bias.data_ptr(), static_cast<int32_t>(input_norm_weight.scalar_type()),
-      attention_norm_weight.data_ptr(), attention_norm_bias.data_ptr(),
-      static_cast<int32_t>(attention_norm_weight.scalar_type()), output.data_ptr<scalar_t>(),
-      normalized.data_ptr<scalar_t>(), active_offset, active_rows, dense_rows, epsilon);
+#undef LAUNCH_INDEXED_LOCAL_SEGMENTED_GATHER_NORM_WIDTH
 }
 
 void LaunchIndexedLocalTransformerClear(torch::Tensor& output, int64_t dense_rows, int64_t hidden_width) {
@@ -5237,19 +5236,24 @@ void LaunchIndexedLocalResidualNormalizeTyped(torch::Tensor& output, const torch
     const torch::Tensor& update_bias, const torch::Tensor& indices, const torch::Tensor& norm_weight,
     const torch::Tensor& norm_bias, torch::Tensor& normalized, int64_t active_offset, int64_t active_rows,
     int64_t dense_rows, int64_t hidden_width, float epsilon, uint32_t block_count, backend::Stream stream) {
-  if (hidden_width != kIndexedLocalHiddenWidth) {
+#define LAUNCH_INDEXED_LOCAL_RESIDUAL_NORM_WIDTH(width)                                                             \
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_residual_normalize_kernel<scalar_t, index_t, width>), dim3(block_count),  \
+      dim3(kThreadsPerBlock), 0, stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),                  \
+      indices.data_ptr<index_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),  \
+      static_cast<int32_t>(norm_weight.scalar_type()), normalized.data_ptr<scalar_t>(), active_offset, active_rows, \
+      dense_rows, epsilon)
+  if (hidden_width == 128) {
+    LAUNCH_INDEXED_LOCAL_RESIDUAL_NORM_WIDTH(128);
+  } else if (hidden_width == 256) {
+    LAUNCH_INDEXED_LOCAL_RESIDUAL_NORM_WIDTH(256);
+  } else {
     DJL_FUSION_LAUNCH_KERNEL((indexed_local_residual_normalize_dynamic_kernel<scalar_t, index_t, false>),
         dim3(block_count), dim3(kThreadsPerBlock), 0, stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
         indices.data_ptr<index_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),
         static_cast<int32_t>(norm_weight.scalar_type()), normalized.data_ptr<scalar_t>(), active_offset, active_rows,
         dense_rows, hidden_width, epsilon);
-    return;
   }
-  DJL_FUSION_LAUNCH_KERNEL((indexed_local_residual_normalize_kernel<scalar_t, index_t>), dim3(block_count),
-      dim3(kThreadsPerBlock), 0, stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
-      indices.data_ptr<index_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),
-      static_cast<int32_t>(norm_weight.scalar_type()), normalized.data_ptr<scalar_t>(), active_offset, active_rows,
-      dense_rows, epsilon);
+#undef LAUNCH_INDEXED_LOCAL_RESIDUAL_NORM_WIDTH
 }
 
 void LaunchIndexedLocalTransformerResidualLayerNorm(torch::Tensor& output, const torch::Tensor& update,
@@ -5302,18 +5306,23 @@ void LaunchIndexedLocalFinalizeTyped(torch::Tensor& output, const torch::Tensor&
     const torch::Tensor& update_bias, const torch::Tensor& norm_weight, const torch::Tensor& norm_bias,
     int64_t active_offset, int64_t active_rows, int64_t dense_rows, int64_t hidden_width, float epsilon,
     uint32_t block_count, backend::Stream stream) {
-  if (hidden_width != kIndexedLocalHiddenWidth) {
+#define LAUNCH_INDEXED_LOCAL_FINALIZE_WIDTH(width)                                                                 \
+  DJL_FUSION_LAUNCH_KERNEL((indexed_local_finalize_kernel<scalar_t, index_t, width>), dim3(block_count),           \
+      dim3(kThreadsPerBlock), 0, stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),                 \
+      indices.data_ptr<index_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(), \
+      static_cast<int32_t>(norm_weight.scalar_type()), active_offset, active_rows, dense_rows, epsilon)
+  if (hidden_width == 128) {
+    LAUNCH_INDEXED_LOCAL_FINALIZE_WIDTH(128);
+  } else if (hidden_width == 256) {
+    LAUNCH_INDEXED_LOCAL_FINALIZE_WIDTH(256);
+  } else {
     DJL_FUSION_LAUNCH_KERNEL((indexed_local_residual_normalize_dynamic_kernel<scalar_t, index_t, true>),
         dim3(block_count), dim3(kThreadsPerBlock), 0, stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(),
         indices.data_ptr<index_t>(), update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),
         static_cast<int32_t>(norm_weight.scalar_type()), static_cast<scalar_t*>(nullptr), active_offset, active_rows,
         dense_rows, hidden_width, epsilon);
-    return;
   }
-  DJL_FUSION_LAUNCH_KERNEL((indexed_local_finalize_kernel<scalar_t, index_t>), dim3(block_count), dim3(kThreadsPerBlock), 0,
-      stream, output.data_ptr<scalar_t>(), update.data_ptr<scalar_t>(), indices.data_ptr<index_t>(),
-      update_bias.data_ptr<scalar_t>(), norm_weight.data_ptr(), norm_bias.data_ptr(),
-      static_cast<int32_t>(norm_weight.scalar_type()), active_offset, active_rows, dense_rows, epsilon);
+#undef LAUNCH_INDEXED_LOCAL_FINALIZE_WIDTH
 }
 
 void LaunchIndexedLocalTransformerFinalize(torch::Tensor& output, const torch::Tensor& update,

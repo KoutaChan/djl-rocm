@@ -136,7 +136,9 @@ public class PtFusionIndexedLocalWidthsTest {
             {257, 2, 130, 73, 1, 9},
             {1025, 1, 17, 53, 3, 3},
             {1, 1, 1, 1, 3, 3},
-            {256, 4, 64, 128, 4, 29}
+            {256, 4, 64, 128, 4, 29},
+            {128, 4, 64, 256, 4, 29},
+            {128, 4, 64, 256, 3, 17}
         };
         List<Object[]> cases = new ArrayList<>();
         for (int index = 0; index < shapes.length; ++index) {

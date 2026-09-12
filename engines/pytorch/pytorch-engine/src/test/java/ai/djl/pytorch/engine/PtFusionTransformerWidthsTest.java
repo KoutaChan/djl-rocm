@@ -125,6 +125,7 @@ public class PtFusionTransformerWidthsTest {
         }
         // Hidden width, attention heads, attention width, tokens, feed-forward width.
         int[][] configurations = {
+            {128, 4, 64, 17, 256},
             {256, 4, 128, 6, 512},
             {384, 4, 128, 6, 256},
             {416, 3, 96, 9, 193},
@@ -151,7 +152,10 @@ public class PtFusionTransformerWidthsTest {
             throw new SkipException("This fusion test requires a PyTorch CUDA or ROCm device.");
         }
         int[][] configurations = {
-            {384, 4, 64, 17, 256}, {416, 3, 96, 9, 193}, {33, 3, 105, 11, 67}
+            {128, 4, 64, 151, 256},
+            {384, 4, 64, 17, 256},
+            {416, 3, 96, 9, 193},
+            {33, 3, 105, 11, 67}
         };
         for (DataType dataType :
                 new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
