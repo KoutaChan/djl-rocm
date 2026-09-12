@@ -26,8 +26,11 @@ constexpr int kLayerNormAffinePartialMaximumBlocks = 1024;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 constexpr int kMaskedEmbeddingGroupWidth = 32;
-constexpr int kMaskedEmbeddingGroupsPerBlock =
-    kMaskedEmbeddingThreadsPerBlock / kMaskedEmbeddingGroupWidth;
+constexpr int kMaskedEmbeddingMaximumGroupedWidth = 512;
+// Keep at least 256 blocks available when grouping narrow rows.
+constexpr int kMaskedEmbeddingMinimumGroupedRows =
+    kMaskedEmbeddingThreadsPerBlock *
+    (kMaskedEmbeddingThreadsPerBlock / kMaskedEmbeddingGroupWidth);
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
 constexpr int kMaximumIndexedPoolChoices = 16;
@@ -1086,23 +1089,24 @@ __global__ void broadcast_residual_to_owned_silu_kernel(scalar_t* values,
   }
 }
 
-template <typename scalar_t>
+template <int group_width, typename scalar_t>
 __global__ void masked_embedding_residual_to_owned_tokens_kernel(
     MaskedEmbeddingResidualArguments arguments) {
   auto* tokens = static_cast<scalar_t*>(arguments.tokens);
   const auto* embedding_table = static_cast<const scalar_t*>(arguments.embedding_table);
   auto* converted_valid_mask = static_cast<scalar_t*>(arguments.converted_valid_mask);
-  const int lane = threadIdx.x % kMaskedEmbeddingGroupWidth;
-  const int group = threadIdx.x / kMaskedEmbeddingGroupWidth;
-  __shared__ int64_t table_rows[kMaskedEmbeddingGroupsPerBlock][kMaskedEmbeddingMaximumIndices];
-  __shared__ int64_t valid_mask_values[kMaskedEmbeddingGroupsPerBlock];
-  __shared__ int32_t valid_index_counts[kMaskedEmbeddingGroupsPerBlock];
-  __shared__ bool invalid_indices[kMaskedEmbeddingGroupsPerBlock];
-  for (int64_t first_row = static_cast<int64_t>(blockIdx.x) * kMaskedEmbeddingGroupsPerBlock;
+  constexpr int groups_per_block = kMaskedEmbeddingThreadsPerBlock / group_width;
+  const int lane = groups_per_block == 1 ? threadIdx.x : threadIdx.x % group_width;
+  const int group = groups_per_block == 1 ? 0 : threadIdx.x / group_width;
+  __shared__ int64_t table_rows[groups_per_block][kMaskedEmbeddingMaximumIndices];
+  __shared__ int64_t valid_mask_values[groups_per_block];
+  __shared__ int32_t valid_index_counts[groups_per_block];
+  __shared__ bool invalid_indices[groups_per_block];
+  for (int64_t first_row = static_cast<int64_t>(blockIdx.x) * groups_per_block;
        first_row < arguments.row_count;
-       first_row += static_cast<int64_t>(gridDim.x) * kMaskedEmbeddingGroupsPerBlock) {
+       first_row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
     const int64_t row = first_row + group;
-    if (lane == 0 && row < arguments.row_count) {
+    if (lane == 0 && (groups_per_block == 1 || row < arguments.row_count)) {
       const int64_t batch = row / arguments.tokens_per_batch;
       const int64_t token = row - batch * arguments.tokens_per_batch;
       valid_mask_values[group] = padded_batch_gather_index_value(arguments.valid_mask,
@@ -1123,9 +1127,9 @@ __global__ void masked_embedding_residual_to_owned_tokens_kernel(
       converted_valid_mask[row] = static_cast<scalar_t>(valid_mask_values[group]);
     }
     __syncthreads();
-    if (row < arguments.row_count) {
+    if (groups_per_block == 1 || row < arguments.row_count) {
       const int64_t row_offset = row * arguments.width;
-      for (int64_t column = lane; column < arguments.width; column += kMaskedEmbeddingGroupWidth) {
+      for (int64_t column = lane; column < arguments.width; column += group_width) {
         if (invalid_indices[group]) {
           tokens[row_offset + column] = static_cast<scalar_t>(NAN);
           continue;
@@ -4644,14 +4648,28 @@ torch::Tensor add_masked_embedding_residual_to_owned_tokens(torch::Tensor& token
     arguments.index_types[index] = padded_batch_gather_index_type(stored_indices[index]);
   }
 
-  const int64_t required_blocks = (row_count - 1) / kMaskedEmbeddingGroupsPerBlock + 1;
+  const bool grouped_rows = arguments.width <= kMaskedEmbeddingMaximumGroupedWidth &&
+      row_count >= kMaskedEmbeddingMinimumGroupedRows;
+  const int groups_per_block = grouped_rows
+      ? kMaskedEmbeddingThreadsPerBlock / kMaskedEmbeddingGroupWidth
+      : 1;
+  const int64_t required_blocks = (row_count - 1) / groups_per_block + 1;
   const uint32_t block_count =
       static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
   const hipStream_t stream = c10::hip::getCurrentHIPStream(tokens.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, tokens.scalar_type(), "masked_embedding_residual_to_owned_tokens", [&] {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<scalar_t>),
-            dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+        if (grouped_rows) {
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<
+                  kMaskedEmbeddingGroupWidth, scalar_t>),
+              dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+        } else {
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<
+                  kMaskedEmbeddingThreadsPerBlock, scalar_t>),
+              dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+        }
       });
   check_hip_kernel_launch("masked embedding residual to owned tokens");
   return converted_valid_mask;

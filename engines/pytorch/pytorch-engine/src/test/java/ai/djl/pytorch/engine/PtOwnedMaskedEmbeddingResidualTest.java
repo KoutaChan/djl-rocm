@@ -145,6 +145,9 @@ public class PtOwnedMaskedEmbeddingResidualTest {
             {1, 7, 33, DataType.FLOAT32, EmbeddingReduction.MEAN_VALID},
             {3, 3, 64, DataType.BFLOAT16, EmbeddingReduction.SUM},
             {1, 17, 513, DataType.FLOAT16, EmbeddingReduction.MEAN_VALID},
+            {1, 2047, 512, DataType.BFLOAT16, EmbeddingReduction.MEAN_VALID},
+            {1, 2048, 512, DataType.BFLOAT16, EmbeddingReduction.MEAN_VALID},
+            {1, 2049, 513, DataType.FLOAT16, EmbeddingReduction.MEAN_VALID},
             {3, 174763, 3, DataType.BFLOAT16, EmbeddingReduction.MEAN_VALID},
         };
     }
