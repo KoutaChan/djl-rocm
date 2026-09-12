@@ -2103,7 +2103,7 @@ __global__ void indexed_local_attention_kernel(
   }
   __shared__ int64_t group_begin;
   __shared__ int64_t group_end;
-  __shared__ float probabilities[(kThreadsPerBlock / 32) * kIndexedLocalMaximumTokens];
+  __shared__ float probabilities[(kThreadsPerBlock / kIndexedLocalHeadWidth) * kIndexedLocalMaximumTokens];
   if (threadIdx.x == 0) {
     group_begin = indexed_local_lower_bound(indices, active_rows, group * token_count);
     group_end = indexed_local_lower_bound(indices, active_rows, (group + 1) * token_count);
@@ -2113,58 +2113,56 @@ __global__ void indexed_local_attention_kernel(
   if (selected_tokens == 0) {
     return;
   }
-  const int32_t lane = threadIdx.x % warpSize;
-  const int32_t wave = threadIdx.x / warpSize;
-  const int32_t head = wave % kIndexedLocalAttentionHeads;
-  const int32_t query_slot = wave / kIndexedLocalAttentionHeads;
-  const int32_t queries_per_block = blockDim.x / (warpSize * kIndexedLocalAttentionHeads);
+  const int32_t lane = threadIdx.x % kIndexedLocalHeadWidth;
+  const int32_t subgroup = threadIdx.x / kIndexedLocalHeadWidth;
+  const int32_t head = subgroup % kIndexedLocalAttentionHeads;
+  const int32_t query_slot = subgroup / kIndexedLocalAttentionHeads;
+  const int32_t queries_per_block = blockDim.x / (kIndexedLocalHeadWidth * kIndexedLocalAttentionHeads);
   constexpr float scale = 0.25f;
   for (int64_t query_base = 0; query_base < selected_tokens; query_base += queries_per_block) {
     const int64_t query = query_base + query_slot;
     const bool active_head = query < selected_tokens;
     if (active_head) {
       for (int64_t key = 0; key < selected_tokens; ++key) {
-        float product = 0.0f;
-        if (lane < kIndexedLocalHeadWidth) {
-          const int64_t query_offset =
-              (group_begin + query) * (3 * kIndexedLocalAttentionWidth) + head * kIndexedLocalHeadWidth + lane;
-          const int64_t key_offset = (group_begin + key) * (3 * kIndexedLocalAttentionWidth) +
-                                     kIndexedLocalAttentionWidth + head * kIndexedLocalHeadWidth + lane;
-          product = static_cast<float>(query_key_value[query_offset]) * static_cast<float>(query_key_value[key_offset]);
-        }
+        const int64_t query_offset =
+            (group_begin + query) * (3 * kIndexedLocalAttentionWidth) + head * kIndexedLocalHeadWidth + lane;
+        const int64_t key_offset = (group_begin + key) * (3 * kIndexedLocalAttentionWidth) +
+                                   kIndexedLocalAttentionWidth + head * kIndexedLocalHeadWidth + lane;
+        float product =
+            static_cast<float>(query_key_value[query_offset]) * static_cast<float>(query_key_value[key_offset]);
         for (int32_t offset = kIndexedLocalHeadWidth / 2; offset > 0; offset /= 2) {
           product += __shfl_down(product, offset, kIndexedLocalHeadWidth);
         }
         if (lane == 0) {
-          probabilities[wave * kIndexedLocalMaximumTokens + key] = product * scale;
+          probabilities[subgroup * kIndexedLocalMaximumTokens + key] = product * scale;
         }
       }
     }
     __syncthreads();
     if (active_head && lane == 0) {
-      float maximum = probabilities[wave * kIndexedLocalMaximumTokens];
+      float maximum = probabilities[subgroup * kIndexedLocalMaximumTokens];
       for (int64_t key = 1; key < selected_tokens; ++key) {
-        maximum = fmaxf(maximum, probabilities[wave * kIndexedLocalMaximumTokens + key]);
+        maximum = fmaxf(maximum, probabilities[subgroup * kIndexedLocalMaximumTokens + key]);
       }
       float denominator = 0.0f;
       for (int64_t key = 0; key < selected_tokens; ++key) {
-        const int64_t offset = wave * kIndexedLocalMaximumTokens + key;
+        const int64_t offset = subgroup * kIndexedLocalMaximumTokens + key;
         const float value = expf(probabilities[offset] - maximum);
         probabilities[offset] = value;
         denominator += value;
       }
       for (int64_t key = 0; key < selected_tokens; ++key) {
-        probabilities[wave * kIndexedLocalMaximumTokens + key] /= denominator;
+        probabilities[subgroup * kIndexedLocalMaximumTokens + key] /= denominator;
       }
     }
     __syncthreads();
-    if (active_head && lane < kIndexedLocalHeadWidth) {
+    if (active_head) {
       float value = 0.0f;
       for (int64_t key = 0; key < selected_tokens; ++key) {
         const int64_t value_offset = (group_begin + key) * (3 * kIndexedLocalAttentionWidth) +
                                      2 * kIndexedLocalAttentionWidth + head * kIndexedLocalHeadWidth + lane;
         value +=
-            probabilities[wave * kIndexedLocalMaximumTokens + key] * static_cast<float>(query_key_value[value_offset]);
+            probabilities[subgroup * kIndexedLocalMaximumTokens + key] * static_cast<float>(query_key_value[value_offset]);
       }
       query_key_value[(group_begin + query) * (3 * kIndexedLocalAttentionWidth) + head * kIndexedLocalHeadWidth +
                       lane] = static_cast<scalar_t>(value);
