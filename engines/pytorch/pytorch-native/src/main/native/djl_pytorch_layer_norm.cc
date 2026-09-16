@@ -23,10 +23,11 @@ namespace detail {
 
 bool is_autocast_layer_norm_layout_supported(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias, at::IntArrayRef normalized_shape) {
-  if (!input.is_cuda() || !input.is_contiguous() || input.dim() < 1 || input.size(-1) <= 0 ||
-      normalized_shape.size() != 1 || normalized_shape[0] != input.size(-1) ||
+  if (!input.is_cuda() || !input.is_contiguous() || normalized_shape.empty() ||
+      input.dim() < static_cast<int64_t>(normalized_shape.size()) ||
+      input.sizes().slice(input.dim() - normalized_shape.size()) != normalized_shape ||
       !weight.defined() || !bias.defined() || !weight.is_contiguous() || !bias.is_contiguous() ||
-      weight.dim() != 1 || weight.size(0) != input.size(-1) || bias.sizes() != weight.sizes() ||
+      weight.sizes() != normalized_shape || weight.numel() <= 0 || bias.sizes() != weight.sizes() ||
       (input.scalar_type() != torch::kFloat16 && input.scalar_type() != torch::kBFloat16) ||
       (weight.scalar_type() != torch::kFloat32 && weight.scalar_type() != torch::kFloat16 &&
           weight.scalar_type() != torch::kBFloat16) ||

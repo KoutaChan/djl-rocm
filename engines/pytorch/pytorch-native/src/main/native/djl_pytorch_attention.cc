@@ -178,12 +178,14 @@ torch::Tensor scaled_dot_product_attention(const torch::Tensor& query, const tor
     return std::get<0>(at::_scaled_dot_product_attention_math(
         query, key, value, math_mask, dropout, causal, std::nullopt, scale, false));
   }
+#endif
+  // Fused SDPA backward requires query/key/value gradient storage on some
+  // backends. A trainable additive bias alone uses the portable math path.
   if (at::GradMode::is_enabled() && mask.has_value() && mask->requires_grad() && !query.requires_grad() &&
       !key.requires_grad() && !value.requires_grad()) {
     return std::get<0>(
         at::_scaled_dot_product_attention_math(query, key, value, mask, dropout, causal, std::nullopt, scale, false));
   }
-#endif
   return at::scaled_dot_product_attention(query, key, value, mask, dropout, causal, scale);
 }
 

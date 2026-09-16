@@ -43,6 +43,7 @@ find_path(UTILS_INCLUDE_DIR NAMES djl/utils.h PATHS ${PROJECT_SOURCE_DIR}/../../
 set(SOURCE_FILES
     "src/main/native/djl_pytorch_utils.h"
     "src/main/native/djl_pytorch_kernel_backend.h"
+    "src/main/native/djl_pytorch_layer_norm_kernels.h"
     "src/main/native/djl_pytorch_accelerator.h"
     "src/main/native/djl_pytorch_accelerator.cc"
     "src/main/native/djl_pytorch_fusion.h"

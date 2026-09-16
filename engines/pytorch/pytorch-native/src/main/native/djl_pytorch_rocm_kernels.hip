@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "djl_pytorch_layer_norm.h"
+#include "djl_pytorch_layer_norm_kernels.h"
 #include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_rocm_launch_config.h"
@@ -3793,12 +3794,43 @@ bool has_supported_masked_embedding_index_layout(
           indices.scalar_type() == torch::kInt64);
 }
 
+template <typename input_t, typename parameter_t, typename converted_t, bool write_converted>
+void launch_wide_autocast_layer_norm(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, torch::Tensor& normalized,
+    torch::Tensor& converted, torch::Tensor& mean,
+    torch::Tensor& reciprocal_standard_deviation, int64_t row_count, int64_t width,
+    float epsilon, hipStream_t stream) {
+  const auto launch = [&](auto cached_values) {
+    constexpr int compiled_cached_values = decltype(cached_values)::value;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(detail::wide_autocast_layer_norm_kernel<
+                           compiled_cached_values, input_t, parameter_t, converted_t,
+                           write_converted>),
+        dim3(row_count), dim3(detail::kLayerNormWideThreadsPerBlock), 0, stream,
+        input.data_ptr<input_t>(), weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+        normalized.data_ptr<float>(),
+        converted.defined() ? converted.data_ptr<converted_t>() : nullptr,
+        mean.defined() ? mean.data_ptr<float>() : nullptr,
+        reciprocal_standard_deviation.defined()
+            ? reciprocal_standard_deviation.data_ptr<float>() : nullptr,
+        width, epsilon);
+  };
+  if (width <= detail::kLayerNormWideThreadsPerBlock * 4) {
+    launch(std::integral_constant<int, 4>{});
+  } else if (width <= detail::kLayerNormWideThreadsPerBlock * 8) {
+    launch(std::integral_constant<int, 8>{});
+  } else if (width <= detail::kLayerNormWideThreadsPerBlock * kAutocastLayerNormCachedValuesPerLaneLimit) {
+    launch(std::integral_constant<int, kAutocastLayerNormCachedValuesPerLaneLimit>{});
+  } else {
+    launch(std::integral_constant<int, 0>{});
+  }
+}
+
 AutocastLayerNormAndCastResult launch_autocast_layer_norm(
     const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias,
     float epsilon, std::optional<torch::ScalarType> converted_type,
     bool capture_statistics) {
   c10::DeviceGuard device_guard(input.device());
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t row_count = input.numel() / width;
   torch::Tensor normalized = torch::empty(input.sizes(),
       input.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
@@ -3836,6 +3868,24 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
         AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
             weight.scalar_type(), "autocast_layer_norm_parameter", [&] {
               using parameter_t = scalar_t;
+              if (cached_values_per_lane > kAutocastLayerNormCachedValuesPerLaneLimit) {
+                if (converted.defined()) {
+                  if (converted.scalar_type() == torch::kFloat16) {
+                    launch_wide_autocast_layer_norm<input_t, parameter_t, c10::Half, true>(
+                        input, weight, bias, normalized, converted, mean,
+                        reciprocal_standard_deviation, row_count, width, epsilon, stream);
+                  } else {
+                    launch_wide_autocast_layer_norm<input_t, parameter_t, c10::BFloat16, true>(
+                        input, weight, bias, normalized, converted, mean,
+                        reciprocal_standard_deviation, row_count, width, epsilon, stream);
+                  }
+                } else {
+                  launch_wide_autocast_layer_norm<input_t, parameter_t, float, false>(
+                      input, weight, bias, normalized, converted, mean,
+                      reciprocal_standard_deviation, row_count, width, epsilon, stream);
+                }
+                return;
+              }
               dispatch_autocast_layer_norm_cached_values_per_lane(
                   cached_values_per_lane, [&](auto cached_values) {
                     constexpr int compiled_cached_values = decltype(cached_values)::value;
@@ -4732,15 +4782,36 @@ void add_bias_and_broadcast_residual_to_owned_and_silu(
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, at::IntArrayRef normalized_shape) {
-  if (!detail::is_autocast_layer_norm_layout_supported(input, weight, bias, normalized_shape)) {
+  if (!detail::is_autocast_layer_norm_layout_supported(input, weight, bias, normalized_shape) ||
+      weight.numel() > std::numeric_limits<int>::max()) {
     return false;
   }
   const auto& properties = device_properties(input.get_device());
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t cached_values_per_lane =
       (width + properties.warpSize - 1) / properties.warpSize;
   if (cached_values_per_lane > kAutocastLayerNormCachedValuesPerLaneLimit) {
-    return false;
+    // The custom backward uses wave-local caches. Wider training calls retain ATen autograd.
+    if (at::GradMode::is_enabled() &&
+        (input.requires_grad() || weight.requires_grad() || bias.requires_grad())) {
+      return false;
+    }
+    const int64_t row_count = input.numel() / width;
+    const bool streaming = width > detail::kLayerNormWideThreadsPerBlock *
+        kAutocastLayerNormCachedValuesPerLaneLimit;
+    const bool aligned_affine = weight.scalar_type() != torch::kFloat32 ||
+        (reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % (4 * sizeof(float)) == 0 &&
+            reinterpret_cast<std::uintptr_t>(bias.data_ptr()) % (4 * sizeof(float)) == 0);
+    const int64_t minimum_blocks_per_processor = std::max(1,
+        properties.maxThreadsPerMultiProcessor / (2 * detail::kLayerNormWideThreadsPerBlock));
+    // Prefer ATen's vectorized path when streaming cannot fill half the thread capacity.
+    // Autocast allocates aligned FP32 input and low-precision affine conversions.
+    if (streaming && width % 4 == 0 && aligned_affine && row_count > 0 &&
+        row_count < minimum_blocks_per_processor * properties.multiProcessorCount) {
+      return false;
+    }
+    return row_count <= static_cast<int64_t>(properties.maxGridSize[0]) &&
+        detail::kLayerNormWideThreadsPerBlock <= properties.maxThreadsPerBlock;
   }
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
@@ -6709,8 +6780,7 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
 
 torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, float epsilon) {
-  const int64_t width = input.size(-1);
-  TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, at::IntArrayRef(&width, 1)),
+  TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, weight.sizes()),
       "autocast LayerNorm received an unsupported ROCm tensor layout");
   return launch_autocast_layer_norm(
       input, weight, bias, epsilon, std::nullopt, false).normalized;
@@ -6719,9 +6789,8 @@ torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
 AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
     torch::ScalarType converted_type, bool capture_statistics) {
-  const int64_t width = input.size(-1);
   TORCH_CHECK(supports_autocast_layer_norm_and_cast(
-                  input, weight, bias, at::IntArrayRef(&width, 1), converted_type),
+                  input, weight, bias, weight.sizes(), converted_type),
       "autocast LayerNorm and cast received an unsupported ROCm tensor layout");
   return launch_autocast_layer_norm(
       input, weight, bias, epsilon, converted_type, capture_statistics);
@@ -6740,10 +6809,12 @@ AutocastLayerNormAndCastGradients autocast_layer_norm_and_cast_backward(
               input.scalar_type() == torch::kBFloat16),
       "autocast LayerNorm backward input is incompatible");
   TORCH_CHECK(weight.is_cuda() && weight.device() == input.device() &&
-          weight.is_contiguous() && weight.dim() == 1 &&
-          weight.size(0) == input.size(-1) && is_fused_floating(weight),
+          weight.is_contiguous() && weight.dim() >= 1 && weight.numel() > 0 &&
+          input.dim() >= weight.dim() &&
+          input.sizes().slice(input.dim() - weight.dim()) == weight.sizes() &&
+          is_fused_floating(weight),
       "autocast LayerNorm backward weight is incompatible");
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t row_count = input.numel() / width;
   TORCH_CHECK(mean.is_cuda() && mean.device() == input.device() &&
           mean.is_contiguous() && mean.scalar_type() == torch::kFloat32 &&

@@ -36,6 +36,10 @@ public class AutocastLayerNormTest {
     private static final float EPSILON = 1.0e-5f;
     private static final int[] ACTIVE_EXTENTS = {1, 384, 31, 256, 1};
     private static final int[] WIDTHS = {1, 17, 64, 256, 257};
+    private static final int[] INFERENCE_WIDTHS = {
+        1, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257, 511, 512, 513, 768, 1024, 1025, 2048, 2049,
+        4096, 4097, 8192, 8193, 16384, 32769
+    };
     private static final DataType[] FLOATING_DATA_TYPES = {
         DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16
     };
@@ -84,7 +88,7 @@ public class AutocastLayerNormTest {
                         for (DataType parameterType : FLOATING_DATA_TYPES) {
                             for (DataType convertedType :
                                     new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
-                                for (int width : new int[] {1, 17, 256, 257, 512}) {
+                                for (int width : INFERENCE_WIDTHS) {
                                     try (NDManager scope = manager.newSubManager()) {
                                         Shape shape = new Shape(3, width);
                                         NDArray input =
@@ -115,6 +119,99 @@ public class AutocastLayerNormTest {
                                                 true);
                                     }
                                 }
+                            }
+                        }
+                    }
+                });
+    }
+
+    @Test
+    public void layerNormAndCastInferenceSupportsTrailingNormalizedDimensions() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    Shape[] inputShapes = {
+                        new Shape(7),
+                        new Shape(3, 5, 127),
+                        new Shape(2, 3, 5, 127),
+                        new Shape(2, 3, 8, 16, 17),
+                        new Shape(2, 9, 17, 33),
+                        new Shape(2, 3, 17),
+                        new Shape(0, 7, 1025)
+                    };
+                    Shape[] normalizedShapes = {
+                        new Shape(7),
+                        new Shape(127),
+                        new Shape(5, 127),
+                        new Shape(8, 16, 17),
+                        new Shape(9, 17, 33),
+                        new Shape(2, 3, 17),
+                        new Shape(7, 1025)
+                    };
+                    for (DataType inputType :
+                            new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                        for (DataType parameterType : FLOATING_DATA_TYPES) {
+                            for (int index = 0; index < inputShapes.length; ++index) {
+                                try (NDManager scope = manager.newSubManager()) {
+                                    Shape shape = inputShapes[index];
+                                    Shape normalizedShape = normalizedShapes[index];
+                                    NDArray input =
+                                            scope.create(sequence(shape.size(), 0.03125f), shape)
+                                                    .toType(inputType, false);
+                                    NDArray weight =
+                                            scope.create(
+                                                            sequence(
+                                                                    normalizedShape.size(),
+                                                                    0.00390625f),
+                                                            normalizedShape)
+                                                    .add(1f)
+                                                    .toType(parameterType, false);
+                                    NDArray bias =
+                                            scope.create(
+                                                            sequence(
+                                                                    normalizedShape.size(),
+                                                                    -0.001953125f),
+                                                            normalizedShape)
+                                                    .toType(parameterType, false);
+                                    verifyInferenceLayerNormAndCast(
+                                            engine,
+                                            device,
+                                            input,
+                                            normalizedShape,
+                                            weight,
+                                            bias,
+                                            inputType,
+                                            true);
+                                }
+                            }
+                        }
+                    }
+                });
+    }
+
+    @Test
+    public void layerNormAndCastInferencePreservesSmallVarianceInWideRows() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (DataType inputType :
+                            new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                        for (int width : new int[] {513, 1025, 4097, 32769}) {
+                            try (NDManager scope = manager.newSubManager()) {
+                                Shape shape = new Shape(3, width);
+                                NDArray input =
+                                        scope.create(sequence(shape.size(), 0.03125f), shape)
+                                                .add(16f)
+                                                .toType(inputType, false);
+                                NDArray weight = scope.ones(new Shape(width));
+                                NDArray bias = scope.zeros(new Shape(width));
+                                verifyInferenceLayerNormAndCast(
+                                        engine,
+                                        device,
+                                        input,
+                                        new Shape(width),
+                                        weight,
+                                        bias,
+                                        inputType,
+                                        true);
                             }
                         }
                     }
@@ -273,9 +370,12 @@ public class AutocastLayerNormTest {
                 inputType == DataType.FLOAT16 ? DataType.FLOAT16 : DataType.BFLOAT16;
         try (InferenceMode inference = engine.newInferenceMode();
                 Autocast autocast = engine.newAutocast(device, autocastType, autocastEnabled)) {
+            // An FP32 reference bypasses both accelerator low-precision specializations.
             expected =
-                    LayerNorm.layerNorm(input, normalizedShape, weight, bias, EPSILON)
-                            .singletonOrThrow();
+                    autocastEnabled
+                            ? floatReference(input, normalizedShape, weight, bias)
+                            : LayerNorm.layerNorm(input, normalizedShape, weight, bias, EPSILON)
+                                    .singletonOrThrow();
             expectedConverted = expected.toType(convertedType, false);
             actual =
                     LayerNorm.layerNormAndCast(
@@ -675,6 +775,52 @@ public class AutocastLayerNormTest {
         }
     }
 
+    @Test
+    public void layerNormAndCastTrainingSupportsTrailingNormalizedDimensions() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (int width : new int[] {17, 257, 2049}) {
+                        for (DataType inputType :
+                                new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                            for (DataType parameterType : FLOATING_DATA_TYPES) {
+                                for (OutputUse outputUse : OutputUse.values()) {
+                                    Shape shape = new Shape(2, 3, width);
+                                    Shape normalizedShape = new Shape(3, width);
+                                    TrainingResult reference =
+                                            trainLayerNormAndCast(
+                                                    engine,
+                                                    manager,
+                                                    device,
+                                                    shape,
+                                                    normalizedShape,
+                                                    inputType,
+                                                    parameterType,
+                                                    inputType,
+                                                    outputUse,
+                                                    false);
+                                    TrainingResult actual =
+                                            trainLayerNormAndCast(
+                                                    engine,
+                                                    manager,
+                                                    device,
+                                                    shape,
+                                                    normalizedShape,
+                                                    inputType,
+                                                    parameterType,
+                                                    inputType,
+                                                    outputUse,
+                                                    true);
+                                    assertTrainingResult(
+                                            actual,
+                                            reference,
+                                            trainingTolerance(inputType, parameterType, inputType));
+                                }
+                            }
+                        }
+                    }
+                });
+    }
+
     private static TrainingResult trainLayerNormAndCast(
             Engine engine,
             NDManager manager,
@@ -686,17 +832,44 @@ public class AutocastLayerNormTest {
             DataType convertedType,
             OutputUse outputUse,
             boolean fused) {
-        Shape shape = new Shape(rows, width);
+        return trainLayerNormAndCast(
+                engine,
+                manager,
+                device,
+                new Shape(rows, width),
+                new Shape(width),
+                inputType,
+                parameterType,
+                convertedType,
+                outputUse,
+                fused);
+    }
+
+    private static TrainingResult trainLayerNormAndCast(
+            Engine engine,
+            NDManager manager,
+            Device device,
+            Shape shape,
+            Shape normalizedShape,
+            DataType inputType,
+            DataType parameterType,
+            DataType convertedType,
+            OutputUse outputUse,
+            boolean fused) {
         try (NDManager scope = manager.newSubManager();
                 NDArray input =
                         scope.create(sequence(shape.size(), 0.03125f, 0), shape)
                                 .toType(inputType, false);
                 NDArray weight =
-                        scope.create(sequence(width, 0.00390625f, 3))
+                        scope.create(
+                                        sequence(normalizedShape.size(), 0.00390625f, 3),
+                                        normalizedShape)
                                 .add(1.0f)
                                 .toType(parameterType, false);
                 NDArray bias =
-                        scope.create(sequence(width, -0.001953125f, 11))
+                        scope.create(
+                                        sequence(normalizedShape.size(), -0.001953125f, 11),
+                                        normalizedShape)
                                 .toType(parameterType, false);
                 NDArray normalizedLossWeight =
                         scope.create(sequence(shape.size(), 0.001953125f, 5), shape);
@@ -715,7 +888,9 @@ public class AutocastLayerNormTest {
 
             try (GradientCollector collector = engine.newGradientCollector();
                     Autocast ignored = engine.newAutocast(device, inputType, true)) {
-                NDList outputs = layerNormAndCast(input, weight, bias, width, convertedType, fused);
+                NDList outputs =
+                        layerNormAndCast(
+                                input, weight, bias, normalizedShape, convertedType, fused);
                 Assert.assertEquals(outputs.get(0).getDataType(), DataType.FLOAT32);
                 Assert.assertEquals(outputs.get(1).getDataType(), convertedType);
                 NDArray objective =
@@ -762,7 +937,9 @@ public class AutocastLayerNormTest {
             input.setRequiresGradient(true);
             weight.setRequiresGradient(true);
             bias.setRequiresGradient(true);
-            NDList outputs = layerNormAndCast(input, weight, bias, width, DataType.FLOAT16, fused);
+            NDList outputs =
+                    layerNormAndCast(
+                            input, weight, bias, new Shape(width), DataType.FLOAT16, fused);
             NDArray objective =
                     trainingObjective(
                             outputs,
@@ -786,10 +963,9 @@ public class AutocastLayerNormTest {
             NDArray input,
             NDArray weight,
             NDArray bias,
-            int width,
+            Shape normalizedShape,
             DataType convertedType,
             boolean fused) {
-        Shape normalizedShape = new Shape(width);
         if (fused) {
             return LayerNorm.layerNormAndCast(
                     input, normalizedShape, weight, bias, EPSILON, convertedType);

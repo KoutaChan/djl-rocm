@@ -132,7 +132,12 @@ public class PtFusionTransformerWidthsTest {
             {33, 3, 105, 17, 67},
             {513, 3, 96, 3, 19},
             {7, 7, 7, 2, 11},
-            {32, 1, 35, 33, 65}
+            {32, 1, 35, 33, 65},
+            // Exercise both cached and streaming rows on wave32 and wave64 devices.
+            {1024, 1, 32, 3, 37},
+            {1025, 1, 32, 3, 37},
+            {2048, 1, 32, 3, 37},
+            {2049, 1, 32, 3, 37}
         };
         Device device = Device.gpu(0);
         for (DataType dataType :

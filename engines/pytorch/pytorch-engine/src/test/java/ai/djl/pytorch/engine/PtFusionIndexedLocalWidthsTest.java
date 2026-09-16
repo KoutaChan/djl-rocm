@@ -143,7 +143,12 @@ public class PtFusionIndexedLocalWidthsTest {
             {128, 4, 64, 256, 3, 4},
             {256, 4, 64, 128, 3, 5},
             {384, 4, 64, 256, 3, 32},
-            {384, 4, 64, 256, 3, 33}
+            {384, 4, 64, 256, 3, 33},
+            // Dense and segmented rows at the cache boundary, then wider streaming rows.
+            {1024, 1, 32, 37, 2, 3},
+            {1024, 1, 32, 37, 2, 3},
+            {2048, 1, 32, 37, 2, 3},
+            {2049, 1, 32, 37, 2, 3}
         };
         List<Object[]> cases = new ArrayList<>();
         for (int index = 0; index < shapes.length; ++index) {

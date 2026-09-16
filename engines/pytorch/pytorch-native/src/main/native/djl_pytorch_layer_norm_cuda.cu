@@ -19,6 +19,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include "djl_pytorch_layer_norm_kernels.h"
+
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -30,7 +32,7 @@ constexpr int kWarpSize = 32;
 constexpr int kThreadsPerBlock = 128;
 constexpr int kMaximumCachedValuesPerLane = 16;
 
-// Keep the ROCm specialization's FP32 Welford and affine boundaries under autocast.
+// Accumulate both statistics and affine results in FP32 under autocast.
 template <int cached_values_per_lane, typename input_t, typename parameter_t,
     typename converted_t>
 __global__ void autocast_layer_norm_and_cast_kernel(const input_t* input,
@@ -62,21 +64,7 @@ __global__ void autocast_layer_norm_and_cast_kernel(const input_t* input,
     }
   }
 
-  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-    const float other_mean = __shfl_down_sync(0xffffffff, mean, offset);
-    const float other_moment = __shfl_down_sync(0xffffffff, moment, offset);
-    const int other_count = __shfl_down_sync(0xffffffff, count, offset);
-    if (lane + offset < kWarpSize && other_count > 0) {
-      const int combined_count = count + other_count;
-      const float delta = other_mean - mean;
-      moment += other_moment + delta * delta * static_cast<float>(count) *
-                                   static_cast<float>(other_count) /
-                                   static_cast<float>(combined_count);
-      mean += delta * static_cast<float>(other_count) /
-              static_cast<float>(combined_count);
-      count = combined_count;
-    }
-  }
+  detail::reduce_layer_norm_statistics(mean, moment, count);
   mean = __shfl_sync(0xffffffff, mean, 0);
   const float inverse_standard_deviation =
       rsqrtf(__shfl_sync(0xffffffff, moment, 0) / static_cast<float>(width) + epsilon);
@@ -99,11 +87,30 @@ template <typename input_t, typename parameter_t, typename converted_t>
 void launch_typed(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, torch::Tensor& normalized, torch::Tensor& converted,
     float epsilon) {
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t row_count = input.numel() / width;
   constexpr int warps_per_block = kThreadsPerBlock / kWarpSize;
   const dim3 grid((row_count + warps_per_block - 1) / warps_per_block);
   const auto stream = c10::cuda::getCurrentCUDAStream(input.get_device()).stream();
+  if (width > kWarpSize * kMaximumCachedValuesPerLane) {
+    const auto launch_wide = [&](auto cached_values) {
+      constexpr int compiled_cached_values = decltype(cached_values)::value;
+      detail::wide_autocast_layer_norm_kernel<compiled_cached_values, input_t,
+          parameter_t, converted_t, true><<<row_count, detail::kLayerNormWideThreadsPerBlock, 0, stream>>>(
+          input.data_ptr<input_t>(), weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+          normalized.data_ptr<float>(), converted.data_ptr<converted_t>(), nullptr, nullptr, width, epsilon);
+    };
+    if (width <= detail::kLayerNormWideThreadsPerBlock * 4) {
+      launch_wide(std::integral_constant<int, 4>{});
+    } else if (width <= detail::kLayerNormWideThreadsPerBlock * 8) {
+      launch_wide(std::integral_constant<int, 8>{});
+    } else if (width <= detail::kLayerNormWideThreadsPerBlock * kMaximumCachedValuesPerLane) {
+      launch_wide(std::integral_constant<int, kMaximumCachedValuesPerLane>{});
+    } else {
+      launch_wide(std::integral_constant<int, 0>{});
+    }
+    return;
+  }
   const auto launch = [&](auto cached_values) {
     constexpr int compiled_cached_values = decltype(cached_values)::value;
     autocast_layer_norm_and_cast_kernel<compiled_cached_values, input_t,
@@ -162,22 +169,23 @@ bool supports_autocast_layer_norm_and_cast(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias,
     at::IntArrayRef normalized_shape, torch::ScalarType converted_type) {
   if (!detail::is_autocast_layer_norm_layout_supported(input, weight, bias, normalized_shape) ||
-      input.size(-1) > kWarpSize * kMaximumCachedValuesPerLane ||
+      weight.numel() > std::numeric_limits<int>::max() ||
       (converted_type != torch::kFloat16 && converted_type != torch::kBFloat16)) {
     return false;
   }
   constexpr int warps_per_block = kThreadsPerBlock / kWarpSize;
-  const int64_t row_count = input.numel() / input.size(-1);
-  const int64_t grid_size = (row_count + warps_per_block - 1) / warps_per_block;
+  const int64_t width = weight.numel();
+  const int64_t row_count = input.numel() / width;
+  const int64_t grid_size = width <= kWarpSize * kMaximumCachedValuesPerLane
+      ? (row_count + warps_per_block - 1) / warps_per_block : row_count;
   return grid_size <= std::numeric_limits<int>::max();
 }
 
 std::vector<torch::Tensor> autocast_layer_norm_and_cast(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
     torch::ScalarType converted_type) {
-  const int64_t width = input.size(-1);
   TORCH_CHECK(supports_autocast_layer_norm_and_cast(
-                  input, weight, bias, at::IntArrayRef(&width, 1), converted_type),
+                  input, weight, bias, weight.sizes(), converted_type),
       "autocast LayerNorm and cast received an unsupported CUDA tensor layout");
   c10::cuda::CUDAGuard device_guard(input.device());
   auto normalized = torch::empty(input.sizes(), input.options().dtype(torch::kFloat32)

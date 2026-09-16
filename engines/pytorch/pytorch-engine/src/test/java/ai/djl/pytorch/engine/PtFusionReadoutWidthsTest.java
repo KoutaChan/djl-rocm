@@ -55,7 +55,14 @@ public class PtFusionReadoutWidthsTest {
             {416, 128, 2, 513, 17, DataType.FLOAT32},
             {65, 144, 3, 97, 259, DataType.FLOAT32},
             {17, 261, 1, 31, 11, DataType.FLOAT32},
-            {7, 9, 3, 13, 5, DataType.BFLOAT16}
+            {7, 9, 3, 13, 5, DataType.BFLOAT16},
+            // Register-cache tails and streaming boundaries on wave32 and wave64 devices.
+            {1023, 32, 1, 37, 3, DataType.FLOAT32},
+            {1024, 32, 1, 37, 3, DataType.FLOAT16},
+            {1025, 32, 1, 37, 3, DataType.BFLOAT16},
+            {2047, 32, 1, 37, 3, DataType.FLOAT32},
+            {2048, 32, 1, 37, 3, DataType.FLOAT16},
+            {2049, 32, 1, 37, 3, DataType.BFLOAT16}
         };
     }
 

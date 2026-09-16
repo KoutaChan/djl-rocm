@@ -440,13 +440,25 @@ __global__ void mapped_grouped_indexed_attention_backward_kernel(
 }
 
 
-size_t shared_memory_bytes(const MappedGroupedIndexedAttentionLayout& layout, bool backward) {
+size_t shared_memory_bytes_per_warp(const MappedGroupedIndexedAttentionLayout& layout, bool backward) {
   const int64_t tokens = layout.shared_tokens + layout.indexed_tokens;
   const int64_t per_warp = backward
       ? tokens * (2 * sizeof(float) + sizeof(int32_t)) +
             (layout.key_features + layout.value_features) * sizeof(float)
       : tokens * (sizeof(float) + sizeof(int32_t)) + layout.key_features * sizeof(float);
-  return static_cast<size_t>(per_warp) * kWarpsPerBlock;
+  return static_cast<size_t>(per_warp);
+}
+
+int attention_warps_per_block(const MappedGroupedIndexedAttentionLayout& layout, bool backward) {
+  const size_t per_warp = shared_memory_bytes_per_warp(layout, backward);
+  // Each warp owns its scratch. Reduce independent queries per block before
+  // falling back, so larger token counts and feature widths remain fused.
+  for (int warps = kWarpsPerBlock; warps > 0; warps /= 2) {
+    if (per_warp <= kSharedMemoryLimit / warps) {
+      return warps;
+    }
+  }
+  return 0;
 }
 
 MappedGroupedIndexedAttentionLayout attention_layout(const torch::Tensor& query,
@@ -465,7 +477,7 @@ MappedGroupedIndexedAttentionLayout attention_layout(const torch::Tensor& query,
 bool supports_mapped_grouped_indexed_attention(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
-    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, bool backward) {
   if (!detail::is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids)) {
@@ -474,8 +486,9 @@ bool supports_mapped_grouped_indexed_attention(const torch::Tensor& query,
   const int64_t queries = query.size(0);
   const int64_t heads = query.size(1);
   const auto layout = attention_layout(query, shared_key_values, shared_delta_table, indexed_deltas);
-  return (queries * heads + kWarpsPerBlock - 1) / kWarpsPerBlock <= std::numeric_limits<int32_t>::max() &&
-      shared_memory_bytes(layout, true) <= kSharedMemoryLimit;
+  const int warps = attention_warps_per_block(layout, backward);
+  return warps > 0 &&
+      (queries * heads + warps - 1) / warps <= std::numeric_limits<int32_t>::max();
 }
 
 MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forward(
@@ -484,7 +497,7 @@ MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forw
     const torch::Tensor& shared_delta_indices, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, float scale, bool capture_probabilities) {
   TORCH_CHECK(supports_mapped_grouped_indexed_attention(query, shared_key_values, shared_group_indices,
-          shared_delta_table, shared_delta_indices, indexed_deltas, indexed_shared_ids),
+          shared_delta_table, shared_delta_indices, indexed_deltas, indexed_shared_ids, capture_probabilities),
       "mapped grouped indexed attention requires supported contiguous CUDA tensors with int32 mappings");
   c10::cuda::CUDAGuard device_guard(query.device());
   const auto layout = attention_layout(query, shared_key_values, shared_delta_table, indexed_deltas);
@@ -499,16 +512,17 @@ MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forw
             query.options().dtype(torch::kFloat32))
       : torch::Tensor();
   float* probability_data = capture_probabilities ? probabilities.data_ptr<float>() : nullptr;
-  const int blocks = static_cast<int>((query_heads + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  const int warps = attention_warps_per_block(layout, false);
+  const int blocks = static_cast<int>((query_heads + warps - 1) / warps);
   const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device()).stream();
-  const size_t shared_bytes = shared_memory_bytes(layout, false);
+  const size_t shared_bytes = shared_memory_bytes_per_warp(layout, false) * warps;
   AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, query.scalar_type(),
       "mapped_grouped_indexed_attention_cuda", [&] {
         const auto launch = [&](auto fp32) {
           constexpr bool use_fp32 = decltype(fp32)::value;
           using output_t = std::conditional_t<use_fp32, float, scalar_t>;
           mapped_grouped_indexed_attention_kernel<scalar_t, output_t, use_fp32>
-              <<<blocks, kThreadsPerBlock, shared_bytes, stream>>>(query.data_ptr<scalar_t>(),
+              <<<blocks, warps * 32, shared_bytes, stream>>>(query.data_ptr<scalar_t>(),
                   shared_key_values.data_ptr<scalar_t>(), shared_group_indices.data_ptr<int32_t>(),
                   shared_delta_table.data_ptr<scalar_t>(), shared_delta_indices.data_ptr<int32_t>(),
                   indexed_deltas.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<int32_t>(),
@@ -552,16 +566,18 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
             query.options().dtype(torch::kFloat32)) : torch::Tensor();
   auto indexed_gradient = needs_indexed_delta_gradient ? torch::empty_like(indexed_deltas) : torch::Tensor();
   const auto gradient = gradient_output.contiguous();
-  const int blocks = static_cast<int>((query_heads + kWarpsPerBlock - 1) / kWarpsPerBlock);
+  const int warps = attention_warps_per_block(layout, true);
+  TORCH_CHECK(warps > 0, "mapped grouped indexed attention backward exceeds CUDA shared memory");
+  const int blocks = static_cast<int>((query_heads + warps - 1) / warps);
   const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device()).stream();
-  const size_t shared_bytes = shared_memory_bytes(layout, true);
+  const size_t shared_bytes = shared_memory_bytes_per_warp(layout, true) * warps;
   AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, query.scalar_type(),
       "mapped_grouped_indexed_attention_backward_cuda", [&] {
         const auto launch = [&](auto fp32) {
           constexpr bool use_fp32 = decltype(fp32)::value;
           using gradient_t = std::conditional_t<use_fp32, float, scalar_t>;
           mapped_grouped_indexed_attention_backward_kernel<scalar_t, gradient_t, use_fp32>
-              <<<blocks, kThreadsPerBlock, shared_bytes, stream>>>(query.data_ptr<scalar_t>(),
+              <<<blocks, warps * 32, shared_bytes, stream>>>(query.data_ptr<scalar_t>(),
                   shared_key_values.data_ptr<scalar_t>(), shared_group_indices.data_ptr<int32_t>(),
                   shared_delta_table.data_ptr<scalar_t>(), shared_delta_indices.data_ptr<int32_t>(),
                   indexed_deltas.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<int32_t>(),

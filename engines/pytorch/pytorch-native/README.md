@@ -52,6 +52,24 @@ operation's `.cc` file. CUDA and ROCm kernels retain their own launch limits, wa
 gradient paths, and autocast behavior. A layout accepted by the public API may still use the portable
 path when a backend specialization does not support it.
 
+### Shape-based normalization
+
+Normalization dispatch uses the flattened row width and the device's warp size, with bounded
+register storage. Contiguous trailing normalization dimensions are treated as one row; the public
+tensor and affine shapes remain unchanged. FP16/BF16 autocast normalization retains FP32 Welford
+statistics and affine output before the requested conversion.
+
+Small rows use the existing warp-local path. Wider inference rows use a block reduction with a
+bounded cache; rows beyond the cache budget are reread after reduction. The wide-row device kernel
+is shared by HIP and CUDA in `djl_pytorch_layer_norm_kernels.h`. ROCm retains its existing custom
+backward for supported warp-local rows, including multidimensional affine shapes. Wider training
+and CUDA training use the portable autograd path.
+
+Fusion normalization uses register-cache buckets rather than a list of model widths. Existing
+specializations remain available, odd widths guard their tails, and widths beyond the per-lane
+register budget retain the streaming implementation. Shape support alone does not establish a
+speedup: compare the relevant row counts, widths, dtypes, and gradient modes on the target device.
+
 ### Adding a functional kernel
 
 1. Define the operation's contract and portable ATen reference in its existing operation `.h` and

@@ -21,7 +21,7 @@ namespace djl::pytorch::cuda {
 bool supports_mapped_grouped_indexed_attention(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
-    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids);
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, bool backward);
 
 using detail::MappedGroupedIndexedAttentionForwardResult;
 
