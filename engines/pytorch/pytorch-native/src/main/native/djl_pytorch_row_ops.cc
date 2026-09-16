@@ -20,9 +20,7 @@
 
 #include <limits>
 
-#if defined(DJL_USE_ROCM_KERNELS)
-#include "djl_pytorch_rocm_kernels.h"
-#endif
+#include "djl_pytorch_kernel_backend.h"
 
 namespace djl::pytorch {
 namespace {
@@ -428,6 +426,12 @@ torch::Tensor padded_batch_gather(
     return rocm::padded_batch_gather_forward(source, stored_indices);
   }
 #endif
+#if defined(DJL_USE_CUDA_KERNELS)
+  if ((!at::GradMode::is_enabled() || !source.requires_grad()) &&
+      cuda::supports_padded_batch_gather(source, {}, stored_indices, {})) {
+    return cuda::padded_batch_gather_forward(source, {}, stored_indices, {});
+  }
+#endif
   return padded_gather_reference(
       source, implicit_batch_indices(stored_indices, source.size(0)), stored_indices, {});
 }
@@ -459,6 +463,12 @@ torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
         source, outer_stored_indices, inner_stored_indices);
   }
 #endif
+#if defined(DJL_USE_CUDA_KERNELS)
+  if ((!at::GradMode::is_enabled() || !source.requires_grad()) &&
+      cuda::supports_padded_batch_gather(source, {}, outer_stored_indices, inner_stored_indices)) {
+    return cuda::padded_batch_gather_forward(source, {}, outer_stored_indices, inner_stored_indices);
+  }
+#endif
   return padded_gather_reference(source,
       implicit_batch_indices(outer_stored_indices, source.size(0)),
       outer_stored_indices, inner_stored_indices);
@@ -486,6 +496,12 @@ torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
     }
     return rocm::padded_batch_gather_by_batch_indices_forward(
         source, batch_indices, stored_indices);
+  }
+#endif
+#if defined(DJL_USE_CUDA_KERNELS)
+  if ((!at::GradMode::is_enabled() || !source.requires_grad()) &&
+      cuda::supports_padded_batch_gather(source, batch_indices, stored_indices, {})) {
+    return cuda::padded_batch_gather_forward(source, batch_indices, stored_indices, {});
   }
 #endif
   return padded_gather_reference(source, batch_indices, stored_indices, {});

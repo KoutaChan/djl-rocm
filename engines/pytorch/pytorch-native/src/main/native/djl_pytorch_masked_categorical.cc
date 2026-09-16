@@ -18,11 +18,22 @@
 #include <limits>
 #include <vector>
 
-#if defined(DJL_USE_ROCM_KERNELS)
-#include "djl_pytorch_rocm_kernels.h"
-#endif
+#include "djl_pytorch_kernel_backend.h"
 
 namespace djl::pytorch {
+namespace detail {
+
+bool is_masked_categorical_layout_supported(
+    const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
+  return logits.is_cuda() && logits.dim() > 0 && axis == logits.dim() - 1 &&
+      logits.size(-1) > 0 && logits.is_contiguous() &&
+      (logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16 ||
+          logits.scalar_type() == torch::kBFloat16) &&
+      mask.device() == logits.device() && mask.scalar_type() == torch::kBool &&
+      mask.is_contiguous() && mask.sizes() == logits.sizes();
+}
+
+}  // namespace detail
 namespace {
 
 int64_t normalize_axis(int64_t axis, int64_t dimensions) {
@@ -170,13 +181,13 @@ torch::Tensor indexed_masked_softmax_pool_reference(const torch::Tensor& logits,
   return torch::where(present, pooled, torch::zeros_like(pooled));
 }
 
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
 
 class MaskedSoftmaxFunction : public torch::autograd::Function<MaskedSoftmaxFunction> {
  public:
   static torch::Tensor forward(torch::autograd::AutogradContext* context,
       const torch::Tensor& logits, const torch::Tensor& mask) {
-    auto probabilities = rocm::masked_softmax_forward(logits, mask);
+    auto probabilities = kernel_backend::masked_softmax_forward(logits, mask);
     context->save_for_backward({probabilities, mask});
     context->saved_data["input_type"] = static_cast<int64_t>(logits.scalar_type());
     return probabilities;
@@ -187,7 +198,19 @@ class MaskedSoftmaxFunction : public torch::autograd::Function<MaskedSoftmaxFunc
     const auto saved = context->get_saved_variables();
     const auto input_type =
         static_cast<torch::ScalarType>(context->saved_data["input_type"].toInt());
-    auto gradient = rocm::masked_softmax_backward(
+#if defined(DJL_USE_CUDA_KERNELS)
+    // Autograd enables GradMode when constructing a higher-order derivative graph.
+    if (at::GradMode::is_enabled()) {
+      auto probabilities = saved.at(0);
+      auto selected_gradient = torch::where(saved.at(1),
+          gradient_outputs.at(0).to(torch::kFloat32), torch::zeros_like(probabilities));
+      auto product_sum = selected_gradient.mul(probabilities).sum(-1, true);
+      auto gradient = torch::where(saved.at(1),
+          probabilities.mul(selected_gradient.sub(product_sum)), torch::zeros_like(probabilities));
+      return {gradient.to(input_type), torch::Tensor()};
+    }
+#endif
+    auto gradient = kernel_backend::masked_softmax_backward(
         gradient_outputs.at(0), saved.at(0), saved.at(1), input_type);
     return {gradient, torch::Tensor()};
   }
@@ -198,7 +221,7 @@ class MaskedLogSumExpFunction : public torch::autograd::Function<MaskedLogSumExp
   static torch::Tensor forward(torch::autograd::AutogradContext* context,
       const torch::Tensor& logits, const torch::Tensor& mask) {
     torch::Tensor normalization;
-    auto normalizers = rocm::masked_log_sum_exp_forward(logits, mask, &normalization);
+    auto normalizers = kernel_backend::masked_log_sum_exp_forward(logits, mask, &normalization);
     context->save_for_backward({logits, mask, normalization});
     return normalizers;
   }
@@ -206,7 +229,15 @@ class MaskedLogSumExpFunction : public torch::autograd::Function<MaskedLogSumExp
   static torch::autograd::variable_list backward(
       torch::autograd::AutogradContext* context, torch::autograd::variable_list gradient_outputs) {
     const auto saved = context->get_saved_variables();
-    auto gradient = rocm::masked_log_sum_exp_backward(
+#if defined(DJL_USE_CUDA_KERNELS)
+    if (at::GradMode::is_enabled()) {
+      auto probabilities = masked_softmax_reference(saved.at(0), saved.at(1), -1);
+      auto gradient = torch::where(saved.at(1),
+          probabilities.mul(gradient_outputs.at(0).to(torch::kFloat32)), torch::zeros_like(probabilities));
+      return {gradient.to(saved.at(0).scalar_type()), torch::Tensor()};
+    }
+#endif
+    auto gradient = kernel_backend::masked_log_sum_exp_backward(
         gradient_outputs.at(0), saved.at(0), saved.at(1), saved.at(2));
     return {gradient, torch::Tensor()};
   }
@@ -222,7 +253,7 @@ class IndexedMaskedSoftmaxPoolValueFunction
     context->saved_data["value_shape"] = values.sizes().vec();
     context->saved_data["value_type"] = static_cast<int64_t>(values.scalar_type());
     context->saved_data["choice_indices"] = choice_indices;
-    return rocm::indexed_masked_softmax_pool_forward(
+    return kernel_backend::indexed_masked_softmax_pool_forward(
         logits, mask, values, choice_indices);
   }
 
@@ -235,14 +266,34 @@ class IndexedMaskedSoftmaxPoolValueFunction
         context->saved_data["value_type"].toInt());
     const auto choice_indices =
         context->saved_data["choice_indices"].toIntVector();
+#if defined(DJL_USE_CUDA_KERNELS)
+    if (at::GradMode::is_enabled() && context->needs_input_grad(2)) {
+      auto index = torch::tensor(choice_indices,
+          torch::TensorOptions().dtype(torch::kLong).device(saved.at(0).device()));
+      auto selected_mask = saved.at(1).index_select(-1, index);
+      auto probabilities = masked_softmax_reference(
+          saved.at(0).index_select(-1, index), selected_mask, -1);
+      auto weighted_gradient = probabilities.unsqueeze(-1).mul(
+          gradient_outputs.at(0).to(torch::kFloat32).unsqueeze(-2));
+      auto selected_gradient = torch::where(selected_mask.unsqueeze(-1),
+          weighted_gradient, torch::zeros_like(weighted_gradient)).to(value_type);
+      auto value_gradient = torch::zeros(value_shape, saved.at(0).options().dtype(value_type))
+          .index_copy(-2, index, selected_gradient);
+      return {torch::Tensor(), torch::Tensor(), value_gradient, torch::Tensor()};
+    }
+#endif
     auto value_gradient = context->needs_input_grad(2)
-        ? rocm::indexed_masked_softmax_pool_value_backward(
+        ? kernel_backend::indexed_masked_softmax_pool_value_backward(
               gradient_outputs.at(0), saved.at(0), saved.at(1), value_shape,
               value_type, choice_indices)
         : torch::Tensor();
     return {torch::Tensor(), torch::Tensor(), value_gradient, torch::Tensor()};
   }
 };
+
+#endif
+
+#if defined(DJL_USE_ROCM_KERNELS)
 
 class GroupedMaskedSoftmaxPoolValueFunction
     : public torch::autograd::Function<GroupedMaskedSoftmaxPoolValueFunction> {
@@ -281,12 +332,12 @@ torch::Tensor masked_softmax(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
   const int64_t normalized_axis = normalize_axis(axis, logits.dim());
   auto boolean_mask = expanded_boolean_mask(logits, mask).contiguous();
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_masked_categorical(logits, boolean_mask, normalized_axis)) {
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (kernel_backend::supports_masked_categorical(logits, boolean_mask, normalized_axis)) {
     if (at::GradMode::is_enabled() && logits.requires_grad()) {
       return MaskedSoftmaxFunction::apply(logits, boolean_mask);
     }
-    return rocm::masked_softmax_forward(logits, boolean_mask);
+    return kernel_backend::masked_softmax_forward(logits, boolean_mask);
   }
 #endif
   return masked_softmax_reference(logits, boolean_mask, normalized_axis);
@@ -322,20 +373,24 @@ torch::Tensor indexed_masked_softmax_pool(const torch::Tensor& logits,
     const torch::Tensor& mask, const torch::Tensor& values,
     at::IntArrayRef choice_indices) {
   validate_indexed_pool_shapes(logits, mask, values, choice_indices);
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
   auto contiguous_logits = logits.contiguous();
+#if defined(DJL_USE_CUDA_KERNELS)
+  auto contiguous_mask = mask.to(torch::kBool).contiguous();
+#else
   auto contiguous_mask = mask.contiguous();
+#endif
   auto contiguous_values = values.contiguous();
   if ((!at::GradMode::is_enabled() ||
           (!logits.requires_grad() && !values.requires_grad())) &&
-      rocm::supports_indexed_masked_softmax_pool(
+      kernel_backend::supports_indexed_masked_softmax_pool(
           contiguous_logits, contiguous_mask, contiguous_values, choice_indices)) {
-    return rocm::indexed_masked_softmax_pool_forward(
+    return kernel_backend::indexed_masked_softmax_pool_forward(
         contiguous_logits, contiguous_mask, contiguous_values, choice_indices);
   }
   if (at::GradMode::is_enabled() && !logits.requires_grad() &&
       values.requires_grad() &&
-      rocm::supports_indexed_masked_softmax_pool(
+      kernel_backend::supports_indexed_masked_softmax_pool(
           contiguous_logits, contiguous_mask, contiguous_values, choice_indices)) {
     return IndexedMaskedSoftmaxPoolValueFunction::apply(contiguous_logits,
         contiguous_mask, contiguous_values, choice_indices.vec());
@@ -348,12 +403,12 @@ torch::Tensor masked_log_sum_exp(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
   const int64_t normalized_axis = normalize_axis(axis, logits.dim());
   auto boolean_mask = expanded_boolean_mask(logits, mask).contiguous();
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_masked_categorical(logits, boolean_mask, normalized_axis)) {
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (kernel_backend::supports_masked_categorical(logits, boolean_mask, normalized_axis)) {
     if (at::GradMode::is_enabled() && logits.requires_grad()) {
       return MaskedLogSumExpFunction::apply(logits, boolean_mask);
     }
-    return rocm::masked_log_sum_exp_forward(logits, boolean_mask);
+    return kernel_backend::masked_log_sum_exp_forward(logits, boolean_mask);
   }
 #endif
   return masked_log_sum_exp_reference(logits, boolean_mask, normalized_axis);

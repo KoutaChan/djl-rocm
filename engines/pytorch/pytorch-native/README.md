@@ -35,11 +35,52 @@ This task will send a Jni library copy to `pytorch-engine` model to test locally
 
 GPU builds require a PyTorch/libtorch distribution and compiler toolchain for the same accelerator
 flavor. Fusion Plan is enabled automatically when the JNI library is built for CUDA or ROCm. Its
-shared command implementation is in `djl_pytorch_fusion_kernels.hip`; CUDA compiles the thin
-`djl_pytorch_fusion_kernels.cu` entry point, and `djl_pytorch_fusion_backend.h` isolates the runtime
-and launch differences. Keep changes to common command behavior in the shared source so CUDA and
-ROCm do not drift. Fusion storage planner settings are documented in the
+shared command implementation is in `djl_pytorch_fusion_kernels_impl.inc`, included by the thin
+`.hip` and `.cu` entry points. Only the selected entry point is compiled;
+`djl_pytorch_fusion_backend.h` isolates runtime and launch differences, while backend-specific BLAS
+paths remain conditional. Keep common command behavior in the shared source so CUDA and ROCm do
+not drift. Fusion storage planner settings are documented in the
 [engine guide](../../../docs/engine.md#fusion-storage-planning).
+
+The same source tree builds separate CPU, CUDA, and ROCm native libraries against the matching
+libtorch distribution. ROCm libtorch also sets `USE_CUDA`, so CMake selects ROCm first and defines
+only that backend's kernel macros. Java selects one native runtime per JVM; this does not load CUDA
+and ROCm libtorch together. Runtime artifacts and caches remain separated by flavor and platform.
+
+Functional operations keep their portable ATen fallback and shared host validation/dispatch in the
+operation's `.cc` file. CUDA and ROCm kernels retain their own launch limits, warp handling, supported
+gradient paths, and autocast behavior. A layout accepted by the public API may still use the portable
+path when a backend specialization does not support it.
+
+### Adding a functional kernel
+
+1. Define the operation's contract and portable ATen reference in its existing operation `.h` and
+   `.cc` files. Validate public shapes, devices, indices, and output semantics before specialization
+   dispatch. Keep a shared layout predicate in the operation's `detail` namespace only when the
+   backends have the same conditions; keep genuinely shared result types there as well.
+2. Put device kernels and launch code in the matching backend source. Its `supports_*` function
+   combines the shared layout predicate with its own dtype, indexing, warp, grid, and shared-memory
+   limits. Unsupported cases must reach the portable reference, not silently change the contract.
+   Do not merge kernels whose accumulation, rounding, padding, or nonfinite behavior differs.
+3. Include backend declarations once in `djl_pytorch_kernel_backend.h`. Operation `.cc` files include
+   that header and use its `kernel_backend` namespace alias under `DJL_USE_ACCELERATOR_KERNELS` for
+   matching APIs. The header selects the compiled backend; no runtime registry is involved. Keep
+   backend-specific branches only where capabilities or signatures actually differ. CPU builds have
+   no selected kernel backend and retain the portable path.
+4. Keep autograd dispatch and saved-tensor ownership in the operation `.cc`. Check whether the active
+   backend supports every requested gradient and deterministic execution before selecting it. Preserve
+   autocast output types and rounding, higher-order gradient fallbacks, empty inputs, and stream/lifetime
+   semantics. An inference-only kernel must fall back when gradients are requested; for example, CUDA
+   padded gather and LayerNorm+cast currently use the portable training path.
+5. Add the kernel source to the appropriate `CUDA_KERNEL_SOURCES` or `ROCM_KERNEL_SOURCES` list in
+   CMake. CMake builds one backend per native library, with ROCm taking precedence when libtorch sets
+   both `USE_ROCM` and `USE_CUDA`. Common included implementations such as the Fusion `.inc` are not
+   separate translation units. Do not set the derived kernel-selection macros from Java.
+6. Reuse the operation's tests for CPU and both GPU backends, checking supported paths and portable
+   fallbacks across dtypes, gradients, autocast, deterministic mode, strides, and empty/padded inputs.
+   Compare against the existing reference under the same numerical contract. Validate a shared change
+   with each native build; keep timing thresholds out of correctness tests and use a separate benchmark
+   when measuring performance.
 
 ### Fusion execution-lane lifetime
 

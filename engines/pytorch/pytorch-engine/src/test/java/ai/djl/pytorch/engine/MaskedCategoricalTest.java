@@ -26,7 +26,7 @@ import ai.djl.training.tracker.Tracker;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
-/** Verifies masked categorical semantics and ROCm optimizer parity. */
+/** Verifies masked categorical semantics and native optimizer parity. */
 public class MaskedCategoricalTest {
 
     @Test
@@ -170,6 +170,7 @@ public class MaskedCategoricalTest {
             return;
         }
         verifyMaskedGradientParity(engine, DataType.FLOAT32, 2e-5f);
+        verifyMaskedGradientParity(engine, DataType.FLOAT16, 3e-3f);
         verifyMaskedGradientParity(engine, DataType.BFLOAT16, 2e-2f);
     }
 
@@ -198,8 +199,33 @@ public class MaskedCategoricalTest {
             return;
         }
         verifyIndexedPoolValueGradientParity(engine, DataType.FLOAT32, 2e-5f);
+        verifyIndexedPoolValueGradientParity(engine, DataType.FLOAT16, 3e-3f);
         verifyIndexedPoolValueGradientParity(engine, DataType.BFLOAT16, 2e-2f);
         verifyProductionShapeIndexedPoolValueGradientParity(engine);
+    }
+
+    @Test
+    public void indexedMaskedSoftmaxPoolStridedInputsPreserveDetachedAndLogitGradients() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            float tolerance =
+                    dataType == DataType.BFLOAT16
+                            ? 2e-2f
+                            : dataType == DataType.FLOAT16 ? 3e-3f : 2e-5f;
+            for (boolean logitGradient : new boolean[] {false, true}) {
+                float[][] expected =
+                        stridedIndexedPoolResult(engine, Device.cpu(), dataType, logitGradient);
+                float[][] actual =
+                        stridedIndexedPoolResult(engine, Device.gpu(), dataType, logitGradient);
+                for (int index = 0; index < expected.length; ++index) {
+                    assertClose(actual[index], expected[index], tolerance);
+                }
+            }
+        }
     }
 
     @Test
@@ -744,6 +770,62 @@ public class MaskedCategoricalTest {
             try (NDArray gradient = values.getGradient().toType(DataType.FLOAT32, false)) {
                 assertClose(gradient.toFloatArray(), expectedGradient, tolerance);
             }
+        }
+    }
+
+    private static float[][] stridedIndexedPoolResult(
+            Engine engine, Device device, DataType dataType, boolean logitGradient) {
+        final int rows = 3;
+        final int choices = 5;
+        final int features = 3;
+        float[] logitData = new float[choices * rows];
+        boolean[] maskData = new boolean[choices * rows];
+        float[] valueData = new float[rows * features * choices];
+        for (int choice = 0; choice < choices; ++choice) {
+            for (int row = 0; row < rows; ++row) {
+                boolean present = row != 2 && (row + choice) % 3 != 0;
+                logitData[choice * rows + row] = present ? (choice - row) * 0.25f : Float.NaN;
+                maskData[choice * rows + row] = present;
+                for (int feature = 0; feature < features; ++feature) {
+                    valueData[(row * features + feature) * choices + choice] =
+                            present ? (row + feature - choice) * 0.125f : Float.NaN;
+                }
+            }
+        }
+        try (NDManager manager = engine.newBaseManager(device);
+                GradientCollector collector = engine.newGradientCollector()) {
+            NDArray logitBase =
+                    manager.create(logitData, new Shape(choices, rows)).toType(dataType, false);
+            logitBase.setRequiresGradient(true);
+            NDArray logits = logitBase.transpose(1, 0);
+            if (!logitGradient) {
+                logits = logits.stopGradient();
+            }
+            NDArray mask = manager.create(maskData, new Shape(choices, rows)).transpose(1, 0);
+            NDArray valueBase =
+                    manager.create(valueData, new Shape(rows, features, choices))
+                            .toType(dataType, false);
+            valueBase.setRequiresGradient(true);
+            NDArray values = valueBase.transpose(0, 2, 1);
+            NDArray weights =
+                    manager.create(
+                                    new float[] {1f, -0.5f, 0.25f, 0.5f, 1f, -1f, 2f, -2f, 3f},
+                                    new Shape(features, rows))
+                            .transpose(1, 0);
+            NDArray pooled = NDArrays.indexedMaskedSoftmaxPool(logits, mask, values, 4, 1, 3);
+            collector.backward(pooled.mul(weights).sum());
+            Assert.assertEquals(pooled.getShape(), new Shape(rows, features));
+            Assert.assertEquals(pooled.getDataType(), DataType.FLOAT32);
+            float[] logitGradients =
+                    logitBase.getGradient().toType(DataType.FLOAT32, false).toFloatArray();
+            if (!logitGradient) {
+                assertClose(logitGradients, new float[logitGradients.length], 0f);
+            }
+            return new float[][] {
+                pooled.toFloatArray(),
+                valueBase.getGradient().toType(DataType.FLOAT32, false).toFloatArray(),
+                logitGradients
+            };
         }
     }
 

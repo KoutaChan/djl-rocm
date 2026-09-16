@@ -15,6 +15,7 @@ package ai.djl.pytorch.engine;
 import ai.djl.Device;
 import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
+import ai.djl.engine.InferenceMode;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
@@ -28,7 +29,7 @@ import org.testng.Assert;
 import org.testng.SkipException;
 import org.testng.annotations.Test;
 
-/** Tests the ROCm specialization for autocast LayerNorm. */
+/** Tests autocast LayerNorm specializations and their eager fallbacks. */
 @SuppressWarnings("try") // Autocast resources are used for their scope side effects.
 public class AutocastLayerNormTest {
 
@@ -72,6 +73,227 @@ public class AutocastLayerNormTest {
                 }
             }
         }
+    }
+
+    @Test
+    public void layerNormAndCastInferenceMatchesEagerAcrossWidthsAndAffineDtypes() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (DataType inputType :
+                            new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                        for (DataType parameterType : FLOATING_DATA_TYPES) {
+                            for (DataType convertedType :
+                                    new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                                for (int width : new int[] {1, 17, 256, 257, 512}) {
+                                    try (NDManager scope = manager.newSubManager()) {
+                                        Shape shape = new Shape(3, width);
+                                        NDArray input =
+                                                scope.create(
+                                                                sequence(shape.size(), 0.03125f),
+                                                                shape)
+                                                        .toType(inputType, false);
+                                        NDArray weight =
+                                                scope.create(sequence(width, 0.00390625f))
+                                                        .add(1f)
+                                                        .toType(parameterType, false);
+                                        NDArray bias =
+                                                scope.create(sequence(width, -0.001953125f))
+                                                        .toType(parameterType, false);
+                                        // Inference mode must ignore leaf flags as well as
+                                        // GradMode.
+                                        input.setRequiresGradient(true);
+                                        weight.setRequiresGradient(true);
+                                        bias.setRequiresGradient(true);
+                                        verifyInferenceLayerNormAndCast(
+                                                engine,
+                                                device,
+                                                input,
+                                                new Shape(width),
+                                                weight,
+                                                bias,
+                                                convertedType,
+                                                true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+    }
+
+    @Test
+    public void layerNormAndCastInferenceFallbacksMatchEager() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (int boundary = 0; boundary < 8; ++boundary) {
+                        try (NDManager scope = manager.newSubManager()) {
+                            int width = boundary == 0 ? 513 : 17;
+                            int rows = boundary == 1 ? 0 : 3;
+                            DataType inputType =
+                                    boundary == 2 ? DataType.FLOAT32 : DataType.BFLOAT16;
+                            DataType convertedType =
+                                    boundary == 3 ? DataType.FLOAT32 : DataType.FLOAT16;
+                            Shape shape = new Shape(rows, width);
+                            Shape normalizedShape = new Shape(width);
+                            NDArray input =
+                                    scope.create(sequence(shape.size(), 0.03125f), shape)
+                                            .toType(inputType, false);
+                            NDArray weight =
+                                    scope.create(sequence(width, 0.00390625f))
+                                            .add(1f)
+                                            .toType(inputType, false);
+                            NDArray bias =
+                                    scope.create(sequence(width, -0.001953125f))
+                                            .toType(inputType, false);
+                            if (boundary == 4) {
+                                input = input.transpose();
+                                normalizedShape = new Shape(rows);
+                                weight = scope.ones(normalizedShape, inputType);
+                                bias = scope.zeros(normalizedShape, inputType);
+                            } else if (boundary == 5) {
+                                normalizedShape = shape;
+                                weight = scope.ones(shape, inputType);
+                                bias = scope.zeros(shape, inputType);
+                            } else if (boundary == 6) {
+                                weight =
+                                        scope.create(
+                                                        sequence(width * 2L, 0.00390625f),
+                                                        new Shape(width, 2))
+                                                .add(1f)
+                                                .toType(inputType, false)
+                                                .get(":, 0");
+                                bias =
+                                        scope.create(
+                                                        sequence(width * 2L, -0.001953125f),
+                                                        new Shape(width, 2))
+                                                .toType(inputType, false)
+                                                .get(":, 1");
+                            }
+                            verifyInferenceLayerNormAndCast(
+                                    engine,
+                                    device,
+                                    input,
+                                    normalizedShape,
+                                    weight,
+                                    bias,
+                                    convertedType,
+                                    boundary != 7);
+                        }
+                    }
+                });
+    }
+
+    @Test
+    public void layerNormAndCastInferenceKeepsFloat32OutputsIndependent() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    NDArray input =
+                            manager.create(sequence(51, 0.03125f), new Shape(3, 17))
+                                    .toType(DataType.BFLOAT16, false);
+                    NDArray weight = manager.ones(new Shape(17));
+                    NDArray bias = manager.zeros(new Shape(17));
+                    try (InferenceMode inference = engine.newInferenceMode();
+                            Autocast autocast =
+                                    engine.newAutocast(device, DataType.BFLOAT16, true)) {
+                        NDList outputs =
+                                LayerNorm.layerNormAndCast(
+                                        input,
+                                        new Shape(17),
+                                        weight,
+                                        bias,
+                                        EPSILON,
+                                        DataType.FLOAT32);
+                        float[] normalized = outputs.get(0).toFloatArray();
+                        Assert.assertEquals(outputs.get(1).toFloatArray(), normalized);
+                        outputs.get(1).addi(3f);
+                        Assert.assertEquals(outputs.get(0).toFloatArray(), normalized);
+                    }
+                });
+    }
+
+    @Test
+    public void layerNormAndCastCudaTrainingMatchesEagerFallback() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            throw new SkipException("This LayerNorm fallback test requires PyTorch CUDA.");
+        }
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            for (DataType inputType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                for (DataType parameterType : FLOATING_DATA_TYPES) {
+                    for (OutputUse outputUse : OutputUse.values()) {
+                        TrainingResult reference =
+                                trainLayerNormAndCast(
+                                        engine,
+                                        manager,
+                                        device,
+                                        3,
+                                        17,
+                                        inputType,
+                                        parameterType,
+                                        inputType,
+                                        outputUse,
+                                        false);
+                        TrainingResult actual =
+                                trainLayerNormAndCast(
+                                        engine,
+                                        manager,
+                                        device,
+                                        3,
+                                        17,
+                                        inputType,
+                                        parameterType,
+                                        inputType,
+                                        outputUse,
+                                        true);
+                        assertTrainingResult(
+                                actual,
+                                reference,
+                                trainingTolerance(inputType, parameterType, inputType));
+                    }
+                }
+            }
+        }
+    }
+
+    private static void verifyInferenceLayerNormAndCast(
+            Engine engine,
+            Device device,
+            NDArray input,
+            Shape normalizedShape,
+            NDArray weight,
+            NDArray bias,
+            DataType convertedType,
+            boolean autocastEnabled) {
+        NDArray expected;
+        NDArray expectedConverted;
+        NDList actual;
+        DataType inputType = input.getDataType();
+        DataType autocastType =
+                inputType == DataType.FLOAT16 ? DataType.FLOAT16 : DataType.BFLOAT16;
+        try (InferenceMode inference = engine.newInferenceMode();
+                Autocast autocast = engine.newAutocast(device, autocastType, autocastEnabled)) {
+            expected =
+                    LayerNorm.layerNorm(input, normalizedShape, weight, bias, EPSILON)
+                            .singletonOrThrow();
+            expectedConverted = expected.toType(convertedType, false);
+            actual =
+                    LayerNorm.layerNormAndCast(
+                            input, normalizedShape, weight, bias, EPSILON, convertedType);
+        }
+        Assert.assertEquals(actual.size(), 2);
+        Assert.assertEquals(actual.get(0).getDataType(), expected.getDataType());
+        Assert.assertEquals(actual.get(1).getDataType(), convertedType);
+        Assert.assertEquals(actual.get(0).getShape(), input.getShape());
+        Assert.assertEquals(actual.get(1).getShape(), input.getShape());
+        assertClose(
+                floatValues(actual.get(0)), floatValues(expected), normalizedTolerance(inputType));
+        assertClose(
+                floatValues(actual.get(1)),
+                floatValues(expectedConverted),
+                convertedTolerance(inputType, convertedType));
+        assertAllFinite(actual.get(0));
+        assertAllFinite(actual.get(1));
     }
 
     private static void verifyLayerNormAndCastSlotReuse(

@@ -13,12 +13,14 @@
 package ai.djl.pytorch.engine;
 
 import ai.djl.Device;
+import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.training.GradientCollector;
 
 import org.testng.Assert;
@@ -990,6 +992,170 @@ public class StructuredAttentionTest {
             engine.setRandomSeed(20260925);
             verifyMappedGroupedAttentionProductionGradients(
                     engine, dataType, 1025, 3, true, true, false, true);
+        }
+    }
+
+    @Test
+    public void mappedGroupedAttentionCudaMatchesCpuAndStridedPortableGradients() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (boolean strided : new boolean[] {false, true}) {
+                Device referenceDevice = strided ? Device.gpu() : Device.cpu();
+                try (NDManager referenceManager = engine.newBaseManager(referenceDevice);
+                        NDManager actualManager = engine.newBaseManager(Device.gpu())) {
+                    NDArray[] expected =
+                            mappedCudaFixture(
+                                    engine, referenceManager, dataType, true, strided, null);
+                    NDArray[] actual =
+                            mappedCudaFixture(
+                                    engine, actualManager, dataType, false, strided, null);
+                    assertMappedCudaFixtureClose(actual, expected, dataType);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void mappedGroupedAttentionCudaAutocastPreservesPortableDtypeAndGradients() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType dataType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                NDArray[] expected =
+                        mappedCudaFixture(engine, manager, dataType, true, false, dataType);
+                NDArray[] actual =
+                        mappedCudaFixture(engine, manager, dataType, false, false, dataType);
+                Assert.assertEquals(actual[0].getDataType(), expected[0].getDataType());
+                assertMappedCudaFixtureClose(actual, expected, dataType);
+                System.out.printf(
+                        "MAPPED_CUDA_AUTOCAST input=%s output=%s reference=%s%n",
+                        dataType, actual[0].getDataType(), expected[0].getDataType());
+            }
+        }
+    }
+
+    @SuppressWarnings("try")
+    private static NDArray[] mappedCudaFixture(
+            Engine engine,
+            NDManager manager,
+            DataType dataType,
+            boolean portableReference,
+            boolean strided,
+            DataType autocastType) {
+        final int queries = 5;
+        final int heads = 4;
+        final int keyFeatures = 8;
+        final int valueFeatures = 16;
+        final int sharedTokens = 34;
+        final int indexedTokens = 13;
+        final int packedWidth = heads * (keyFeatures + valueFeatures);
+        Shape[] shapes = {
+            new Shape(queries, heads, keyFeatures),
+            new Shape(2, sharedTokens, packedWidth),
+            new Shape(3, packedWidth),
+            new Shape(queries, indexedTokens, packedWidth)
+        };
+        boolean floatReference = portableReference && !manager.getDevice().isGpu();
+        NDArray[] inputs = new NDArray[shapes.length];
+        for (int input = 0; input < inputs.length; ++input) {
+            float[] data = new float[(int) shapes[input].size()];
+            for (int index = 0; index < data.length; ++index) {
+                boolean padded = input == 3 && (index / packedWidth % indexedTokens) % 3 == 0;
+                data[index] = padded ? Float.NaN : ((index * 5 + input * 3) % 17 - 8) * 0.03125f;
+            }
+            NDArray values = manager.create(data, shapes[input]).toType(dataType, false);
+            if (floatReference) {
+                values = values.toType(DataType.FLOAT32, false);
+            }
+            if (strided && (input == 0 || input == 3)) {
+                values = values.expandDims(-1).repeat(shapes[input].dimension(), 2).get("...,0");
+            }
+            inputs[input] = requiringGradient(values);
+        }
+        int[] deltaIds = new int[queries * sharedTokens];
+        int[] indexedIds = new int[queries * indexedTokens];
+        for (int index = 0; index < deltaIds.length; ++index) {
+            deltaIds[index] = index % 2;
+        }
+        for (int query = 0; query < queries; ++query) {
+            for (int token = 0; token < indexedTokens; ++token) {
+                indexedIds[query * indexedTokens + token] = token % 3 == 0 ? 0 : token + 1;
+            }
+        }
+        NDArray groups = manager.create(new int[] {1, 0, 1, 0, 1});
+        NDArray relations = manager.create(deltaIds, new Shape(queries, sharedTokens));
+        NDArray stored = manager.create(indexedIds, new Shape(queries, indexedTokens));
+        float[] weightData = new float[queries * heads * valueFeatures];
+        for (int index = 0; index < weightData.length; ++index) {
+            weightData[index] = (index % 7 - 3) * 0.125f;
+        }
+        NDArray weights = manager.create(weightData, new Shape(queries, heads, valueFeatures));
+        NDArray output;
+        try (GradientCollector collector = engine.newGradientCollector()) {
+            try (Autocast ignored =
+                    autocastType == null
+                            ? null
+                            : engine.newAutocast(manager.getDevice(), autocastType, true)) {
+                output =
+                        portableReference
+                                ? mappedGroupedAttentionReference(
+                                        inputs[0],
+                                        inputs[1],
+                                        groups,
+                                        inputs[2],
+                                        relations,
+                                        inputs[3],
+                                        stored,
+                                        1.0 / Math.sqrt(keyFeatures),
+                                        floatReference && dataType == DataType.BFLOAT16)
+                                : NDArrays.mappedGroupedIndexedScaledDotProductAttention(
+                                        inputs[0],
+                                        inputs[1],
+                                        groups,
+                                        inputs[2],
+                                        relations,
+                                        inputs[3],
+                                        stored,
+                                        1.0 / Math.sqrt(keyFeatures));
+            }
+            collector.backward(output.mul(weights).sum());
+        }
+        Assert.assertEquals(output.getShape(), new Shape(queries, heads, valueFeatures));
+        NDArray[] results = {
+            output,
+            inputs[0].getGradient(),
+            inputs[1].getGradient(),
+            inputs[2].getGradient(),
+            inputs[3].getGradient()
+        };
+        float[] indexedGradient = results[4].toType(DataType.FLOAT32, false).toFloatArray();
+        for (int row = 0; row < indexedIds.length; ++row) {
+            if (indexedIds[row] == 0) {
+                for (int feature = 0; feature < packedWidth; ++feature) {
+                    Assert.assertEquals(indexedGradient[row * packedWidth + feature], 0f);
+                }
+            }
+        }
+        assertAllZero(results[3].get("2,:").toType(DataType.FLOAT32, false).toFloatArray());
+        return results;
+    }
+
+    private static void assertMappedCudaFixtureClose(
+            NDArray[] actual, NDArray[] expected, DataType dataType) {
+        for (int index = 0; index < actual.length; ++index) {
+            Assert.assertEquals(actual[index].getShape(), expected[index].getShape());
+            float[] values = actual[index].toType(DataType.FLOAT32, false).toFloatArray();
+            float[] reference = expected[index].toType(DataType.FLOAT32, false).toFloatArray();
+            for (float value : values) {
+                Assert.assertTrue(Float.isFinite(value));
+            }
+            assertClose(values, reference, gradientTolerance(dataType));
         }
     }
 

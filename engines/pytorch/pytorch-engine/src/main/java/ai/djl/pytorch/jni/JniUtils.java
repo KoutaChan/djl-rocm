@@ -420,6 +420,7 @@ public final class JniUtils {
     public static PtNDArray createEmptyNdArray(
             PtNDManager manager, Shape shape, DataType dType, Device device, SparseFormat fmt) {
         int layoutVal = layoutMapper(fmt, device);
+        // Older JNI libraries use the native default dtype for complex allocations.
         return new PtNDArray(
                 manager,
                 PyTorchLibrary.LIB.torchEmpty(
@@ -427,7 +428,9 @@ public final class JniUtils {
                         dType.ordinal(),
                         layoutVal,
                         new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()},
-                        false));
+                        false),
+                shape,
+                dType == DataType.COMPLEX64 ? null : dType);
     }
 
     public static PtNDArray createZerosNdArray(
@@ -613,6 +616,20 @@ public final class JniUtils {
             return ndArray;
         }
         List<NDIndexElement> indices = index.getIndices();
+        if (indices.size() == 1
+                && index.getEllipsisIndex() == -1
+                && indices.get(0) instanceof NDIndexSlice) {
+            NDIndexSlice slice = (NDIndexSlice) indices.get(0);
+            Long start = slice.getMin();
+            Long end = slice.getMax();
+            Long step = slice.getStep();
+            if (start != null && end != null && (step == null || step > 0)) {
+                return new PtNDArray(
+                        manager,
+                        PyTorchLibrary.LIB.torchSlice(
+                                ndArray.getHandle(), 0, start, end, step == null ? 1 : step));
+            }
+        }
         long torchIndexHandle = PyTorchLibrary.LIB.torchIndexInit(indices.size());
         try {
             // Index aggregation

@@ -14,17 +14,68 @@
 #include "djl_pytorch_structured_attention.h"
 
 #include <ATen/Context.h>
+#include <ATen/autocast_mode.h>
+#include <c10/core/impl/LocalDispatchKeySet.h>
+#include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/custom_function.h>
 
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
+#include <optional>
+#include <vector>
 
-#if defined(DJL_USE_ROCM_KERNELS)
-#include "djl_pytorch_rocm_kernels.h"
-#endif
+#include "djl_pytorch_kernel_backend.h"
 
 namespace djl::pytorch {
+namespace detail {
+
+bool is_mapped_grouped_indexed_attention_layout_supported(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
+  if (!query.is_cuda() || query.dim() != 3 || shared_key_values.dim() != 3 ||
+      shared_group_indices.dim() != 1 || shared_delta_table.dim() != 2 ||
+      shared_delta_indices.dim() != 2 || indexed_deltas.dim() != 3 ||
+      indexed_shared_ids.dim() != 2 || !query.is_contiguous() ||
+      !shared_key_values.is_contiguous() || !shared_group_indices.is_contiguous() ||
+      !shared_delta_table.is_contiguous() || !shared_delta_indices.is_contiguous() ||
+      !indexed_deltas.is_contiguous() || !indexed_shared_ids.is_contiguous() ||
+      (query.scalar_type() != torch::kFloat32 && query.scalar_type() != torch::kFloat16 &&
+          query.scalar_type() != torch::kBFloat16) || query.scalar_type() != shared_key_values.scalar_type() ||
+      query.scalar_type() != shared_delta_table.scalar_type() ||
+      query.scalar_type() != indexed_deltas.scalar_type() ||
+      shared_group_indices.scalar_type() != torch::kInt32 ||
+      shared_delta_indices.scalar_type() != torch::kInt32 ||
+      indexed_shared_ids.scalar_type() != torch::kInt32) {
+    return false;
+  }
+  const int64_t query_count = query.size(0);
+  const int64_t heads = query.size(1);
+  const int64_t key_features = query.size(2);
+  const int64_t group_count = shared_key_values.size(0);
+  const int64_t shared_tokens = shared_key_values.size(1);
+  const int64_t packed_width = shared_key_values.size(2);
+  const int64_t indexed_tokens = indexed_deltas.size(1);
+  const int64_t key_width = heads * key_features;
+  return query_count > 0 && heads > 0 && key_features > 0 && group_count > 0 &&
+         shared_tokens > 0 && shared_delta_table.size(0) > 0 && packed_width > key_width &&
+         (packed_width - key_width) % heads == 0 &&
+         shared_group_indices.size(0) == query_count &&
+         shared_delta_table.size(1) == packed_width &&
+         shared_delta_indices.size(0) == query_count &&
+         shared_delta_indices.size(1) == shared_tokens &&
+         indexed_deltas.size(0) == query_count && indexed_deltas.size(2) == packed_width &&
+         indexed_shared_ids.size(0) == query_count &&
+         indexed_shared_ids.size(1) == indexed_tokens &&
+         shared_key_values.device() == query.device() &&
+         shared_group_indices.device() == query.device() &&
+         shared_delta_table.device() == query.device() &&
+         shared_delta_indices.device() == query.device() && indexed_deltas.device() == query.device() &&
+         indexed_shared_ids.device() == query.device();
+}
+
+}  // namespace detail
 namespace {
 
 bool requires_autograd(std::initializer_list<const torch::Tensor*> tensors) {
@@ -262,6 +313,10 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
   }
 };
 
+#endif
+
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+
 class MappedGroupedIndexedAttentionFunction
     : public torch::autograd::Function<MappedGroupedIndexedAttentionFunction> {
  public:
@@ -270,13 +325,16 @@ class MappedGroupedIndexedAttentionFunction
       const torch::Tensor& shared_group_indices, const torch::Tensor& shared_delta_table,
       const torch::Tensor& shared_delta_indices, const torch::Tensor& indexed_deltas,
       const torch::Tensor& indexed_shared_ids, double scale) {
-    auto result = rocm::mapped_grouped_indexed_attention_forward(query, shared_key_values,
+    auto result = kernel_backend::mapped_grouped_indexed_attention_forward(query, shared_key_values,
         shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
         indexed_shared_ids, static_cast<float>(scale), true);
     context->save_for_backward({query, shared_key_values, shared_group_indices,
         shared_delta_table, shared_delta_indices, indexed_deltas, indexed_shared_ids,
         result.probabilities});
     context->saved_data["scale"] = scale;
+#if defined(DJL_USE_CUDA_KERNELS)
+    context->saved_data["autocast_enabled"] = at::autocast::is_autocast_enabled(at::DeviceType::CUDA);
+#endif
     return result.output;
   }
 
@@ -285,7 +343,32 @@ class MappedGroupedIndexedAttentionFunction
       torch::autograd::variable_list gradient_outputs) {
     const auto saved = context->get_saved_variables();
     const auto scale = context->saved_data["scale"].toDouble();
-    auto gradients = rocm::mapped_grouped_indexed_attention_backward(saved.at(0),
+#if defined(DJL_USE_CUDA_KERNELS)
+    if (at::GradMode::is_enabled()) {
+      // Recompute a differentiable reference graph only for higher-order derivatives.
+      c10::impl::ForceDispatchKeyGuard restore_dispatch;
+      at::autocast::set_autocast_enabled(
+          at::DeviceType::CUDA, context->saved_data["autocast_enabled"].toBool());
+      auto output = mapped_grouped_indexed_attention_reference(saved.at(0), saved.at(1),
+          saved.at(2), saved.at(3), saved.at(4), saved.at(5), saved.at(6), scale);
+      torch::autograd::variable_list inputs;
+      std::vector<size_t> input_indices;
+      for (size_t index : {size_t{0}, size_t{1}, size_t{3}, size_t{5}}) {
+        if (context->needs_input_grad(index)) {
+          inputs.push_back(saved.at(index));
+          input_indices.push_back(index);
+        }
+      }
+      auto gradients = torch::autograd::grad(
+          {output}, inputs, {gradient_outputs.at(0)}, std::nullopt, true, true);
+      torch::autograd::variable_list result(8);
+      for (size_t index = 0; index < gradients.size(); ++index) {
+        result[input_indices[index]] = gradients[index];
+      }
+      return result;
+    }
+#endif
+    auto gradients = kernel_backend::mapped_grouped_indexed_attention_backward(saved.at(0),
         saved.at(1), saved.at(2), saved.at(3), saved.at(4), saved.at(5), saved.at(6),
         saved.at(7), gradient_outputs.at(0), static_cast<float>(scale),
         context->needs_input_grad(0), context->needs_input_grad(1),
@@ -367,7 +450,7 @@ torch::Tensor mapped_grouped_indexed_attention(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, double scale) {
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
   const bool needs_autograd = requires_autograd(
       {&query, &shared_key_values, &shared_delta_table, &indexed_deltas});
   const bool needs_atomic_table_gradient = needs_autograd &&
@@ -375,18 +458,24 @@ torch::Tensor mapped_grouped_indexed_attention(const torch::Tensor& query,
   const bool deterministic_fallback =
       needs_atomic_table_gradient && at::globalContext().deterministicAlgorithms();
   if (!deterministic_fallback &&
+#if defined(DJL_USE_ROCM_KERNELS)
       rocm::supports_mapped_grouped_indexed_attention_forward(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids) &&
       (!needs_autograd || rocm::supports_mapped_grouped_indexed_attention_backward(query,
           shared_key_values, shared_group_indices, shared_delta_table,
           shared_delta_indices, indexed_deltas, indexed_shared_ids))) {
+#else
+      cuda::supports_mapped_grouped_indexed_attention(query, shared_key_values,
+          shared_group_indices, shared_delta_table, shared_delta_indices,
+          indexed_deltas, indexed_shared_ids)) {
+#endif
     if (needs_autograd) {
       return MappedGroupedIndexedAttentionFunction::apply(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids, scale);
     }
-    return rocm::mapped_grouped_indexed_attention_forward(query, shared_key_values,
+    return kernel_backend::mapped_grouped_indexed_attention_forward(query, shared_key_values,
         shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
         indexed_shared_ids, static_cast<float>(scale), false)
         .output;

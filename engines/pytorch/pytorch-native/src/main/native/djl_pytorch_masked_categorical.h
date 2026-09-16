@@ -17,6 +17,12 @@
 #include <torch/torch.h>
 
 namespace djl::pytorch {
+namespace detail {
+
+bool is_masked_categorical_layout_supported(
+    const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis);
+
+}  // namespace detail
 
 torch::Tensor masked_softmax(const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis);
 

@@ -1,7 +1,7 @@
 #ifndef DJL_PYTORCH_ROCM_KERNELS_H
 #define DJL_PYTORCH_ROCM_KERNELS_H
 
-#include <torch/torch.h>
+#include "djl_pytorch_structured_attention.h"
 
 #include <vector>
 
@@ -199,10 +199,7 @@ bool supports_mapped_grouped_indexed_attention_backward(const torch::Tensor& que
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids);
 
-struct MappedGroupedIndexedAttentionForwardResult {
-  torch::Tensor output;
-  torch::Tensor probabilities;
-};
+using detail::MappedGroupedIndexedAttentionForwardResult;
 
 MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
@@ -210,12 +207,7 @@ MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forw
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids, float scale,
     bool capture_probabilities);
 
-struct MappedGroupedIndexedAttentionGradients {
-  torch::Tensor query;
-  torch::Tensor shared_key_values;
-  torch::Tensor shared_delta_table;
-  torch::Tensor indexed_deltas;
-};
+using detail::MappedGroupedIndexedAttentionGradients;
 
 MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,

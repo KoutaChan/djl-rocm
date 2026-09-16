@@ -88,6 +88,21 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     }
 
     /**
+     * Constructs a PyTorch {@code NDArray} with metadata supplied by its native allocation
+     * (internal. Use {@link NDManager} instead).
+     *
+     * @param manager the manager to attach the new array to
+     * @param handle the pointer to the native PyTorch memory
+     * @param shape the allocated shape
+     * @param dataType the allocated element type, or null to query the native type
+     */
+    public PtNDArray(PtNDManager manager, long handle, Shape shape, DataType dataType) {
+        this(manager, handle);
+        this.shape = new Shape(shape.getShape().clone());
+        this.dataType = dataType;
+    }
+
+    /**
      * Constructs a PyTorch {@code NDArray} from a native handle (internal. Use {@link NDManager}
      * instead) with the data that is hold on Java side.
      *

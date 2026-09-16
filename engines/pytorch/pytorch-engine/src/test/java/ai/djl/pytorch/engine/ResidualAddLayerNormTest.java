@@ -15,6 +15,7 @@ package ai.djl.pytorch.engine;
 import ai.djl.Device;
 import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
+import ai.djl.engine.EngineException;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
@@ -33,7 +34,8 @@ import org.testng.annotations.Test;
 public class ResidualAddLayerNormTest {
 
     private static final float EPSILON = 1.0e-5f;
-    private static final int[] WIDTHS = {1, 17, 64, 256, 257};
+    private static final int[] WIDTHS = {1, 17, 64, 256, 257, 384};
+    private static final DataType[] AFFINE_TYPES = {DataType.FLOAT32, DataType.BFLOAT16};
 
     @Test
     public void cpuFallbackMatchesComposedOperationsAndPreservesInputs() {
@@ -72,29 +74,39 @@ public class ResidualAddLayerNormTest {
         Device device = Device.gpu();
         try (NDManager manager = engine.newBaseManager(device)) {
             for (int width : WIDTHS) {
-                TrainingResult reference =
-                        train(
-                                engine,
-                                manager,
-                                device,
-                                11,
-                                width,
-                                DataType.FLOAT32,
-                                DataType.BFLOAT16,
-                                OutputUse.BOTH,
-                                false);
-                TrainingResult fused =
-                        train(
-                                engine,
-                                manager,
-                                device,
-                                11,
-                                width,
-                                DataType.FLOAT32,
-                                DataType.BFLOAT16,
-                                OutputUse.BOTH,
-                                true);
-                assertTrainingResult(fused, reference, 4.0e-3f);
+                for (DataType parameterType : AFFINE_TYPES) {
+                    for (DataType residualType : AFFINE_TYPES) {
+                        DataType updateType =
+                                residualType == DataType.FLOAT32
+                                        ? DataType.BFLOAT16
+                                        : DataType.FLOAT32;
+                        TrainingResult reference =
+                                train(
+                                        engine,
+                                        manager,
+                                        device,
+                                        11,
+                                        width,
+                                        residualType,
+                                        updateType,
+                                        parameterType,
+                                        OutputUse.BOTH,
+                                        false);
+                        TrainingResult fused =
+                                train(
+                                        engine,
+                                        manager,
+                                        device,
+                                        11,
+                                        width,
+                                        residualType,
+                                        updateType,
+                                        parameterType,
+                                        OutputUse.BOTH,
+                                        true);
+                        assertTrainingResult(fused, reference, 4.0e-3f);
+                    }
+                }
             }
         }
     }
@@ -106,29 +118,33 @@ public class ResidualAddLayerNormTest {
         Device device = Device.gpu();
         try (NDManager manager = engine.newBaseManager(device)) {
             for (OutputUse outputUse : OutputUse.values()) {
-                TrainingResult reference =
-                        train(
-                                engine,
-                                manager,
-                                device,
-                                outputUse == OutputUse.BOTH ? 257 : 13,
-                                256,
-                                DataType.BFLOAT16,
-                                DataType.BFLOAT16,
-                                outputUse,
-                                false);
-                TrainingResult fused =
-                        train(
-                                engine,
-                                manager,
-                                device,
-                                outputUse == OutputUse.BOTH ? 257 : 13,
-                                256,
-                                DataType.BFLOAT16,
-                                DataType.BFLOAT16,
-                                outputUse,
-                                true);
-                assertTrainingResult(fused, reference, 1.5e-2f);
+                for (DataType parameterType : AFFINE_TYPES) {
+                    TrainingResult reference =
+                            train(
+                                    engine,
+                                    manager,
+                                    device,
+                                    outputUse == OutputUse.BOTH ? 257 : 13,
+                                    256,
+                                    DataType.BFLOAT16,
+                                    DataType.BFLOAT16,
+                                    parameterType,
+                                    outputUse,
+                                    false);
+                    TrainingResult fused =
+                            train(
+                                    engine,
+                                    manager,
+                                    device,
+                                    outputUse == OutputUse.BOTH ? 257 : 13,
+                                    256,
+                                    DataType.BFLOAT16,
+                                    DataType.BFLOAT16,
+                                    parameterType,
+                                    outputUse,
+                                    true);
+                    assertTrainingResult(fused, reference, 1.5e-2f);
+                }
             }
         }
     }
@@ -139,11 +155,112 @@ public class ResidualAddLayerNormTest {
         requireRocm(engine);
         Device device = Device.gpu();
         try (NDManager manager = engine.newBaseManager(device)) {
-            float[][] reference = trainChain(engine, manager, device, false);
-            float[][] fused = trainChain(engine, manager, device, true);
-            Assert.assertEquals(fused.length, reference.length);
-            for (int index = 0; index < fused.length; ++index) {
-                assertClose(fused[index], reference[index], 6.0e-3f);
+            for (DataType parameterType : AFFINE_TYPES) {
+                float[][] reference = trainChain(engine, manager, device, parameterType, false);
+                float[][] fused = trainChain(engine, manager, device, parameterType, true);
+                Assert.assertEquals(fused.length, reference.length);
+                for (int index = 0; index < fused.length; ++index) {
+                    assertClose(fused[index], reference[index], 6.0e-3f);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void disabledAutocastPreservesBfloat16OutputAndDtypeValidation() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device);
+                Autocast ignored = new PtAutocast(device, DataType.BFLOAT16, false, true)) {
+            Shape shape = new Shape(3, 64);
+            NDArray residual =
+                    manager.create(sequence(shape.size(), 0.03125f, 0), shape)
+                            .toType(DataType.BFLOAT16, false);
+            NDArray update =
+                    manager.create(sequence(shape.size(), -0.015625f, 7), shape)
+                            .toType(DataType.BFLOAT16, false);
+            NDArray gamma = manager.ones(new Shape(64), DataType.BFLOAT16);
+            NDArray beta = manager.zeros(new Shape(64), DataType.BFLOAT16);
+            NDList actual = residualAddLayerNorm(residual, update, gamma, beta, 64, true);
+            NDList expected = residualAddLayerNorm(residual, update, gamma, beta, 64, false);
+            Assert.assertEquals(actual.get(0).getDataType(), DataType.BFLOAT16);
+            assertClose(actual.get(0), expected.get(0), 0f);
+            assertClose(actual.get(1), expected.get(1), 0f);
+
+            NDArray floatResidual = residual.toType(DataType.FLOAT32, false);
+            NDArray floatUpdate = update.toType(DataType.FLOAT32, false);
+            Assert.expectThrows(
+                    EngineException.class,
+                    () -> residualAddLayerNorm(floatResidual, floatUpdate, gamma, beta, 64, false));
+            Assert.expectThrows(
+                    EngineException.class,
+                    () -> residualAddLayerNorm(floatResidual, floatUpdate, gamma, beta, 64, true));
+        }
+    }
+
+    @Test
+    public void rocmAffineReductionMatchesEagerAtLargeRowCount() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            for (DataType parameterType : AFFINE_TYPES) {
+                // The active learner's shape reaches the 1024-partial reduction limit.
+                TrainingResult reference =
+                        train(
+                                engine,
+                                manager,
+                                device,
+                                17408,
+                                384,
+                                DataType.FLOAT32,
+                                DataType.BFLOAT16,
+                                parameterType,
+                                OutputUse.BOTH,
+                                false);
+                TrainingResult fused =
+                        train(
+                                engine,
+                                manager,
+                                device,
+                                17408,
+                                384,
+                                DataType.FLOAT32,
+                                DataType.BFLOAT16,
+                                parameterType,
+                                OutputUse.BOTH,
+                                true);
+                assertRelativeClose(fused.normalized, reference.normalized, 3.0e-5f);
+                assertClose(fused.summedResidual, reference.summedResidual, 0f);
+                assertRelativeClose(fused.residualGradient, reference.residualGradient, 1.0e-4f);
+                assertRelativeClose(fused.updateGradient, reference.updateGradient, 1.2e-2f);
+                float affineTolerance = parameterType == DataType.FLOAT32 ? 1.0e-4f : 1.2e-2f;
+                assertRelativeClose(fused.gammaGradient, reference.gammaGradient, affineTolerance);
+                assertRelativeClose(fused.betaGradient, reference.betaGradient, affineTolerance);
+            }
+        }
+    }
+
+    @Test
+    public void rocmAffineReductionMatchesEagerAcrossLargeChainedBlocks() {
+        Engine engine = Engine.getInstance();
+        requireRocm(engine);
+        Device device = Device.gpu();
+        try (NDManager manager = engine.newBaseManager(device)) {
+            for (DataType parameterType : AFFINE_TYPES) {
+                float[][] reference =
+                        trainChain(engine, manager, device, parameterType, false, 17408, 64);
+                float[][] fused =
+                        trainChain(engine, manager, device, parameterType, true, 17408, 64);
+                for (int index = 0; index < fused.length; ++index) {
+                    boolean bfloatGradient =
+                            index == 5
+                                    || index == 6
+                                    || (index >= 7 && parameterType == DataType.BFLOAT16);
+                    assertRelativeClose(
+                            fused[index], reference[index], bfloatGradient ? 1.2e-2f : 1.0e-4f);
+                }
             }
         }
     }
@@ -156,6 +273,7 @@ public class ResidualAddLayerNormTest {
             int width,
             DataType residualType,
             DataType updateType,
+            DataType parameterType,
             OutputUse outputUse,
             boolean fused) {
         Shape shape = new Shape(rows, width);
@@ -164,8 +282,13 @@ public class ResidualAddLayerNormTest {
         try (NDManager scope = manager.newSubManager();
                 NDArray residual = scope.create(residualValues, shape).toType(residualType, false);
                 NDArray update = scope.create(updateValues, shape).toType(updateType, false);
-                NDArray gamma = scope.create(sequence(width, 0.00390625f, 3)).add(1f);
-                NDArray beta = scope.create(sequence(width, -0.001953125f, 11));
+                NDArray gamma =
+                        scope.create(sequence(width, 0.00390625f, 3))
+                                .add(1f)
+                                .toType(parameterType, false);
+                NDArray beta =
+                        scope.create(sequence(width, -0.001953125f, 11))
+                                .toType(parameterType, false);
                 NDArray normalizedLossWeight =
                         scope.create(sequence(shape.size(), 0.001953125f, 5), shape);
                 NDArray summedLossWeight =
@@ -211,6 +334,16 @@ public class ResidualAddLayerNormTest {
                 }
                 collector.backward(objective);
 
+                Assert.assertEquals(outputs.get(0).getDataType(), DataType.FLOAT32);
+                Assert.assertEquals(residual.getGradient().getDataType(), residualType);
+                Assert.assertEquals(update.getGradient().getDataType(), updateType);
+                if (outputUse == OutputUse.SUM) {
+                    Assert.assertNull(JniUtils.getGradient((PtNDArray) gamma));
+                    Assert.assertNull(JniUtils.getGradient((PtNDArray) beta));
+                } else {
+                    Assert.assertEquals(gamma.getGradient().getDataType(), parameterType);
+                    Assert.assertEquals(beta.getGradient().getDataType(), parameterType);
+                }
                 Assert.assertEquals(floatValues(residual), cast(residualValues, residualType), 0f);
                 Assert.assertEquals(floatValues(update), cast(updateValues, updateType), 0f);
                 return new TrainingResult(
@@ -225,9 +358,22 @@ public class ResidualAddLayerNormTest {
     }
 
     private static float[][] trainChain(
-            Engine engine, NDManager manager, Device device, boolean fused) {
-        int rows = 37;
-        int width = 256;
+            Engine engine,
+            NDManager manager,
+            Device device,
+            DataType parameterType,
+            boolean fused) {
+        return trainChain(engine, manager, device, parameterType, fused, 37, 256);
+    }
+
+    private static float[][] trainChain(
+            Engine engine,
+            NDManager manager,
+            Device device,
+            DataType parameterType,
+            boolean fused,
+            int rows,
+            int width) {
         Shape shape = new Shape(rows, width);
         float[] residualValues = sequence(shape.size(), 0.03125f, 0);
         float[] firstUpdateValues = sequence(shape.size(), -0.015625f, 7);
@@ -238,10 +384,20 @@ public class ResidualAddLayerNormTest {
                         scope.create(firstUpdateValues, shape).toType(DataType.BFLOAT16, false);
                 NDArray secondUpdate =
                         scope.create(secondUpdateValues, shape).toType(DataType.BFLOAT16, false);
-                NDArray firstGamma = scope.create(sequence(width, 0.00390625f, 3)).add(1f);
-                NDArray firstBeta = scope.create(sequence(width, -0.001953125f, 11));
-                NDArray secondGamma = scope.create(sequence(width, -0.001953125f, 13)).add(1f);
-                NDArray secondBeta = scope.create(sequence(width, 0.0009765625f, 17));
+                NDArray firstGamma =
+                        scope.create(sequence(width, 0.00390625f, 3))
+                                .add(1f)
+                                .toType(parameterType, false);
+                NDArray firstBeta =
+                        scope.create(sequence(width, -0.001953125f, 11))
+                                .toType(parameterType, false);
+                NDArray secondGamma =
+                        scope.create(sequence(width, -0.001953125f, 13))
+                                .add(1f)
+                                .toType(parameterType, false);
+                NDArray secondBeta =
+                        scope.create(sequence(width, 0.0009765625f, 17))
+                                .toType(parameterType, false);
                 NDArray firstNormalizedLossWeight =
                         scope.create(sequence(shape.size(), 0.001953125f, 5), shape);
                 NDArray secondNormalizedLossWeight =
@@ -370,6 +526,26 @@ public class ResidualAddLayerNormTest {
         for (int index = 0; index < actual.length; ++index) {
             Assert.assertEquals(
                     actual[index], expected[index], tolerance, "mismatch at index " + index);
+        }
+    }
+
+    private static void assertRelativeClose(
+            float[] actual, float[] expected, float relativeTolerance) {
+        Assert.assertEquals(actual.length, expected.length);
+        for (int index = 0; index < actual.length; ++index) {
+            float tolerance = 1.0e-5f + relativeTolerance * Math.abs(expected[index]);
+            if (!Float.isFinite(actual[index])
+                    || Math.abs(actual[index] - expected[index]) > tolerance) {
+                Assert.fail(
+                        "mismatch at index "
+                                + index
+                                + ": expected "
+                                + expected[index]
+                                + " but found "
+                                + actual[index]
+                                + ", tolerance="
+                                + tolerance);
+            }
         }
     }
 

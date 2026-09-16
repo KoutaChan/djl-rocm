@@ -17,6 +17,26 @@
 #include <torch/torch.h>
 
 namespace djl::pytorch {
+namespace detail {
+
+struct MappedGroupedIndexedAttentionForwardResult {
+  torch::Tensor output;
+  torch::Tensor probabilities;
+};
+
+struct MappedGroupedIndexedAttentionGradients {
+  torch::Tensor query;
+  torch::Tensor shared_key_values;
+  torch::Tensor shared_delta_table;
+  torch::Tensor indexed_deltas;
+};
+
+bool is_mapped_grouped_indexed_attention_layout_supported(const torch::Tensor& query,
+    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
+    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
+    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids);
+
+}  // namespace detail
 
 torch::Tensor indexed_relation_bias(const torch::Tensor& relation_logits, const torch::Tensor& relation_bias,
     const torch::Tensor& relation_ids, double scale);

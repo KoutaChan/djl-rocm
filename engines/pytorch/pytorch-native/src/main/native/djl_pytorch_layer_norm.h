@@ -19,6 +19,12 @@
 #include <vector>
 
 namespace djl::pytorch {
+namespace detail {
+
+bool is_autocast_layer_norm_layout_supported(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, at::IntArrayRef normalized_shape);
+
+}  // namespace detail
 
 std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
     at::IntArrayRef normalized_shape, const torch::Tensor& weight,

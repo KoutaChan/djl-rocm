@@ -13,9 +13,7 @@
 
 #include "djl_pytorch_routing_masks.h"
 
-#if defined(DJL_USE_ROCM_KERNELS)
-#include "djl_pytorch_rocm_kernels.h"
-#endif
+#include "djl_pytorch_kernel_backend.h"
 
 namespace djl::pytorch {
 namespace {
@@ -76,9 +74,9 @@ torch::Tensor categorical_masks(const torch::Tensor& categories, const torch::Te
   for (const auto field : field_indices) {
     TORCH_CHECK(field >= 0 && field < categories.size(-1), "categorical field index is out of range");
   }
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_categorical_masks(categories, mask, field_indices.size())) {
-    return rocm::categorical_masks(categories, mask, field_indices, category_sets);
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (kernel_backend::supports_categorical_masks(categories, mask, field_indices.size())) {
+    return kernel_backend::categorical_masks(categories, mask, field_indices, category_sets);
   }
 #endif
   return categorical_masks_reference(categories, mask, field_indices, category_sets);
@@ -95,9 +93,9 @@ torch::Tensor binary_choice_masks(const torch::Tensor& routes, const torch::Tens
   for (const auto field : {representative_field, first_route_field, second_route_field}) {
     TORCH_CHECK(field >= 0 && field < routes.size(-1), "routing field index is out of range");
   }
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_binary_choice_masks(routes, first_mask, second_mask)) {
-    return rocm::binary_choice_masks(routes, first_mask, second_mask, representative_field,
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (kernel_backend::supports_binary_choice_masks(routes, first_mask, second_mask)) {
+    return kernel_backend::binary_choice_masks(routes, first_mask, second_mask, representative_field,
         first_route_field, second_route_field, padding_value);
   }
 #endif

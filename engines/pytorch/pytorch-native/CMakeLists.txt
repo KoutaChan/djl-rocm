@@ -42,6 +42,7 @@ find_path(UTILS_INCLUDE_DIR NAMES djl/utils.h PATHS ${PROJECT_SOURCE_DIR}/../../
 
 set(SOURCE_FILES
     "src/main/native/djl_pytorch_utils.h"
+    "src/main/native/djl_pytorch_kernel_backend.h"
     "src/main/native/djl_pytorch_accelerator.h"
     "src/main/native/djl_pytorch_accelerator.cc"
     "src/main/native/djl_pytorch_fusion.h"
@@ -99,6 +100,8 @@ set(SOURCE_FILES
     "src/main/native/ai_djl_pytorch_jni_cache.h"
     "src/main/native/ai_djl_pytorch_jni_cache.cc")
 
+# ROCm libtorch also enables USE_CUDA. Select exactly one kernel compiler,
+# with ROCm taking precedence; CPU and Android retain the portable sources.
 if(USE_ROCM AND NOT BUILD_ANDROID)
     if(DEFINED ENV{PYTORCH_ROCM_ARCH} AND NOT "$ENV{PYTORCH_ROCM_ARCH}" STREQUAL "")
         set(CMAKE_HIP_ARCHITECTURES "$ENV{PYTORCH_ROCM_ARCH}")
@@ -118,29 +121,26 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
     if(NOT DEFINED CMAKE_HIP_FLAGS_MINSIZEREL OR CMAKE_HIP_FLAGS_MINSIZEREL STREQUAL "")
         set(CMAKE_HIP_FLAGS_MINSIZEREL "-Os -DNDEBUG" CACHE STRING "HIP MinSizeRel flags" FORCE)
     endif()
-    list(APPEND SOURCE_FILES
+    set(ROCM_KERNEL_SOURCES
         "src/main/native/djl_pytorch_fusion_kernels.hip"
         "src/main/native/djl_pytorch_rocm_kernels.hip"
         "src/main/native/djl_pytorch_single_query_attention.hip"
         "src/main/native/djl_pytorch_short_attention.hip"
-        "src/main/native/djl_pytorch_packed_relation_attention.hip"
+        "src/main/native/djl_pytorch_packed_relation_attention.hip")
+    list(APPEND SOURCE_FILES ${ROCM_KERNEL_SOURCES}
         "src/main/native/djl_pytorch_rocm_launch_config.cc")
-    set_source_files_properties(
-        "src/main/native/djl_pytorch_fusion_kernels.hip"
-        "src/main/native/djl_pytorch_rocm_kernels.hip"
-        "src/main/native/djl_pytorch_single_query_attention.hip"
-        "src/main/native/djl_pytorch_short_attention.hip"
-        "src/main/native/djl_pytorch_packed_relation_attention.hip"
-        PROPERTIES LANGUAGE HIP)
-endif()
-
-if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
+    set_source_files_properties(${ROCM_KERNEL_SOURCES} PROPERTIES LANGUAGE HIP)
+elseif(USE_CUDA AND NOT BUILD_ANDROID)
     enable_language(CUDA)
-    list(APPEND SOURCE_FILES
-        "src/main/native/djl_pytorch_fusion_kernels.cu")
-    set_source_files_properties(
+    set(CUDA_KERNEL_SOURCES
         "src/main/native/djl_pytorch_fusion_kernels.cu"
-        PROPERTIES LANGUAGE CUDA)
+        "src/main/native/djl_pytorch_layer_norm_cuda.cu"
+        "src/main/native/djl_pytorch_masked_categorical_cuda.cu"
+        "src/main/native/djl_pytorch_routing_masks_cuda.cu"
+        "src/main/native/djl_pytorch_row_ops_cuda.cu"
+        "src/main/native/djl_pytorch_structured_attention_cuda.cu")
+    list(APPEND SOURCE_FILES ${CUDA_KERNEL_SOURCES})
+    set_source_files_properties(${CUDA_KERNEL_SOURCES} PROPERTIES LANGUAGE CUDA)
 endif()
 
 if(PT_VERSION)
@@ -247,9 +247,8 @@ if(USE_ROCM AND NOT BUILD_ANDROID)
     else()
         message(STATUS "AOTriton public utility API not found; SDPA cache initialization disabled")
     endif()
-endif()
-if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID)
-    target_compile_definitions(djl_torch PRIVATE DJL_USE_FUSION_KERNELS DJL_USE_CUDA_FUSION_KERNELS)
+elseif(USE_CUDA AND NOT BUILD_ANDROID)
+    target_compile_definitions(djl_torch PRIVATE DJL_USE_FUSION_KERNELS DJL_USE_CUDA_FUSION_KERNELS DJL_USE_CUDA_KERNELS)
     set_property(TARGET djl_torch PROPERTY CUDA_STANDARD 17)
 endif()
 

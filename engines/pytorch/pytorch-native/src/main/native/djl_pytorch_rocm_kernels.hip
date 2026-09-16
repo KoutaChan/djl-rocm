@@ -13,8 +13,11 @@
 #include <type_traits>
 #include <vector>
 
+#include "djl_pytorch_layer_norm.h"
+#include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_rocm_launch_config.h"
+#include "djl_pytorch_structured_attention.h"
 
 namespace djl::pytorch::rocm {
 namespace {
@@ -23,6 +26,7 @@ namespace {
 constexpr int kResidualCachedValuesPerLaneLimit = 16;
 constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
 constexpr int kLayerNormAffinePartialMaximumBlocks = 1024;
+constexpr int kLayerNormAffineFeatureTile = 8;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
 constexpr int kMaskedEmbeddingGroupWidth = 32;
@@ -2496,10 +2500,10 @@ __global__ void autocast_layer_norm_and_cast_backward_kernel(
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t,
-    typename summed_t>
+    typename summed_t, typename parameter_t>
 __global__ void residual_add_layer_norm_forward_kernel(
-    const residual_t* residual, const update_t* update, const float* weight,
-    const float* bias, float* normalized, summed_t* summed_residual,
+    const residual_t* residual, const update_t* update, const parameter_t* weight,
+    const parameter_t* bias, float* normalized, summed_t* summed_residual,
     float* mean_output, float* reciprocal_standard_deviation_output,
     int64_t row_count, int64_t width, float epsilon) {
   const int lane = threadIdx.x % warpSize;
@@ -2567,16 +2571,16 @@ __global__ void residual_add_layer_norm_forward_kernel(
       const float standardized =
           (cached_values[cached_index] - mean) * reciprocal_standard_deviation;
       normalized[row_offset + feature] =
-          standardized * weight[feature] + bias[feature];
+          standardized * static_cast<float>(weight[feature]) + static_cast<float>(bias[feature]);
     }
   }
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t,
-    typename summed_t>
+    typename summed_t, typename parameter_t>
 __global__ void residual_add_layer_norm_input_gradient_kernel(
     const float* normalized_gradient, const summed_t* summed_gradient,
-    const summed_t* summed_residual, const float* weight, const float* mean,
+    const summed_t* summed_residual, const parameter_t* weight, const float* mean,
     const float* reciprocal_standard_deviation, residual_t* residual_gradient,
     update_t* update_gradient, float* affine_partials, int64_t row_count,
     int64_t width) {
@@ -2609,7 +2613,7 @@ __global__ void residual_add_layer_norm_input_gradient_kernel(
         const float gradient = normalized_gradient == nullptr
             ? 0.0f
             : normalized_gradient[index];
-        const float scaled_gradient = gradient * weight[feature];
+        const float scaled_gradient = gradient * static_cast<float>(weight[feature]);
         cached_standardized[cached_index] = standardized;
         cached_scaled_gradient[cached_index] = scaled_gradient;
         cached_weight_gradient[cached_index] += gradient * standardized;
@@ -2700,23 +2704,36 @@ __global__ void layer_norm_affine_partial_reduction_kernel(
     const float* affine_partials, parameter_t* weight_gradient,
     parameter_t* bias_gradient,
     int64_t partial_count, int64_t width) {
-  const int64_t feature =
-      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (feature >= width) {
-    return;
-  }
+  extern __shared__ float partial_sums[];
+  float* weight_sums = partial_sums;
+  float* bias_sums = weight_sums + blockDim.x;
+  const int feature_lane = threadIdx.x % kLayerNormAffineFeatureTile;
+  const int partial_lane = threadIdx.x / kLayerNormAffineFeatureTile;
+  const int partial_lanes = blockDim.x / kLayerNormAffineFeatureTile;
+  const int64_t feature = static_cast<int64_t>(blockIdx.x) * kLayerNormAffineFeatureTile + feature_lane;
   float weight_sum = 0.0f;
   float bias_sum = 0.0f;
-  for (int64_t partial = 0; partial < partial_count; partial++) {
-    const int64_t offset = partial * 2 * width;
-    weight_sum += affine_partials[offset + feature];
-    bias_sum += affine_partials[offset + width + feature];
+  if (feature < width) {
+    for (int64_t partial = partial_lane; partial < partial_count; partial += partial_lanes) {
+      const int64_t offset = partial * 2 * width;
+      weight_sum += affine_partials[offset + feature];
+      bias_sum += affine_partials[offset + width + feature];
+    }
   }
-  if (weight_gradient != nullptr) {
-    weight_gradient[feature] = static_cast<parameter_t>(weight_sum);
-  }
-  if (bias_gradient != nullptr) {
-    bias_gradient[feature] = static_cast<parameter_t>(bias_sum);
+  weight_sums[threadIdx.x] = weight_sum;
+  bias_sums[threadIdx.x] = bias_sum;
+  __syncthreads();
+  // Each feature has one writer; all accumulation stays FP32 until the final cast.
+  if (partial_lane == 0 && feature < width) {
+    weight_sum = 0.0f;
+    bias_sum = 0.0f;
+    for (int source = 0; source < partial_lanes; ++source) {
+      const int index = source * kLayerNormAffineFeatureTile + feature_lane;
+      weight_sum += weight_sums[index];
+      bias_sum += bias_sums[index];
+    }
+    if (weight_gradient != nullptr) weight_gradient[feature] = static_cast<parameter_t>(weight_sum);
+    if (bias_gradient != nullptr) bias_gradient[feature] = static_cast<parameter_t>(bias_sum);
   }
 }
 
@@ -2888,16 +2905,21 @@ void launch_residual_add_layer_norm_forward_typed(
     torch::Tensor& mean, torch::Tensor& reciprocal_standard_deviation,
     dim3 grid, dim3 block, hipStream_t stream, int64_t row_count,
     int64_t width, float epsilon) {
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_forward_kernel<
-                         cached_values_per_lane, residual_t, update_t, summed_t>),
-      grid, block, 0, stream, residual.data_ptr<residual_t>(),
-      update.data_ptr<update_t>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
-      normalized.data_ptr<float>(), summed_residual.data_ptr<summed_t>(),
-      mean.defined() ? mean.data_ptr<float>() : nullptr,
-      reciprocal_standard_deviation.defined()
-          ? reciprocal_standard_deviation.data_ptr<float>()
-          : nullptr,
-      row_count, width, epsilon);
+  auto launch = [&](auto parameter) {
+    using parameter_t = decltype(parameter);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_forward_kernel<
+                           cached_values_per_lane, residual_t, update_t, summed_t, parameter_t>),
+        grid, block, 0, stream, residual.data_ptr<residual_t>(),
+        update.data_ptr<update_t>(), weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+        normalized.data_ptr<float>(), summed_residual.data_ptr<summed_t>(),
+        mean.defined() ? mean.data_ptr<float>() : nullptr,
+        reciprocal_standard_deviation.defined()
+            ? reciprocal_standard_deviation.data_ptr<float>()
+            : nullptr,
+        row_count, width, epsilon);
+  };
+  if (weight.scalar_type() == torch::kFloat32) launch(float{});
+  else launch(c10::BFloat16{});
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t>
@@ -2991,17 +3013,22 @@ void launch_residual_add_layer_norm_input_gradient_typed(
     torch::Tensor& affine_partials, dim3 grid, dim3 block,
     size_t shared_memory_bytes, hipStream_t stream, int64_t row_count,
     int64_t width) {
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_input_gradient_kernel<
-                         cached_values_per_lane, residual_t, update_t, summed_t>),
-      grid, block, shared_memory_bytes, stream,
-      normalized_gradient.defined() ? normalized_gradient.data_ptr<float>() : nullptr,
-      summed_gradient.defined() ? summed_gradient.data_ptr<summed_t>() : nullptr,
-      summed_residual.data_ptr<summed_t>(), weight.data_ptr<float>(),
-      mean.data_ptr<float>(), reciprocal_standard_deviation.data_ptr<float>(),
-      residual_gradient.defined() ? residual_gradient.data_ptr<residual_t>() : nullptr,
-      update_gradient.defined() ? update_gradient.data_ptr<update_t>() : nullptr,
-      affine_partials.defined() ? affine_partials.data_ptr<float>() : nullptr,
-      row_count, width);
+  auto launch = [&](auto parameter) {
+    using parameter_t = decltype(parameter);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_input_gradient_kernel<
+                           cached_values_per_lane, residual_t, update_t, summed_t, parameter_t>),
+        grid, block, shared_memory_bytes, stream,
+        normalized_gradient.defined() ? normalized_gradient.data_ptr<float>() : nullptr,
+        summed_gradient.defined() ? summed_gradient.data_ptr<summed_t>() : nullptr,
+        summed_residual.data_ptr<summed_t>(), weight.data_ptr<parameter_t>(),
+        mean.data_ptr<float>(), reciprocal_standard_deviation.data_ptr<float>(),
+        residual_gradient.defined() ? residual_gradient.data_ptr<residual_t>() : nullptr,
+        update_gradient.defined() ? update_gradient.data_ptr<update_t>() : nullptr,
+        affine_partials.defined() ? affine_partials.data_ptr<float>() : nullptr,
+        row_count, width);
+  };
+  if (weight.scalar_type() == torch::kFloat32) launch(float{});
+  else launch(c10::BFloat16{});
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t>
@@ -3239,7 +3266,7 @@ void launch_layer_norm_affine_partial_reduction_typed(
     int64_t width) {
   hipLaunchKernelGGL(HIP_KERNEL_NAME(
                          layer_norm_affine_partial_reduction_kernel<parameter_t>),
-      grid, block, 0, stream, affine_partials.data_ptr<float>(),
+      grid, block, 2 * block.x * sizeof(float), stream, affine_partials.data_ptr<float>(),
       weight_gradient.defined() ? weight_gradient.data_ptr<parameter_t>() : nullptr,
       bias_gradient.defined() ? bias_gradient.data_ptr<parameter_t>() : nullptr,
       partial_count, width);
@@ -3415,50 +3442,6 @@ bool is_grouped_indexed_attention_layout_supported(const torch::Tensor& query,
          indexed_shared_ids.size(0) == query_count && indexed_shared_ids.size(1) == indexed_tokens &&
          shared_key_values.device() == query.device() && shared_deltas.device() == query.device() &&
          indexed_deltas.device() == query.device() && indexed_shared_ids.device() == query.device();
-}
-
-bool is_mapped_grouped_indexed_attention_layout_supported(const torch::Tensor& query,
-    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
-    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
-    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
-  if (!query.is_cuda() || query.dim() != 3 || shared_key_values.dim() != 3 ||
-      shared_group_indices.dim() != 1 || shared_delta_table.dim() != 2 ||
-      shared_delta_indices.dim() != 2 || indexed_deltas.dim() != 3 ||
-      indexed_shared_ids.dim() != 2 || !query.is_contiguous() ||
-      !shared_key_values.is_contiguous() || !shared_group_indices.is_contiguous() ||
-      !shared_delta_table.is_contiguous() || !shared_delta_indices.is_contiguous() ||
-      !indexed_deltas.is_contiguous() || !indexed_shared_ids.is_contiguous() ||
-      !is_fused_floating(query) || query.scalar_type() != shared_key_values.scalar_type() ||
-      query.scalar_type() != shared_delta_table.scalar_type() ||
-      query.scalar_type() != indexed_deltas.scalar_type() ||
-      shared_group_indices.scalar_type() != torch::kInt32 ||
-      shared_delta_indices.scalar_type() != torch::kInt32 ||
-      indexed_shared_ids.scalar_type() != torch::kInt32) {
-    return false;
-  }
-  const int64_t query_count = query.size(0);
-  const int64_t heads = query.size(1);
-  const int64_t key_features = query.size(2);
-  const int64_t group_count = shared_key_values.size(0);
-  const int64_t shared_tokens = shared_key_values.size(1);
-  const int64_t packed_width = shared_key_values.size(2);
-  const int64_t indexed_tokens = indexed_deltas.size(1);
-  const int64_t key_width = heads * key_features;
-  return query_count > 0 && heads > 0 && key_features > 0 && group_count > 0 &&
-         shared_tokens > 0 && shared_delta_table.size(0) > 0 && packed_width > key_width &&
-         (packed_width - key_width) % heads == 0 &&
-         shared_group_indices.size(0) == query_count &&
-         shared_delta_table.size(1) == packed_width &&
-         shared_delta_indices.size(0) == query_count &&
-         shared_delta_indices.size(1) == shared_tokens &&
-         indexed_deltas.size(0) == query_count && indexed_deltas.size(2) == packed_width &&
-         indexed_shared_ids.size(0) == query_count &&
-         indexed_shared_ids.size(1) == indexed_tokens &&
-         shared_key_values.device() == query.device() &&
-         shared_group_indices.device() == query.device() &&
-         shared_delta_table.device() == query.device() &&
-         shared_delta_indices.device() == query.device() && indexed_deltas.device() == query.device() &&
-         indexed_shared_ids.device() == query.device();
 }
 
 bool has_supported_padded_gather_index_layout(
@@ -4460,7 +4443,7 @@ bool supports_mapped_grouped_indexed_attention_forward(const torch::Tensor& quer
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
-  if (!is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
+  if (!detail::is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids)) {
     return false;
@@ -4478,7 +4461,7 @@ bool supports_mapped_grouped_indexed_attention_backward(const torch::Tensor& que
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
-  if (!is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
+  if (!detail::is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids)) {
     return false;
@@ -4569,8 +4552,9 @@ bool supports_residual_add_layer_norm(const torch::Tensor& residual,
       weight.size(0) != residual.size(-1) || bias.sizes() != weight.sizes() ||
       !is_fused_floating(residual) || !is_fused_floating(update) ||
       summed_type != at::result_type(residual, update) ||
-      !is_fused_floating_type(summed_type) || weight.scalar_type() != torch::kFloat32 ||
-      bias.scalar_type() != torch::kFloat32 || normalized_type != torch::kFloat32 ||
+      !is_fused_floating_type(summed_type) ||
+      (weight.scalar_type() != torch::kFloat32 && weight.scalar_type() != torch::kBFloat16) ||
+      bias.scalar_type() != weight.scalar_type() || normalized_type != torch::kFloat32 ||
       update.device() != residual.device() || weight.device() != residual.device() ||
       bias.device() != residual.device()) {
     return false;
@@ -4748,14 +4732,7 @@ void add_bias_and_broadcast_residual_to_owned_and_silu(
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, at::IntArrayRef normalized_shape) {
-  if (!input.is_cuda() || !input.is_contiguous() || input.dim() < 1 || input.size(-1) <= 0 ||
-      normalized_shape.size() != 1 || normalized_shape[0] != input.size(-1) ||
-      !weight.defined() || !bias.defined() || !weight.is_contiguous() || !bias.is_contiguous() ||
-      weight.dim() != 1 || weight.size(0) != input.size(-1) || bias.sizes() != weight.sizes() ||
-      (input.scalar_type() != torch::kFloat16 && input.scalar_type() != torch::kBFloat16) ||
-      !is_fused_floating(weight) ||
-      bias.scalar_type() != weight.scalar_type() || weight.device() != input.device() ||
-      bias.device() != input.device()) {
+  if (!detail::is_autocast_layer_norm_layout_supported(input, weight, bias, normalized_shape)) {
     return false;
   }
   const auto& properties = device_properties(input.get_device());
@@ -4793,10 +4770,7 @@ bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor
 
 bool supports_masked_categorical(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
-  return logits.is_cuda() && logits.is_contiguous() && mask.is_contiguous() &&
-         is_fused_floating(logits) && mask.scalar_type() == torch::kBool &&
-         mask.sizes() == logits.sizes() && mask.device() == logits.device() && logits.dim() > 0 &&
-         logits.size(-1) > 0 && axis == logits.dim() - 1;
+  return detail::is_masked_categorical_layout_supported(logits, mask, axis);
 }
 
 bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
@@ -6609,9 +6583,10 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
           is_fused_floating(summed_residual),
       "residual add LayerNorm backward requires a contiguous ROCm sum");
   TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() &&
-          weight.scalar_type() == torch::kFloat32 && weight.dim() == 1 &&
+          (weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == torch::kBFloat16) &&
+          weight.dim() == 1 &&
           weight.size(0) == summed_residual.size(-1),
-      "residual add LayerNorm backward requires contiguous FP32 affine weights");
+      "residual add LayerNorm backward requires contiguous FP32 or BF16 affine weights");
   TORCH_CHECK(mean.is_cuda() && reciprocal_standard_deviation.is_cuda() &&
           mean.device() == summed_residual.device() &&
           reciprocal_standard_deviation.device() == summed_residual.device() &&
@@ -6721,7 +6696,7 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
     if (needs_affine_gradient) {
       const dim3 affine_block(threads_per_block);
       const dim3 affine_grid(
-          (width + threads_per_block - 1) / threads_per_block);
+          (width + kLayerNormAffineFeatureTile - 1) / kLayerNormAffineFeatureTile);
       launch_layer_norm_affine_partial_reduction(affine_partials,
           weight_gradient, bias_gradient, affine_grid, affine_block, stream,
           partial_count, width);
@@ -6867,7 +6842,7 @@ AutocastLayerNormAndCastGradients autocast_layer_norm_and_cast_backward(
   if (needs_affine_gradient) {
     const dim3 affine_block(threads_per_block);
     const dim3 affine_grid(
-        (width + threads_per_block - 1) / threads_per_block);
+        (width + kLayerNormAffineFeatureTile - 1) / kLayerNormAffineFeatureTile);
     launch_layer_norm_affine_partial_reduction(affine_partials,
         weight_gradient, bias_gradient, affine_grid, affine_block, stream,
         partial_count, width);
