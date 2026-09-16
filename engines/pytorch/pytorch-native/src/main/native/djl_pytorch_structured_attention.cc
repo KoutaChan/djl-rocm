@@ -15,7 +15,9 @@
 
 #include <ATen/Context.h>
 #include <ATen/autocast_mode.h>
+#include <c10/core/InferenceMode.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
+#include <c10/util/ScopeExit.h>
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/csrc/autograd/custom_function.h>
 
@@ -328,6 +330,76 @@ class GroupedIndexedAttentionFunction : public torch::autograd::Function<Grouped
 
 #endif
 
+#if defined(DJL_USE_CUDA_KERNELS)
+
+class GroupedPackedAttentionFunction
+    : public torch::autograd::Function<GroupedPackedAttentionFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& query, const torch::Tensor& packed_key_value,
+      const torch::Tensor& mask, int64_t heads, double scale) {
+    auto boolean_mask = mask.ne(0);
+    context->save_for_backward({query, packed_key_value, boolean_mask});
+    context->saved_data["heads"] = heads;
+    context->saved_data["scale"] = scale;
+    context->saved_data["autocast_enabled"] =
+        at::autocast::is_autocast_enabled(at::DeviceType::CUDA);
+    context->saved_data["autocast_dtype"] = static_cast<int64_t>(
+        at::autocast::get_autocast_dtype(at::DeviceType::CUDA));
+    context->set_materialize_grads(false);
+    return kernel_backend::grouped_packed_attention_forward(
+        query, packed_key_value, boolean_mask, heads, static_cast<float>(scale));
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    torch::autograd::variable_list result(5);
+    if (!gradient_outputs.at(0).defined()) {
+      return result;
+    }
+    const auto saved = context->get_saved_variables();
+    torch::autograd::variable_list inputs;
+    std::vector<size_t> input_indices;
+    for (size_t index : {size_t{0}, size_t{1}}) {
+      if (context->needs_input_grad(index)) {
+        inputs.push_back(saved.at(index));
+        input_indices.push_back(index);
+      }
+    }
+    if (inputs.empty()) {
+      return result;
+    }
+    const bool create_graph = at::GradMode::is_enabled();
+    c10::InferenceMode inference_mode{false};
+    torch::autograd::AutoGradMode enable_grad{true};
+    torch::Tensor output;
+    {
+      c10::impl::ForceDispatchKeyGuard restore_dispatch;
+      const auto previous_dtype = at::autocast::get_autocast_dtype(at::DeviceType::CUDA);
+      auto restore_dtype = c10::make_scope_exit([previous_dtype]() {
+        at::autocast::set_autocast_dtype(at::DeviceType::CUDA, previous_dtype);
+      });
+      at::autocast::set_autocast_enabled(
+          at::DeviceType::CUDA, context->saved_data["autocast_enabled"].toBool());
+      at::autocast::set_autocast_dtype(at::DeviceType::CUDA,
+          static_cast<at::ScalarType>(context->saved_data["autocast_dtype"].toInt()));
+
+      // Recompute with forward autocast, then differentiate in the caller's backward scope.
+      output = grouped_packed_attention_reference(saved.at(0), saved.at(1), saved.at(2),
+          context->saved_data["heads"].toInt(), context->saved_data["scale"].toDouble());
+    }
+    auto gradients = torch::autograd::grad(
+        {output}, inputs, {gradient_outputs.at(0)}, std::nullopt, create_graph, true);
+    for (size_t index = 0; index < gradients.size(); ++index) {
+      result[input_indices[index]] = gradients[index];
+    }
+    return result;
+  }
+};
+
+#endif
+
 #if defined(DJL_USE_ACCELERATOR_KERNELS)
 
 class MappedGroupedIndexedAttentionFunction
@@ -430,6 +502,15 @@ torch::Tensor grouped_packed_attention(const torch::Tensor& query,
     return rocm::grouped_packed_attention_forward(query, packed_key_value,
         mask, heads, static_cast<float>(scale), false)
         .output;
+  }
+#elif defined(DJL_USE_CUDA_KERNELS)
+  if (kernel_backend::supports_grouped_packed_attention_forward(query, packed_key_value, mask, heads)) {
+    if (requires_autograd({&query, &packed_key_value})) {
+      return GroupedPackedAttentionFunction::apply(
+          query, packed_key_value, mask, heads, scale);
+    }
+    return kernel_backend::grouped_packed_attention_forward(
+        query, packed_key_value, mask, heads, static_cast<float>(scale));
   }
 #endif
   return grouped_packed_attention_reference(

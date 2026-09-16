@@ -18,6 +18,13 @@
 
 namespace djl::pytorch::cuda {
 
+bool supports_grouped_packed_attention_forward(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask, int64_t heads);
+
+torch::Tensor grouped_packed_attention_forward(const torch::Tensor& query,
+    const torch::Tensor& packed_key_value, const torch::Tensor& mask,
+    int64_t heads, float scale);
+
 bool supports_mapped_grouped_indexed_attention(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,

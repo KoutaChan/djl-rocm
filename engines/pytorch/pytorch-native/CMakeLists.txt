@@ -137,6 +137,7 @@ elseif(USE_CUDA AND NOT BUILD_ANDROID)
         "src/main/native/djl_pytorch_fusion_kernels.cu"
         "src/main/native/djl_pytorch_layer_norm_cuda.cu"
         "src/main/native/djl_pytorch_masked_categorical_cuda.cu"
+        "src/main/native/djl_pytorch_nn_functional_cuda.cu"
         "src/main/native/djl_pytorch_routing_masks_cuda.cu"
         "src/main/native/djl_pytorch_row_ops_cuda.cu"
         "src/main/native/djl_pytorch_structured_attention_cuda.cu")

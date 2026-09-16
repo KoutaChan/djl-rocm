@@ -138,6 +138,22 @@ Native tensor-size, allocation, matrix-operation, and launch limits also apply. 
 validates the dimension requirements above before execution. Feed-forward width is sized
 independently in the workspace, including indexed local transformers where `F` exceeds `3 * A`.
 
+### CUDA input operations
+
+CUDA provides fused offset embeddings and embedding-feature packing, plus segmented lookup index
+preparation and gather. These paths support arbitrary positive feature widths and nonnegative
+integer-index strides, including broadcasts, up to index rank eight. Unsupported layouts retain
+the portable reference. Segmented lookup keeps the
+same contiguous gathered layout and ATen reduction so its accumulation order remains unchanged.
+Embedding gradient requests and gradient-enabled segmented lookup retain ATen autograd.
+
+Owned masked-embedding residuals and broadcast residual SiLU use CUDA kernels for FP32, FP16, and
+BF16 with arbitrary positive widths. They retain the existing exclusive-input inference contract.
+The CUDA kernels preserve the intermediate dtype rounding of the portable operations, including a
+materialized sigmoid before SiLU multiplication, and retain padding and zero-mask NaN/Inf behavior.
+The ROCm backend keeps its existing numerical contract; backend parity does not imply identical
+rounding between a fused SiLU and a separately rounded sigmoid product.
+
 ### NVIDIA CUDA
 
 Install a CUDA toolkit compatible with the selected libtorch flavor and make `nvcc` available to

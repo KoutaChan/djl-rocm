@@ -18,6 +18,26 @@
 
 namespace djl::pytorch::cuda {
 
+bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table);
+
+torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table);
+
+bool supports_embedding_feature_pack(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features);
+
+torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
+    const torch::Tensor& offsets, const torch::Tensor& table,
+    const torch::Tensor& features);
+
+bool supports_segmented_lookup_sum(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
+
+torch::Tensor segmented_lookup_sum_forward(
+    const torch::Tensor& lookup_table, const torch::Tensor& stored_indices);
+
 bool supports_padded_batch_gather(const torch::Tensor& source,
     const torch::Tensor& batch_indices, const torch::Tensor& outer_stored_indices,
     const torch::Tensor& inner_stored_indices);

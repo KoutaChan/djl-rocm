@@ -15,6 +15,7 @@ package ai.djl.pytorch.engine;
 import ai.djl.Device;
 import ai.djl.engine.Autocast;
 import ai.djl.engine.Engine;
+import ai.djl.engine.InferenceMode;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDManager;
@@ -260,6 +261,336 @@ public class StructuredAttentionTest {
 
             assertFiniteNonzeroGradient(query);
             assertFiniteNonzeroGradient(packedKeyValue);
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaGeneralShapesAndMaskTypesMatchReference() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        int[][] shapes = {
+            {2, 3, 7, 5, 2, 4, 3},
+            {2, 1, 33, 32, 3, 31, 33},
+            {1, 2, 1, 1, 1, 1, 65},
+            {1, 3, 9, 17, 5, 7, 17},
+            {1, 1, 2, 33, 2, 16, 7},
+            {1, 1, 2, 7, 2, 33, 17},
+            {0, 2, 3, 4, 2, 7, 5}
+        };
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (DataType maskType :
+                    new DataType[] {
+                        DataType.BOOLEAN,
+                        DataType.INT32,
+                        DataType.FLOAT32,
+                        DataType.FLOAT16,
+                        DataType.BFLOAT16
+                    }) {
+                for (int[] dimensions : shapes) {
+                    engine.setRandomSeed(20260916);
+                    try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                        int batch = dimensions[0];
+                        int groups = dimensions[1];
+                        int queries = dimensions[2];
+                        int keys = dimensions[3];
+                        int heads = dimensions[4];
+                        int queryWidth = heads * dimensions[5];
+                        int valueWidth = heads * dimensions[6];
+                        NDArray query =
+                                manager.randomNormal(
+                                        new Shape(batch, queries, queryWidth), dataType);
+                        NDArray packed =
+                                manager.randomNormal(
+                                        new Shape(batch, groups, keys, queryWidth + valueWidth),
+                                        dataType);
+                        NDArray mask = manager.ones(new Shape(batch, groups, keys), maskType);
+                        if (batch > 0) {
+                            mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+                            packed.set(new ai.djl.ndarray.index.NDIndex("..., -1, :"), Float.NaN);
+                        }
+                        NDArray expected =
+                                groupedPackedAttentionReference(query, packed, mask, heads, 0.25);
+                        NDArray actual =
+                                NDArrays.groupedPackedScaledDotProductAttention(
+                                        query, packed, mask, heads, 0.25);
+                        Assert.assertEquals(
+                                actual.getShape(), new Shape(batch, groups, queries, valueWidth));
+                        Assert.assertEquals(actual.getDataType(), expected.getDataType());
+                        float tolerance =
+                                dataType == DataType.FLOAT32
+                                        ? 2e-4f
+                                        : dataType == DataType.FLOAT16 ? 3e-3f : 2e-2f;
+                        assertClose(
+                                actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                                expected.toType(DataType.FLOAT32, false).toFloatArray(),
+                                tolerance);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaAutocastPreservesReferenceDtypes() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType computeType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (DataType inputType :
+                    new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+                engine.setRandomSeed(20260916);
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    NDArray query = manager.randomNormal(new Shape(2, 7, 12), inputType);
+                    NDArray packed = manager.randomNormal(new Shape(2, 3, 5, 30), inputType);
+                    NDArray mask = manager.ones(new Shape(2, 3, 5), DataType.INT32);
+                    mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+                    NDArray expected;
+                    NDArray actual;
+                    try (Autocast ignored = engine.newAutocast(Device.gpu(), computeType, true)) {
+                        expected = groupedPackedAttentionReference(query, packed, mask, 3, 0.5);
+                        actual =
+                                NDArrays.groupedPackedScaledDotProductAttention(
+                                        query, packed, mask, 3, 0.5);
+                    }
+                    Assert.assertEquals(actual.getDataType(), computeType);
+                    Assert.assertEquals(actual.getDataType(), expected.getDataType());
+                    assertClose(
+                            actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                            expected.toType(DataType.FLOAT32, false).toFloatArray(),
+                            computeType == DataType.FLOAT16 ? 3e-3f : 2e-2f);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaBackwardRestoresForwardAutocast() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType dataType : new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (int requiredGradients : new int[] {1, 2, 3}) {
+                engine.setRandomSeed(20260926);
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    NDArray queryValues = manager.randomNormal(new Shape(2, 7, 12), dataType);
+                    NDArray packedValues = manager.randomNormal(new Shape(2, 3, 5, 30), dataType);
+                    packedValues.set(new ai.djl.ndarray.index.NDIndex("..., -1, :"), Float.NaN);
+                    NDArray mask = manager.ones(new Shape(2, 3, 5), DataType.INT32);
+                    mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+                    NDArray outputGradient = manager.randomNormal(new Shape(2, 3, 7, 18), dataType);
+                    NDArray query = queryValues.duplicate();
+                    NDArray packed = packedValues.duplicate();
+                    NDArray referenceQuery = queryValues.duplicate();
+                    NDArray referencePacked = packedValues.duplicate();
+                    boolean queryGradient = (requiredGradients & 1) != 0;
+                    boolean packedGradient = (requiredGradients & 2) != 0;
+                    query.setRequiresGradient(queryGradient);
+                    packed.setRequiresGradient(packedGradient);
+                    referenceQuery.setRequiresGradient(queryGradient);
+                    referencePacked.setRequiresGradient(packedGradient);
+                    NDArray inference;
+                    try (Autocast ignored = engine.newAutocast(Device.gpu(), dataType, true)) {
+                        inference =
+                                NDArrays.groupedPackedScaledDotProductAttention(
+                                        queryValues, packedValues, mask, 3, 0.5);
+                    }
+                    try (GradientCollector collector = engine.newGradientCollector()) {
+                        NDArray actual;
+                        NDArray expected;
+                        try (Autocast ignored = engine.newAutocast(Device.gpu(), dataType, true)) {
+                            actual =
+                                    NDArrays.groupedPackedScaledDotProductAttention(
+                                            query, packed, mask, 3, 0.5);
+                            expected =
+                                    groupedPackedAttentionReference(
+                                            referenceQuery, referencePacked, mask, 3, 0.5);
+                        }
+                        Assert.assertEquals(actual.toByteBuffer(), inference.toByteBuffer());
+                        NDArray referenceLoss = expected.mul(outputGradient).sum();
+                        NDArray loss = actual.mul(outputGradient).sum();
+                        DataType backwardType =
+                                dataType == DataType.FLOAT16 ? DataType.BFLOAT16 : DataType.FLOAT16;
+                        try (Autocast ignored =
+                                new PtAutocast(Device.gpu(), backwardType, false, true)) {
+                            collector.backward(referenceLoss);
+                            collector.backward(loss);
+                            Assert.assertFalse(JniUtils.autocastIsEnabled(1));
+                            Assert.assertEquals(
+                                    JniUtils.autocastGetDataType(1), backwardType.ordinal());
+                        }
+                    }
+                    if (queryGradient) {
+                        assertGradientClose(query, referenceQuery, gradientTolerance(dataType));
+                    } else {
+                        Assert.assertFalse(query.hasGradient());
+                    }
+                    if (packedGradient) {
+                        assertGradientClose(packed, referencePacked, gradientTolerance(dataType));
+                        try (NDArray gradient = packed.getGradient();
+                                NDArray masked = gradient.get("..., -1, :")) {
+                            assertAllZero(masked.toType(DataType.FLOAT32, false).toFloatArray());
+                        }
+                    } else {
+                        Assert.assertFalse(packed.hasGradient());
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaPreservesHigherOrderGradients() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        engine.setRandomSeed(20260927);
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray queryValues = manager.randomNormal(new Shape(1, 2, 4));
+            NDArray packed = manager.randomNormal(new Shape(1, 2, 3, 8));
+            NDArray mask = manager.ones(new Shape(1, 2, 3), DataType.INT32);
+            mask.set(new ai.djl.ndarray.index.NDIndex("..., -1"), 0);
+            NDArray query = requiringGradient(queryValues.duplicate());
+            NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray output =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packed, mask, 2, 0.5);
+                NDArray reference =
+                        groupedPackedAttentionReference(referenceQuery, packed, mask, 2, 0.5);
+                NDArray loss = output.square().sum();
+                NDArray referenceLoss = reference.square().sum();
+                NDArray unit = manager.ones(loss.getShape());
+                JniUtils.backward((PtNDArray) loss, (PtNDArray) unit, true, true);
+                JniUtils.backward((PtNDArray) referenceLoss, (PtNDArray) unit, true, true);
+                try (NDArray gradient = query.getGradient();
+                        NDArray referenceGradient = referenceQuery.getGradient()) {
+                    collector.backward(gradient.square().sum());
+                    collector.backward(referenceGradient.square().sum());
+                }
+            }
+            assertFiniteNonzeroGradient(query);
+            assertGradientClose(query, referenceQuery, 2e-4f);
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaBackwardInsideInferenceMode() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        engine.setRandomSeed(20260928);
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray queryValues = manager.randomNormal(new Shape(1, 2, 4));
+            NDArray packedValues = manager.randomNormal(new Shape(1, 2, 3, 8));
+            NDArray query = requiringGradient(queryValues.duplicate());
+            NDArray packed = requiringGradient(packedValues.duplicate());
+            NDArray referenceQuery = requiringGradient(queryValues.duplicate());
+            NDArray referencePacked = requiringGradient(packedValues.duplicate());
+            NDArray mask = manager.ones(new Shape(1, 2, 3), DataType.INT32);
+            try (GradientCollector collector = engine.newGradientCollector()) {
+                NDArray loss =
+                        NDArrays.groupedPackedScaledDotProductAttention(query, packed, mask, 2, 0.5)
+                                .sum();
+                NDArray referenceLoss =
+                        groupedPackedAttentionReference(
+                                        referenceQuery, referencePacked, mask, 2, 0.5)
+                                .sum();
+                NDArray unit = manager.ones(loss.getShape());
+                try (InferenceMode ignored = engine.newInferenceMode()) {
+                    JniUtils.backward((PtNDArray) loss, (PtNDArray) unit, false, false);
+                    JniUtils.backward((PtNDArray) referenceLoss, (PtNDArray) unit, false, false);
+                    Assert.assertFalse(JniUtils.isGradMode());
+                }
+                Assert.assertTrue(JniUtils.isGradMode());
+            }
+            assertGradientClose(query, referenceQuery, 2e-5f);
+            assertGradientClose(packed, referencePacked, 2e-5f);
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaMaskedNonFiniteMemoryAndQueriesReturnZero() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                NDArray query =
+                        manager.create(
+                                        new float[] {Float.NaN, Float.POSITIVE_INFINITY},
+                                        new Shape(1, 2, 1))
+                                .toType(dataType, false);
+                NDArray packed =
+                        manager.create(
+                                        new float[] {
+                                            Float.NaN, Float.POSITIVE_INFINITY, 0f, Float.NaN
+                                        },
+                                        new Shape(1, 1, 2, 2))
+                                .toType(dataType, false);
+                NDArray mask = manager.zeros(new Shape(1, 1, 2), DataType.INT32);
+                NDArray expected = groupedPackedAttentionReference(query, packed, mask, 1, 1.0);
+                NDArray actual =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                query, packed, mask, 1, 1.0);
+                assertAllZero(expected.toType(DataType.FLOAT32, false).toFloatArray());
+                assertAllZero(actual.toType(DataType.FLOAT32, false).toFloatArray());
+
+                NDArray finiteQuery = manager.ones(new Shape(1, 2, 1), dataType);
+                NDArray partiallyMasked =
+                        manager.create(
+                                        new float[] {0f, 5f, Float.NaN, Float.POSITIVE_INFINITY},
+                                        new Shape(1, 1, 2, 2))
+                                .toType(dataType, false);
+                NDArray partialMask = manager.create(new int[] {1, 0}, new Shape(1, 1, 2));
+                NDArray partialOutput =
+                        NDArrays.groupedPackedScaledDotProductAttention(
+                                finiteQuery, partiallyMasked, partialMask, 1, 1.0);
+                assertClose(
+                        partialOutput.toType(DataType.FLOAT32, false).toFloatArray(),
+                        new float[] {5f, 5f},
+                        0f);
+            }
+        }
+    }
+
+    @Test
+    public void groupedPackedAttentionCudaKeepsNonFiniteScoresObservable() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (float exceptional : new float[] {Float.NaN, Float.POSITIVE_INFINITY}) {
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    NDArray query = manager.ones(new Shape(1, 2, 1), dataType);
+                    NDArray packed =
+                            manager.create(
+                                            new float[] {exceptional, 3f, 0f, 1f},
+                                            new Shape(1, 1, 2, 2))
+                                    .toType(dataType, false);
+                    NDArray mask = manager.ones(new Shape(1, 1, 2), DataType.INT32);
+                    NDArray expected = groupedPackedAttentionReference(query, packed, mask, 1, 1.0);
+                    NDArray actual =
+                            NDArrays.groupedPackedScaledDotProductAttention(
+                                    query, packed, mask, 1, 1.0);
+                    for (float value : expected.toType(DataType.FLOAT32, false).toFloatArray()) {
+                        Assert.assertTrue(Float.isNaN(value));
+                    }
+                    for (float value : actual.toType(DataType.FLOAT32, false).toFloatArray()) {
+                        Assert.assertTrue(Float.isNaN(value));
+                    }
+                }
+            }
         }
     }
 

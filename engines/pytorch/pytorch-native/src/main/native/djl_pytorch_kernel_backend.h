@@ -27,6 +27,7 @@ namespace kernel_backend = rocm;
 #elif defined(DJL_USE_CUDA_KERNELS)
 #include "djl_pytorch_layer_norm_cuda.h"
 #include "djl_pytorch_masked_categorical_cuda.h"
+#include "djl_pytorch_nn_functional_cuda.h"
 #include "djl_pytorch_routing_masks_cuda.h"
 #include "djl_pytorch_row_ops_cuda.h"
 #include "djl_pytorch_structured_attention_cuda.h"

@@ -24,6 +24,7 @@ import ai.djl.nn.core.Embedding;
 import ai.djl.training.GradientCollector;
 
 import org.testng.Assert;
+import org.testng.SkipException;
 import org.testng.annotations.Test;
 
 public class EmbeddingWithOffsetsTest {
@@ -141,6 +142,144 @@ public class EmbeddingWithOffsetsTest {
             verifyStridedFeaturePackParity(
                     manager, DataType.INT16, DataType.INT32, DataType.FLOAT32);
         }
+    }
+
+    @Test
+    public void gpuFeaturePackSupportsArbitraryWidthsRanksAndStrides() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("GPU is unavailable");
+        }
+        long[][] shapes = {
+            {2, 3},
+            {2, 3, 3},
+            {2, 1, 2, 3},
+            {2, 1, 1, 1, 1, 1, 1, 3},
+            {2, 1, 1, 1, 1, 1, 1, 1, 3},
+            {0, 3}
+        };
+        for (DataType type :
+                new DataType[] {
+                    DataType.FLOAT32, DataType.FLOAT64, DataType.FLOAT16, DataType.BFLOAT16
+                }) {
+            for (int width : new int[] {1, 17, 257}) {
+                for (long[] dimensions : shapes) {
+                    try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                        Shape shape = new Shape(dimensions);
+                        NDArray raw = manager.zeros(shape, DataType.INT32).add(1);
+                        NDArray offsets = manager.create(new int[] {0, 2, 4});
+                        NDArray table =
+                                manager.arange(8 * width).reshape(8, width).toType(type, false);
+                        long[] featureShape = dimensions.clone();
+                        featureShape[featureShape.length - 1] = 5;
+                        NDArray features = manager.ones(new Shape(featureShape), type);
+                        verifyFeaturePackComposition(raw, offsets, table, features);
+                    }
+                }
+            }
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray raw =
+                    manager.create(new int[] {0, 91, 1, 92, 2, 93, 3, 94}, new Shape(2, 2, 2))
+                            .get("...,0");
+            NDArray offsets = manager.create(1L);
+            NDArray table = manager.arange(85).toType(DataType.FLOAT32, false).reshape(5, 17);
+            NDArray features =
+                    manager.arange(12)
+                            .toType(DataType.FLOAT32, false)
+                            .reshape(2, 3, 2)
+                            .get("...,0");
+            verifyFeaturePackComposition(raw, offsets, table, features);
+            NDArray nonContiguousTable =
+                    manager.arange(85).toType(DataType.FLOAT32, false).reshape(17, 5).transpose();
+            verifyFeaturePackComposition(raw, offsets, nonContiguousTable, features);
+        }
+    }
+
+    @Test
+    public void gpuEmbeddingOffsetsPreserveIntegerPromotionAndWrapping() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("GPU is unavailable");
+        }
+        try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+            NDArray table = manager.arange(8).toType(DataType.FLOAT32, false).reshape(4, 2);
+            NDArray features = manager.ones(new Shape(1, 3), DataType.FLOAT32);
+            for (DataType type : new DataType[] {DataType.INT32, DataType.INT64}) {
+                long minimum = type == DataType.INT32 ? Integer.MIN_VALUE : Long.MIN_VALUE;
+                NDArray raw =
+                        manager.create(new long[] {minimum, minimum + 1}, new Shape(1, 2))
+                                .toType(type, false);
+                NDArray offsets =
+                        manager.create(new long[] {minimum, minimum}, new Shape(1, 2))
+                                .toType(type, false);
+                verifyFeaturePackComposition(raw, offsets, table, features);
+                NDArray expected =
+                        Embedding.embedding(raw.add(offsets), table, SparseFormat.DENSE)
+                                .singletonOrThrow();
+                Assert.assertEquals(
+                        NDArrays.embeddingWithOffsets(raw, offsets, table).toFloatArray(),
+                        expected.toFloatArray());
+            }
+            // A scalar tensor follows ATen's dimensioned/scalar promotion rules.
+            NDArray raw =
+                    manager.create(
+                            new int[] {Integer.MIN_VALUE, Integer.MIN_VALUE + 1}, new Shape(1, 2));
+            verifyFeaturePackComposition(
+                    raw, manager.create((long) Integer.MIN_VALUE), table, features);
+            NDArray scalar = manager.create(1);
+            Assert.assertEquals(
+                    NDArrays.embeddingWithOffsets(scalar, scalar, table).toFloatArray(),
+                    new float[] {4, 5});
+        }
+    }
+
+    @Test
+    public void gpuEmbeddingFeaturePackKeepsGradientFallback() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("GPU is unavailable");
+        }
+        for (boolean packed : new boolean[] {false, true}) {
+            try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                NDArray raw = manager.create(new long[] {0, 1, 3, 1}, new Shape(2, 2));
+                NDArray offsets = manager.create(new int[] {0, 2}, new Shape(1, 2));
+                NDArray table = manager.arange(8).toType(DataType.FLOAT32, false).reshape(4, 2);
+                NDArray features = manager.ones(new Shape(2, 3), DataType.FLOAT32);
+                table.setRequiresGradient(true);
+                features.setRequiresGradient(true);
+                try (GradientCollector collector = engine.newGradientCollector()) {
+                    NDArray result =
+                            packed
+                                    ? NDArrays.embeddingFeaturePack(raw, offsets, table, features)
+                                    : NDArrays.embeddingWithOffsets(raw, offsets, table);
+                    collector.backward(result.sum());
+                }
+                Assert.assertEquals(
+                        table.getGradient().toFloatArray(), new float[] {1, 1, 0, 0, 0, 0, 3, 3});
+                if (packed) {
+                    Assert.assertEquals(
+                            features.getGradient().toFloatArray(), new float[] {1, 1, 1, 1, 1, 1});
+                }
+            }
+        }
+    }
+
+    private static void verifyFeaturePackComposition(
+            NDArray raw, NDArray offsets, NDArray table, NDArray features) {
+        long[] embeddedShape = raw.getShape().getShape().clone();
+        embeddedShape[embeddedShape.length - 1] *= table.getShape().get(1);
+        NDArray expected =
+                Embedding.embedding(raw.add(offsets), table, SparseFormat.DENSE)
+                        .singletonOrThrow()
+                        .reshape(embeddedShape)
+                        .concat(features, embeddedShape.length - 1);
+        NDArray actual = NDArrays.embeddingFeaturePack(raw, offsets, table, features);
+        Assert.assertEquals(actual.getShape(), expected.getShape());
+        Assert.assertEquals(actual.getDataType(), expected.getDataType());
+        Assert.assertEquals(
+                actual.toType(DataType.FLOAT32, false).toFloatArray(),
+                expected.toType(DataType.FLOAT32, false).toFloatArray());
     }
 
     @Test(expectedExceptions = IllegalArgumentException.class)

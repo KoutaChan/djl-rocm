@@ -225,6 +225,137 @@ public class PtOwnedMaskedEmbeddingResidualTest {
         }
     }
 
+    @Test
+    public void cudaPaddingAndZeroMasksPreserveNonFiniteArithmetic() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            throw new SkipException("This test requires the CUDA masked embedding kernel.");
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (EmbeddingReduction reduction : EmbeddingReduction.values()) {
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    NDArray table =
+                            manager.create(
+                                            new float[] {
+                                                Float.NaN,
+                                                Float.POSITIVE_INFINITY,
+                                                Float.NEGATIVE_INFINITY,
+                                                -0f,
+                                                0.5f,
+                                                1,
+                                                -1,
+                                                2,
+                                                -0f,
+                                                -0.5f,
+                                                2,
+                                                1,
+                                                -2,
+                                                0f,
+                                                0.25f
+                                            },
+                                            new Shape(3, 5))
+                                    .toType(dataType, false);
+                    NDArray tokens =
+                            manager.create(
+                                            new float[] {
+                                                1,
+                                                2,
+                                                3,
+                                                -0f,
+                                                0.125f,
+                                                Float.NaN,
+                                                Float.POSITIVE_INFINITY,
+                                                Float.NEGATIVE_INFINITY,
+                                                -0f,
+                                                0.25f,
+                                                0.125f,
+                                                0.25f,
+                                                0.5f,
+                                                1,
+                                                2
+                                            },
+                                            new Shape(1, 3, 5))
+                                    .toType(dataType, false);
+                    NDArray raw =
+                            manager.create(
+                                    new long[] {0, 1, 0, 1, 2, 0, 1, 2, 257}, new Shape(1, 3, 3));
+                    NDArray first = raw.get("...,0");
+                    NDArray second = raw.get("...,1");
+                    NDArray mask = raw.get("...,2");
+                    float[] expected =
+                            referenceResidual(tokens, first, second, table, mask, reduction)
+                                    .toType(DataType.FLOAT32, false)
+                                    .toFloatArray();
+                    NDArray convertedMask =
+                            NDArrays.addMaskedEmbeddingResidualToOwnedTokens(
+                                    tokens, new NDList(first, second), table, mask, 0, reduction);
+                    float[] actual = tokens.toType(DataType.FLOAT32, false).toFloatArray();
+                    for (int index = 0; index < actual.length; ++index) {
+                        if (Float.isNaN(expected[index])) {
+                            Assert.assertTrue(Float.isNaN(actual[index]));
+                        } else {
+                            Assert.assertEquals(
+                                    Float.floatToRawIntBits(actual[index]),
+                                    Float.floatToRawIntBits(expected[index]));
+                        }
+                    }
+                    Assert.assertEquals(
+                            convertedMask.toType(DataType.FLOAT32, false).toFloatArray(),
+                            mask.toType(dataType, false)
+                                    .toType(DataType.FLOAT32, false)
+                                    .toFloatArray());
+                }
+            }
+        }
+    }
+
+    @Test
+    public void gpuEmptyInputsPreserveTokenAndMaskShapes() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("GPU is unavailable");
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (Shape shape : new Shape[] {new Shape(0, 3, 33), new Shape(2, 0, 33)}) {
+                try (NDManager manager = engine.newBaseManager(Device.gpu())) {
+                    Shape maskShape = new Shape(shape.get(0), shape.get(1));
+                    NDArray table = manager.ones(new Shape(2, shape.get(2)), dataType);
+                    NDArray first = manager.zeros(maskShape, DataType.INT32);
+                    NDArray second = manager.zeros(maskShape, DataType.INT32);
+                    NDArray mask = manager.zeros(maskShape, DataType.INT32);
+                    for (EmbeddingReduction reduction : EmbeddingReduction.values()) {
+                        for (int indexCount : new int[] {1, 2}) {
+                            NDArray tokens = manager.zeros(shape, dataType);
+                            NDList indices =
+                                    indexCount == 1 ? new NDList(first) : new NDList(first, second);
+                            NDArray convertedMask =
+                                    NDArrays.addMaskedEmbeddingResidualToOwnedTokens(
+                                            tokens, indices, table, mask, 0, reduction);
+
+                            Assert.assertEquals(tokens.getShape(), shape);
+                            Assert.assertEquals(tokens.getDataType(), dataType);
+                            Assert.assertEquals(
+                                    tokens.toType(DataType.FLOAT32, false).toFloatArray().length,
+                                    0);
+                            Assert.assertSame(convertedMask.getManager(), tokens.getManager());
+                            Assert.assertEquals(convertedMask.getShape(), maskShape);
+                            Assert.assertEquals(convertedMask.getDataType(), dataType);
+                            Assert.assertEquals(convertedMask.getDevice(), tokens.getDevice());
+                            Assert.assertEquals(
+                                    convertedMask
+                                            .toType(DataType.FLOAT32, false)
+                                            .toFloatArray()
+                                            .length,
+                                    0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private static NDArray referenceResidual(
             NDArray tokens,
             NDArray first,
