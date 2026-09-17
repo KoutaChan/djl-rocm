@@ -173,7 +173,12 @@ abstract class PrepareHipblaslt @Inject constructor(
                 "msgpack-LICENSE_1_0.txt" to build.resolve("deps/msgpack-cxx-6.1.0/source/LICENSE_1_0.txt")
             )
             if (profile.family == "modern") {
-                originals["origami-LICENSE.md"] = source.resolve("shared/origami/LICENSE.md")
+                // ROCm 7.1 omits Origami's license file; its MIT notice matches hipBLASLt's.
+                originals["origami-LICENSE.md"] = if (profile.version == "7.1.0") {
+                    originals.getValue("hipblaslt-LICENSE.md")
+                } else {
+                    source.resolve("shared/origami/LICENSE.md")
+                }
             }
             if (dependencies.any { it.contains("rocroller") }) {
                 originals["fmt-LICENSE"] = build.resolve("deps/fmt/source/LICENSE")
