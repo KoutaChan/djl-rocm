@@ -20,9 +20,7 @@
 
 #include <limits>
 
-#if defined(DJL_USE_ROCM_KERNELS)
-#include "djl_pytorch_rocm_kernels.h"
-#endif
+#include "djl_pytorch_kernel_backend.h"
 
 namespace djl::pytorch {
 namespace {
@@ -296,12 +294,16 @@ torch::Tensor embedding_with_offsets(const torch::Tensor& raw_ids,
       "embedding table must be a rank-two floating-point tensor");
   TORCH_CHECK(raw_ids.device() == offsets.device() && raw_ids.device() == table.device(),
       "raw IDs, offsets, and embedding table must use the same device");
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_embedding_with_offsets(raw_ids, offsets, table)) {
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (kernel_backend::supports_embedding_with_offsets(raw_ids, offsets, table)) {
     if (at::GradMode::is_enabled() && table.requires_grad()) {
+#if defined(DJL_USE_ROCM_KERNELS)
       return EmbeddingWithOffsetsFunction::apply(raw_ids, offsets, table);
+#else
+      return embedding_with_offsets_reference(raw_ids, offsets, table);
+#endif
     }
-    return rocm::embedding_with_offsets_forward(raw_ids, offsets, table);
+    return kernel_backend::embedding_with_offsets_forward(raw_ids, offsets, table);
   }
 #endif
   return embedding_with_offsets_reference(raw_ids, offsets, table);
@@ -333,10 +335,10 @@ torch::Tensor embedding_feature_pack(const torch::Tensor& raw_ids,
       "embedding table must be a rank-two floating-point tensor");
   TORCH_CHECK(raw_ids.device() == offsets.device() && raw_ids.device() == table.device(),
       "raw IDs, offsets, table, and features must use the same device");
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (rocm::supports_embedding_feature_pack(raw_ids, offsets, table, features) &&
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (kernel_backend::supports_embedding_feature_pack(raw_ids, offsets, table, features) &&
       !(at::GradMode::is_enabled() && (table.requires_grad() || features.requires_grad()))) {
-    return rocm::embedding_feature_pack_forward(raw_ids, offsets, table, features);
+    return kernel_backend::embedding_feature_pack_forward(raw_ids, offsets, table, features);
   }
 #endif
   return embedding_feature_pack_reference(raw_ids, offsets, table, features);
@@ -377,10 +379,10 @@ torch::Tensor segmented_lookup_sum(
       "segmented lookup indices must be int16, int32, or int64");
   TORCH_CHECK(lookup_table.device() == stored_indices.device(),
       "segmented lookup table and stored indices must share a device");
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
   if (!at::GradMode::is_enabled() &&
-      rocm::supports_segmented_lookup_sum(lookup_table, stored_indices)) {
-    return rocm::segmented_lookup_sum_forward(lookup_table, stored_indices);
+      kernel_backend::supports_segmented_lookup_sum(lookup_table, stored_indices)) {
+    return kernel_backend::segmented_lookup_sum_forward(lookup_table, stored_indices);
   }
 #endif
   return segmented_lookup_sum_reference(lookup_table, stored_indices);
@@ -428,6 +430,12 @@ torch::Tensor padded_batch_gather(
     return rocm::padded_batch_gather_forward(source, stored_indices);
   }
 #endif
+#if defined(DJL_USE_CUDA_KERNELS)
+  if ((!at::GradMode::is_enabled() || !source.requires_grad()) &&
+      cuda::supports_padded_batch_gather(source, {}, stored_indices, {})) {
+    return cuda::padded_batch_gather_forward(source, {}, stored_indices, {});
+  }
+#endif
   return padded_gather_reference(
       source, implicit_batch_indices(stored_indices, source.size(0)), stored_indices, {});
 }
@@ -459,6 +467,12 @@ torch::Tensor padded_batch_gather_2d(const torch::Tensor& source,
         source, outer_stored_indices, inner_stored_indices);
   }
 #endif
+#if defined(DJL_USE_CUDA_KERNELS)
+  if ((!at::GradMode::is_enabled() || !source.requires_grad()) &&
+      cuda::supports_padded_batch_gather(source, {}, outer_stored_indices, inner_stored_indices)) {
+    return cuda::padded_batch_gather_forward(source, {}, outer_stored_indices, inner_stored_indices);
+  }
+#endif
   return padded_gather_reference(source,
       implicit_batch_indices(outer_stored_indices, source.size(0)),
       outer_stored_indices, inner_stored_indices);
@@ -486,6 +500,12 @@ torch::Tensor padded_batch_gather_by_batch_indices(const torch::Tensor& source,
     }
     return rocm::padded_batch_gather_by_batch_indices_forward(
         source, batch_indices, stored_indices);
+  }
+#endif
+#if defined(DJL_USE_CUDA_KERNELS)
+  if ((!at::GradMode::is_enabled() || !source.requires_grad()) &&
+      cuda::supports_padded_batch_gather(source, batch_indices, stored_indices, {})) {
+    return cuda::padded_batch_gather_forward(source, batch_indices, stored_indices, {});
   }
 #endif
   return padded_gather_reference(source, batch_indices, stored_indices, {});

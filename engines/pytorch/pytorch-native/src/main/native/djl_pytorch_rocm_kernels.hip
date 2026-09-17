@@ -13,8 +13,12 @@
 #include <type_traits>
 #include <vector>
 
+#include "djl_pytorch_layer_norm.h"
+#include "djl_pytorch_layer_norm_kernels.h"
+#include "djl_pytorch_masked_categorical.h"
 #include "djl_pytorch_rocm_kernels.h"
 #include "djl_pytorch_rocm_launch_config.h"
+#include "djl_pytorch_structured_attention.h"
 
 namespace djl::pytorch::rocm {
 namespace {
@@ -23,8 +27,15 @@ namespace {
 constexpr int kResidualCachedValuesPerLaneLimit = 16;
 constexpr int kAutocastLayerNormCachedValuesPerLaneLimit = 16;
 constexpr int kLayerNormAffinePartialMaximumBlocks = 1024;
+constexpr int kLayerNormAffineFeatureTile = 8;
 constexpr int kMaskedEmbeddingMaximumIndices = 2;
 constexpr int kMaskedEmbeddingThreadsPerBlock = 256;
+constexpr int kMaskedEmbeddingGroupWidth = 32;
+constexpr int kMaskedEmbeddingMaximumGroupedWidth = 512;
+// Keep at least 256 blocks available when grouping narrow rows.
+constexpr int kMaskedEmbeddingMinimumGroupedRows =
+    kMaskedEmbeddingThreadsPerBlock *
+    (kMaskedEmbeddingThreadsPerBlock / kMaskedEmbeddingGroupWidth);
 constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
 constexpr int kMaximumIndexedPoolChoices = 16;
@@ -152,8 +163,12 @@ __global__ void fused_adam_update_kernel(scalar_t* weight, const scalar_t* gradi
        index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
     float weight_value = static_cast<float>(weight[index]);
     float gradient_value = static_cast<float>(gradient[index]) * rescale_gradient;
-    if (clip_gradient >= 0.0f && gradient_value > clip_gradient) {
-      gradient_value = clip_gradient;
+    if (clip_gradient >= 0.0f) {
+      if (gradient_value > clip_gradient) {
+        gradient_value = clip_gradient;
+      } else if (gradient_value < -clip_gradient) {
+        gradient_value = -clip_gradient;
+      }
     }
     if (adamw) {
       weight_value -= weight_value * learning_rate * weight_decay;
@@ -239,7 +254,7 @@ __global__ void embedding_feature_pack_kernel(const raw_t* raw_ids,
 
 template <typename scalar_t, bool write_probabilities>
 __global__ void masked_categorical_forward_kernel(const scalar_t* logits, const bool* mask,
-    float* output, int64_t row_count, int64_t width) {
+    float* output, int64_t row_count, int64_t width, float* normalization) {
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
   const int waves_per_block = blockDim.x / warpSize;
@@ -283,13 +298,17 @@ __global__ void masked_categorical_forward_kernel(const scalar_t* logits, const 
       }
     } else if (lane == 0) {
       output[row] = choice_count > 0 ? logf(denominator) + maximum : 0.0f;
+      if (normalization != nullptr) {
+        normalization[row * 2] = maximum;
+        normalization[row * 2 + 1] = denominator;
+      }
     }
   }
 }
 
 template <int subwave_width, typename scalar_t, bool write_probabilities>
 __global__ void masked_categorical_forward_subwave_kernel(const scalar_t* logits, const bool* mask,
-    float* output, int64_t row_count, int64_t width) {
+    float* output, int64_t row_count, int64_t width, float* normalization) {
   const int lane = threadIdx.x % subwave_width;
   const int group = threadIdx.x / subwave_width;
   const int groups_per_block = blockDim.x / subwave_width;
@@ -333,6 +352,10 @@ __global__ void masked_categorical_forward_subwave_kernel(const scalar_t* logits
       }
     } else if (lane == 0) {
       output[row] = choice_count > 0 ? logf(denominator) + maximum : 0.0f;
+      if (normalization != nullptr) {
+        normalization[row * 2] = maximum;
+        normalization[row * 2 + 1] = denominator;
+      }
     }
   }
 }
@@ -764,7 +787,7 @@ __global__ void masked_softmax_backward_kernel(const float* gradient_output,
 
 template <typename scalar_t>
 __global__ void masked_log_sum_exp_backward_kernel(const float* gradient_output,
-    const scalar_t* logits, const bool* mask, const float* normalizers, scalar_t* gradient_input,
+    const scalar_t* logits, const bool* mask, const float* normalization, scalar_t* gradient_input,
     int64_t row_count, int64_t width) {
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
@@ -774,11 +797,14 @@ __global__ void masked_log_sum_exp_backward_kernel(const float* gradient_output,
        row += static_cast<int64_t>(gridDim.x) * waves_per_block) {
     const int64_t row_offset = row * width;
     const float row_gradient = gradient_output[row];
-    const float normalizer = normalizers[row];
+    // Keep the maximum separate: adding log(sum) can round it away for large logits.
+    const float maximum = normalization[row * 2];
+    const float denominator = normalization[row * 2 + 1];
     for (int64_t column = lane; column < width; column += warpSize) {
       const int64_t index = row_offset + column;
       gradient_input[index] = mask[index]
-          ? static_cast<scalar_t>(row_gradient * expf(static_cast<float>(logits[index]) - normalizer))
+          ? static_cast<scalar_t>(row_gradient *
+                (expf(static_cast<float>(logits[index]) - maximum) / denominator))
           : static_cast<scalar_t>(0.0f);
     }
   }
@@ -1068,65 +1094,73 @@ __global__ void broadcast_residual_to_owned_silu_kernel(scalar_t* values,
   }
 }
 
-template <typename scalar_t>
+template <int group_width, typename scalar_t>
 __global__ void masked_embedding_residual_to_owned_tokens_kernel(
     MaskedEmbeddingResidualArguments arguments) {
   auto* tokens = static_cast<scalar_t*>(arguments.tokens);
   const auto* embedding_table = static_cast<const scalar_t*>(arguments.embedding_table);
   auto* converted_valid_mask = static_cast<scalar_t*>(arguments.converted_valid_mask);
-  __shared__ int64_t table_rows[kMaskedEmbeddingMaximumIndices];
-  __shared__ int64_t valid_mask_value;
-  __shared__ int32_t valid_index_count;
-  __shared__ bool invalid_index;
-  for (int64_t row = blockIdx.x; row < arguments.row_count; row += gridDim.x) {
-    const int64_t batch = row / arguments.tokens_per_batch;
-    const int64_t token = row - batch * arguments.tokens_per_batch;
-    if (threadIdx.x == 0) {
-      valid_mask_value = padded_batch_gather_index_value(arguments.valid_mask,
+  constexpr int groups_per_block = kMaskedEmbeddingThreadsPerBlock / group_width;
+  const int lane = groups_per_block == 1 ? threadIdx.x : threadIdx.x % group_width;
+  const int group = groups_per_block == 1 ? 0 : threadIdx.x / group_width;
+  __shared__ int64_t table_rows[groups_per_block][kMaskedEmbeddingMaximumIndices];
+  __shared__ int64_t valid_mask_values[groups_per_block];
+  __shared__ int32_t valid_index_counts[groups_per_block];
+  __shared__ bool invalid_indices[groups_per_block];
+  for (int64_t first_row = static_cast<int64_t>(blockIdx.x) * groups_per_block;
+       first_row < arguments.row_count;
+       first_row += static_cast<int64_t>(gridDim.x) * groups_per_block) {
+    const int64_t row = first_row + group;
+    if (lane == 0 && (groups_per_block == 1 || row < arguments.row_count)) {
+      const int64_t batch = row / arguments.tokens_per_batch;
+      const int64_t token = row - batch * arguments.tokens_per_batch;
+      valid_mask_values[group] = padded_batch_gather_index_value(arguments.valid_mask,
           batch * arguments.valid_mask_row_stride + token * arguments.valid_mask_token_stride,
           arguments.valid_mask_type);
-      valid_index_count = 0;
-      invalid_index = false;
+      valid_index_counts[group] = 0;
+      invalid_indices[group] = false;
       for (int32_t source = 0; source < arguments.index_count; ++source) {
         const int64_t table_row = padded_batch_gather_index_value(arguments.stored_indices[source],
             batch * arguments.index_row_strides[source] + token * arguments.index_token_strides[source],
             arguments.index_types[source]);
-        table_rows[source] = table_row;
+        table_rows[group][source] = table_row;
         if (table_row != arguments.padding_index) {
-          ++valid_index_count;
-          invalid_index |= table_row < 0 || table_row >= arguments.vocabulary_size;
+          ++valid_index_counts[group];
+          invalid_indices[group] |= table_row < 0 || table_row >= arguments.vocabulary_size;
         }
       }
-      converted_valid_mask[row] = static_cast<scalar_t>(valid_mask_value);
+      converted_valid_mask[row] = static_cast<scalar_t>(valid_mask_values[group]);
     }
     __syncthreads();
-    const int64_t row_offset = row * arguments.width;
-    for (int64_t column = threadIdx.x; column < arguments.width; column += blockDim.x) {
-      if (invalid_index) {
-        tokens[row_offset + column] = static_cast<scalar_t>(NAN);
-        continue;
-      }
-      if (valid_mask_value == 0) {
-        tokens[row_offset + column] = static_cast<scalar_t>(0.0f);
-        continue;
-      }
-      float identity = 0.0f;
-      for (int32_t source = 0; source < arguments.index_count; ++source) {
-        const int64_t table_row = table_rows[source];
-        if (table_row == arguments.padding_index || invalid_index) {
+    if (groups_per_block == 1 || row < arguments.row_count) {
+      const int64_t row_offset = row * arguments.width;
+      for (int64_t column = lane; column < arguments.width; column += group_width) {
+        if (invalid_indices[group]) {
+          tokens[row_offset + column] = static_cast<scalar_t>(NAN);
           continue;
         }
-        identity = round_masked_embedding_value<scalar_t>(identity +
-            static_cast<float>(embedding_table[table_row * arguments.width + column]));
+        if (valid_mask_values[group] == 0) {
+          tokens[row_offset + column] = static_cast<scalar_t>(0.0f);
+          continue;
+        }
+        float identity = 0.0f;
+        for (int32_t source = 0; source < arguments.index_count; ++source) {
+          const int64_t table_row = table_rows[group][source];
+          if (table_row == arguments.padding_index) {
+            continue;
+          }
+          identity = round_masked_embedding_value<scalar_t>(identity +
+              static_cast<float>(embedding_table[table_row * arguments.width + column]));
+        }
+        if (arguments.mean_valid && valid_index_counts[group] > 0) {
+          identity = round_masked_embedding_value<scalar_t>(
+              identity / static_cast<float>(valid_index_counts[group]));
+        }
+        const float updated = round_masked_embedding_value<scalar_t>(
+            static_cast<float>(tokens[row_offset + column]) + identity);
+        tokens[row_offset + column] =
+            static_cast<scalar_t>(updated * static_cast<float>(valid_mask_values[group]));
       }
-      if (arguments.mean_valid && valid_index_count > 0) {
-        identity = round_masked_embedding_value<scalar_t>(
-            identity / static_cast<float>(valid_index_count));
-      }
-      const float updated = round_masked_embedding_value<scalar_t>(
-          static_cast<float>(tokens[row_offset + column]) + identity);
-      tokens[row_offset + column] =
-          static_cast<scalar_t>(updated * static_cast<float>(valid_mask_value));
     }
     __syncthreads();
   }
@@ -1429,7 +1463,7 @@ __device__ __forceinline__ int64_t indexed_id_offset(
 template <typename scalar_t, typename index_t, bool contiguous>
 __global__ void grouped_indexed_attention_kernel(const scalar_t* query, const scalar_t* shared_key_values,
     const scalar_t* shared_deltas, const scalar_t* indexed_deltas, const index_t* indexed_shared_ids, scalar_t* output,
-    float* log_sum_exp, int64_t query_head_count, GroupedIndexedAttentionLayout layout, float scale) {
+    float* probabilities, int64_t query_head_count, GroupedIndexedAttentionLayout layout, float scale) {
   extern __shared__ unsigned char shared_storage[];
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
@@ -1513,8 +1547,12 @@ __global__ void grouped_indexed_attention_kernel(const scalar_t* query, const sc
   }
   const float sum = __shfl(local_sum, 0);
   const float inverse_sum = active ? 1.0f / sum : 0.0f;
-  if (active && lane == 0 && log_sum_exp != nullptr) {
-    log_sum_exp[query_head] = maximum + logf(sum);
+  // Preserve normalization even when the common score is too large for an absolute LSE.
+  if (active && probabilities != nullptr) {
+    for (int64_t attended_token = lane; attended_token < total_tokens; attended_token += warpSize) {
+      probabilities[query_head * total_tokens + attended_token] =
+          token_weights[attended_token] * inverse_sum;
+    }
   }
   __syncthreads();
 
@@ -1549,12 +1587,12 @@ void launch_grouped_indexed_attention(const torch::Tensor& query, const torch::T
     const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
     const torch::Tensor& indexed_shared_ids, torch::Tensor& output, int64_t grid_size, int block_threads,
     size_t shared_memory_bytes, hipStream_t stream, int64_t query_head_count,
-    const GroupedIndexedAttentionLayout& layout, float scale, float* log_sum_exp) {
+    const GroupedIndexedAttentionLayout& layout, float scale, float* probabilities) {
   hipLaunchKernelGGL(HIP_KERNEL_NAME(grouped_indexed_attention_kernel<scalar_t, index_t, contiguous>),
       dim3(grid_size), dim3(block_threads), shared_memory_bytes, stream, query.data_ptr<scalar_t>(),
       shared_key_values.data_ptr<scalar_t>(), shared_deltas.data_ptr<scalar_t>(),
       indexed_deltas.data_ptr<scalar_t>(), indexed_shared_ids.data_ptr<index_t>(), output.data_ptr<scalar_t>(),
-      log_sum_exp, query_head_count, layout, scale);
+      probabilities, query_head_count, layout, scale);
 }
 
 struct MappedGroupedIndexedAttentionLayout {
@@ -1787,11 +1825,18 @@ __global__ void mapped_grouped_indexed_attention_backward_kernel(
     const scalar_t* gradient_output, scalar_t* query_gradient,
     float* shared_key_value_gradient, float* shared_delta_table_gradient,
     scalar_t* indexed_delta_gradient, int64_t query_head_count,
+    int64_t delta_gradient_shards, int64_t delta_gradient_elements,
     MappedGroupedIndexedAttentionLayout layout, float scale) {
   extern __shared__ unsigned char shared_storage[];
   const int lane = threadIdx.x % warpSize;
   const int wave = threadIdx.x / warpSize;
   const int waves_per_block = blockDim.x / warpSize;
+  // Queries often share the same relation code. Spread their atomic writes over
+  // independent tables, then reduce those FP32 partials once after this kernel.
+  if (shared_delta_table_gradient != nullptr) {
+    shared_delta_table_gradient +=
+        (blockIdx.x % delta_gradient_shards) * delta_gradient_elements;
+  }
   const int64_t total_tokens = layout.shared_tokens + layout.indexed_tokens;
   float* all_probabilities = reinterpret_cast<float*>(shared_storage);
   float* all_score_gradients = all_probabilities + waves_per_block * total_tokens;
@@ -1948,7 +1993,7 @@ __global__ void mapped_grouped_indexed_attention_backward_kernel(
 template <typename scalar_t, typename index_t, bool contiguous>
 __global__ void grouped_indexed_attention_backward_query_kernel(const scalar_t* query,
     const scalar_t* shared_key_values, const scalar_t* shared_deltas, const scalar_t* indexed_deltas,
-    const index_t* indexed_shared_ids, const float* log_sum_exp, const scalar_t* gradient_output,
+    const index_t* indexed_shared_ids, const float* probabilities, const scalar_t* gradient_output,
     scalar_t* query_gradient, scalar_t* shared_delta_gradient, scalar_t* indexed_delta_gradient,
     int64_t query_head_count, GroupedIndexedAttentionLayout layout, float scale) {
   extern __shared__ unsigned char shared_storage[];
@@ -1996,25 +2041,8 @@ __global__ void grouped_indexed_attention_backward_query_kernel(const scalar_t* 
                     indexed_shared_ids[indexed_id_offset<contiguous>(layout, query_index, token)]);
       const bool present = stored_id > 0 && stored_id <= layout.shared_tokens;
       const int64_t shared_index = stored_id - 1;
-      float score = -std::numeric_limits<float>::infinity();
-      if (present) {
-        score = 0.0f;
-        for (int64_t feature = 0; feature < layout.key_features; feature++) {
-          const int64_t packed_feature = key_offset + feature;
-          const float base = static_cast<float>(shared_key_values[shared_offset<contiguous>(
-              layout, group, shared_index, packed_feature)]);
-          const float delta =
-              shared_token
-                  ? static_cast<float>(shared_deltas[shared_delta_offset<contiguous>(
-                        layout, query_index, token, packed_feature)])
-                  : static_cast<float>(indexed_deltas[indexed_delta_offset<contiguous>(
-                        layout, query_index, token, packed_feature)]);
-          score += query_values[feature] * (base + delta);
-        }
-        score *= scale;
-      }
       shared_indices[attended_token] = present ? static_cast<int32_t>(shared_index) : -1;
-      token_weights[attended_token] = present ? expf(score - log_sum_exp[query_head]) : 0.0f;
+      token_weights[attended_token] = probabilities[query_head * total_tokens + attended_token];
     }
   }
   __syncthreads();
@@ -2473,10 +2501,10 @@ __global__ void autocast_layer_norm_and_cast_backward_kernel(
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t,
-    typename summed_t>
+    typename summed_t, typename parameter_t>
 __global__ void residual_add_layer_norm_forward_kernel(
-    const residual_t* residual, const update_t* update, const float* weight,
-    const float* bias, float* normalized, summed_t* summed_residual,
+    const residual_t* residual, const update_t* update, const parameter_t* weight,
+    const parameter_t* bias, float* normalized, summed_t* summed_residual,
     float* mean_output, float* reciprocal_standard_deviation_output,
     int64_t row_count, int64_t width, float epsilon) {
   const int lane = threadIdx.x % warpSize;
@@ -2544,16 +2572,16 @@ __global__ void residual_add_layer_norm_forward_kernel(
       const float standardized =
           (cached_values[cached_index] - mean) * reciprocal_standard_deviation;
       normalized[row_offset + feature] =
-          standardized * weight[feature] + bias[feature];
+          standardized * static_cast<float>(weight[feature]) + static_cast<float>(bias[feature]);
     }
   }
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t,
-    typename summed_t>
+    typename summed_t, typename parameter_t>
 __global__ void residual_add_layer_norm_input_gradient_kernel(
     const float* normalized_gradient, const summed_t* summed_gradient,
-    const summed_t* summed_residual, const float* weight, const float* mean,
+    const summed_t* summed_residual, const parameter_t* weight, const float* mean,
     const float* reciprocal_standard_deviation, residual_t* residual_gradient,
     update_t* update_gradient, float* affine_partials, int64_t row_count,
     int64_t width) {
@@ -2586,7 +2614,7 @@ __global__ void residual_add_layer_norm_input_gradient_kernel(
         const float gradient = normalized_gradient == nullptr
             ? 0.0f
             : normalized_gradient[index];
-        const float scaled_gradient = gradient * weight[feature];
+        const float scaled_gradient = gradient * static_cast<float>(weight[feature]);
         cached_standardized[cached_index] = standardized;
         cached_scaled_gradient[cached_index] = scaled_gradient;
         cached_weight_gradient[cached_index] += gradient * standardized;
@@ -2677,23 +2705,36 @@ __global__ void layer_norm_affine_partial_reduction_kernel(
     const float* affine_partials, parameter_t* weight_gradient,
     parameter_t* bias_gradient,
     int64_t partial_count, int64_t width) {
-  const int64_t feature =
-      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (feature >= width) {
-    return;
-  }
+  extern __shared__ float partial_sums[];
+  float* weight_sums = partial_sums;
+  float* bias_sums = weight_sums + blockDim.x;
+  const int feature_lane = threadIdx.x % kLayerNormAffineFeatureTile;
+  const int partial_lane = threadIdx.x / kLayerNormAffineFeatureTile;
+  const int partial_lanes = blockDim.x / kLayerNormAffineFeatureTile;
+  const int64_t feature = static_cast<int64_t>(blockIdx.x) * kLayerNormAffineFeatureTile + feature_lane;
   float weight_sum = 0.0f;
   float bias_sum = 0.0f;
-  for (int64_t partial = 0; partial < partial_count; partial++) {
-    const int64_t offset = partial * 2 * width;
-    weight_sum += affine_partials[offset + feature];
-    bias_sum += affine_partials[offset + width + feature];
+  if (feature < width) {
+    for (int64_t partial = partial_lane; partial < partial_count; partial += partial_lanes) {
+      const int64_t offset = partial * 2 * width;
+      weight_sum += affine_partials[offset + feature];
+      bias_sum += affine_partials[offset + width + feature];
+    }
   }
-  if (weight_gradient != nullptr) {
-    weight_gradient[feature] = static_cast<parameter_t>(weight_sum);
-  }
-  if (bias_gradient != nullptr) {
-    bias_gradient[feature] = static_cast<parameter_t>(bias_sum);
+  weight_sums[threadIdx.x] = weight_sum;
+  bias_sums[threadIdx.x] = bias_sum;
+  __syncthreads();
+  // Each feature has one writer; all accumulation stays FP32 until the final cast.
+  if (partial_lane == 0 && feature < width) {
+    weight_sum = 0.0f;
+    bias_sum = 0.0f;
+    for (int source = 0; source < partial_lanes; ++source) {
+      const int index = source * kLayerNormAffineFeatureTile + feature_lane;
+      weight_sum += weight_sums[index];
+      bias_sum += bias_sums[index];
+    }
+    if (weight_gradient != nullptr) weight_gradient[feature] = static_cast<parameter_t>(weight_sum);
+    if (bias_gradient != nullptr) bias_gradient[feature] = static_cast<parameter_t>(bias_sum);
   }
 }
 
@@ -2865,16 +2906,21 @@ void launch_residual_add_layer_norm_forward_typed(
     torch::Tensor& mean, torch::Tensor& reciprocal_standard_deviation,
     dim3 grid, dim3 block, hipStream_t stream, int64_t row_count,
     int64_t width, float epsilon) {
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_forward_kernel<
-                         cached_values_per_lane, residual_t, update_t, summed_t>),
-      grid, block, 0, stream, residual.data_ptr<residual_t>(),
-      update.data_ptr<update_t>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
-      normalized.data_ptr<float>(), summed_residual.data_ptr<summed_t>(),
-      mean.defined() ? mean.data_ptr<float>() : nullptr,
-      reciprocal_standard_deviation.defined()
-          ? reciprocal_standard_deviation.data_ptr<float>()
-          : nullptr,
-      row_count, width, epsilon);
+  auto launch = [&](auto parameter) {
+    using parameter_t = decltype(parameter);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_forward_kernel<
+                           cached_values_per_lane, residual_t, update_t, summed_t, parameter_t>),
+        grid, block, 0, stream, residual.data_ptr<residual_t>(),
+        update.data_ptr<update_t>(), weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+        normalized.data_ptr<float>(), summed_residual.data_ptr<summed_t>(),
+        mean.defined() ? mean.data_ptr<float>() : nullptr,
+        reciprocal_standard_deviation.defined()
+            ? reciprocal_standard_deviation.data_ptr<float>()
+            : nullptr,
+        row_count, width, epsilon);
+  };
+  if (weight.scalar_type() == torch::kFloat32) launch(float{});
+  else launch(c10::BFloat16{});
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t>
@@ -2968,17 +3014,22 @@ void launch_residual_add_layer_norm_input_gradient_typed(
     torch::Tensor& affine_partials, dim3 grid, dim3 block,
     size_t shared_memory_bytes, hipStream_t stream, int64_t row_count,
     int64_t width) {
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_input_gradient_kernel<
-                         cached_values_per_lane, residual_t, update_t, summed_t>),
-      grid, block, shared_memory_bytes, stream,
-      normalized_gradient.defined() ? normalized_gradient.data_ptr<float>() : nullptr,
-      summed_gradient.defined() ? summed_gradient.data_ptr<summed_t>() : nullptr,
-      summed_residual.data_ptr<summed_t>(), weight.data_ptr<float>(),
-      mean.data_ptr<float>(), reciprocal_standard_deviation.data_ptr<float>(),
-      residual_gradient.defined() ? residual_gradient.data_ptr<residual_t>() : nullptr,
-      update_gradient.defined() ? update_gradient.data_ptr<update_t>() : nullptr,
-      affine_partials.defined() ? affine_partials.data_ptr<float>() : nullptr,
-      row_count, width);
+  auto launch = [&](auto parameter) {
+    using parameter_t = decltype(parameter);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(residual_add_layer_norm_input_gradient_kernel<
+                           cached_values_per_lane, residual_t, update_t, summed_t, parameter_t>),
+        grid, block, shared_memory_bytes, stream,
+        normalized_gradient.defined() ? normalized_gradient.data_ptr<float>() : nullptr,
+        summed_gradient.defined() ? summed_gradient.data_ptr<summed_t>() : nullptr,
+        summed_residual.data_ptr<summed_t>(), weight.data_ptr<parameter_t>(),
+        mean.data_ptr<float>(), reciprocal_standard_deviation.data_ptr<float>(),
+        residual_gradient.defined() ? residual_gradient.data_ptr<residual_t>() : nullptr,
+        update_gradient.defined() ? update_gradient.data_ptr<update_t>() : nullptr,
+        affine_partials.defined() ? affine_partials.data_ptr<float>() : nullptr,
+        row_count, width);
+  };
+  if (weight.scalar_type() == torch::kFloat32) launch(float{});
+  else launch(c10::BFloat16{});
 }
 
 template <int cached_values_per_lane, typename residual_t, typename update_t>
@@ -3216,7 +3267,7 @@ void launch_layer_norm_affine_partial_reduction_typed(
     int64_t width) {
   hipLaunchKernelGGL(HIP_KERNEL_NAME(
                          layer_norm_affine_partial_reduction_kernel<parameter_t>),
-      grid, block, 0, stream, affine_partials.data_ptr<float>(),
+      grid, block, 2 * block.x * sizeof(float), stream, affine_partials.data_ptr<float>(),
       weight_gradient.defined() ? weight_gradient.data_ptr<parameter_t>() : nullptr,
       bias_gradient.defined() ? bias_gradient.data_ptr<parameter_t>() : nullptr,
       partial_count, width);
@@ -3392,50 +3443,6 @@ bool is_grouped_indexed_attention_layout_supported(const torch::Tensor& query,
          indexed_shared_ids.size(0) == query_count && indexed_shared_ids.size(1) == indexed_tokens &&
          shared_key_values.device() == query.device() && shared_deltas.device() == query.device() &&
          indexed_deltas.device() == query.device() && indexed_shared_ids.device() == query.device();
-}
-
-bool is_mapped_grouped_indexed_attention_layout_supported(const torch::Tensor& query,
-    const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
-    const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
-    const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
-  if (!query.is_cuda() || query.dim() != 3 || shared_key_values.dim() != 3 ||
-      shared_group_indices.dim() != 1 || shared_delta_table.dim() != 2 ||
-      shared_delta_indices.dim() != 2 || indexed_deltas.dim() != 3 ||
-      indexed_shared_ids.dim() != 2 || !query.is_contiguous() ||
-      !shared_key_values.is_contiguous() || !shared_group_indices.is_contiguous() ||
-      !shared_delta_table.is_contiguous() || !shared_delta_indices.is_contiguous() ||
-      !indexed_deltas.is_contiguous() || !indexed_shared_ids.is_contiguous() ||
-      !is_fused_floating(query) || query.scalar_type() != shared_key_values.scalar_type() ||
-      query.scalar_type() != shared_delta_table.scalar_type() ||
-      query.scalar_type() != indexed_deltas.scalar_type() ||
-      shared_group_indices.scalar_type() != torch::kInt32 ||
-      shared_delta_indices.scalar_type() != torch::kInt32 ||
-      indexed_shared_ids.scalar_type() != torch::kInt32) {
-    return false;
-  }
-  const int64_t query_count = query.size(0);
-  const int64_t heads = query.size(1);
-  const int64_t key_features = query.size(2);
-  const int64_t group_count = shared_key_values.size(0);
-  const int64_t shared_tokens = shared_key_values.size(1);
-  const int64_t packed_width = shared_key_values.size(2);
-  const int64_t indexed_tokens = indexed_deltas.size(1);
-  const int64_t key_width = heads * key_features;
-  return query_count > 0 && heads > 0 && key_features > 0 && group_count > 0 &&
-         shared_tokens > 0 && shared_delta_table.size(0) > 0 && packed_width > key_width &&
-         (packed_width - key_width) % heads == 0 &&
-         shared_group_indices.size(0) == query_count &&
-         shared_delta_table.size(1) == packed_width &&
-         shared_delta_indices.size(0) == query_count &&
-         shared_delta_indices.size(1) == shared_tokens &&
-         indexed_deltas.size(0) == query_count && indexed_deltas.size(2) == packed_width &&
-         indexed_shared_ids.size(0) == query_count &&
-         indexed_shared_ids.size(1) == indexed_tokens &&
-         shared_key_values.device() == query.device() &&
-         shared_group_indices.device() == query.device() &&
-         shared_delta_table.device() == query.device() &&
-         shared_delta_indices.device() == query.device() && indexed_deltas.device() == query.device() &&
-         indexed_shared_ids.device() == query.device();
 }
 
 bool has_supported_padded_gather_index_layout(
@@ -3787,12 +3794,43 @@ bool has_supported_masked_embedding_index_layout(
           indices.scalar_type() == torch::kInt64);
 }
 
+template <typename input_t, typename parameter_t, typename converted_t, bool write_converted>
+void launch_wide_autocast_layer_norm(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, torch::Tensor& normalized,
+    torch::Tensor& converted, torch::Tensor& mean,
+    torch::Tensor& reciprocal_standard_deviation, int64_t row_count, int64_t width,
+    float epsilon, hipStream_t stream) {
+  const auto launch = [&](auto cached_values) {
+    constexpr int compiled_cached_values = decltype(cached_values)::value;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(detail::wide_autocast_layer_norm_kernel<
+                           compiled_cached_values, input_t, parameter_t, converted_t,
+                           write_converted>),
+        dim3(row_count), dim3(detail::kLayerNormWideThreadsPerBlock), 0, stream,
+        input.data_ptr<input_t>(), weight.data_ptr<parameter_t>(), bias.data_ptr<parameter_t>(),
+        normalized.data_ptr<float>(),
+        converted.defined() ? converted.data_ptr<converted_t>() : nullptr,
+        mean.defined() ? mean.data_ptr<float>() : nullptr,
+        reciprocal_standard_deviation.defined()
+            ? reciprocal_standard_deviation.data_ptr<float>() : nullptr,
+        width, epsilon);
+  };
+  if (width <= detail::kLayerNormWideThreadsPerBlock * 4) {
+    launch(std::integral_constant<int, 4>{});
+  } else if (width <= detail::kLayerNormWideThreadsPerBlock * 8) {
+    launch(std::integral_constant<int, 8>{});
+  } else if (width <= detail::kLayerNormWideThreadsPerBlock * kAutocastLayerNormCachedValuesPerLaneLimit) {
+    launch(std::integral_constant<int, kAutocastLayerNormCachedValuesPerLaneLimit>{});
+  } else {
+    launch(std::integral_constant<int, 0>{});
+  }
+}
+
 AutocastLayerNormAndCastResult launch_autocast_layer_norm(
     const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& bias,
     float epsilon, std::optional<torch::ScalarType> converted_type,
     bool capture_statistics) {
   c10::DeviceGuard device_guard(input.device());
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t row_count = input.numel() / width;
   torch::Tensor normalized = torch::empty(input.sizes(),
       input.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous));
@@ -3830,6 +3868,24 @@ AutocastLayerNormAndCastResult launch_autocast_layer_norm(
         AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
             weight.scalar_type(), "autocast_layer_norm_parameter", [&] {
               using parameter_t = scalar_t;
+              if (cached_values_per_lane > kAutocastLayerNormCachedValuesPerLaneLimit) {
+                if (converted.defined()) {
+                  if (converted.scalar_type() == torch::kFloat16) {
+                    launch_wide_autocast_layer_norm<input_t, parameter_t, c10::Half, true>(
+                        input, weight, bias, normalized, converted, mean,
+                        reciprocal_standard_deviation, row_count, width, epsilon, stream);
+                  } else {
+                    launch_wide_autocast_layer_norm<input_t, parameter_t, c10::BFloat16, true>(
+                        input, weight, bias, normalized, converted, mean,
+                        reciprocal_standard_deviation, row_count, width, epsilon, stream);
+                  }
+                } else {
+                  launch_wide_autocast_layer_norm<input_t, parameter_t, float, false>(
+                      input, weight, bias, normalized, converted, mean,
+                      reciprocal_standard_deviation, row_count, width, epsilon, stream);
+                }
+                return;
+              }
               dispatch_autocast_layer_norm_cached_values_per_lane(
                   cached_values_per_lane, [&](auto cached_values) {
                     constexpr int compiled_cached_values = decltype(cached_values)::value;
@@ -3998,19 +4054,20 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     const float query_value = lane < key_features
         ? static_cast<float>(query[query_offset + lane])
         : 0.0f;
-    float score = -std::numeric_limits<float>::infinity();
-    if (lane < key_tokens) {
-      const bool present = shared_mask[lane] != 0;
+    const bool present = lane < key_tokens && shared_mask[lane] != 0;
+    float score = 0.0f;
+    for (int feature = 0; feature < key_features; ++feature) {
+      // A masked key lane can still supply a query feature to the other lanes.
+      const float query_feature = __shfl(query_value, feature, query_group_width);
       if (present) {
-        score = 0.0f;
-        for (int feature = 0; feature < key_features; ++feature) {
-          score += __shfl(
-                       query_value, static_cast<int>(feature), query_group_width) *
-              shared_keys[feature * key_tokens + lane];
-        }
-        score = round_grouped_attention_boundary<scalar_t>(score);
-        score = round_grouped_attention_boundary<scalar_t>(score * scale);
+        score += query_feature * shared_keys[feature * key_tokens + lane];
       }
+    }
+    if (present) {
+      score = round_grouped_attention_boundary<scalar_t>(score);
+      score = round_grouped_attention_boundary<scalar_t>(score * scale);
+    } else {
+      score = -std::numeric_limits<float>::infinity();
     }
     float local_maximum = score;
     for (int offset = query_group_width / 2; offset > 0; offset /= 2) {
@@ -4019,7 +4076,6 @@ __global__ void grouped_packed_attention_kernel(const scalar_t* query,
     }
     const float maximum = __shfl(local_maximum, 0, query_group_width);
 
-    const bool present = lane < key_tokens && shared_mask[lane] != 0;
     const float weight = present ? expf(score - maximum) : 0.0f;
     float local_sum = weight;
     for (int offset = query_group_width / 2; offset > 0; offset /= 2) {
@@ -4437,7 +4493,7 @@ bool supports_mapped_grouped_indexed_attention_forward(const torch::Tensor& quer
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
-  if (!is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
+  if (!detail::is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids)) {
     return false;
@@ -4455,7 +4511,7 @@ bool supports_mapped_grouped_indexed_attention_backward(const torch::Tensor& que
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_group_indices,
     const torch::Tensor& shared_delta_table, const torch::Tensor& shared_delta_indices,
     const torch::Tensor& indexed_deltas, const torch::Tensor& indexed_shared_ids) {
-  if (!is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
+  if (!detail::is_mapped_grouped_indexed_attention_layout_supported(query, shared_key_values,
           shared_group_indices, shared_delta_table, shared_delta_indices, indexed_deltas,
           indexed_shared_ids)) {
     return false;
@@ -4546,8 +4602,9 @@ bool supports_residual_add_layer_norm(const torch::Tensor& residual,
       weight.size(0) != residual.size(-1) || bias.sizes() != weight.sizes() ||
       !is_fused_floating(residual) || !is_fused_floating(update) ||
       summed_type != at::result_type(residual, update) ||
-      !is_fused_floating_type(summed_type) || weight.scalar_type() != torch::kFloat32 ||
-      bias.scalar_type() != torch::kFloat32 || normalized_type != torch::kFloat32 ||
+      !is_fused_floating_type(summed_type) ||
+      (weight.scalar_type() != torch::kFloat32 && weight.scalar_type() != torch::kBFloat16) ||
+      bias.scalar_type() != weight.scalar_type() || normalized_type != torch::kFloat32 ||
       update.device() != residual.device() || weight.device() != residual.device() ||
       bias.device() != residual.device()) {
     return false;
@@ -4625,13 +4682,28 @@ torch::Tensor add_masked_embedding_residual_to_owned_tokens(torch::Tensor& token
     arguments.index_types[index] = padded_batch_gather_index_type(stored_indices[index]);
   }
 
+  const bool grouped_rows = arguments.width <= kMaskedEmbeddingMaximumGroupedWidth &&
+      row_count >= kMaskedEmbeddingMinimumGroupedRows;
+  const int groups_per_block = grouped_rows
+      ? kMaskedEmbeddingThreadsPerBlock / kMaskedEmbeddingGroupWidth
+      : 1;
+  const int64_t required_blocks = (row_count - 1) / groups_per_block + 1;
   const uint32_t block_count =
-      static_cast<uint32_t>(std::min<int64_t>(row_count, 65535));
+      static_cast<uint32_t>(std::min<int64_t>(required_blocks, 65535));
   const hipStream_t stream = c10::hip::getCurrentHIPStream(tokens.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, tokens.scalar_type(), "masked_embedding_residual_to_owned_tokens", [&] {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<scalar_t>),
-            dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+        if (grouped_rows) {
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<
+                  kMaskedEmbeddingGroupWidth, scalar_t>),
+              dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+        } else {
+          hipLaunchKernelGGL(
+              HIP_KERNEL_NAME(masked_embedding_residual_to_owned_tokens_kernel<
+                  kMaskedEmbeddingThreadsPerBlock, scalar_t>),
+              dim3(block_count), dim3(kMaskedEmbeddingThreadsPerBlock), 0, stream, arguments);
+        }
       });
   check_hip_kernel_launch("masked embedding residual to owned tokens");
   return converted_valid_mask;
@@ -4710,22 +4782,36 @@ void add_bias_and_broadcast_residual_to_owned_and_silu(
 
 bool supports_autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, at::IntArrayRef normalized_shape) {
-  if (!input.is_cuda() || !input.is_contiguous() || input.dim() < 1 || input.size(-1) <= 0 ||
-      normalized_shape.size() != 1 || normalized_shape[0] != input.size(-1) ||
-      !weight.defined() || !bias.defined() || !weight.is_contiguous() || !bias.is_contiguous() ||
-      weight.dim() != 1 || weight.size(0) != input.size(-1) || bias.sizes() != weight.sizes() ||
-      (input.scalar_type() != torch::kFloat16 && input.scalar_type() != torch::kBFloat16) ||
-      !is_fused_floating(weight) ||
-      bias.scalar_type() != weight.scalar_type() || weight.device() != input.device() ||
-      bias.device() != input.device()) {
+  if (!detail::is_autocast_layer_norm_layout_supported(input, weight, bias, normalized_shape) ||
+      weight.numel() > std::numeric_limits<int>::max()) {
     return false;
   }
   const auto& properties = device_properties(input.get_device());
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t cached_values_per_lane =
       (width + properties.warpSize - 1) / properties.warpSize;
   if (cached_values_per_lane > kAutocastLayerNormCachedValuesPerLaneLimit) {
-    return false;
+    // The custom backward uses wave-local caches. Wider training calls retain ATen autograd.
+    if (at::GradMode::is_enabled() &&
+        (input.requires_grad() || weight.requires_grad() || bias.requires_grad())) {
+      return false;
+    }
+    const int64_t row_count = input.numel() / width;
+    const bool streaming = width > detail::kLayerNormWideThreadsPerBlock *
+        kAutocastLayerNormCachedValuesPerLaneLimit;
+    const bool aligned_affine = weight.scalar_type() != torch::kFloat32 ||
+        (reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % (4 * sizeof(float)) == 0 &&
+            reinterpret_cast<std::uintptr_t>(bias.data_ptr()) % (4 * sizeof(float)) == 0);
+    const int64_t minimum_blocks_per_processor = std::max(1,
+        properties.maxThreadsPerMultiProcessor / (2 * detail::kLayerNormWideThreadsPerBlock));
+    // Prefer ATen's vectorized path when streaming cannot fill half the thread capacity.
+    // Autocast allocates aligned FP32 input and low-precision affine conversions.
+    if (streaming && width % 4 == 0 && aligned_affine && row_count > 0 &&
+        row_count < minimum_blocks_per_processor * properties.multiProcessorCount) {
+      return false;
+    }
+    return row_count <= static_cast<int64_t>(properties.maxGridSize[0]) &&
+        detail::kLayerNormWideThreadsPerBlock <= properties.maxThreadsPerBlock;
   }
   const int threads_per_block = configured_threads_per_block(properties,
       rocm_kernel_launch_config().residual_add_layer_norm_threads_per_block,
@@ -4755,10 +4841,7 @@ bool supports_fused_adam_update(const torch::Tensor& weight, const torch::Tensor
 
 bool supports_masked_categorical(
     const torch::Tensor& logits, const torch::Tensor& mask, int64_t axis) {
-  return logits.is_cuda() && logits.is_contiguous() && mask.is_contiguous() &&
-         is_fused_floating(logits) && mask.scalar_type() == torch::kBool &&
-         mask.sizes() == logits.sizes() && mask.device() == logits.device() && logits.dim() > 0 &&
-         logits.size(-1) > 0 && axis == logits.dim() - 1;
+  return detail::is_masked_categorical_layout_supported(logits, mask, axis);
 }
 
 bool supports_embedding_with_offsets(const torch::Tensor& raw_ids,
@@ -5101,12 +5184,12 @@ torch::Tensor masked_softmax_forward(const torch::Tensor& logits, const torch::T
             hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_subwave_kernel<
                                    compiled_subwave_width, scalar_t, true>),
                 dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
-                mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+                mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width, nullptr);
           });
         } else {
           hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, true>),
               dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
-              mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+              mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width, nullptr);
         }
       });
   check_hip_kernel_launch("masked_softmax");
@@ -5342,7 +5425,8 @@ torch::Tensor masked_softmax_backward(const torch::Tensor& gradient_output,
   return gradient_input;
 }
 
-torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torch::Tensor& mask) {
+torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits,
+    const torch::Tensor& mask, torch::Tensor* normalization) {
   TORCH_CHECK(supports_masked_categorical(logits, mask, logits.dim() - 1),
       "masked log-sum-exp received an unsupported ROCm tensor layout");
   c10::DeviceGuard device_guard(logits.device());
@@ -5351,6 +5435,11 @@ torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torc
   auto output = torch::empty(output_shape, logits.options().dtype(torch::kFloat32));
   const int64_t width = logits.size(-1);
   const int64_t row_count = logits.numel() / width;
+  if (normalization != nullptr) {
+    *normalization = torch::empty({row_count, 2}, logits.options().dtype(torch::kFloat32));
+  }
+  float* normalization_data =
+      normalization == nullptr ? nullptr : normalization->data_ptr<float>();
   if (row_count == 0) {
     return output;
   }
@@ -5372,12 +5461,12 @@ torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torc
             hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_subwave_kernel<
                                    compiled_subwave_width, scalar_t, false>),
                 dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
-                mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+                mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width, normalization_data);
           });
         } else {
           hipLaunchKernelGGL(HIP_KERNEL_NAME(masked_categorical_forward_kernel<scalar_t, false>),
               dim3(blocks), dim3(threads_per_block), 0, stream, logits.data_ptr<scalar_t>(),
-              mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width);
+              mask.data_ptr<bool>(), output.data_ptr<float>(), row_count, width, normalization_data);
         }
       });
   check_hip_kernel_launch("masked_log_sum_exp");
@@ -5385,7 +5474,7 @@ torch::Tensor masked_log_sum_exp_forward(const torch::Tensor& logits, const torc
 }
 
 torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,
-    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& normalizers) {
+    const torch::Tensor& logits, const torch::Tensor& mask, const torch::Tensor& normalization) {
   c10::DeviceGuard device_guard(logits.device());
   auto contiguous_gradient = gradient_output.to(torch::kFloat32).contiguous();
   auto gradient_input = torch::empty_like(logits);
@@ -5408,7 +5497,7 @@ torch::Tensor masked_log_sum_exp_backward(const torch::Tensor& gradient_output,
       torch::kHalf, torch::kBFloat16, logits.scalar_type(), "masked_log_sum_exp_backward", [&] {
         hipLaunchKernelGGL(masked_log_sum_exp_backward_kernel<scalar_t>, dim3(blocks),
             dim3(threads_per_block), 0, stream, contiguous_gradient.data_ptr<float>(),
-            logits.data_ptr<scalar_t>(), mask.data_ptr<bool>(), normalizers.data_ptr<float>(),
+            logits.data_ptr<scalar_t>(), mask.data_ptr<bool>(), normalization.data_ptr<float>(),
             gradient_input.data_ptr<scalar_t>(), row_count, width);
       });
   check_hip_kernel_launch("masked_log_sum_exp_backward");
@@ -5996,7 +6085,7 @@ GroupedPackedAttentionGradients grouped_packed_attention_backward(const torch::T
 
 GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
-    const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, float scale, bool capture_log_sum_exp) {
+    const torch::Tensor& indexed_shared_ids, int64_t queries_per_group, float scale, bool capture_probabilities) {
   TORCH_CHECK(query.is_cuda(), "grouped indexed attention requires a ROCm tensor");
   TORCH_CHECK(query.dim() == 3, "query must be rank 3");
   TORCH_CHECK(shared_key_values.dim() == 3, "shared key/value data must be rank 3");
@@ -6039,11 +6128,12 @@ GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const tor
   c10::DeviceGuard device_guard(query.device());
   torch::Tensor output = torch::empty(
       {query_count, heads, value_features}, query.options().memory_format(torch::MemoryFormat::Contiguous));
-  torch::Tensor log_sum_exp = capture_log_sum_exp
-                                  ? torch::empty({query_count, heads}, query.options().dtype(torch::kFloat32))
-                                  : torch::Tensor();
+  torch::Tensor probabilities = capture_probabilities
+      ? torch::empty({query_count, heads, shared_tokens + indexed_tokens},
+            query.options().dtype(torch::kFloat32).memory_format(torch::MemoryFormat::Contiguous))
+      : torch::Tensor();
   if (query_count == 0) {
-    return {output, log_sum_exp};
+    return {output, probabilities};
   }
   const int64_t query_head_count = query_count * heads;
   const auto launch_plan = grouped_indexed_attention_launch_plan(
@@ -6074,7 +6164,7 @@ GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const tor
                           shared_deltas.is_contiguous() && indexed_deltas.is_contiguous() &&
                           indexed_shared_ids.is_contiguous();
   const hipStream_t stream = c10::hip::getCurrentHIPStream(query.get_device()).stream();
-  float* log_sum_exp_data = capture_log_sum_exp ? log_sum_exp.data_ptr<float>() : nullptr;
+  float* probability_data = capture_probabilities ? probabilities.data_ptr<float>() : nullptr;
   AT_DISPATCH_FLOATING_TYPES_AND2(
       torch::kHalf, torch::kBFloat16, query.scalar_type(), "grouped_indexed_attention", [&] {
         if (indexed_shared_ids.scalar_type() == torch::kInt32) {
@@ -6082,29 +6172,29 @@ GroupedIndexedAttentionForwardResult grouped_indexed_attention_forward(const tor
             launch_grouped_indexed_attention<scalar_t, int32_t, true>(query, shared_key_values,
                 shared_deltas, indexed_deltas, indexed_shared_ids, output, launch_plan->grid_size,
                 launch_plan->block_threads, launch_plan->shared_memory_bytes, stream,
-                query_head_count, layout, scale, log_sum_exp_data);
+                query_head_count, layout, scale, probability_data);
           } else {
             launch_grouped_indexed_attention<scalar_t, int32_t, false>(query, shared_key_values,
                 shared_deltas, indexed_deltas, indexed_shared_ids, output, launch_plan->grid_size,
                 launch_plan->block_threads, launch_plan->shared_memory_bytes, stream,
-                query_head_count, layout, scale, log_sum_exp_data);
+                query_head_count, layout, scale, probability_data);
           }
         } else {
           if (contiguous) {
             launch_grouped_indexed_attention<scalar_t, int64_t, true>(query, shared_key_values,
                 shared_deltas, indexed_deltas, indexed_shared_ids, output, launch_plan->grid_size,
                 launch_plan->block_threads, launch_plan->shared_memory_bytes, stream,
-                query_head_count, layout, scale, log_sum_exp_data);
+                query_head_count, layout, scale, probability_data);
           } else {
             launch_grouped_indexed_attention<scalar_t, int64_t, false>(query, shared_key_values,
                 shared_deltas, indexed_deltas, indexed_shared_ids, output, launch_plan->grid_size,
                 launch_plan->block_threads, launch_plan->shared_memory_bytes, stream,
-                query_head_count, layout, scale, log_sum_exp_data);
+                query_head_count, layout, scale, probability_data);
           }
         }
       });
   check_hip_kernel_launch("grouped_indexed_attention");
-  return {output, log_sum_exp};
+  return {output, probabilities};
 }
 
 MappedGroupedIndexedAttentionForwardResult mapped_grouped_indexed_attention_forward(const torch::Tensor& query,
@@ -6193,9 +6283,17 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
       needs_shared_key_value_gradient
           ? torch::zeros(shared_key_values.sizes(), gradient_options.dtype(torch::kFloat32))
           : torch::Tensor();
+  const int64_t delta_gradient_elements = shared_delta_table.numel();
+  constexpr int64_t maximum_delta_gradient_bytes = 32 * 1024 * 1024;
+  const int64_t delta_gradient_shards = needs_shared_delta_table_gradient
+      ? std::max<int64_t>(1, std::min<int64_t>({32, (query_count + 255) / 256,
+            maximum_delta_gradient_bytes /
+                (delta_gradient_elements * static_cast<int64_t>(sizeof(float)))}))
+      : 1;
   torch::Tensor shared_delta_table_accumulator =
       needs_shared_delta_table_gradient
-          ? torch::zeros(shared_delta_table.sizes(), gradient_options.dtype(torch::kFloat32))
+          ? torch::zeros({delta_gradient_shards, shared_delta_table.size(0), packed_width},
+                gradient_options.dtype(torch::kFloat32))
           : torch::Tensor();
   torch::Tensor indexed_delta_gradient =
       needs_indexed_delta_gradient ? torch::empty(indexed_deltas.sizes(), gradient_options)
@@ -6230,7 +6328,7 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
                 ? shared_delta_table_accumulator.data_ptr<float>()
                 : nullptr,
             needs_indexed_delta_gradient ? indexed_delta_gradient.data_ptr<scalar_t>() : nullptr,
-            query_head_count, layout, scale);
+            query_head_count, delta_gradient_shards, delta_gradient_elements, layout, scale);
       });
   check_hip_kernel_launch("mapped_grouped_indexed_attention_backward");
   torch::Tensor shared_key_value_gradient =
@@ -6239,7 +6337,9 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
           : torch::Tensor();
   torch::Tensor shared_delta_table_gradient =
       needs_shared_delta_table_gradient
-          ? shared_delta_table_accumulator.to(query.scalar_type())
+          ? (delta_gradient_shards == 1 ? shared_delta_table_accumulator.select(0, 0)
+                                       : shared_delta_table_accumulator.sum(0))
+                .to(query.scalar_type())
           : torch::Tensor();
   return {query_gradient, shared_key_value_gradient, shared_delta_table_gradient,
       indexed_delta_gradient};
@@ -6247,7 +6347,7 @@ MappedGroupedIndexedAttentionGradients mapped_grouped_indexed_attention_backward
 
 GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch::Tensor& query,
     const torch::Tensor& shared_key_values, const torch::Tensor& shared_deltas, const torch::Tensor& indexed_deltas,
-    const torch::Tensor& indexed_shared_ids, const torch::Tensor& log_sum_exp,
+    const torch::Tensor& indexed_shared_ids, const torch::Tensor& probabilities,
     const torch::Tensor& gradient_output, int64_t queries_per_group, float scale, bool needs_query_gradient,
     bool needs_shared_key_value_gradient, bool needs_shared_delta_gradient,
     bool needs_indexed_delta_gradient) {
@@ -6263,13 +6363,14 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
   TORCH_CHECK(gradient_output.dim() == 3 && gradient_output.size(0) == query_count &&
                   gradient_output.size(1) == heads && gradient_output.size(2) == value_features,
       "grouped indexed attention output gradient shape mismatch");
-  TORCH_CHECK(log_sum_exp.dim() == 2 && log_sum_exp.size(0) == query_count &&
-                  log_sum_exp.size(1) == heads &&
-                  log_sum_exp.scalar_type() == torch::kFloat32,
-      "grouped indexed attention log-sum-exp shape or dtype mismatch");
+  TORCH_CHECK(probabilities.dim() == 3 && probabilities.size(0) == query_count &&
+                  probabilities.size(1) == heads &&
+                  probabilities.size(2) == shared_tokens + indexed_tokens &&
+                  probabilities.scalar_type() == torch::kFloat32 && probabilities.is_contiguous(),
+      "grouped indexed attention probability shape, dtype, or layout mismatch");
   TORCH_CHECK(gradient_output.scalar_type() == query.scalar_type(),
       "grouped indexed attention output gradient dtype mismatch");
-  TORCH_CHECK(gradient_output.device() == query.device() && log_sum_exp.device() == query.device(),
+  TORCH_CHECK(gradient_output.device() == query.device() && probabilities.device() == query.device(),
       "grouped indexed attention backward inputs must be on the same device");
 
   c10::DeviceGuard device_guard(query.device());
@@ -6335,7 +6436,6 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
         "grouped indexed attention shared key/value gradient launch exceeds this device's limits");
   }
 
-  const torch::Tensor contiguous_log_sum_exp = log_sum_exp.contiguous();
   const torch::Tensor contiguous_gradient_output = gradient_output.contiguous();
   const hipStream_t stream = c10::hip::getCurrentHIPStream(query.get_device()).stream();
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -6349,7 +6449,7 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
                 query_launch_plan->shared_memory_bytes, stream,
                 query.data_ptr<scalar_t>(), shared_key_values.data_ptr<scalar_t>(),
                 shared_deltas.data_ptr<scalar_t>(), indexed_deltas.data_ptr<scalar_t>(),
-                indexed_shared_ids.data_ptr<index_t>(), contiguous_log_sum_exp.data_ptr<float>(),
+                indexed_shared_ids.data_ptr<index_t>(), probabilities.data_ptr<float>(),
                 contiguous_gradient_output.data_ptr<scalar_t>(),
                 needs_query_gradient ? query_gradient.data_ptr<scalar_t>() : nullptr,
                 needs_shared_delta_workspace ? shared_delta_workspace.data_ptr<scalar_t>() : nullptr,
@@ -6362,7 +6462,7 @@ GroupedIndexedAttentionGradients grouped_indexed_attention_backward(const torch:
                 query_launch_plan->shared_memory_bytes, stream,
                 query.data_ptr<scalar_t>(), shared_key_values.data_ptr<scalar_t>(),
                 shared_deltas.data_ptr<scalar_t>(), indexed_deltas.data_ptr<scalar_t>(),
-                indexed_shared_ids.data_ptr<index_t>(), contiguous_log_sum_exp.data_ptr<float>(),
+                indexed_shared_ids.data_ptr<index_t>(), probabilities.data_ptr<float>(),
                 contiguous_gradient_output.data_ptr<scalar_t>(),
                 needs_query_gradient ? query_gradient.data_ptr<scalar_t>() : nullptr,
                 needs_shared_delta_workspace ? shared_delta_workspace.data_ptr<scalar_t>() : nullptr,
@@ -6554,9 +6654,10 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
           is_fused_floating(summed_residual),
       "residual add LayerNorm backward requires a contiguous ROCm sum");
   TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() &&
-          weight.scalar_type() == torch::kFloat32 && weight.dim() == 1 &&
+          (weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == torch::kBFloat16) &&
+          weight.dim() == 1 &&
           weight.size(0) == summed_residual.size(-1),
-      "residual add LayerNorm backward requires contiguous FP32 affine weights");
+      "residual add LayerNorm backward requires contiguous FP32 or BF16 affine weights");
   TORCH_CHECK(mean.is_cuda() && reciprocal_standard_deviation.is_cuda() &&
           mean.device() == summed_residual.device() &&
           reciprocal_standard_deviation.device() == summed_residual.device() &&
@@ -6666,7 +6767,7 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
     if (needs_affine_gradient) {
       const dim3 affine_block(threads_per_block);
       const dim3 affine_grid(
-          (width + threads_per_block - 1) / threads_per_block);
+          (width + kLayerNormAffineFeatureTile - 1) / kLayerNormAffineFeatureTile);
       launch_layer_norm_affine_partial_reduction(affine_partials,
           weight_gradient, bias_gradient, affine_grid, affine_block, stream,
           partial_count, width);
@@ -6679,8 +6780,7 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
 
 torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, float epsilon) {
-  const int64_t width = input.size(-1);
-  TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, at::IntArrayRef(&width, 1)),
+  TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, weight.sizes()),
       "autocast LayerNorm received an unsupported ROCm tensor layout");
   return launch_autocast_layer_norm(
       input, weight, bias, epsilon, std::nullopt, false).normalized;
@@ -6689,9 +6789,8 @@ torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tenso
 AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,
     const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
     torch::ScalarType converted_type, bool capture_statistics) {
-  const int64_t width = input.size(-1);
   TORCH_CHECK(supports_autocast_layer_norm_and_cast(
-                  input, weight, bias, at::IntArrayRef(&width, 1), converted_type),
+                  input, weight, bias, weight.sizes(), converted_type),
       "autocast LayerNorm and cast received an unsupported ROCm tensor layout");
   return launch_autocast_layer_norm(
       input, weight, bias, epsilon, converted_type, capture_statistics);
@@ -6710,10 +6809,12 @@ AutocastLayerNormAndCastGradients autocast_layer_norm_and_cast_backward(
               input.scalar_type() == torch::kBFloat16),
       "autocast LayerNorm backward input is incompatible");
   TORCH_CHECK(weight.is_cuda() && weight.device() == input.device() &&
-          weight.is_contiguous() && weight.dim() == 1 &&
-          weight.size(0) == input.size(-1) && is_fused_floating(weight),
+          weight.is_contiguous() && weight.dim() >= 1 && weight.numel() > 0 &&
+          input.dim() >= weight.dim() &&
+          input.sizes().slice(input.dim() - weight.dim()) == weight.sizes() &&
+          is_fused_floating(weight),
       "autocast LayerNorm backward weight is incompatible");
-  const int64_t width = input.size(-1);
+  const int64_t width = weight.numel();
   const int64_t row_count = input.numel() / width;
   TORCH_CHECK(mean.is_cuda() && mean.device() == input.device() &&
           mean.is_contiguous() && mean.scalar_type() == torch::kFloat32 &&
@@ -6812,7 +6913,7 @@ AutocastLayerNormAndCastGradients autocast_layer_norm_and_cast_backward(
   if (needs_affine_gradient) {
     const dim3 affine_block(threads_per_block);
     const dim3 affine_grid(
-        (width + threads_per_block - 1) / threads_per_block);
+        (width + kLayerNormAffineFeatureTile - 1) / kLayerNormAffineFeatureTile);
     launch_layer_norm_affine_partial_reduction(affine_partials,
         weight_gradient, bias_gradient, affine_grid, affine_block, stream,
         partial_count, width);

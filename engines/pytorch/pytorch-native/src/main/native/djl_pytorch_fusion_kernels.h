@@ -28,6 +28,13 @@ inline constexpr int32_t kMaximumAffinePrefixRank = 8;
 inline constexpr int32_t kMaximumIndexedAffineSources = 32;
 inline constexpr int32_t kMaximumIndexedAffineOutputWidth = 32;
 inline constexpr int32_t kMaximumIndexedLocalTransformerSegments = 8;
+// Portable per-block budgets avoid requiring backend-specific shared-memory opt-in.
+inline constexpr int64_t kFusionAttentionSharedMemoryBytes = 48 * 1024;
+inline constexpr int64_t kSingleQueryReadoutSharedMemoryReserve = 32;
+
+inline bool UsesIndexedLocalAttentionInPlace(int64_t token_count, int64_t attention_heads, int64_t attention_width) {
+  return token_count > 0 && token_count <= 32 && attention_heads == 4 && attention_width == 64;
+}
 
 class FusionMatmulPlan;
 class FusionMatmulWorkspace;
@@ -288,7 +295,7 @@ void LaunchIndexedLocalTransformerGatherNormalizeSegments(
 
 void LaunchIndexedLocalTransformerAttention(torch::Tensor& query_key_value, const torch::Tensor& indices,
     torch::ScalarType index_data_type, int64_t active_rows, int64_t dense_rows, int64_t token_count,
-    int64_t attention_heads, int64_t attention_width);
+    int64_t attention_heads, int64_t attention_width, torch::Tensor* context);
 
 void LaunchIndexedLocalTransformerResidualLayerNorm(torch::Tensor& output, const torch::Tensor& update,
     const torch::Tensor& update_bias, const torch::Tensor& indices, torch::ScalarType index_data_type,

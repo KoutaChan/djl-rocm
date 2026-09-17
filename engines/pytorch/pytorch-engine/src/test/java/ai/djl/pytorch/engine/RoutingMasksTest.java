@@ -19,11 +19,12 @@ import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.pytorch.jni.JniUtils;
 
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
-/** Verifies portable and ROCm routing-mask semantics. */
+/** Verifies portable and native routing-mask semantics. */
 public class RoutingMasksTest {
 
     /** Verifies field selection, category sets, and mask propagation. */
@@ -55,6 +56,156 @@ public class RoutingMasksTest {
                     verifyBinaryChoiceMasks(engine, Device.gpu(), indexType, maskType);
                 }
             }
+        }
+    }
+
+    @Test
+    public void categoricalRulesPreserveIntegerBoundsAndNonFiniteMasks() {
+        Engine engine = Engine.getInstance();
+        for (DataType maskType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (boolean strided : new boolean[] {false, true}) {
+                verifyCategoricalBounds(engine, Device.cpu(), maskType, strided);
+                if (hasCudaBackend(engine)) {
+                    verifyCategoricalBounds(engine, Device.gpu(), maskType, strided);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void categoricalRuleCountsBeyondNativeLimitUsePortableSemantics() {
+        Engine engine = Engine.getInstance();
+        verifyManyCategoricalRules(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyManyCategoricalRules(engine, Device.gpu());
+        }
+    }
+
+    @Test
+    public void binaryChoiceMasksPreserveLongPaddingAndNonFiniteArithmetic() {
+        Engine engine = Engine.getInstance();
+        for (DataType maskType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (boolean strided : new boolean[] {false, true}) {
+                float[] expected = binaryBoundaryResult(engine, Device.cpu(), maskType, strided);
+                if (hasCudaBackend(engine)) {
+                    float[] actual = binaryBoundaryResult(engine, Device.gpu(), maskType, strided);
+                    assertClose(actual, expected, 0f);
+                }
+            }
+        }
+    }
+
+    private static void verifyCategoricalBounds(
+            Engine engine, Device device, DataType maskType, boolean strided) {
+        long[] categories = {
+            -1L,
+            0L,
+            63L,
+            64L,
+            Long.MIN_VALUE,
+            Long.MAX_VALUE,
+            1L,
+            62L,
+            63L,
+            64L,
+            -1L,
+            0L,
+            1L,
+            62L,
+            Long.MAX_VALUE,
+            Long.MIN_VALUE
+        };
+        float[] masks = {
+            1f, 0.5f, -0.25f, 2f, Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, -0f
+        };
+        int[] fields = {0, 1, 0, 1};
+        long[] sets = {1L | Long.MIN_VALUE, -1L, 0L, Long.MIN_VALUE};
+        float[] expected = new float[masks.length * fields.length];
+        for (int row = 0; row < masks.length; ++row) {
+            for (int rule = 0; rule < fields.length; ++rule) {
+                long category = categories[fields[rule] * masks.length + row];
+                boolean selected =
+                        category >= 0 && category < 64 && (sets[rule] & (1L << category)) != 0;
+                expected[row * fields.length + rule] = (selected ? 1f : 0f) * masks[row];
+            }
+        }
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray metadata =
+                    manager.create(categories, new Shape(2, masks.length)).transpose(1, 0);
+            if (!strided) {
+                metadata = metadata.reshape(-1).reshape(masks.length, 2);
+            }
+            NDArray mask = manager.create(masks).toType(maskType, false);
+            if (strided) {
+                mask = mask.expandDims(1).repeat(1, 2).get(":,0");
+            }
+            NDArray actual = NDArrays.categoricalMasks(metadata, mask, fields, sets);
+            Assert.assertEquals(actual.getDataType(), maskType);
+            Assert.assertEquals(actual.getShape(), new Shape(masks.length, fields.length));
+            assertClose(actual.toType(DataType.FLOAT32, false).toFloatArray(), expected, 0f);
+        }
+    }
+
+    private static void verifyManyCategoricalRules(Engine engine, Device device) {
+        int[] fields = new int[65];
+        long[] sets = new long[fields.length];
+        float[] expected = new float[3 * fields.length];
+        for (int rule = 0; rule < fields.length; ++rule) {
+            sets[rule] = rule % 2 == 0 ? 1L : Long.MIN_VALUE;
+            expected[rule] = rule % 2 == 0 ? 1f : 0f;
+            expected[fields.length + rule] = rule % 2 == 0 ? 0f : 1f;
+        }
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray categories = manager.create(new long[] {0L, 63L, 64L}, new Shape(3, 1));
+            NDArray result =
+                    NDArrays.categoricalMasks(categories, manager.ones(new Shape(3)), fields, sets);
+            assertClose(result.toFloatArray(), expected, 0f);
+        }
+    }
+
+    private static float[] binaryBoundaryResult(
+            Engine engine, Device device, DataType maskType, boolean strided) {
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray routes =
+                    manager.create(
+                                    new long[] {
+                                        Long.MIN_VALUE, Long.MAX_VALUE, 0L, Long.MIN_VALUE,
+                                        Long.MIN_VALUE, Long.MIN_VALUE, Long.MAX_VALUE,
+                                                Long.MIN_VALUE,
+                                        Long.MAX_VALUE, Long.MIN_VALUE, Long.MIN_VALUE,
+                                                Long.MIN_VALUE
+                                    },
+                                    new Shape(3, 4))
+                            .transpose(1, 0);
+            if (!strided) {
+                routes = routes.reshape(-1).reshape(4, 3);
+            }
+            NDArray masks =
+                    manager.create(
+                                    new float[] {
+                                        0.1f,
+                                        0.2f,
+                                        -1f,
+                                        Float.NaN,
+                                        1f,
+                                        -1f,
+                                        Float.POSITIVE_INFINITY,
+                                        Float.NEGATIVE_INFINITY,
+                                        -1f,
+                                        65504f,
+                                        65504f,
+                                        -1f
+                                    },
+                                    new Shape(4, 3))
+                            .toType(maskType, false);
+            NDArray result =
+                    NDArrays.binaryChoiceMasks(
+                            routes, masks.get(":,0"), masks.get(":,1"), 0, 1, 2, Long.MIN_VALUE);
+            Assert.assertEquals(result.getDataType(), maskType);
+            Assert.assertEquals(result.getShape(), new Shape(4, 4));
+            return result.toType(DataType.FLOAT32, false).toFloatArray();
         }
     }
 
@@ -128,10 +279,21 @@ public class RoutingMasksTest {
         }
     }
 
+    private static boolean hasCudaBackend(Engine engine) {
+        // Fusion reports the native build backend: CUDA = 1, ROCm = 2.
+        return engine.getGpuCount() > 0 && JniUtils.getFusionBackend() == 1;
+    }
+
     private static void assertClose(float[] actual, float[] expected, float tolerance) {
         Assert.assertEquals(actual.length, expected.length);
         for (int index = 0; index < actual.length; ++index) {
-            Assert.assertEquals(actual[index], expected[index], tolerance, "index=" + index);
+            if (Float.isNaN(expected[index])) {
+                Assert.assertTrue(Float.isNaN(actual[index]), "index=" + index);
+            } else if (Float.isInfinite(expected[index])) {
+                Assert.assertEquals(actual[index], expected[index], "index=" + index);
+            } else {
+                Assert.assertEquals(actual[index], expected[index], tolerance, "index=" + index);
+            }
         }
     }
 }

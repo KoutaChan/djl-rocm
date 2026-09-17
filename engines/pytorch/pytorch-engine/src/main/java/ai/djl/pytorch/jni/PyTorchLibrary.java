@@ -344,6 +344,16 @@ final class PyTorchLibrary {
     native long torchGroupedPackedScaledDotProductAttention(
             long query, long packedKeyValue, long mask, long heads, float scale);
 
+    native long torchPackedRelationScaledDotProductAttention(
+            long query,
+            long packedKeyValue,
+            long mask,
+            long packedCodes,
+            long relationTable,
+            long heads,
+            long entriesPerSegment,
+            float scale);
+
     native long torchGroupedIndexedScaledDotProductAttention(
             long query,
             long sharedKeyValues,
@@ -1007,6 +1017,12 @@ final class PyTorchLibrary {
     native boolean iValueIsMap(long iValueHandle);
 
     native void zeroGrad(long handle);
+
+    native long torchCreateTensorCopyPlan(long[] sources, long[] destinations);
+
+    native void torchTensorCopyPlanCopy(long handle);
+
+    native void torchDeleteTensorCopyPlan(long handle);
 
     native boolean torchUnscaleGradientsAndCheckFinite(long[] gradientHandles, float inverseScale);
 

@@ -19,6 +19,7 @@ import ai.djl.ndarray.NDArrays;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.pytorch.jni.JniUtils;
 import ai.djl.training.GradientCollector;
 
 import org.testng.Assert;
@@ -117,6 +118,68 @@ public class PaddedBatchGatherTest {
     }
 
     @Test
+    public void cudaGatherVariantsPreserveClampedNonFiniteValuesAndSignedZero() {
+        Engine engine = Engine.getInstance();
+        // Fusion reports the native build backend: CUDA = 1, ROCm = 2.
+        if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
+            return;
+        }
+        for (DataType dataType :
+                new DataType[] {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}) {
+            for (DataType indexType :
+                    new DataType[] {DataType.INT16, DataType.INT32, DataType.INT64}) {
+                for (String indexLayout : new String[] {"contiguous", "strided", "broadcast"}) {
+                    for (boolean sourceView : new boolean[] {false, true}) {
+                        float[][] expected =
+                                gatherBoundaryResults(
+                                        engine,
+                                        Device.cpu(),
+                                        dataType,
+                                        indexType,
+                                        indexLayout,
+                                        sourceView);
+                        float[][] actual =
+                                gatherBoundaryResults(
+                                        engine,
+                                        Device.gpu(),
+                                        dataType,
+                                        indexType,
+                                        indexLayout,
+                                        sourceView);
+                        for (int variant = 0; variant < expected.length; ++variant) {
+                            Assert.assertEquals(actual[variant].length, expected[variant].length);
+                            for (int index = 0; index < expected[variant].length; ++index) {
+                                float value = actual[variant][index];
+                                float reference = expected[variant][index];
+                                String context =
+                                        dataType
+                                                + "/"
+                                                + indexType
+                                                + "/"
+                                                + indexLayout
+                                                + "/sourceView="
+                                                + sourceView
+                                                + "/variant="
+                                                + variant
+                                                + "/index="
+                                                + index;
+                                if (Float.isNaN(reference)) {
+                                    Assert.assertTrue(Float.isNaN(value), context);
+                                } else {
+                                    Assert.assertEquals(
+                                            Float.floatToRawIntBits(value),
+                                            Float.floatToRawIntBits(reference),
+                                            context);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     public void sourceGradientsAccumulateRepeatedRowsAcrossVariantsAndDtypes() {
         Engine engine = Engine.getInstance();
         verifySourceGradients(engine, Device.cpu(), DataType.FLOAT32, false);
@@ -138,6 +201,85 @@ public class PaddedBatchGatherTest {
                 verifyEmptyGradient(engine, Device.gpu(), dataType);
             }
         }
+    }
+
+    private static float[][] gatherBoundaryResults(
+            Engine engine,
+            Device device,
+            DataType dataType,
+            DataType indexType,
+            String indexLayout,
+            boolean sourceView) {
+        float[] values = {
+            Float.NaN,
+            Float.POSITIVE_INFINITY,
+            -0f,
+            -2f,
+            Float.NEGATIVE_INFINITY,
+            0f,
+            10f,
+            -3f,
+            Float.NaN,
+            -0f,
+            4f,
+            Float.POSITIVE_INFINITY
+        };
+        try (NDManager manager = engine.newBaseManager(device)) {
+            NDArray source =
+                    manager.create(values, new Shape(2, 2, 3))
+                            .toType(dataType, false)
+                            .transpose(0, 2, 1);
+            NDArray pairSource =
+                    manager.create(values, new Shape(2, 2, 3))
+                            .toType(dataType, false)
+                            .expandDims(-1)
+                            .repeat(3, 2)
+                            .transpose(0, 2, 1, 3);
+            if (!sourceView) {
+                source = source.reshape(-1).reshape(2, 3, 2);
+                pairSource = pairSource.reshape(-1).reshape(2, 3, 2, 2);
+            }
+            NDArray outer =
+                    boundaryIndices(
+                            manager,
+                            new int[] {0, 1, 3, 4, -1, 2, Short.MIN_VALUE, Short.MAX_VALUE},
+                            indexType,
+                            indexLayout);
+            NDArray inner =
+                    boundaryIndices(
+                            manager, new int[] {1, 2, 1, 2, 1, 0, 2, 1}, indexType, indexLayout);
+            NDArray batches =
+                    boundaryIndices(
+                            manager,
+                            new int[] {0, 1, 1, -1, 2, 0, 1, 0},
+                            DataType.INT64,
+                            indexLayout);
+            NDArray[] results = {
+                NDArrays.paddedBatchGather(source, outer),
+                NDArrays.paddedBatchGather(pairSource, outer, inner),
+                NDArrays.paddedBatchGatherByBatchIndices(source, batches, outer)
+            };
+            float[][] data = new float[results.length][];
+            for (int index = 0; index < results.length; ++index) {
+                Assert.assertEquals(results[index].getShape(), new Shape(2, 8, 2));
+                Assert.assertEquals(results[index].getDataType(), dataType);
+                data[index] = results[index].toType(DataType.FLOAT32, false).toFloatArray();
+            }
+            return data;
+        }
+    }
+
+    private static NDArray boundaryIndices(
+            NDManager manager, int[] values, DataType dataType, String layout) {
+        NDArray indices =
+                manager.create(values, new Shape(1, values.length)).toType(dataType, false);
+        if ("broadcast".equals(layout)) {
+            return indices.broadcast(2, values.length);
+        }
+        indices = indices.repeat(0, 2);
+        return "strided".equals(layout)
+                ? indices.expandDims(-1).repeat(2, 2).get("...,0")
+                : indices;
     }
 
     private static void verifySourceGradients(
@@ -192,6 +334,19 @@ public class PaddedBatchGatherTest {
             assertClose(
                     source.getGradient().toType(DataType.FLOAT32, false).toFloatArray(),
                     new float[] {0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f});
+
+            NDArray detached = source.stopGradient();
+            NDArray[] forwardResults = {
+                NDArrays.paddedBatchGather(detached, storedIndices),
+                NDArrays.paddedBatchGather(
+                        detached.reshape(2, 3, 1, 2), storedIndices, storedIndices),
+                NDArrays.paddedBatchGatherByBatchIndices(detached, storedIndices, storedIndices)
+            };
+            for (NDArray result : forwardResults) {
+                Assert.assertEquals(result.getShape(), new Shape(2, 0, 2));
+                Assert.assertEquals(result.getDataType(), dataType);
+                Assert.assertEquals(result.size(), 0L);
+            }
         }
     }
 

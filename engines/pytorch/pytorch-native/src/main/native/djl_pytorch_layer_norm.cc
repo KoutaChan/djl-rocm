@@ -16,11 +16,29 @@
 #include <ATen/autocast_mode.h>
 #include <torch/csrc/autograd/custom_function.h>
 
-#if defined(DJL_USE_ROCM_KERNELS)
-#include "djl_pytorch_rocm_kernels.h"
-#endif
+#include "djl_pytorch_kernel_backend.h"
 
 namespace djl::pytorch {
+namespace detail {
+
+bool is_autocast_layer_norm_layout_supported(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, at::IntArrayRef normalized_shape) {
+  if (!input.is_cuda() || !input.is_contiguous() || normalized_shape.empty() ||
+      input.dim() < static_cast<int64_t>(normalized_shape.size()) ||
+      input.sizes().slice(input.dim() - normalized_shape.size()) != normalized_shape ||
+      !weight.defined() || !bias.defined() || !weight.is_contiguous() || !bias.is_contiguous() ||
+      weight.sizes() != normalized_shape || weight.numel() <= 0 || bias.sizes() != weight.sizes() ||
+      (input.scalar_type() != torch::kFloat16 && input.scalar_type() != torch::kBFloat16) ||
+      (weight.scalar_type() != torch::kFloat32 && weight.scalar_type() != torch::kFloat16 &&
+          weight.scalar_type() != torch::kBFloat16) ||
+      bias.scalar_type() != weight.scalar_type() || weight.device() != input.device() ||
+      bias.device() != input.device()) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace detail
 namespace {
 
 std::vector<torch::Tensor> layer_norm_and_cast_reference(const torch::Tensor& input,
@@ -129,12 +147,13 @@ std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
     at::IntArrayRef normalized_shape, const torch::Tensor& weight,
     const torch::Tensor& bias, double epsilon,
     torch::ScalarType converted_type) {
-#if defined(DJL_USE_ROCM_KERNELS)
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
   if (at::autocast::is_autocast_enabled(at::DeviceType::CUDA) &&
-      rocm::supports_autocast_layer_norm_and_cast(
+      kernel_backend::supports_autocast_layer_norm_and_cast(
           input, weight, bias, normalized_shape, converted_type)) {
     const bool needs_autograd = at::GradMode::is_enabled() &&
         (input.requires_grad() || weight.requires_grad() || bias.requires_grad());
+#if defined(DJL_USE_ROCM_KERNELS)
     if (needs_autograd) {
       auto outputs = LayerNormAndCastFunction::apply(input, weight, bias,
           normalized_shape.vec(), epsilon, static_cast<int64_t>(converted_type));
@@ -143,6 +162,12 @@ std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
     auto result = rocm::autocast_layer_norm_and_cast(input, weight, bias,
         static_cast<float>(epsilon), converted_type, false);
     return {std::move(result.normalized), std::move(result.converted)};
+#else
+    if (!needs_autograd) {
+      return cuda::autocast_layer_norm_and_cast(
+          input, weight, bias, static_cast<float>(epsilon), converted_type);
+    }
+#endif
   }
 #endif
   return layer_norm_and_cast_reference(
@@ -154,12 +179,11 @@ std::vector<torch::Tensor> residual_add_layer_norm(const torch::Tensor& residual
     const torch::Tensor& weight, const torch::Tensor& bias, double epsilon) {
 #if defined(DJL_USE_ROCM_KERNELS)
   const auto summed_type = at::result_type(residual, update);
-  const auto normalized_type =
-      at::autocast::is_autocast_enabled(at::DeviceType::CUDA)
-      ? torch::kFloat32
-      : summed_type;
+  const bool autocast_enabled = at::autocast::is_autocast_enabled(at::DeviceType::CUDA);
+  const auto normalized_type = autocast_enabled ? torch::kFloat32 : summed_type;
   if (rocm::supports_residual_add_layer_norm(residual, update, weight, bias,
-          normalized_shape, summed_type, normalized_type)) {
+          normalized_shape, summed_type, normalized_type) &&
+      (autocast_enabled || weight.scalar_type() == torch::kFloat32)) {
     const bool needs_autograd = at::GradMode::is_enabled() &&
         (residual.requires_grad() || update.requires_grad() || weight.requires_grad() ||
             bias.requires_grad());

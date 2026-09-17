@@ -11,6 +11,4 @@
  * and limitations under the License.
  */
 
-// CUDA and ROCm compile the same kernels and launch implementations. The included source selects
-// only the thin runtime wrapper and the optional ROCm hipBLASLt fast path.
-#include "djl_pytorch_fusion_kernels.hip"
+#include "djl_pytorch_fusion_kernels_impl.inc"

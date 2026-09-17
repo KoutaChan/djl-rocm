@@ -84,6 +84,24 @@ public class AdamWMasterWeightTest {
     }
 
     @Test
+    public void clipsBothGradientSignsBeforeAdamWMomentUpdates() {
+        Engine engine = Engine.getInstance();
+        verifySymmetricClipping(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifySymmetricClipping(engine, Device.gpu());
+        }
+    }
+
+    @Test
+    public void clippingPreservesNaNGradients() {
+        Engine engine = Engine.getInstance();
+        verifyNaNClipping(engine, Device.cpu());
+        if (engine.getGpuCount() > 0) {
+            verifyNaNClipping(engine, Device.gpu());
+        }
+    }
+
+    @Test
     public void rejectsIncompatibleDevices() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0) {
@@ -170,6 +188,77 @@ public class AdamWMasterWeightTest {
         return Optimizer.adamW()
                 .optLearningRateTracker(Tracker.fixed(1.0e-3f))
                 .optWeightDecays(0.01f)
+                .build();
+    }
+
+    private static void verifySymmetricClipping(Engine engine, Device device) {
+        float[][] rawGradients = {
+            {4f, -8f, 0.125f, -0.25f},
+            {-16f, 2f, -0.25f, 0.125f},
+            {0.25f, -0.5f, 8f, -4f},
+            {1f, -1f, 0.25f, -0.25f}
+        };
+        // Rescale by 0.25, then clip to [-0.5, 0.5], before updating Adam moments.
+        float[][] expectedGradients = {
+            {0.5f, -0.5f, 0.03125f, -0.0625f},
+            {-0.5f, 0.5f, -0.0625f, 0.03125f},
+            {0.0625f, -0.125f, 0.5f, -0.5f},
+            {0.25f, -0.25f, 0.0625f, -0.0625f}
+        };
+        for (DataType gradientType : new DataType[] {DataType.FLOAT32, DataType.BFLOAT16}) {
+            try (NDManager manager = engine.newBaseManager(device);
+                    NDArray referenceWeight = manager.create(new float[] {1f, -2f, 0.5f, 3f});
+                    NDArray fullPrecisionWeight = referenceWeight.duplicate();
+                    NDArray masterWeight = referenceWeight.duplicate();
+                    NDArray modelWeight = masterWeight.toType(DataType.BFLOAT16, false)) {
+                Optimizer reference = optimizer();
+                Optimizer fullPrecision = clippedOptimizer();
+                Optimizer mixedPrecision = clippedOptimizer();
+                for (int step = 0; step < rawGradients.length; step++) {
+                    try (NDArray gradient = manager.create(rawGradients[step]);
+                            NDArray modelGradient = gradient.toType(gradientType, true);
+                            NDArray expectedGradient = manager.create(expectedGradients[step])) {
+                        reference.update("weight", referenceWeight, expectedGradient);
+                        fullPrecision.update("weight", fullPrecisionWeight, gradient);
+                        mixedPrecision.updateWithMasterWeight(
+                                "weight", modelWeight, masterWeight, modelGradient);
+                        assertClose(
+                                fullPrecisionWeight.toFloatArray(),
+                                referenceWeight.toFloatArray(),
+                                2e-6f);
+                        assertClose(
+                                masterWeight.toFloatArray(), referenceWeight.toFloatArray(), 2e-6f);
+                        assertClose(gradient.toFloatArray(), rawGradients[step], 0f);
+                        try (NDArray roundedMaster = masterWeight.toType(DataType.BFLOAT16, false);
+                                NDArray expectedModel =
+                                        roundedMaster.toType(DataType.FLOAT32, false);
+                                NDArray actualModel = modelWeight.toType(DataType.FLOAT32, false)) {
+                            assertClose(
+                                    actualModel.toFloatArray(), expectedModel.toFloatArray(), 0f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static void verifyNaNClipping(Engine engine, Device device) {
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray weight = manager.ones(new Shape(2));
+                NDArray gradient = manager.create(new float[] {Float.NaN, 0.25f})) {
+            clippedOptimizer().update("weight", weight, gradient);
+            float[] values = weight.toFloatArray();
+            Assert.assertTrue(Float.isNaN(values[0]));
+            Assert.assertTrue(Float.isFinite(values[1]));
+        }
+    }
+
+    private static Optimizer clippedOptimizer() {
+        return Optimizer.adamW()
+                .optLearningRateTracker(Tracker.fixed(1.0e-3f))
+                .optWeightDecays(0.01f)
+                .setRescaleGrad(0.25f)
+                .optClipGrad(0.5f)
                 .build();
     }
 

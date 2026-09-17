@@ -25,6 +25,7 @@
 #include "djl_pytorch_attention.h"
 #include "djl_pytorch_fusion_kernels.h"
 #include "djl_pytorch_jni_exception.h"
+#include "djl_pytorch_kernel_backend.h"
 #include "djl_pytorch_layer_norm.h"
 #include "djl_pytorch_projected_residual_mlp.h"
 #include "djl_pytorch_masked_categorical.h"
@@ -512,10 +513,10 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddMaskedEmbeddingResidualToOwnedTok
   }
 
   torch::Tensor converted_valid_mask;
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (djl::pytorch::rocm::supports_masked_embedding_residual_to_owned_tokens(
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (djl::pytorch::kernel_backend::supports_masked_embedding_residual_to_owned_tokens(
           *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr)) {
-    converted_valid_mask = djl::pytorch::rocm::add_masked_embedding_residual_to_owned_tokens(
+    converted_valid_mask = djl::pytorch::kernel_backend::add_masked_embedding_residual_to_owned_tokens(
         *tokens_ptr, stored_indices, *embedding_table_ptr, *valid_mask_ptr,
         static_cast<int64_t>(jpadding_index), jreduction == 1);
   } else
@@ -560,10 +561,10 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddBroadcastResidualToOwnedAndSilu(
         "mask must use the values data type and device");
   }
 
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (djl::pytorch::rocm::supports_broadcast_residual_to_owned_silu(
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (djl::pytorch::kernel_backend::supports_broadcast_residual_to_owned_silu(
           *values_ptr, *residual_ptr, mask_ptr)) {
-    djl::pytorch::rocm::add_broadcast_residual_to_owned_and_silu(
+    djl::pytorch::kernel_backend::add_broadcast_residual_to_owned_and_silu(
         *values_ptr, *residual_ptr, mask_ptr);
   } else
 #endif
@@ -610,10 +611,10 @@ Java_ai_djl_pytorch_jni_PyTorchLibrary_torchAddBiasAndBroadcastResidualToOwnedAn
         "mask must use the values data type and device");
   }
 
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (djl::pytorch::rocm::supports_bias_and_broadcast_residual_to_owned_silu(
+#if defined(DJL_USE_ACCELERATOR_KERNELS)
+  if (djl::pytorch::kernel_backend::supports_bias_and_broadcast_residual_to_owned_silu(
           *values_ptr, *bias_ptr, *residual_ptr, mask_ptr)) {
-    djl::pytorch::rocm::add_bias_and_broadcast_residual_to_owned_and_silu(
+    djl::pytorch::kernel_backend::add_bias_and_broadcast_residual_to_owned_and_silu(
         *values_ptr, *bias_ptr, *residual_ptr, mask_ptr);
   } else
 #endif

@@ -267,6 +267,17 @@ public final class PtEngine extends Engine {
         return new PtFlatGradientPacker(parameters, destination);
     }
 
+    /**
+     * Creates a reusable copy plan for fixed pairs of tensors on one device.
+     *
+     * @param sources ordered source tensors
+     * @param destinations equally shaped and typed destination tensors
+     * @return a caller-owned plan, closed before its tensors
+     */
+    public PtTensorCopyPlan newTensorCopyPlan(NDList sources, NDList destinations) {
+        return new PtTensorCopyPlan(sources, destinations);
+    }
+
     /** {@inheritDoc} */
     @Override
     public GradientCollectorMode getGradientCollectorMode() {

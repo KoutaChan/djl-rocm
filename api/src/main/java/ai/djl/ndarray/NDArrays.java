@@ -531,6 +531,78 @@ public final class NDArrays {
     }
 
     /**
+     * Attends to shared packed memory using nibble-packed categorical relation bias and values.
+     *
+     * <p>Queries are [B,Q,A], memory is [B,K,2A], and mask is [B,K]. Each INT16 relation word
+     * stores four unsigned four-bit codes, lowest nibble first. Table rows form consecutive
+     * segments of entriesPerSegment rows; the last segment may be shorter. Every segment
+     * contributes one bias per head and one relative value per attention feature. Padding
+     * contributes neither output nor gradients; fully masked rows return zero. Codes and masks are
+     * not differentiable. GPU implementations must read shared memory and relation rows without
+     * expanding memory per query.
+     *
+     * @param query query projection [B,Q,A]
+     * @param packedKeyValue shared keys followed by values [B,K,2A]
+     * @param mask nonzero valid-key mask [B,K]
+     * @param packedRelationCodes INT16 codes [B,Q,K,ceil(segments/4)]
+     * @param relationTable floating-point table [rows,heads+A], with bias columns first
+     * @param heads attention head count
+     * @param entriesPerSegment maximum entries in one segment, between 1 and 16
+     * @param scale query-key dot-product scale
+     * @return attended values [B,Q,A]
+     */
+    public static NDArray packedRelationScaledDotProductAttention(
+            NDArray query,
+            NDArray packedKeyValue,
+            NDArray mask,
+            NDArray packedRelationCodes,
+            NDArray relationTable,
+            long heads,
+            long entriesPerSegment,
+            double scale) {
+        Shape q = query.getShape();
+        Shape kv = packedKeyValue.getShape();
+        Shape codes = packedRelationCodes.getShape();
+        Shape table = relationTable.getShape();
+        if (q.dimension() != 3
+                || kv.dimension() != 3
+                || table.dimension() != 2
+                || codes.dimension() != 4
+                || heads <= 0
+                || entriesPerSegment <= 0
+                || entriesPerSegment > 16
+                || !Double.isFinite(scale)) {
+            throw new IllegalArgumentException(
+                    "invalid packed relation attention rank or attributes");
+        }
+        long segments = (table.get(0) + entriesPerSegment - 1) / entriesPerSegment;
+        if (q.get(1) <= 0
+                || q.get(2) <= 0
+                || q.get(2) % heads != 0
+                || kv.get(0) != q.get(0)
+                || kv.get(1) <= 0
+                || kv.get(2) != 2 * q.get(2)
+                || !mask.getShape().equals(new Shape(q.get(0), kv.get(1)))
+                || !codes.equals(new Shape(q.get(0), q.get(1), kv.get(1), (segments + 3) / 4))
+                || table.get(0) <= 0
+                || table.get(1) != heads + q.get(2)
+                || packedRelationCodes.getDataType() != DataType.INT16
+                || !relationTable.getDataType().isFloating()) {
+            throw new IllegalArgumentException(
+                    "incompatible packed relation attention shapes or dtypes");
+        }
+        return query.getNDArrayInternal()
+                .packedRelationScaledDotProductAttention(
+                        packedKeyValue,
+                        mask,
+                        packedRelationCodes,
+                        relationTable,
+                        heads,
+                        entriesPerSegment,
+                        scale);
+    }
+
+    /**
      * Applies grouped attention to packed token-major key/value projections.
      *
      * <p>The query is shared by every group in the same leading row. Packed memory stores all head

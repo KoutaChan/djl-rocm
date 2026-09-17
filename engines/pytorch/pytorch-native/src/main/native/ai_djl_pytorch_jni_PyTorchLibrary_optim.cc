@@ -47,7 +47,7 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_adamUpdate(JNIEnv*
   }
   if (clip_grad >= 0.0) {
     // Add clip grad option
-    grad.clamp_max_(clip_grad);
+    grad.clamp_(-clip_grad, clip_grad);
   }
   if (!adamw) {
     // rescaled_grad is obtained here
