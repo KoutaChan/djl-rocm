@@ -32,6 +32,7 @@
 #include <c10/core/Event.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
+#include <torch/version.h>
 #if defined(USE_ROCM)
 #include <c10/hip/HIPCachingAllocator.h>
 #include <c10/hip/HIPStream.h>
@@ -86,6 +87,16 @@ struct StreamScope {
 };
 
 namespace {
+
+#if defined(USE_ROCM) && \
+    (TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 11))
+// PyTorch 2.11's hipify v2 keeps the CUDA names in ROCm builds.
+using NativeStream = c10::hip::HIPStream;
+namespace NativeCachingAllocator = c10::hip::HIPCachingAllocator;
+#elif defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
+using NativeStream = c10::cuda::CUDAStream;
+namespace NativeCachingAllocator = c10::cuda::CUDACachingAllocator;
+#endif
 
 c10::Stream GetCurrentStream(c10::Device device) {
   c10::DeviceGuard device_guard(device);
@@ -480,7 +491,7 @@ StreamScope* OpenDeviceStream(DeviceStream* stream) {
 uint64_t GetStreamId(DeviceStream* stream) {
   TORCH_CHECK(stream != nullptr, "A native stream identifier requires a GPU stream");
 #if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
-  return reinterpret_cast<uintptr_t>(c10::cuda::CUDAStream(stream->stream).stream());
+  return reinterpret_cast<uintptr_t>(NativeStream(stream->stream).stream());
 #else
   TORCH_CHECK(false, "Native stream identifiers require a CUDA or ROCm build");
 #endif
@@ -699,7 +710,11 @@ void DeleteAcceleratorGraph(AcceleratorGraph* graph) {
 std::vector<AllocatorStreamPool> GetAllocatorSnapshot(c10::DeviceIndex device) {
   InitializeAccelerator();
 #if defined(USE_ROCM) || defined(USE_CUDA) || defined(DJL_USE_CUDA_FUSION_KERNELS)
-  const auto snapshot = c10::cuda::CUDACachingAllocator::snapshot({0, 0}, false);
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 11)
+  const auto snapshot = NativeCachingAllocator::snapshot({0, 0});
+#else
+  const auto snapshot = NativeCachingAllocator::snapshot({0, 0}, false);
+#endif
   // Inactive blocks cannot be shared across streams, private pools, or size classes.
   using PoolKey = std::tuple<uint64_t, uint64_t, uint64_t, bool>;
   std::map<PoolKey, AllocatorStreamPool> pools;

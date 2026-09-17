@@ -14,7 +14,7 @@
 #ifndef DJL_PYTORCH_ROW_OPS_CUDA_H
 #define DJL_PYTORCH_ROW_OPS_CUDA_H
 
-#include <torch/torch.h>
+#include <torch/types.h>
 
 namespace djl::pytorch::cuda {
 

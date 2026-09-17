@@ -82,6 +82,7 @@ public class PtOwnedMaskedEmbeddingResidualTest {
     }
 
     @Test(dataProvider = "lowPrecisionReductions")
+    @SuppressWarnings("try")
     public void lowPrecisionResidualPreservesIntermediateRounding(
             DataType dataType, EmbeddingReduction reduction) {
         Engine engine = Engine.getInstance();

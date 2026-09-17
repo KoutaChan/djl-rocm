@@ -14,7 +14,7 @@
 #ifndef DJL_PYTORCH_NN_FUNCTIONAL_CUDA_H
 #define DJL_PYTORCH_NN_FUNCTIONAL_CUDA_H
 
-#include <torch/torch.h>
+#include <torch/types.h>
 
 #include <vector>
 

@@ -14,7 +14,7 @@
 #ifndef DJL_PYTORCH_LAYER_NORM_H
 #define DJL_PYTORCH_LAYER_NORM_H
 
-#include <torch/torch.h>
+#include <torch/types.h>
 
 #include <vector>
 

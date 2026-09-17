@@ -14,7 +14,7 @@
 #ifndef DJL_PYTORCH_STRUCTURED_ATTENTION_H
 #define DJL_PYTORCH_STRUCTURED_ATTENTION_H
 
-#include <torch/torch.h>
+#include <torch/types.h>
 
 namespace djl::pytorch {
 namespace detail {

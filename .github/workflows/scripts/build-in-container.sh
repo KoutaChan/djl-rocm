@@ -84,7 +84,7 @@ ensure_rocm_cmake() {
     # ROCm 6.4's host sources require 3.25.2, while Ubuntu 22.04 supplies 3.22.
     if dpkg --compare-versions "$version" lt 3.25.2; then
         python3 -m venv /opt/djl-cmake
-        /opt/djl-cmake/bin/python -m pip install --no-cache-dir cmake==3.30.8
+        /opt/djl-cmake/bin/python -m pip install --no-cache-dir cmake==3.30.9
         export PATH="/opt/djl-cmake/bin:${PATH}"
     fi
 }

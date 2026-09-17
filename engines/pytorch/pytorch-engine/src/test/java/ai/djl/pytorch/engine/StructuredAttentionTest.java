@@ -334,6 +334,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    @SuppressWarnings("try")
     public void groupedPackedAttentionCudaAutocastPreservesReferenceDtypes() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
@@ -368,6 +369,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    @SuppressWarnings("try")
     public void groupedPackedAttentionCudaBackwardRestoresForwardAutocast() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {
@@ -480,6 +482,7 @@ public class StructuredAttentionTest {
     }
 
     @Test
+    @SuppressWarnings("try")
     public void groupedPackedAttentionCudaBackwardInsideInferenceMode() {
         Engine engine = Engine.getInstance();
         if (engine.getGpuCount() == 0 || JniUtils.getFusionBackend() != 1) {

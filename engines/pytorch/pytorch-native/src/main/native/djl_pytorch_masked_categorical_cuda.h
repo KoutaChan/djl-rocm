@@ -14,7 +14,7 @@
 #ifndef DJL_PYTORCH_MASKED_CATEGORICAL_CUDA_H
 #define DJL_PYTORCH_MASKED_CATEGORICAL_CUDA_H
 
-#include <torch/torch.h>
+#include <torch/types.h>
 
 namespace djl::pytorch::cuda {
 

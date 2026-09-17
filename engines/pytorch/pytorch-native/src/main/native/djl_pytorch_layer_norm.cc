@@ -15,6 +15,7 @@
 
 #include <ATen/autocast_mode.h>
 #include <torch/csrc/autograd/custom_function.h>
+#include <torch/nn/functional/normalization.h>
 
 #include "djl_pytorch_kernel_backend.h"
 
