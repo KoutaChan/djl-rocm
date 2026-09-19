@@ -79,7 +79,8 @@ class ProjectedResidualMlpFunction
     const int64_t input_width = input.size(-1);
     const int64_t rows = input.numel() / input_width;
     context->save_for_backward({input.reshape({rows, input_width}),
-        combined_weight, output_weight, result.combined});
+        combined_weight, output_weight, result.combined,
+        output_weight.requires_grad() ? result.activated : torch::Tensor()});
     context->saved_data["input_shape"] = input.sizes().vec();
     context->set_materialize_grads(false);
     return result.output;
@@ -110,9 +111,9 @@ class ProjectedResidualMlpFunction
     torch::Tensor output_weight_gradient;
 
     auto preactivation = combined.narrow(1, output_width, hidden_width);
-    auto hidden = torch::silu(preactivation);
     if (context->needs_input_grad(3)) {
-      output_weight_gradient = torch::matmul(gradient.transpose(0, 1), hidden);
+      output_weight_gradient =
+          torch::matmul(gradient.transpose(0, 1), saved.at(4));
     }
 
     const bool needs_combined_gradient = context->needs_input_grad(0) ||

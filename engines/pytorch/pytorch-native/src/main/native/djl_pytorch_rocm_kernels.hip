@@ -1,4 +1,5 @@
 #include <ATen/Dispatch.h>
+#include <ATen/ops/result_type.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
@@ -40,6 +41,8 @@ constexpr int kBroadcastResidualSiluThreadsPerBlock = 256;
 constexpr int kMaximumCategoricalMaskRules = 32;
 constexpr int kMaximumIndexedPoolChoices = 16;
 constexpr int kWeightedRowStatisticsThreadsPerBlock = 256;
+constexpr int64_t kEmbeddingGradientWorkspaceElements = 1 << 20;
+constexpr int kEmbeddingGradientMaximumShards = 16;
 
 template <typename residual_t, typename update_t>
 using residual_sum_t = std::conditional_t<
@@ -185,11 +188,18 @@ __global__ void fused_adam_update_kernel(scalar_t* weight, const scalar_t* gradi
   }
 }
 
+__device__ int64_t embedding_index_sum(int64_t raw, int64_t offset, bool long_indices) {
+  // Match ATen integer promotion and wrapping before checking the embedding index.
+  return long_indices
+      ? static_cast<int64_t>(static_cast<uint64_t>(raw) + static_cast<uint64_t>(offset))
+      : static_cast<int32_t>(static_cast<uint32_t>(raw) + static_cast<uint32_t>(offset));
+}
+
 template <typename raw_t, typename offset_t, typename table_t>
 __global__ void embedding_with_offsets_kernel(const raw_t* raw_ids,
     const offset_t* offsets, const table_t* table, table_t* output,
     int64_t output_elements, int64_t raw_columns, int64_t offset_rows,
-    int64_t offset_columns, int64_t table_rows, int64_t embedding_width) {
+    int64_t offset_columns, int64_t table_rows, int64_t embedding_width, bool long_indices) {
   for (int64_t output_index =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        output_index < output_elements;
@@ -201,8 +211,7 @@ __global__ void embedding_with_offsets_kernel(const raw_t* raw_ids,
     const int64_t offset_column = offset_columns == 1 ? 0 : raw_column;
     const int64_t offset_index = offset_row * offset_columns + offset_column;
     const int64_t table_row =
-        static_cast<int64_t>(raw_ids[raw_index]) +
-        static_cast<int64_t>(offsets[offset_index]);
+        embedding_index_sum(raw_ids[raw_index], offsets[offset_index], long_indices);
     assert(table_row >= 0 && table_row < table_rows);
     output[output_index] = table_row >= 0 && table_row < table_rows
         ? table[table_row * embedding_width + output_index % embedding_width]
@@ -219,7 +228,7 @@ __global__ void embedding_feature_pack_kernel(const raw_t* raw_ids,
     int64_t offset_column_stride,
     int64_t feature_outer_stride, int64_t feature_inner_stride,
     int64_t table_rows, int64_t embedding_width, int64_t feature_width,
-    int64_t output_width) {
+    int64_t output_width, bool long_indices) {
   for (int64_t output_index =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        output_index < output_elements;
@@ -241,14 +250,44 @@ __global__ void embedding_feature_pack_kernel(const raw_t* raw_ids,
     }
     const int64_t raw_column = column / embedding_width;
     const int64_t embedding_column = column % embedding_width;
-    const int64_t table_row =
-        static_cast<int64_t>(raw_ids[raw_base + raw_column]) +
-        static_cast<int64_t>(
-            offsets[offset_base + raw_column * offset_column_stride]);
+    const int64_t table_row = embedding_index_sum(raw_ids[raw_base + raw_column],
+        offsets[offset_base + raw_column * offset_column_stride], long_indices);
     assert(table_row >= 0 && table_row < table_rows);
     output[output_index] = table_row >= 0 && table_row < table_rows
         ? table[table_row * embedding_width + embedding_column]
         : static_cast<scalar_t>(0);
+  }
+}
+
+template <typename raw_t, typename offset_t, typename scalar_t>
+__global__ void embedding_feature_pack_backward_kernel(const scalar_t* gradient,
+    const raw_t* raw_ids, const offset_t* offsets, float* table_gradients,
+    int64_t elements, int64_t raw_columns, int64_t rows_per_outer,
+    int64_t raw_outer_stride, int64_t raw_inner_stride,
+    int64_t offset_outer_stride, int64_t offset_inner_stride, int64_t offset_column_stride,
+    int64_t gradient_outer_stride, int64_t gradient_inner_stride, int64_t gradient_column_stride,
+    int64_t table_rows, int64_t embedding_width, int shards, bool long_indices) {
+  float* shard = table_gradients + (blockIdx.x % shards) * table_rows * embedding_width;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t feature = index % embedding_width;
+    const int64_t field_index = index / embedding_width;
+    const int64_t field = field_index % raw_columns;
+    const int64_t row = field_index / raw_columns;
+    const int64_t outer_row = row / rows_per_outer;
+    const int64_t inner_row = row % rows_per_outer;
+    const int64_t raw_index = outer_row * raw_outer_stride + inner_row * raw_inner_stride + field;
+    const int64_t offset_index = outer_row * offset_outer_stride +
+        inner_row * offset_inner_stride + field * offset_column_stride;
+    const int64_t table_row =
+        embedding_index_sum(raw_ids[raw_index], offsets[offset_index], long_indices);
+    if (table_row >= 0 && table_row < table_rows) {
+      const int64_t gradient_index = outer_row * gradient_outer_stride +
+          inner_row * gradient_inner_stride +
+          (field * embedding_width + feature) * gradient_column_stride;
+      atomicAdd(shard + table_row * embedding_width + feature,
+          static_cast<float>(gradient[gradient_index]));
+    }
   }
 }
 
@@ -4895,7 +4934,8 @@ bool supports_embedding_feature_pack(const torch::Tensor& raw_ids,
       return false;
     }
   }
-  return true;
+  const auto index_type = at::result_type(raw_ids, offsets);
+  return index_type == torch::kInt32 || index_type == torch::kInt64;
 }
 
 bool supports_grouped_masked_softmax_pool(
@@ -5045,6 +5085,7 @@ torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
       std::min<int64_t>(required_blocks, static_cast<int64_t>(properties.maxGridSize[0])));
   const hipStream_t stream =
       c10::hip::getCurrentHIPStream(table.get_device()).stream();
+  const bool long_indices = at::result_type(raw_ids, offsets) == torch::kInt64;
   AT_DISPATCH_INTEGRAL_TYPES(
       raw_ids.scalar_type(), "embedding_with_offsets_raw_ids", [&] {
         using raw_t = scalar_t;
@@ -5061,7 +5102,7 @@ torch::Tensor embedding_with_offsets_forward(const torch::Tensor& raw_ids,
                         raw_ids.data_ptr<raw_t>(), offsets.data_ptr<offset_t>(),
                         table.data_ptr<table_t>(), output.data_ptr<table_t>(),
                         output_elements, raw_ids.size(1), offsets.size(0),
-                        offsets.size(1), table.size(0), table.size(1));
+                        offsets.size(1), table.size(0), table.size(1), long_indices);
                   });
             });
       });
@@ -5099,6 +5140,7 @@ torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
   const int64_t offset_inner_stride =
       expanded_offsets.dim() == 3 ? expanded_offsets.stride(1) : 0;
   const int64_t feature_inner_stride = features.dim() == 3 ? features.stride(1) : 0;
+  const bool long_indices = at::result_type(raw_ids, offsets) == torch::kInt64;
   AT_DISPATCH_INTEGRAL_TYPES(
       raw_ids.scalar_type(), "embedding_feature_pack_raw_ids", [&] {
         using raw_t = scalar_t;
@@ -5120,12 +5162,61 @@ torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
                         expanded_offsets.stride(0), offset_inner_stride,
                         expanded_offsets.stride(-1),
                         features.stride(0), feature_inner_stride,
-                        table.size(0), table.size(1), features.size(-1), output_width);
+                        table.size(0), table.size(1), features.size(-1), output_width, long_indices);
                   });
             });
       });
   check_hip_kernel_launch("embedding_feature_pack");
   return output;
+}
+
+torch::Tensor try_embedding_feature_pack_backward(const torch::Tensor& gradient,
+    const torch::Tensor& raw_ids, const torch::Tensor& offsets,
+    int64_t table_rows, int64_t embedding_width) {
+  const int64_t table_elements = table_rows * embedding_width;
+  if (table_elements > kEmbeddingGradientWorkspaceElements) {
+    return {};
+  }
+  c10::DeviceGuard device_guard(gradient.device());
+  const auto& properties = device_properties(gradient.get_device());
+  const int threads = std::min(256, properties.maxThreadsPerBlock);
+  const int64_t elements = raw_ids.numel() * embedding_width;
+  const int blocks = static_cast<int>(std::min<int64_t>(
+      (elements + threads - 1) / threads, properties.multiProcessorCount * 4));
+  const int shards = static_cast<int>(std::min<int64_t>(
+      std::min(blocks, kEmbeddingGradientMaximumShards),
+      kEmbeddingGradientWorkspaceElements / table_elements));
+  auto accumulated = torch::zeros(
+      {shards, table_rows, embedding_width}, gradient.options().dtype(torch::kFloat32));
+  auto expanded_offsets = offsets.expand_as(raw_ids);
+  const int64_t rows_per_outer = raw_ids.dim() == 3 ? raw_ids.size(1) : 1;
+  const int64_t raw_inner_stride = raw_ids.dim() == 3 ? raw_ids.stride(1) : 0;
+  const int64_t offset_inner_stride = raw_ids.dim() == 3 ? expanded_offsets.stride(1) : 0;
+  const int64_t gradient_inner_stride = gradient.dim() == 3 ? gradient.stride(1) : 0;
+  const bool long_indices = at::result_type(raw_ids, offsets) == torch::kInt64;
+  const auto stream = c10::hip::getCurrentHIPStream(gradient.get_device()).stream();
+  AT_DISPATCH_INTEGRAL_TYPES(raw_ids.scalar_type(), "embedding_feature_pack_backward_raw", [&] {
+    using raw_t = scalar_t;
+    AT_DISPATCH_INTEGRAL_TYPES(offsets.scalar_type(), "embedding_feature_pack_backward_offsets", [&] {
+      using offset_t = scalar_t;
+      AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16,
+          gradient.scalar_type(), "embedding_feature_pack_backward", [&] {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(embedding_feature_pack_backward_kernel<raw_t, offset_t, scalar_t>),
+                dim3(blocks), dim3(threads), 0, stream,
+                gradient.data_ptr<scalar_t>(), raw_ids.data_ptr<raw_t>(),
+                expanded_offsets.data_ptr<offset_t>(),
+                accumulated.data_ptr<float>(), elements, raw_ids.size(-1), rows_per_outer,
+                raw_ids.stride(0), raw_inner_stride, expanded_offsets.stride(0),
+                offset_inner_stride, expanded_offsets.stride(-1), gradient.stride(0),
+                gradient_inner_stride, gradient.stride(-1),
+                table_rows, embedding_width, shards, long_indices);
+          });
+    });
+  });
+  check_hip_kernel_launch("embedding feature pack backward");
+  auto table_gradient = shards == 1 ? accumulated.squeeze(0) : accumulated.sum(0);
+  return table_gradient.to(gradient.scalar_type());
 }
 
 void fused_adam_update(torch::Tensor& weight, const torch::Tensor& gradient, torch::Tensor& mean,
@@ -6780,10 +6871,16 @@ ResidualAddLayerNormGradients residual_add_layer_norm_backward(
 
 torch::Tensor autocast_layer_norm(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, float epsilon) {
+  return autocast_layer_norm(input, weight, bias, epsilon, false).normalized;
+}
+
+AutocastLayerNormAndCastResult autocast_layer_norm(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
+    bool capture_statistics) {
   TORCH_CHECK(supports_autocast_layer_norm(input, weight, bias, weight.sizes()),
       "autocast LayerNorm received an unsupported ROCm tensor layout");
   return launch_autocast_layer_norm(
-      input, weight, bias, epsilon, std::nullopt, false).normalized;
+      input, weight, bias, epsilon, std::nullopt, capture_statistics);
 }
 
 AutocastLayerNormAndCastResult autocast_layer_norm_and_cast(const torch::Tensor& input,

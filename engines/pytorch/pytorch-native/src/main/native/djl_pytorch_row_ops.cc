@@ -193,6 +193,54 @@ class EmbeddingWithOffsetsFunction
   }
 };
 
+class EmbeddingFeaturePackFunction
+    : public torch::autograd::Function<EmbeddingFeaturePackFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      const torch::Tensor& raw_ids, const torch::Tensor& offsets,
+      const torch::Tensor& table, const torch::Tensor& features) {
+    context->save_for_backward({raw_ids, offsets});
+    context->saved_data["table_rows"] = table.size(0);
+    context->saved_data["embedding_width"] = table.size(1);
+    context->set_materialize_grads(false);
+    return rocm::embedding_feature_pack_forward(raw_ids, offsets, table, features);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradient_outputs) {
+    const auto& gradient = gradient_outputs.at(0);
+    if (!gradient.defined()) {
+      return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    }
+    const auto saved = context->get_saved_variables();
+    const auto& raw_ids = saved.at(0);
+    const int64_t embedding_width = context->saved_data["embedding_width"].toInt();
+    const int64_t embedded_width = raw_ids.size(-1) * embedding_width;
+    torch::Tensor table_gradient;
+    if (context->needs_input_grad(2)) {
+      const int64_t table_rows = context->saved_data["table_rows"].toInt();
+      if (!at::GradMode::is_enabled() && !at::globalContext().deterministicAlgorithms()) {
+        table_gradient = rocm::try_embedding_feature_pack_backward(
+            gradient, raw_ids, saved.at(1), table_rows, embedding_width);
+      }
+      if (!table_gradient.defined()) {
+        auto embedding_shape = raw_ids.sizes().vec();
+        embedding_shape.push_back(embedding_width);
+        auto embedding_gradient = gradient.narrow(-1, 0, embedded_width).reshape(embedding_shape);
+        auto indices = raw_ids.add(saved.at(1));
+        table_gradient = at::embedding_dense_backward(
+            embedding_gradient, indices, table_rows, -1, false);
+      }
+    }
+    torch::Tensor feature_gradient;
+    if (context->needs_input_grad(3)) {
+      feature_gradient = gradient.narrow(-1, embedded_width, gradient.size(-1) - embedded_width);
+    }
+    return {torch::Tensor(), torch::Tensor(), table_gradient, feature_gradient};
+  }
+};
+
 class ScatterRowsFunction : public torch::autograd::Function<ScatterRowsFunction> {
  public:
   static torch::Tensor forward(torch::autograd::AutogradContext* context,
@@ -336,8 +384,14 @@ torch::Tensor embedding_feature_pack(const torch::Tensor& raw_ids,
   TORCH_CHECK(raw_ids.device() == offsets.device() && raw_ids.device() == table.device(),
       "raw IDs, offsets, table, and features must use the same device");
 #if defined(DJL_USE_ACCELERATOR_KERNELS)
-  if (kernel_backend::supports_embedding_feature_pack(raw_ids, offsets, table, features) &&
-      !(at::GradMode::is_enabled() && (table.requires_grad() || features.requires_grad()))) {
+  if (kernel_backend::supports_embedding_feature_pack(raw_ids, offsets, table, features)) {
+    if (at::GradMode::is_enabled() && (table.requires_grad() || features.requires_grad())) {
+#if defined(DJL_USE_ROCM_KERNELS)
+      return EmbeddingFeaturePackFunction::apply(raw_ids, offsets, table, features);
+#else
+      return embedding_feature_pack_reference(raw_ids, offsets, table, features);
+#endif
+    }
     return kernel_backend::embedding_feature_pack_forward(raw_ids, offsets, table, features);
   }
 #endif

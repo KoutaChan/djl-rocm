@@ -26,6 +26,10 @@ bool is_autocast_layer_norm_layout_supported(const torch::Tensor& input,
 
 }  // namespace detail
 
+torch::Tensor layer_norm(const torch::Tensor& input,
+    at::IntArrayRef normalized_shape, const torch::Tensor& weight,
+    const torch::Tensor& bias, double epsilon);
+
 std::vector<torch::Tensor> layer_norm_and_cast(const torch::Tensor& input,
     at::IntArrayRef normalized_shape, const torch::Tensor& weight,
     const torch::Tensor& bias, double epsilon,

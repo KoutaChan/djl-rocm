@@ -95,6 +95,7 @@ public class ProjectedResidualMlpTest {
             {DataType.FLOAT16, null, 17, 17, 7, 3},
             {DataType.BFLOAT16, null, 64, 64, 5, 6},
             {DataType.FLOAT32, DataType.BFLOAT16, 17, 256, 64, 64},
+            {DataType.FLOAT32, DataType.FLOAT16, 128, 512, 128, 128},
             {DataType.FLOAT32, DataType.FLOAT16, 257, 257, 5, 2}
         };
     }
@@ -213,6 +214,51 @@ public class ProjectedResidualMlpTest {
             assertClose(actual.combinedWeightGradient, expected.combinedWeightGradient, 0.02f);
             assertClose(actual.combinedBiasGradient, expected.combinedBiasGradient, 0.02f);
             assertClose(actual.outputWeightGradient, expected.outputWeightGradient, 0.02f);
+        }
+    }
+
+    @SuppressWarnings("try")
+    @Test
+    public void gpuFrozenOutputWeightPreservesInputGradient() {
+        Engine engine = Engine.getInstance();
+        if (engine.getGpuCount() == 0) {
+            throw new SkipException("This test requires a PyTorch CUDA or ROCm device.");
+        }
+        Device device = Device.gpu(0);
+        try (NDManager manager = engine.newBaseManager(device);
+                NDArray input = values(manager, new Shape(2, 3, 17), 0.011f, DataType.FLOAT32);
+                NDArray referenceInput = input.duplicate();
+                NDArray combinedWeight =
+                        values(manager, new Shape(12, 17), -0.007f, DataType.FLOAT32);
+                NDArray combinedBias = values(manager, new Shape(12), 0.005f, DataType.FLOAT32);
+                NDArray outputWeight = values(manager, new Shape(5, 7), 0.009f, DataType.FLOAT32);
+                NDArray lossWeight = values(manager, new Shape(2, 3, 5), 0.003f, DataType.FLOAT32)) {
+            input.setRequiresGradient(true);
+            referenceInput.setRequiresGradient(true);
+            try (GradientCollector collector = engine.newGradientCollector();
+                    Autocast ignored = engine.newAutocast(device, DataType.FLOAT16, true)) {
+                NDArray actual =
+                        NDArrays.projectedResidualMlp(
+                                input, combinedWeight, combinedBias, outputWeight);
+                NDArray combined =
+                        Linear.linear(referenceInput, combinedWeight, combinedBias)
+                                .singletonOrThrow();
+                NDArray expected =
+                        combined.get("...,0:5")
+                                .add(
+                                        Linear.linear(
+                                                        Activation.swish(
+                                                                combined.get("...,5:"), 1.0f),
+                                                        outputWeight,
+                                                        null)
+                                                .singletonOrThrow());
+                collector.backward(actual.add(expected).mul(lossWeight).sum());
+                assertClose(actual, expected, 0.02f);
+            }
+            try (NDArray actualGradient = input.getGradient();
+                    NDArray expectedGradient = referenceInput.getGradient()) {
+                assertClose(actualGradient, expectedGradient, 0.02f);
+            }
         }
     }
 

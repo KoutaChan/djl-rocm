@@ -31,6 +31,11 @@ torch::Tensor embedding_feature_pack_forward(const torch::Tensor& raw_ids,
     const torch::Tensor& offsets, const torch::Tensor& table,
     const torch::Tensor& features);
 
+// Returns an undefined tensor when a table exceeds the bounded accumulation workspace.
+torch::Tensor try_embedding_feature_pack_backward(const torch::Tensor& gradient,
+    const torch::Tensor& raw_ids, const torch::Tensor& offsets,
+    int64_t table_rows, int64_t embedding_width);
+
 bool supports_scatter_rows(const torch::Tensor& rows, const torch::Tensor& row_indices);
 
 bool supports_segmented_lookup_sum(
@@ -311,6 +316,10 @@ struct AutocastLayerNormAndCastGradients {
   torch::Tensor weight;
   torch::Tensor bias;
 };
+
+AutocastLayerNormAndCastResult autocast_layer_norm(const torch::Tensor& input,
+    const torch::Tensor& weight, const torch::Tensor& bias, float epsilon,
+    bool capture_statistics);
 
 bool supports_autocast_layer_norm_and_cast(const torch::Tensor& input, const torch::Tensor& weight,
     const torch::Tensor& bias, at::IntArrayRef normalized_shape, torch::ScalarType converted_type);

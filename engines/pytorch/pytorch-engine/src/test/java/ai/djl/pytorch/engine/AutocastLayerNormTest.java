@@ -617,6 +617,192 @@ public class AutocastLayerNormTest {
     }
 
     @Test
+    public void autocastLayerNormTrainingMatchesFloatReference() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (DataType inputType :
+                            new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                        for (DataType parameterType :
+                                new DataType[] {DataType.FLOAT32, inputType}) {
+                            for (int width : new int[] {17, 128, 416, 512, 513, 1025}) {
+                                verifyLayerNormTraining(
+                                        engine,
+                                        manager,
+                                        device,
+                                        new Shape(13, width),
+                                        new Shape(width),
+                                        inputType,
+                                        parameterType,
+                                        7,
+                                        false);
+                            }
+                        }
+                    }
+                });
+    }
+
+    @Test
+    public void autocastLayerNormTrainingSupportsRequestedGradients() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (int gradientMask = 1; gradientMask < 8; ++gradientMask) {
+                        verifyLayerNormTraining(
+                                engine,
+                                manager,
+                                device,
+                                new Shape(9, 128),
+                                new Shape(128),
+                                DataType.BFLOAT16,
+                                DataType.BFLOAT16,
+                                gradientMask,
+                                false);
+                    }
+                });
+    }
+
+    @Test
+    public void autocastLayerNormTrainingSupportsTrailingDimensionsAndFallbacks() {
+        runOnGpuIfAvailable(
+                (engine, manager, device) -> {
+                    for (DataType inputType :
+                            new DataType[] {DataType.FLOAT16, DataType.BFLOAT16}) {
+                        for (int trailingWidth : new int[] {128, 257}) {
+                            verifyLayerNormTraining(
+                                    engine,
+                                    manager,
+                                    device,
+                                    new Shape(3, 2, trailingWidth),
+                                    new Shape(2, trailingWidth),
+                                    inputType,
+                                    DataType.FLOAT32,
+                                    7,
+                                    false);
+                            verifyLayerNormTraining(
+                                    engine,
+                                    manager,
+                                    device,
+                                    new Shape(3, 2, trailingWidth),
+                                    new Shape(2, trailingWidth),
+                                    inputType,
+                                    DataType.FLOAT32,
+                                    7,
+                                    true);
+                        }
+                    }
+                    verifyLayerNormTraining(
+                            engine,
+                            manager,
+                            device,
+                            new Shape(0, 512),
+                            new Shape(512),
+                            DataType.BFLOAT16,
+                            DataType.FLOAT32,
+                            7,
+                            false);
+                    verifyLayerNormTraining(
+                            engine,
+                            manager,
+                            device,
+                            new Shape(8193, 128),
+                            new Shape(128),
+                            DataType.BFLOAT16,
+                            DataType.FLOAT32,
+                            7,
+                            false);
+                });
+    }
+
+    private static void verifyLayerNormTraining(
+            Engine engine,
+            NDManager manager,
+            Device device,
+            Shape shape,
+            Shape normalizedShape,
+            DataType inputType,
+            DataType parameterType,
+            int gradientMask,
+            boolean nonContiguous) {
+        TrainingResult expected =
+                trainLayerNorm(
+                        engine,
+                        manager,
+                        device,
+                        shape,
+                        normalizedShape,
+                        inputType,
+                        parameterType,
+                        gradientMask,
+                        nonContiguous,
+                        true);
+        TrainingResult actual =
+                trainLayerNorm(
+                        engine,
+                        manager,
+                        device,
+                        shape,
+                        normalizedShape,
+                        inputType,
+                        parameterType,
+                        gradientMask,
+                        nonContiguous,
+                        false);
+        assertTrainingResult(
+                actual, expected, trainingTolerance(inputType, parameterType, inputType));
+    }
+
+    private static TrainingResult trainLayerNorm(
+            Engine engine,
+            NDManager manager,
+            Device device,
+            Shape shape,
+            Shape normalizedShape,
+            DataType inputType,
+            DataType parameterType,
+            int gradientMask,
+            boolean nonContiguous,
+            boolean reference) {
+        try (NDManager scope = manager.newSubManager()) {
+            NDArray input =
+                    scope.create(sequence(shape.size(), 0.03125f, 0), shape)
+                            .toType(inputType, false);
+            if (nonContiguous) {
+                input = input.reshape(shape.get(1), shape.get(0), shape.get(2)).transpose(1, 0, 2);
+            }
+            NDArray weight =
+                    scope.create(sequence(normalizedShape.size(), 0.00390625f, 3), normalizedShape)
+                            .add(1.0f)
+                            .toType(parameterType, false);
+            NDArray bias =
+                    scope.create(
+                                    sequence(normalizedShape.size(), -0.001953125f, 11),
+                                    normalizedShape)
+                            .toType(parameterType, false);
+            NDArray lossWeight = scope.create(sequence(shape.size(), 0.001953125f, 5), shape);
+            input.setRequiresGradient((gradientMask & 1) != 0);
+            weight.setRequiresGradient((gradientMask & 2) != 0);
+            bias.setRequiresGradient((gradientMask & 4) != 0);
+            try (GradientCollector collector = engine.newGradientCollector();
+                    Autocast ignored = engine.newAutocast(device, inputType, true)) {
+                // Explicit FP32 inputs keep the reference on ATen even when ordinary LayerNorm is
+                // fused.
+                NDArray output =
+                        reference
+                                ? floatReference(input, normalizedShape, weight, bias)
+                                : LayerNorm.layerNorm(input, normalizedShape, weight, bias, EPSILON)
+                                        .singletonOrThrow();
+                Assert.assertEquals(output.getDataType(), DataType.FLOAT32);
+                collector.backward(output.mul(lossWeight).sum());
+                return new TrainingResult(
+                        floatValues(output),
+                        null,
+                        gradientValues(input),
+                        gradientValues(weight),
+                        gradientValues(bias));
+            }
+        }
+    }
+
+    @Test
     public void layerNormAndCastAutogradMatchesEagerAcrossWidths() {
         Engine engine = Engine.getInstance();
         requireRocm(engine);
@@ -970,9 +1156,7 @@ public class AutocastLayerNormTest {
             return LayerNorm.layerNormAndCast(
                     input, normalizedShape, weight, bias, EPSILON, convertedType);
         }
-        NDArray normalized =
-                LayerNorm.layerNorm(input, normalizedShape, weight, bias, EPSILON)
-                        .singletonOrThrow();
+        NDArray normalized = floatReference(input, normalizedShape, weight, bias);
         return new NDList(normalized, normalized.toType(convertedType, false));
     }
 
@@ -1087,9 +1271,9 @@ public class AutocastLayerNormTest {
 
     private static NDArray floatReference(
             NDArray input, Shape normalizedShape, NDArray weight, NDArray bias) {
-        NDArray floatInput = input.toType(DataType.FLOAT32, false);
-        NDArray floatWeight = weight.toType(DataType.FLOAT32, false);
-        NDArray floatBias = bias.toType(DataType.FLOAT32, false);
+        NDArray floatInput = input.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+        NDArray floatWeight = weight.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
+        NDArray floatBias = bias.getNDArrayInternal().differentiableCast(DataType.FLOAT32);
         return LayerNorm.layerNorm(floatInput, normalizedShape, floatWeight, floatBias, EPSILON)
                 .singletonOrThrow();
     }
@@ -1122,7 +1306,7 @@ public class AutocastLayerNormTest {
     private static void assertTrainingResult(
             TrainingResult actual, TrainingResult expected, float tolerance) {
         assertClose(actual.normalized, expected.normalized, tolerance);
-        assertClose(actual.converted, expected.converted, tolerance);
+        assertNullableClose(actual.converted, expected.converted, tolerance);
         assertNullableClose(actual.inputGradient, expected.inputGradient, tolerance);
         assertNullableClose(actual.weightGradient, expected.weightGradient, tolerance);
         assertNullableClose(actual.biasGradient, expected.biasGradient, tolerance);

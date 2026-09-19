@@ -765,20 +765,8 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchNNLayerNorm(
   if (jbias != djl::utils::jni::NULL_PTR) {
     bias = *reinterpret_cast<torch::Tensor*>(jbias);
   }
-  torch::Tensor result;
-#if defined(DJL_USE_ROCM_KERNELS)
-  if (!at::GradMode::is_enabled() &&
-      at::autocast::is_autocast_enabled(at::DeviceType::CUDA) &&
-      djl::pytorch::rocm::supports_autocast_layer_norm(
-          *tensor_ptr, weight, bias, normalized_shape_vec)) {
-    result = djl::pytorch::rocm::autocast_layer_norm(
-        *tensor_ptr, weight, bias, static_cast<float>(jeps));
-  } else
-#endif
-  {
-    result = torch::nn::functional::layer_norm(*tensor_ptr,
-        torch::nn::functional::LayerNormFuncOptions(normalized_shape_vec).weight(weight).bias(bias).eps(jeps));
-  }
+  auto result = djl::pytorch::layer_norm(
+      *tensor_ptr, normalized_shape_vec, weight, bias, jeps);
   const auto* result_ptr = new torch::Tensor(std::move(result));
   return reinterpret_cast<uintptr_t>(result_ptr);
 #endif
