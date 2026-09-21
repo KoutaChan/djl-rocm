@@ -733,6 +733,12 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
 
     /** {@inheritDoc} */
     @Override
+    public PtNDArray floorDivide(Number n) {
+        return JniUtils.floorDivide(this, n);
+    }
+
+    /** {@inheritDoc} */
+    @Override
     public PtNDArray div(NDArray other) {
         return JniUtils.div(this, manager.from(other));
     }

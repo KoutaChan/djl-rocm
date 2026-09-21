@@ -21,6 +21,9 @@
 
 namespace djl::pytorch::fusion {
 
+void LaunchWeightedCompactReduce(const torch::Tensor& rows, const torch::Tensor& weights,
+    const torch::Tensor& indices, torch::Tensor& output, int64_t capacity);
+
 inline constexpr int32_t kMaximumOutputPackSources = 32;
 inline constexpr int32_t kMaximumAffineTerms = 32;
 inline constexpr int32_t kMaximumAffineGroups = 32;

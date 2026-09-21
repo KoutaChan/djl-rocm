@@ -3051,6 +3051,16 @@ public final class NDArrays {
         return array.getNDArrayInternal().concatToType(arrays.subNDList(1), axis, dataType);
     }
 
+    /** Applies a linear projection directly after differentiable typed concatenation. */
+    public static NDArray concatToTypeLinear(
+            NDList arrays, DataType dataType, NDArray weight, NDArray bias) {
+        Preconditions.checkArgument(!arrays.isEmpty(), "need at least one array");
+        Preconditions.checkArgument(dataType.isFloating(), "output data type must be floating");
+        NDArray first = arrays.head();
+        return first.getNDArrayInternal().concatToTypeLinear(
+                arrays.subNDList(1), dataType, weight, bias);
+    }
+
     /**
      * Returns the truth value of {@link NDArray} a AND {@link NDArray} b element-wise.
      *

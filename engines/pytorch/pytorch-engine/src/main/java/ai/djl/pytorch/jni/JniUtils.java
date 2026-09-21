@@ -1079,6 +1079,13 @@ public final class JniUtils {
     }
 
     /** Converts floating-point arrays while concatenating them along an existing axis. */
+    /** Reduces weighted rows with sorted unique dense transition indices. */
+    public static PtNDArray weightedCompactReduce(
+            PtNDArray rows, PtNDArray weights, PtNDArray indices, long actions, long capacity) {
+        return new PtNDArray(rows.getManager(), PyTorchLibrary.LIB.torchWeightedCompactReduce(
+                rows.getHandle(), weights.getHandle(), indices.getHandle(), actions, capacity));
+    }
+
     public static PtNDArray concatToType(PtNDArray[] arrays, long dim, DataType dataType) {
         long[] pointers = Arrays.stream(arrays).mapToLong(PtNDArray::getHandle).toArray();
         return new PtNDArray(
@@ -1550,6 +1557,17 @@ public final class JniUtils {
                         value.longValue(),
                         value.doubleValue(),
                         isFloatingScalar(value)));
+    }
+
+    public static PtNDArray floorDivide(PtNDArray ndArray, Number value) {
+        boolean floating = isFloatingScalar(value);
+        if (floating ? value.doubleValue() == 0.0 : value.longValue() == 0) {
+            throw new IllegalArgumentException("floorDivide divisor must be nonzero");
+        }
+        return new PtNDArray(
+                ndArray.getManager(),
+                PyTorchLibrary.LIB.torchFloorDivideScalar(
+                        ndArray.getHandle(), value.longValue(), value.doubleValue(), floating));
     }
 
     public static void divi(PtNDArray ndArray1, PtNDArray ndArray2) {

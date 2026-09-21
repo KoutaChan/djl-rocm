@@ -864,6 +864,16 @@ __global__ void mapped_grouped_masked_softmax_pool_kernel(
       }
     }
     __syncthreads();
+    if (!has_values) {
+      for (int64_t column = threadIdx.x; column < width;
+           column += blockDim.x) {
+        contexts[output_row * width + column] = 0.0f;
+      }
+      // All threads take this branch. Finish the row before the shared
+      // probabilities and presence flag are reused by the next grid-stride row.
+      __syncthreads();
+      continue;
+    }
     for (int64_t column = threadIdx.x; column < width;
          column += blockDim.x) {
       float sum = 0.0f;
@@ -1561,8 +1571,8 @@ __global__ void single_query_attention_kernel(const scalar_t* seed_products, con
     const scalar_t* key_value_weight, scalar_t* state, scalar_t* context, int64_t batch_count, int64_t readout_count,
     int64_t token_count, int64_t runtime_hidden_width, int64_t attention_heads, int64_t attention_width) {
   const int64_t hidden_width = specialized ? kSingleQuerySpecializedHiddenWidth : runtime_hidden_width;
-  const int64_t batch = blockIdx.x;
-  const int64_t readout_head = blockIdx.y;
+  const int64_t batch = blockIdx.y;
+  const int64_t readout_head = blockIdx.x;
   const int64_t readout = readout_head / attention_heads;
   const int64_t head = readout_head - readout * attention_heads;
   if (batch >= batch_count || readout >= readout_count) {
@@ -1581,6 +1591,7 @@ __global__ void single_query_attention_kernel(const scalar_t* seed_products, con
   __shared__ float softmax_maximum;
   __shared__ float softmax_denominator;
   __shared__ int64_t softmax_valid_count;
+  __shared__ float reduction_values[32];
   const int64_t seed_offset = (batch * readout_count + readout) * hidden_width;
   const int64_t state_offset = (readout * batch_count + batch) * hidden_width;
   const int64_t readout_hidden_offset = readout * hidden_width;
@@ -1589,17 +1600,26 @@ __global__ void single_query_attention_kernel(const scalar_t* seed_products, con
       state[state_offset + feature] = seed_products[seed_offset + feature];
     }
   }
-  for (int64_t head_feature = threadIdx.x; head_feature < head_width; head_feature += blockDim.x) {
+  const int32_t projection_lane = threadIdx.x % warpSize;
+  const int32_t projection_wave = threadIdx.x / warpSize;
+  const int32_t projection_waves = blockDim.x / warpSize;
+  for (int64_t head_feature = projection_wave; head_feature < head_width;
+       head_feature += projection_waves) {
     const int64_t attention_feature = head * head_width + head_feature;
-    float value = static_cast<float>(
-        query_bias[readout * attention_width + attention_feature]);
+    float value = 0.0f;
     const int64_t weight_offset = (readout * attention_width + attention_feature) * hidden_width;
-    for (int32_t feature = 0; feature < hidden_width; ++feature) {
+    for (int32_t feature = projection_lane; feature < hidden_width; feature += warpSize) {
       const float seed = static_cast<float>(seed_products[seed_offset + feature]) +
           static_cast<float>(seed_bias[readout_hidden_offset + feature]);
       value += seed * static_cast<float>(query_weight[weight_offset + feature]);
     }
-    query[head_feature] = value;
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      value += __shfl_down(value, offset);
+    }
+    if (projection_lane == 0) {
+      query[head_feature] = value + static_cast<float>(
+          query_bias[readout * attention_width + attention_feature]);
+    }
   }
   __syncthreads();
 
@@ -1616,37 +1636,60 @@ __global__ void single_query_attention_kernel(const scalar_t* seed_products, con
   }
   __syncthreads();
 
-  for (int64_t token = threadIdx.x; token < token_count; token += blockDim.x) {
+  // Cooperate on each token's dot product so adjacent lanes read adjacent
+  // memory features. Accumulate in FP32; only the reduction order changes.
+  const int32_t score_lane = threadIdx.x % warpSize;
+  const int32_t score_wave = threadIdx.x / warpSize;
+  const int32_t score_waves = blockDim.x / warpSize;
+  for (int64_t token = score_wave; token < token_count; token += score_waves) {
     const bool valid = single_query_valid(
         valid_mask, batch * token_count + token);
     float score = -INFINITY;
     if (valid) {
       score = 0.0f;
       const int64_t memory_offset = (batch * token_count + token) * hidden_width;
-      for (int32_t feature = 0; feature < hidden_width; ++feature) {
-        score += static_cast<float>(
-                     static_cast<scalar_t>(memory[memory_offset + feature])) *
+      for (int32_t feature = score_lane; feature < hidden_width; feature += warpSize) {
+        score += static_cast<float>(static_cast<scalar_t>(memory[memory_offset + feature])) *
             direction[feature];
       }
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        score += __shfl_down(score, offset);
+      }
     }
-    probabilities[token] = score;
+    if (score_lane == 0) {
+      probabilities[token] = score;
+    }
+  }
+  __syncthreads();
+  float maximum = -INFINITY;
+  int valid_count = 0;
+  for (int64_t token = threadIdx.x; token < token_count; token += blockDim.x) {
+    if (single_query_valid(valid_mask, batch * token_count + token)) {
+      const float score = probabilities[token];
+      maximum = isnan(maximum) || isnan(score) ? NAN : fmaxf(maximum, score);
+      ++valid_count;
+    }
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    const float other = __shfl_down(maximum, offset);
+    maximum = isnan(maximum) || isnan(other) ? NAN : fmaxf(maximum, other);
+    valid_count += __shfl_down(valid_count, offset);
+  }
+  if (score_lane == 0) {
+    reduction_values[score_wave] = maximum;
+    reduction_values[16 + score_wave] = static_cast<float>(valid_count);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    float maximum = -INFINITY;
-    int64_t valid_count = 0;
-    for (int64_t token = 0; token < token_count; ++token) {
-      if (single_query_valid(
-              valid_mask, batch * token_count + token)) {
-        const float score = probabilities[token];
-        maximum = isnan(maximum) || isnan(score)
-            ? NAN
-            : fmaxf(maximum, score);
-        valid_tokens[valid_count++] = static_cast<valid_index_t>(token);
-      }
+    float value = -INFINITY;
+    int count = 0;
+    for (int wave = 0; wave < score_waves; ++wave) {
+      const float other = reduction_values[wave];
+      value = isnan(value) || isnan(other) ? NAN : fmaxf(value, other);
+      count += static_cast<int>(reduction_values[16 + wave]);
     }
-    softmax_maximum = maximum;
-    softmax_valid_count = valid_count;
+    softmax_maximum = value;
+    softmax_valid_count = count;
   }
   __syncthreads();
   for (int64_t token = threadIdx.x; token < token_count; token += blockDim.x) {
@@ -1656,13 +1699,19 @@ __global__ void single_query_attention_kernel(const scalar_t* seed_products, con
         : 0.0f;
   }
   __syncthreads();
+  float denominator = 0.0f;
+  for (int64_t token = threadIdx.x; token < token_count; token += blockDim.x) {
+    denominator += probabilities[token];
+  }
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    denominator += __shfl_down(denominator, offset);
+  }
+  if (score_lane == 0) reduction_values[score_wave] = denominator;
+  __syncthreads();
   if (threadIdx.x == 0) {
-    // Preserve the original token-by-token addition order.
-    float denominator = 0.0f;
-    for (int64_t token = 0; token < token_count; ++token) {
-      denominator += probabilities[token];
-    }
-    softmax_denominator = denominator;
+    float sum = 0.0f;
+    for (int wave = 0; wave < score_waves; ++wave) sum += reduction_values[wave];
+    softmax_denominator = sum;
   }
   __syncthreads();
   if (softmax_valid_count != 0) {
@@ -1674,26 +1723,32 @@ __global__ void single_query_attention_kernel(const scalar_t* seed_products, con
 
   for (int32_t feature = threadIdx.x; feature < hidden_width; feature += blockDim.x) {
     float value = 0.0f;
-    for (int64_t index = 0; index < softmax_valid_count; ++index) {
-      const int64_t token = valid_tokens[index];
+    for (int64_t token = 0; token < token_count; ++token) {
+      if (!single_query_valid(valid_mask, batch * token_count + token)) continue;
       const float probability = probabilities[token];
       value += probability * static_cast<float>(
-                                 static_cast<scalar_t>(memory[(batch * token_count + token) * hidden_width + feature]));
+          static_cast<scalar_t>(memory[(batch * token_count + token) * hidden_width + feature]));
     }
     pooled[feature] = value;
   }
   __syncthreads();
-  for (int64_t head_feature = threadIdx.x; head_feature < head_width; head_feature += blockDim.x) {
+  for (int64_t head_feature = projection_wave; head_feature < head_width;
+       head_feature += projection_waves) {
     const int64_t attention_feature = head * head_width + head_feature;
     float value = 0.0f;
     const int64_t value_weight_offset =
         (readout * (2 * attention_width) + attention_width + attention_feature) * hidden_width;
-    for (int32_t feature = 0; feature < hidden_width; ++feature) {
+    for (int32_t feature = projection_lane; feature < hidden_width; feature += warpSize) {
       value += pooled[feature] *
           static_cast<float>(key_value_weight[value_weight_offset + feature]);
     }
-    context[(readout * batch_count + batch) * attention_width +
-        attention_feature] = static_cast<scalar_t>(value);
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      value += __shfl_down(value, offset);
+    }
+    if (projection_lane == 0) {
+      context[(readout * batch_count + batch) * attention_width +
+          attention_feature] = static_cast<scalar_t>(value);
+    }
   }
 }
 
@@ -3956,6 +4011,43 @@ void LaunchOutputPackTyped(const OutputPackArguments& arguments,
       arguments);
 }
 
+template <typename scalar_t>
+__global__ void weighted_compact_reduce_kernel(const scalar_t* rows, const scalar_t* weights,
+    const int64_t* indices, scalar_t* output, int64_t count, int64_t width, int64_t capacity) {
+  const int64_t action = blockIdx.x;
+  int64_t lo = 0, hi = count;
+  while (lo < hi) {
+    const int64_t mid = lo + (hi - lo) / 2;
+    if (indices[mid] < action * capacity) lo = mid + 1;
+    else hi = mid;
+  }
+  for (int64_t feature = threadIdx.x; feature < width; feature += blockDim.x) {
+    scalar_t sum = static_cast<scalar_t>(0.0f);
+    for (int64_t item = lo; item < count && indices[item] < (action + 1) * capacity; ++item) {
+      const scalar_t product = static_cast<scalar_t>(static_cast<float>(rows[item * width + feature]) *
+          static_cast<float>(weights[indices[item]]));
+      sum = static_cast<scalar_t>(static_cast<float>(sum) + static_cast<float>(product));
+    }
+    output[action * width + feature] = sum;
+  }
+}
+
+void LaunchWeightedCompactReduce(const torch::Tensor& rows, const torch::Tensor& weights,
+    const torch::Tensor& indices, torch::Tensor& output, int64_t capacity) {
+  if (output.numel() == 0) return;
+  const auto stream = backend::GetCurrentStream(output.get_device());
+#define LAUNCH_WEIGHTED_COMPACT(T) \
+  DJL_FUSION_LAUNCH_KERNEL((weighted_compact_reduce_kernel<T>), dim3(output.size(0)), dim3(128), 0, stream, \
+      rows.data_ptr<T>(), weights.data_ptr<T>(), indices.data_ptr<int64_t>(), output.data_ptr<T>(), \
+      rows.size(0), rows.size(1), capacity)
+  if (rows.scalar_type() == torch::kFloat32) { LAUNCH_WEIGHTED_COMPACT(float); }
+  else if (rows.scalar_type() == torch::kBFloat16) { LAUNCH_WEIGHTED_COMPACT(c10::BFloat16); }
+  else if (rows.scalar_type() == torch::kFloat16) { LAUNCH_WEIGHTED_COMPACT(c10::Half); }
+  else TORCH_CHECK(false, "unsupported weighted compact reduction dtype");
+#undef LAUNCH_WEIGHTED_COMPACT
+  CheckKernelLaunch("weighted compact reduction");
+}
+
 void LaunchOutputPack(const OutputPackSource* sources, int32_t source_count,
     torch::Tensor& output, int64_t row_count, int64_t output_width) {
   if (row_count == 0) {
@@ -4802,7 +4894,7 @@ void LaunchSingleQueryReadoutAttentionTyped(const torch::Tensor& seed_products, 
                   : sizeof(float) * (2 * hidden_width + attention_width / attention_heads + 2 * token_count);
 #define LAUNCH_SINGLE_QUERY_ATTENTION_SHAPE(specialized)                                                            \
   DJL_FUSION_LAUNCH_KERNEL((single_query_attention_kernel<memory_t, scalar_t, mask_t, specialized>),                \
-      dim3(batch_count, readout_count* attention_heads), dim3(kThreadsPerBlock), shared_bytes, stream,              \
+      dim3(readout_count * attention_heads, batch_count), dim3(128), shared_bytes, stream,              \
       seed_products.data_ptr<scalar_t>(), seed_bias.data_ptr<scalar_t>(), memory.data_ptr<memory_t>(),              \
       valid_mask.data_ptr<mask_t>(), query_weight.data_ptr<scalar_t>(), query_bias.data_ptr<scalar_t>(),            \
       key_value_weight.data_ptr<scalar_t>(), state.data_ptr<scalar_t>(), context.data_ptr<scalar_t>(), batch_count, \

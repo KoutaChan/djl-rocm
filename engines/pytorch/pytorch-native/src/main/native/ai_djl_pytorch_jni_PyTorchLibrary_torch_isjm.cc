@@ -13,6 +13,7 @@
 #include <ATen/ops/unique_dim.h>
 #include <c10/core/DeviceGuard.h>
 #include <djl/utils.h>
+#include <torch/csrc/autograd/custom_function.h>
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "djl_pytorch_fusion_kernels.h"
@@ -31,8 +32,96 @@ void record_concat_to_type_stream(const torch::Tensor& tensor) {
       tensor.storage().data_ptr(), guard_impl.getStream(tensor.device()));
 }
 
+class ConcatToTypeFunction : public torch::autograd::Function<ConcatToTypeFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* context,
+      at::TensorList tensors, int64_t output_type) {
+    c10::DeviceGuard device_guard(tensors.front().device());
+    auto sizes = tensors.front().sizes().vec();
+    std::vector<int64_t> widths;
+    std::vector<int64_t> types;
+    int64_t width = 0;
+    std::vector<djl::pytorch::fusion::OutputPackSource> sources;
+    for (const auto& tensor : tensors) {
+      record_concat_to_type_stream(tensor);
+      sources.push_back({tensor.data_ptr(), tensor.scalar_type(), tensor.size(-1), width});
+      widths.push_back(tensor.size(-1));
+      types.push_back(static_cast<int64_t>(tensor.scalar_type()));
+      width += tensor.size(-1);
+    }
+    sizes.back() = width;
+    auto output = torch::empty(sizes,
+        tensors.front().options().dtype(static_cast<torch::ScalarType>(output_type)));
+    context->saved_data["widths"] = widths;
+    context->saved_data["types"] = types;
+    context->set_materialize_grads(false);
+    record_concat_to_type_stream(output);
+    djl::pytorch::fusion::LaunchOutputPack(sources.data(), sources.size(), output,
+        width == 0 ? 0 : output.numel() / width, width);
+    return output;
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* context,
+      torch::autograd::variable_list gradients) {
+    const auto widths = context->saved_data["widths"].toIntVector();
+    const auto types = context->saved_data["types"].toIntVector();
+    torch::autograd::variable_list result(widths.size() + 1);
+    if (!gradients.at(0).defined()) return result;
+    int64_t offset = 0;
+    for (size_t index = 0; index < widths.size(); ++index) {
+      if (context->needs_input_grad(index)) {
+        result[index] = gradients[0].narrow(-1, offset, widths[index])
+            .to(static_cast<torch::ScalarType>(types[index]));
+      }
+      offset += widths[index];
+    }
+    return result;
+  }
+};
+
 }  // namespace
 #endif
+
+// Experimental sorted compact-row reduction. Indices must be sorted, unique,
+// nonnegative dense transition IDs; Java dispatch retains the reference fallback.
+extern "C" JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchWeightedCompactReduce(
+    JNIEnv* env, jobject, jlong jrows, jlong jweights, jlong jindices,
+    jlong actions, jlong capacity) {
+  API_BEGIN()
+  const auto& rows = *reinterpret_cast<torch::Tensor*>(jrows);
+  const auto& weights = *reinterpret_cast<torch::Tensor*>(jweights);
+  const auto& indices = *reinterpret_cast<torch::Tensor*>(jindices);
+  TORCH_CHECK(rows.dim() == 2 && indices.dim() == 1 && weights.dim() == 1 &&
+      indices.numel() == rows.size(0) && actions >= 0 && capacity > 0 &&
+      weights.numel() / capacity == actions && weights.numel() % capacity == 0,
+      "invalid weighted compact reduction shape");
+  TORCH_CHECK(rows.device() == weights.device() && rows.device() == indices.device() &&
+      rows.scalar_type() == weights.scalar_type() && indices.scalar_type() == torch::kInt64,
+      "invalid weighted compact reduction dtype/device");
+  // Until native backward is validated, the differentiable ATen reference is used.
+  torch::Tensor result;
+#if defined(DJL_USE_ROCM_KERNELS)
+  if (!at::GradMode::is_enabled() && rows.is_cuda() && rows.is_contiguous() &&
+      weights.is_contiguous() && indices.is_contiguous()) {
+    c10::DeviceGuard guard(rows.device());
+    result = torch::empty({actions, rows.size(1)}, rows.options());
+    record_concat_to_type_stream(rows);
+    record_concat_to_type_stream(weights);
+    record_concat_to_type_stream(indices);
+    record_concat_to_type_stream(result);
+    djl::pytorch::fusion::LaunchWeightedCompactReduce(rows, weights, indices, result, capacity);
+  } else
+#endif
+  {
+    auto action_indices = torch::floor_divide(indices, capacity);
+    auto selected_weights = weights.index_select(0, indices).unsqueeze(1);
+    result = torch::zeros({actions, rows.size(1)}, rows.options()).index_add(
+        0, action_indices, rows * selected_weights);
+  }
+  return reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(result)));
+  API_END_RETURN()
+}
 
 JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchReshape(
     JNIEnv* env, jobject jthis, jlong jhandle, jlongArray jshape) {
@@ -135,7 +224,6 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchConcatToType
   for (const torch::Tensor& tensor : tensors) {
     native = native && tensor.dim() == rank && tensor.is_cuda() &&
         tensor.is_contiguous() && tensor.device() == device &&
-        !tensor.requires_grad() &&
         (tensor.scalar_type() == torch::kFloat16 ||
          tensor.scalar_type() == torch::kBFloat16 ||
          tensor.scalar_type() == torch::kFloat32);
@@ -147,6 +235,12 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchConcatToType
     }
   }
   if (native) {
+    if (at::GradMode::is_enabled() && std::any_of(tensors.begin(), tensors.end(),
+            [](const torch::Tensor& tensor) { return tensor.requires_grad(); })) {
+      auto output = ConcatToTypeFunction::apply(at::TensorList(tensors),
+          static_cast<int64_t>(output_type));
+      return reinterpret_cast<uintptr_t>(new torch::Tensor(std::move(output)));
+    }
     c10::DeviceGuard device_guard(device);
     output_sizes[rank - 1] = output_width;
     torch::Tensor output = torch::empty(

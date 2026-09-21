@@ -180,6 +180,16 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTrueDivideSc
   API_END_RETURN()
 }
 
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFloorDivideScalar(JNIEnv* env, jobject jthis,
+    jlong jself, jlong jinteger_value, jdouble jfloating_value, jboolean jfloating) {
+  API_BEGIN()
+  const auto* self_ptr = reinterpret_cast<torch::Tensor*>(jself);
+  const auto scalar = utils::GetScalarFromJNumber(jinteger_value, jfloating_value, jfloating);
+  const auto* result_ptr = new torch::Tensor(self_ptr->div(scalar, "floor"));
+  return reinterpret_cast<uintptr_t>(result_ptr);
+  API_END_RETURN()
+}
+
 JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchTrueDividei(
     JNIEnv* env, jobject jthis, jlong jself, jlong jother) {
   API_BEGIN()

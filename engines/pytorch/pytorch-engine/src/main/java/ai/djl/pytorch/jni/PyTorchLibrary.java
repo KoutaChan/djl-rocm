@@ -251,6 +251,9 @@ final class PyTorchLibrary {
     native long torchTrueDivideScalar(
             long self, long integerValue, double floatingValue, boolean floating);
 
+    native long torchFloorDivideScalar(
+            long self, long integerValue, double floatingValue, boolean floating);
+
     native void torchTrueDividei(long self, long other);
 
     native void torchTrueDivideiScalar(
@@ -591,6 +594,9 @@ final class PyTorchLibrary {
     native long torchCat(long[] handles, long dim);
 
     native long torchConcatToType(long[] handles, long dim, int dataType);
+
+    native long torchWeightedCompactReduce(
+            long rows, long weights, long indices, long actions, long capacity);
 
     native long torchRepeat(long handle, long[] repeats);
 

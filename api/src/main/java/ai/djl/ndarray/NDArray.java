@@ -1526,6 +1526,22 @@ public interface NDArray extends NDResource, BytesSupplier {
     NDArray div(Number n);
 
     /**
+     * Divides this {@code NDArray} by a scalar, rounding each quotient toward negative infinity.
+     *
+     * <p>An integer array divided by an integer scalar retains its data type and is evaluated
+     * without conversion to floating point. A quotient that exceeds the result data type is not
+     * supported.
+     *
+     * @param n the nonzero divisor
+     * @return the element-wise floor quotients, with the same shape as this array
+     * @throws IllegalArgumentException if the divisor is zero
+     * @throws UnsupportedOperationException if the engine does not support floor division
+     */
+    default NDArray floorDivide(Number n) {
+        throw new UnsupportedOperationException("floorDivide is not supported by this engine");
+    }
+
+    /**
      * Divides this {@code NDArray} by the other {@code NDArray} element-wise.
      *
      * <p>The shapes of this {@code NDArray} and the other {@code NDArray} must be broadcastable.

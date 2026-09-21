@@ -1171,6 +1171,19 @@ public interface NDArrayEx {
         }
     }
 
+    /**
+     * Concatenates floating-point arrays along the last axis and applies a linear projection.
+     * Engines may fuse the packing and projection; the default implementation is differentiable.
+     */
+    default NDArray concatToTypeLinear(
+            NDList arrays, DataType dataType, NDArray weight, NDArray bias) {
+        NDList sources = new NDList(arrays.size() + 1);
+        sources.add(getArray());
+        sources.addAll(arrays);
+        NDArray packed = NDArrays.concatToType(sources, -1, dataType);
+        return packed.getNDArrayInternal().linear(packed, weight, bias).singletonOrThrow();
+    }
+
     /** Gathers, projects, and scatters rows with shared destination indices. */
     default NDArray indexedAffine(
             NDList sources,
