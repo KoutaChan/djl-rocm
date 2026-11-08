@@ -19,6 +19,10 @@
         <Class name="~ai\.djl\.Device"/>
     </Match>
     <Match>
+        <Bug pattern="DM_GC"/>
+        <Class name="ai.djl.pytorch.engine.PtNDManagerTest"/>
+    </Match>
+    <Match>
         <Class name="~ai\.djl\.mxnet\.jna\..*"/>
     </Match>
 </FindBugsFilter>

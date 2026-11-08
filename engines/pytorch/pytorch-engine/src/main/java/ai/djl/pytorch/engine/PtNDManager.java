@@ -92,7 +92,14 @@ public class PtNDManager extends BaseNDManager {
         return JniUtils.createEmptyNdArray(this, shape, dataType, device, SparseFormat.DENSE);
     }
 
-    /** {@inheritDoc} */
+    /**
+     * {@inheritDoc}
+     *
+     * <p>On the CPU, the returned array shares a direct {@code ByteBuffer} without a copy and keeps
+     * it reachable only until the array is closed, so keep the array open while libtorch may still
+     * read the tensor, for example until backward has run. Other data is copied into memory that
+     * libtorch owns.
+     */
     @Override
     public PtNDArray create(Buffer data, Shape shape, DataType dataType) {
         int size = Math.toIntExact(shape.size());
@@ -101,10 +108,7 @@ public class PtNDManager extends BaseNDManager {
             return JniUtils.createNdFromByteBuffer(
                     this, (ByteBuffer) data, shape, dataType, SparseFormat.DENSE, device);
         }
-        ByteBuffer buf = allocateDirect(size * dataType.getNumOfBytes());
-        copyBuffer(data, buf);
-        return JniUtils.createNdFromByteBuffer(
-                this, buf, shape, dataType, SparseFormat.DENSE, device);
+        return JniUtils.createNdFromBuffer(this, data, shape, dataType, SparseFormat.DENSE, device);
     }
 
     /** {@inheritDoc} */

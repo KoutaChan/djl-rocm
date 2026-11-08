@@ -13,6 +13,7 @@
 package ai.djl.pytorch.jni;
 
 import ai.djl.Device;
+import ai.djl.ndarray.BaseNDManager;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDScope;
 import ai.djl.ndarray.index.NDIndex;
@@ -42,6 +43,7 @@ import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
@@ -411,6 +413,52 @@ public final class JniUtils {
             return new PtNDArray(manager, handle);
         }
         return new PtNDArray(manager, handle, data);
+    }
+
+    /**
+     * Creates a tensor from a copy of the given data.
+     *
+     * <p>A CPU tensor created by {@link #createNdFromByteBuffer} shares the Java buffer, which
+     * stays reachable only while its {@link PtNDArray} is open, but libtorch can keep using the
+     * tensor after that: autograd saves inputs for backward and views share the storage. On the
+     * CPU, the data is therefore copied into a tensor that libtorch allocates. Other devices and
+     * layouts make their own copy in native code and keep using a staging buffer.
+     *
+     * @param manager the manager to attach the new array to
+     * @param data the data to copy
+     * @param shape the shape of the new array
+     * @param dType the data type of the new array
+     * @param fmt the sparse format of the new array
+     * @param device the device of the new array
+     * @return the new array
+     */
+    public static PtNDArray createNdFromBuffer(
+            PtNDManager manager,
+            Buffer data,
+            Shape shape,
+            DataType dType,
+            SparseFormat fmt,
+            Device device) {
+        int size = Math.toIntExact(shape.size());
+        if (layoutMapper(fmt, device) != 0 || !Device.Type.CPU.equals(device.getDeviceType())) {
+            ByteBuffer buf = manager.allocateDirect(size * dType.getNumOfBytes());
+            BaseNDManager.copyBuffer(data, buf);
+            return createNdFromByteBuffer(manager, buf, shape, dType, fmt, device);
+        }
+        PtNDArray array = createEmptyNdArray(manager, shape, dType, device, fmt);
+        if (size > 0) {
+            try {
+                ByteBuffer target =
+                        PyTorchLibrary.LIB
+                                .torchDirectByteBuffer(array.getHandle())
+                                .order(ByteOrder.nativeOrder());
+                BaseNDManager.copyBuffer(data, target);
+            } catch (RuntimeException | Error e) {
+                array.close();
+                throw e;
+            }
+        }
+        return array;
     }
 
     public static void emptyCudaCache() {
