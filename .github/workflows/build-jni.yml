@@ -338,7 +338,7 @@ jobs:
       matrix:
         include:
           - classifier: osx-aarch64
-            runner: macos-14
+            runner: macos-15
             pt: "2.11.0"
             arch: aarch64
     steps:
