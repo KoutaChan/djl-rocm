@@ -13,6 +13,7 @@
 #include <djl/utils.h>
 
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
+#include "djl_pytorch_java_buffer.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_utils.h"
 
@@ -23,22 +24,50 @@ JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFromBlob(JNI
   API_BEGIN()
   const auto shape_vec = djl::utils::jni::GetVecFromJLongArray(env, jshape);
   const auto device = utils::GetDeviceFromJDevice(env, jdevice);
-  auto options = torch::TensorOptions().requires_grad(JNI_TRUE == jrequired_grad);
+  auto options = torch::TensorOptions();
   // DJL's UNKNOWN type
   if (jdtype != 8) {
     options = options.dtype(utils::GetScalarTypeFromDType(jdtype));
   }
-  // the java side hold the reference for the directByteBuffer
-  torch::Tensor result = torch::from_blob(env->GetDirectBufferAddress(jbuffer), shape_vec, options);
-  // from_blob doesn't support torch::kSparse and torch::kMkldnn, so explicit cast the type here
-  if (jlayout == 1) {
-    result = result.to_sparse();
-  } else if (jlayout == 2) {
-    result = result.to_mkldnn();
+  torch::Tensor result;
+  if (jlayout == 0 && device.is_cpu()) {
+    // the tensor shares the directByteBuffer, and its storage keeps the buffer reachable until libtorch frees it
+    result = djl::pytorch::FromDirectBuffer(env, jbuffer, shape_vec, options);
+  } else {
+    // other layouts and devices copy the directByteBuffer before this call returns
+    result = torch::from_blob(env->GetDirectBufferAddress(jbuffer), shape_vec, options);
+    // from_blob doesn't support torch::kSparse and torch::kMkldnn, so explicit cast the type here
+    if (jlayout == 1) {
+      result = result.to_sparse();
+    } else if (jlayout == 2) {
+      result = result.to_mkldnn();
+    }
+    // Don't change device unless data on CPU
+    if (!device.is_cpu()) {
+      result = result.to(device);
+    }
   }
-  // Don't change device unless data on CPU
-  if (!device.is_cpu()) {
-    result = result.to(device);
+  if (JNI_TRUE == jrequired_grad) {
+    result.requires_grad_(true);
+  }
+  const torch::Tensor* tensor_ptr = new torch::Tensor(result);
+  return reinterpret_cast<uintptr_t>(tensor_ptr);
+  API_END_RETURN()
+}
+
+JNIEXPORT jlong JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchFromArray(
+    JNIEnv* env, jobject jthis, jobject jarray, jlong joffset, jlong jlength, jlongArray jshape, jint jdtype) {
+  API_BEGIN()
+  const auto shape_vec = djl::utils::jni::GetVecFromJLongArray(env, jshape);
+  auto options = torch::TensorOptions();
+  // DJL's UNKNOWN type
+  if (jdtype != 8) {
+    options = options.dtype(utils::GetScalarTypeFromDType(jdtype));
+  }
+  // the CPU tensor holds a copy of the array in memory that libtorch owns
+  const auto result = djl::pytorch::FromArray(env, jarray, joffset, jlength, shape_vec, options);
+  if (env->ExceptionCheck()) {
+    return 0;
   }
   const torch::Tensor* tensor_ptr = new torch::Tensor(result);
   return reinterpret_cast<uintptr_t>(tensor_ptr);

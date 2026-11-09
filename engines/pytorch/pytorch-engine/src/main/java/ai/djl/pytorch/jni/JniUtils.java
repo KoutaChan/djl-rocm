@@ -397,32 +397,24 @@ public final class JniUtils {
             DataType dType,
             SparseFormat fmt,
             Device device) {
-        int layout = layoutMapper(fmt, device);
         long handle =
                 PyTorchLibrary.LIB.torchFromBlob(
                         data,
                         shape.getShape(),
                         dType.ordinal(),
-                        layout,
+                        layoutMapper(fmt, device),
                         new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()},
                         false);
-
-        if (layout == 1 || layout == 2 || device.isGpu()) {
-            // MKLDNN & COO & GPU device will explicitly make a copy in native code
-            // so we don't want to hold a reference on Java side
-            return new PtNDArray(manager, handle);
-        }
-        return new PtNDArray(manager, handle, data);
+        // A dense CPU tensor shares the buffer, and its storage keeps the buffer reachable until
+        // libtorch frees it. MKLDNN & COO & GPU device make a copy in native code.
+        return new PtNDArray(manager, handle, shape, dType == DataType.COMPLEX64 ? null : dType);
     }
 
     /**
      * Creates a tensor from a copy of the given data.
      *
-     * <p>A CPU tensor created by {@link #createNdFromByteBuffer} shares the Java buffer, which
-     * stays reachable only while its {@link PtNDArray} is open, but libtorch can keep using the
-     * tensor after that: autograd saves inputs for backward and views share the storage. On the
-     * CPU, the data is therefore copied into a tensor that libtorch allocates. Other devices and
-     * layouts make their own copy in native code and keep using a staging buffer.
+     * <p>The data is copied once into a CPU tensor that libtorch allocates, straight from the array
+     * of a heap buffer when it has one. Other devices and layouts copy that tensor in native code.
      *
      * @param manager the manager to attach the new array to
      * @param data the data to copy
@@ -439,26 +431,80 @@ public final class JniUtils {
             DataType dType,
             SparseFormat fmt,
             Device device) {
-        int size = Math.toIntExact(shape.size());
-        if (layoutMapper(fmt, device) != 0 || !Device.Type.CPU.equals(device.getDeviceType())) {
-            ByteBuffer buf = manager.allocateDirect(size * dType.getNumOfBytes());
-            BaseNDManager.copyBuffer(data, buf);
-            return createNdFromByteBuffer(manager, buf, shape, dType, fmt, device);
+        long handle = copyToCpuTensor(data, shape, dType);
+        if (layoutMapper(fmt, device) == 0 && Device.Type.CPU.equals(device.getDeviceType())) {
+            return new PtNDArray(
+                    manager, handle, shape, dType == DataType.COMPLEX64 ? null : dType);
         }
-        PtNDArray array = createEmptyNdArray(manager, shape, dType, device, fmt);
-        if (size > 0) {
+        try {
+            ByteBuffer view = PyTorchLibrary.LIB.torchDirectByteBuffer(handle);
+            return createNdFromByteBuffer(manager, view, shape, dType, fmt, device);
+        } finally {
+            PyTorchLibrary.LIB.torchDeleteTensor(handle);
+        }
+    }
+
+    /**
+     * Copies data into a new dense CPU tensor that libtorch allocates.
+     *
+     * @param data the data to copy
+     * @param shape the shape of the tensor
+     * @param dType the data type of the tensor
+     * @return the handle of the new tensor
+     */
+    private static long copyToCpuTensor(Buffer data, Shape shape, DataType dType) {
+        int elementSize = arrayElementSize(data, dType);
+        if (elementSize > 0) {
+            long handle =
+                    PyTorchLibrary.LIB.torchFromArray(
+                            data.array(),
+                            (long) (data.arrayOffset() + data.position()) * elementSize,
+                            (long) data.remaining() * elementSize,
+                            shape.getShape(),
+                            dType.ordinal());
+            // Consumes the data as a copy into a view does
+            data.position(data.limit());
+            return handle;
+        }
+        Device device = Device.cpu();
+        // A strided layout, which the MKLDNN option does not change
+        long handle =
+                PyTorchLibrary.LIB.torchEmpty(
+                        shape.getShape(),
+                        dType.ordinal(),
+                        0,
+                        new int[] {PtDeviceType.toDeviceType(device), device.getDeviceId()},
+                        false);
+        if (shape.size() > 0) {
             try {
                 ByteBuffer target =
                         PyTorchLibrary.LIB
-                                .torchDirectByteBuffer(array.getHandle())
+                                .torchDirectByteBuffer(handle)
                                 .order(ByteOrder.nativeOrder());
                 BaseNDManager.copyBuffer(data, target);
             } catch (RuntimeException | Error e) {
-                array.close();
+                PyTorchLibrary.LIB.torchDeleteTensor(handle);
                 throw e;
             }
         }
-        return array;
+        return handle;
+    }
+
+    /**
+     * Returns the size of the elements of the array that backs a heap buffer, or 0 to copy the data
+     * through a view because there is no accessible array or its elements are neither bytes nor of
+     * the size of the data type.
+     *
+     * @param data the data to copy
+     * @param dType the data type of the tensor
+     * @return the number of bytes of an array element, or 0
+     */
+    private static int arrayElementSize(Buffer data, DataType dType) {
+        if (!data.hasArray()) {
+            return 0;
+        }
+        int size = DataType.fromBuffer(data).getNumOfBytes();
+        return size == 1 || size == dType.getNumOfBytes() ? size : 0;
     }
 
     public static void emptyCudaCache() {
@@ -819,9 +865,28 @@ public final class JniUtils {
                 ndArray.getHandle(), value.getHandle(), minIndices, maxIndices, stepIndices);
     }
 
-    public static void set(PtNDArray self, ByteBuffer data) {
-        // Note the ByteBuffer here is directByteBuffer
-        PyTorchLibrary.LIB.torchSet(self.getHandle(), data);
+    public static void set(PtNDArray self, Buffer data) {
+        if (data.isDirect() && data instanceof ByteBuffer) {
+            // A CPU tensor shares the buffer, and its new storage keeps the buffer reachable
+            PyTorchLibrary.LIB.torchSet(self.getHandle(), (ByteBuffer) data);
+            return;
+        }
+        int elementSize = arrayElementSize(data, self.getDataType());
+        if (elementSize > 0) {
+            PyTorchLibrary.LIB.torchSetFromArray(
+                    self.getHandle(),
+                    data.array(),
+                    (long) (data.arrayOffset() + data.position()) * elementSize,
+                    (long) data.remaining() * elementSize);
+            data.position(data.limit());
+            return;
+        }
+        long source = copyToCpuTensor(data, self.getShape(), self.getDataType());
+        try {
+            PyTorchLibrary.LIB.torchSetFromTensor(self.getHandle(), source);
+        } finally {
+            PyTorchLibrary.LIB.torchDeleteTensor(source);
+        }
     }
 
     public static long allocatePinnedBuffer(int size, DataType dataType) {
@@ -2761,6 +2826,17 @@ public final class JniUtils {
         return PyTorchLibrary.LIB.torchIsContiguous(ndArray.getHandle());
     }
 
+    /**
+     * Returns the data of an array as a byte buffer.
+     *
+     * <p>With {@code tryDirect}, a dense CPU array returns a view of its memory instead of a copy.
+     * The view is valid only while the array is open and keeps its storage, so it serves to copy
+     * the data out within one call.
+     *
+     * @param ndArray the array to read
+     * @param tryDirect whether to return a view of the memory if possible
+     * @return the data of the array
+     */
     public static ByteBuffer getByteBuffer(PtNDArray ndArray, boolean tryDirect) {
         if (ndArray.getDevice().equals(Device.cpu())) {
             if (tryDirect

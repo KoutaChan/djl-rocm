@@ -13,6 +13,7 @@
 
 #include "ai_djl_pytorch_jni_cache.h"
 
+JavaVM* JAVA_VM;
 jclass NULL_PTR_EXCEPTION_CLASS;
 jclass ILLEGAL_STATE_EXCEPTION_CLASS;
 jclass ENGINE_EXCEPTION_CLASS;
@@ -29,6 +30,7 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
   if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION) != JNI_OK) {
     return JNI_ERR;
   }
+  JAVA_VM = vm;
   jclass temp_class;
   temp_class = env->FindClass("java/lang/NullPointerException");
   NULL_PTR_EXCEPTION_CLASS = (jclass) env->NewGlobalRef(temp_class);

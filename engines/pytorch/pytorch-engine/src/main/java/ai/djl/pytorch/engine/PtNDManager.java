@@ -95,10 +95,11 @@ public class PtNDManager extends BaseNDManager {
     /**
      * {@inheritDoc}
      *
-     * <p>On the CPU, the returned array shares a direct {@code ByteBuffer} without a copy and keeps
-     * it reachable only until the array is closed, so keep the array open while libtorch may still
-     * read the tensor, for example until backward has run. Other data is copied into memory that
-     * libtorch owns.
+     * <p>On the CPU, a direct {@code ByteBuffer} is shared without a copy unless MKLDNN is enabled:
+     * libtorch keeps the buffer reachable while any tensor, view or saved tensor uses its memory,
+     * and writes to the buffer are visible to them. Memory that its owner frees explicitly, such as
+     * a {@link PtPinnedBuffer}, must stay valid while libtorch may read it. Other data is copied
+     * once into memory that libtorch owns.
      */
     @Override
     public PtNDArray create(Buffer data, Shape shape, DataType dataType) {

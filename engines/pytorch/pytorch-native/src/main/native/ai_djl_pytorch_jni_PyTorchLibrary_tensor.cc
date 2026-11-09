@@ -13,6 +13,7 @@
 #include "ai_djl_pytorch_jni_PyTorchLibrary.h"
 #include "ai_djl_pytorch_jni_cache.h"
 #include "djl_pytorch_accelerator.h"
+#include "djl_pytorch_java_buffer.h"
 #include "djl_pytorch_jni_exception.h"
 #include "djl_pytorch_row_ops.h"
 #include "djl_pytorch_utils.h"
@@ -233,20 +234,54 @@ JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSet(
   // the jbuffer is on the CPU. Although storage can specify GPU device,
   // it still doesn't move the data to GPU for us. So we
   // handle the gpu case explicitly here
-  if (tensor_ptr->device().is_cuda()) {
+  if (!tensor_ptr->is_cpu()) {
     auto options = torch::TensorOptions().dtype(tensor_ptr->dtype()).requires_grad(false);
     torch::Tensor temp = torch::from_blob(env->GetDirectBufferAddress(jbuffer), sizes, options);
     temp = temp.to(tensor_ptr->device());
     tensor_ptr->set_(temp);
     return;
   }
+  // the storage shares the jbuffer and keeps it reachable until libtorch frees the storage
   std::vector<int64_t> strides = at::detail::defaultStrides(sizes);
   torch::Storage storage(torch::Storage::use_byte_size_t(),
       at::detail::computeStorageNbytes(sizes, strides, tensor_ptr->dtype().itemsize()),
-      torch::DataPtr(env->GetDirectBufferAddress(jbuffer), tensor_ptr->device()),
+      djl::pytorch::DirectBufferDataPtr(env, jbuffer),
       /*allocator=*/nullptr,
       /*resizable=*/false);
   tensor_ptr->set_(storage, 0, sizes, strides);
+  API_END()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSetFromTensor(
+    JNIEnv* env, jobject jthis, jlong jhandle, jlong jsource_handle) {
+  API_BEGIN()
+  torch::AutoNonVariableTypeMode guard;
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto* source_ptr = reinterpret_cast<torch::Tensor*>(jsource_handle);
+  // the tensor shares the storage of the source, which libtorch owns
+  if (source_ptr->device() == tensor_ptr->device()) {
+    tensor_ptr->set_(*source_ptr);
+  } else {
+    tensor_ptr->set_(source_ptr->to(tensor_ptr->device()));
+  }
+  API_END()
+}
+
+JNIEXPORT void JNICALL Java_ai_djl_pytorch_jni_PyTorchLibrary_torchSetFromArray(
+    JNIEnv* env, jobject jthis, jlong jhandle, jobject jarray, jlong joffset, jlong jlength) {
+  API_BEGIN()
+  torch::AutoNonVariableTypeMode guard;
+  const auto* tensor_ptr = reinterpret_cast<torch::Tensor*>(jhandle);
+  const auto options = torch::TensorOptions().dtype(tensor_ptr->dtype());
+  // the tensor takes the storage of a copy of the array, which libtorch owns
+  auto source = djl::pytorch::FromArray(env, jarray, joffset, jlength, tensor_ptr->sizes(), options);
+  if (env->ExceptionCheck()) {
+    return;
+  }
+  if (!tensor_ptr->is_cpu()) {
+    source = source.to(tensor_ptr->device());
+  }
+  tensor_ptr->set_(source);
   API_END()
 }
 

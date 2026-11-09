@@ -424,6 +424,8 @@ final class PyTorchLibrary {
             int[] device,
             boolean requiredGrad);
 
+    native long torchFromArray(Object array, long offset, long length, long[] shape, int dType);
+
     native long torchIndex(long handle, long[] minIndices, long[] maxIndices, long[] stepIndices);
 
     native void torchIndexPut(
@@ -436,6 +438,10 @@ final class PyTorchLibrary {
     native void torchIndexAdvPut(long handle, long torchIndexHandle, long data);
 
     native void torchSet(long handle, ByteBuffer data);
+
+    native void torchSetFromTensor(long handle, long sourceHandle);
+
+    native void torchSetFromArray(long handle, Object array, long offset, long length);
 
     native long torchAllocatePinnedBuffer(long size, int dtype);
 

@@ -61,6 +61,8 @@ public final class PtPinnedBuffer extends NativeResource<Long> {
      *
      * <p>The returned view shares the native memory with this buffer, but has independent position
      * and limit. Closing this {@code PtPinnedBuffer} invalidates all views returned by this method.
+     * A CPU tensor created from a view without a copy reads the same memory, so keep this buffer
+     * open until libtorch no longer uses that tensor.
      *
      * @return a direct {@link ByteBuffer} backed by host transfer memory
      */

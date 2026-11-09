@@ -16,6 +16,7 @@
 
 #include <jni.h>
 
+extern JavaVM* JAVA_VM;
 extern jclass NULL_PTR_EXCEPTION_CLASS;
 extern jclass ILLEGAL_STATE_EXCEPTION_CLASS;
 extern jclass ENGINE_EXCEPTION_CLASS;

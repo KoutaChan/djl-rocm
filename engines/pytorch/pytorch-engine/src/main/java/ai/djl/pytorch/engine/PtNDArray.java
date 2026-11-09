@@ -26,6 +26,11 @@ import ai.djl.util.NativeResource;
 
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.nio.DoubleBuffer;
+import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
+import java.nio.LongBuffer;
+import java.nio.ShortBuffer;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,10 +54,6 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     private PtNDManager manager;
     private PtNDArrayEx ptNDArrayEx;
     private String[] strs;
-
-    // keep a reference to direct buffer to avoid GC release the memory
-    @SuppressWarnings("PMD.UnusedPrivateField")
-    private ByteBuffer dataRef;
 
     /**
      * Constructs a PyTorch {@code NDArray} from a native handle (internal. Use {@link NDManager}
@@ -100,24 +101,6 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         this(manager, handle);
         this.shape = new Shape(shape.getShape().clone());
         this.dataType = dataType;
-    }
-
-    /**
-     * Constructs a PyTorch {@code NDArray} from a native handle (internal. Use {@link NDManager}
-     * instead) with the data that is hold on Java side.
-     *
-     * @param manager the manager to attach the new array to
-     * @param handle the pointer to the native PyTorch memory
-     * @param data the direct buffer of the data
-     */
-    @SuppressWarnings("this-escape")
-    public PtNDArray(PtNDManager manager, long handle, ByteBuffer data) {
-        super(handle);
-        this.manager = manager;
-        this.ptNDArrayEx = new PtNDArrayEx(this);
-        manager.attachInternal(getUid(), this);
-        dataRef = data;
-        NDScope.register(this);
     }
 
     /**
@@ -256,14 +239,149 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
         return JniUtils.detachGradient(this);
     }
 
-    /** {@inheritDoc} */
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The returned buffer is always a copy, so it stays valid after this array is closed or its
+     * data is replaced.
+     */
     @Override
     public ByteBuffer toByteBuffer(boolean tryDirect) {
         if (getDataType() == DataType.STRING) {
             throw new UnsupportedOperationException(
                     "toByteBuffer is not supported for String tensor.");
         }
-        return JniUtils.getByteBuffer(this, tryDirect);
+        return JniUtils.getByteBuffer(this, false);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public double[] toDoubleArray() {
+        if (getDataType() != DataType.FLOAT64) {
+            return NDArray.super.toDoubleArray();
+        }
+        DoubleBuffer db = dataView().asDoubleBuffer();
+        double[] ret = new double[db.remaining()];
+        db.get(ret);
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public float[] toFloatArray() {
+        if (getDataType() != DataType.FLOAT32) {
+            return NDArray.super.toFloatArray();
+        }
+        FloatBuffer fb = dataView().asFloatBuffer();
+        float[] ret = new float[fb.remaining()];
+        fb.get(ret);
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public short[] toShortArray() {
+        if (getDataType() != DataType.INT16) {
+            return NDArray.super.toShortArray();
+        }
+        ShortBuffer sb = dataView().asShortBuffer();
+        short[] ret = new short[sb.remaining()];
+        sb.get(ret);
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public int[] toUnsignedShortArray() {
+        if (getDataType() != DataType.UINT16) {
+            return NDArray.super.toUnsignedShortArray();
+        }
+        ShortBuffer sb = dataView().asShortBuffer();
+        int[] ret = new int[sb.remaining()];
+        for (int i = 0; i < ret.length; ++i) {
+            ret[i] = sb.get() & 0xffff;
+        }
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public int[] toIntArray() {
+        DataType dType = getDataType();
+        if (dType != DataType.INT32 && dType != DataType.UINT32) {
+            return NDArray.super.toIntArray();
+        }
+        IntBuffer ib = dataView().asIntBuffer();
+        int[] ret = new int[ib.remaining()];
+        ib.get(ret);
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public long[] toUnsignedIntArray() {
+        if (getDataType() != DataType.UINT32) {
+            return NDArray.super.toUnsignedIntArray();
+        }
+        IntBuffer ib = dataView().asIntBuffer();
+        long[] ret = new long[ib.remaining()];
+        for (int i = 0; i < ret.length; ++i) {
+            ret[i] = ib.get() & 0X00000000FFFFFFFFL;
+        }
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public long[] toLongArray() {
+        if (getDataType() != DataType.INT64) {
+            return NDArray.super.toLongArray();
+        }
+        LongBuffer lb = dataView().asLongBuffer();
+        long[] ret = new long[lb.remaining()];
+        lb.get(ret);
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public int[] toUint8Array() {
+        ByteBuffer bb = dataView();
+        int[] ret = new int[bb.remaining()];
+        for (int i = 0; i < ret.length; ++i) {
+            ret[i] = bb.get() & 0xff;
+        }
+        return ret;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean[] toBooleanArray() {
+        if (getDataType() != DataType.BOOLEAN) {
+            return NDArray.super.toBooleanArray();
+        }
+        ByteBuffer bb = dataView();
+        boolean[] ret = new boolean[bb.remaining()];
+        for (int i = 0; i < ret.length; ++i) {
+            ret[i] = bb.get() != 0;
+        }
+        return ret;
+    }
+
+    /**
+     * Returns the data of this array for a copy that the caller makes before returning.
+     *
+     * <p>A dense CPU array returns a view of its memory, which is valid only while this array is
+     * open and keeps its storage. Other arrays return a copy.
+     *
+     * @return the data of this array
+     */
+    private ByteBuffer dataView() {
+        if (getDataType() == DataType.STRING) {
+            throw new UnsupportedOperationException(
+                    "toByteBuffer is not supported for String tensor.");
+        }
+        return JniUtils.getByteBuffer(this, true);
     }
 
     /** {@inheritDoc} */
@@ -275,29 +393,9 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
     /** {@inheritDoc} */
     @Override
     public void set(Buffer buffer) {
-        int size = Math.toIntExact(size());
-        DataType type = getDataType();
-        BaseNDManager.validateBuffer(buffer, type, size);
-        // TODO how do we handle the exception happened in the middle
-        dataRef = null;
-        if (buffer.isDirect() && buffer instanceof ByteBuffer) {
-            // If NDArray is on the GPU, it is native code responsibility to control the data life
-            // cycle
-            if (!getDevice().isGpu()) {
-                dataRef = (ByteBuffer) buffer;
-            }
-            JniUtils.set(this, (ByteBuffer) buffer);
-            return;
-        }
-        // int8, uint8, boolean use ByteBuffer, so need to explicitly input DataType
-        ByteBuffer buf = manager.allocateDirect(size * type.getNumOfBytes());
-        BaseNDManager.copyBuffer(buffer, buf);
-
-        // If NDArray is on the GPU, it is native code responsibility to control the data life cycle
-        if (!getDevice().isGpu()) {
-            dataRef = buf;
-        }
-        JniUtils.set(this, buf);
+        BaseNDManager.validateBuffer(buffer, getDataType(), Math.toIntExact(size()));
+        // A direct ByteBuffer is shared on the CPU, other data is copied into libtorch memory
+        JniUtils.set(this, buffer);
     }
 
     /**
@@ -1895,6 +1993,5 @@ public class PtNDArray extends NativeResource<Long> implements NDArray {
             JniUtils.deleteNDArray(pointer);
         }
         manager.detachInternal(getUid());
-        dataRef = null;
     }
 }

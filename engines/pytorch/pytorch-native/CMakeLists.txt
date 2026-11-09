@@ -77,6 +77,8 @@ set(SOURCE_FILES
     "src/main/native/djl_pytorch_flat_gradient.cc"
     "src/main/native/djl_pytorch_tensor_copy.h"
     "src/main/native/djl_pytorch_tensor_copy.cc"
+    "src/main/native/djl_pytorch_java_buffer.h"
+    "src/main/native/djl_pytorch_java_buffer.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_tensor_copy.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_system.cc"
     "src/main/native/ai_djl_pytorch_jni_PyTorchLibrary_fusion.cc"
