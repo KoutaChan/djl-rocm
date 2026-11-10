@@ -5,11 +5,10 @@
 #include <torch/torch.h>
 
 namespace djl::pytorch {
-torch::Tensor packed_relation_attention(
-    const torch::Tensor& query, const torch::Tensor& key_value,
-    const torch::Tensor& mask, const torch::Tensor& packed_codes,
-    const torch::Tensor& table, int64_t heads, int64_t entries_per_segment,
-    double scale);
+// The CPU computes whole rows with at most block_triples (row, query, key) triples at a time.
+torch::Tensor packed_relation_attention(const torch::Tensor& query, const torch::Tensor& key_value,
+    const torch::Tensor& mask, const torch::Tensor& packed_codes, const torch::Tensor& table, int64_t heads,
+    int64_t entries_per_segment, double scale, int64_t block_triples);
 
 #if defined(DJL_USE_ROCM_KERNELS)
 namespace rocm {

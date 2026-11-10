@@ -1299,6 +1299,10 @@ public final class JniUtils {
 
     /**
      * Applies native packed relation attention with shared K/V and differentiable relation values.
+     *
+     * <p>The CPU computes whole rows with at most {@code blockTriples} (row, query, key) triples
+     * at a time, so its memory does not grow with the number of rows; the backward pass of a batch
+     * larger than one block recomputes each block. The GPU kernel ignores the limit.
      */
     public static PtNDArray packedRelationScaledDotProductAttention(
             PtNDArray query,
@@ -1308,7 +1312,8 @@ public final class JniUtils {
             PtNDArray relationTable,
             long heads,
             long entriesPerSegment,
-            float scale) {
+            float scale,
+            long blockTriples) {
         return new PtNDArray(
                 query.getManager(),
                 PyTorchLibrary.LIB.torchPackedRelationScaledDotProductAttention(
@@ -1319,7 +1324,8 @@ public final class JniUtils {
                         relationTable.getHandle(),
                         heads,
                         entriesPerSegment,
-                        scale));
+                        scale,
+                        blockTriples));
     }
 
     /**

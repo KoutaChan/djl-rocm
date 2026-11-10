@@ -355,7 +355,8 @@ final class PyTorchLibrary {
             long relationTable,
             long heads,
             long entriesPerSegment,
-            float scale);
+            float scale,
+            long blockTriples);
 
     native long torchGroupedIndexedScaledDotProductAttention(
             long query,

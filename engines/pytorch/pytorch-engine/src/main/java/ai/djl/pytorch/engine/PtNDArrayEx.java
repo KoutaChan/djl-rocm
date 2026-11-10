@@ -34,6 +34,9 @@ import java.util.List;
 /** {@code PtNDArrayEx} is the PyTorch implementation of the {@link NDArrayEx}. */
 public class PtNDArrayEx implements NDArrayEx {
 
+    /** The (row, query, key) triples that packed relation attention computes at once on the CPU. */
+    private static final long PACKED_RELATION_BLOCK_TRIPLES = 1L << 14;
+
     private PtNDArray array;
 
     /**
@@ -1144,16 +1147,6 @@ public class PtNDArrayEx implements NDArrayEx {
             long heads,
             long entriesPerSegment,
             double scale) {
-        if (!array.getDevice().isGpu()) {
-            return NDArrayEx.super.packedRelationScaledDotProductAttention(
-                    packedKeyValue,
-                    mask,
-                    packedCodes,
-                    relationTable,
-                    heads,
-                    entriesPerSegment,
-                    scale);
-        }
         PtNDManager manager = array.getManager();
         return JniUtils.packedRelationScaledDotProductAttention(
                 array,
@@ -1163,7 +1156,8 @@ public class PtNDArrayEx implements NDArrayEx {
                 manager.from(relationTable),
                 heads,
                 entriesPerSegment,
-                (float) scale);
+                (float) scale,
+                PACKED_RELATION_BLOCK_TRIPLES);
     }
 
     /** {@inheritDoc} */
