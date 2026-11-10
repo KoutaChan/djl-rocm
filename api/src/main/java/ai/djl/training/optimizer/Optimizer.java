@@ -42,10 +42,15 @@ import java.util.function.Function;
  * An {@code Optimizer} updates the weight parameters to minimize the loss function. {@code
  * Optimizer} is an abstract class that provides the base implementation for optimizers.
  *
+ * <p>An optimizer owns the state arrays that it creates for the parameters, such as momentum and
+ * Adam moments. They are not attached to the {@link NDManager} of a weight, so they live until the
+ * optimizer is closed. A {@link ai.djl.training.Trainer} closes its optimizer when the trainer is
+ * closed; code that calls {@link #update} directly closes the optimizer when it is done.
+ *
  * @see <a href="https://d2l.djl.ai/chapter_optimization/index.html">The D2L chapters on
  *     optimization algorithms</a>
  */
-public abstract class Optimizer {
+public abstract class Optimizer implements AutoCloseable {
 
     private static final String STATE_MAGIC = "DJL_OPTIMIZER_STATE";
     private static final int STATE_VERSION = 1;
@@ -386,9 +391,29 @@ public abstract class Optimizer {
                 }
             }
             for (String stateName : getStateNames()) {
+                Map<String, Map<Device, NDArray>> replaced = getState(stateName);
                 setState(stateName, states.getOrDefault(stateName, new ConcurrentHashMap<>()));
+                closeState(replaced);
             }
         }
+    }
+
+    /**
+     * Releases the optimizer state arrays and resets the update counts.
+     *
+     * <p>An optimizer that updates again after it was closed starts over, like a newly built
+     * optimizer with the same configuration. Subclasses that keep state arrays outside {@link
+     * #getState} must override this method to release them.
+     */
+    @Override
+    public void close() {
+        for (String stateName : getStateNames()) {
+            Map<String, Map<Device, NDArray>> released = getState(stateName);
+            setState(stateName, new ConcurrentHashMap<>());
+            closeState(released);
+        }
+        updateCounts.clear();
+        numUpdate = 0;
     }
 
     /**
@@ -433,19 +458,23 @@ public abstract class Optimizer {
                         k -> {
                             Map<Device, NDArray> map = new ConcurrentHashMap<>();
                             NDArray s = defaultFunction.apply(k);
-                            // TODO attach s to the NDManager of ParameterStore
-                            s.detach(); // s is detached because it would be put into the optimizer
-                            // callback manager and closed after the optimizer callback
-                            // when using the MxParameterServer. For now, this will let it be closed
-                            // by the
-                            // GC when the optimizer is out of scope. Ideally, it should be put into
-                            // the
-                            // trainer manager instead.
+                            // The optimizer owns its state and releases it in close(). Detach it
+                            // from the manager of the weight, which can be a short-lived scope
+                            // such as the MxParameterServer callback manager.
+                            s.detach();
                             map.put(device, s);
                             return map;
                         });
         return arrayMap.computeIfAbsent(
                 device, k -> arrayMap.values().iterator().next().toDevice(device, true));
+    }
+
+    private static void closeState(Map<String, Map<Device, NDArray>> state) {
+        for (Map<Device, NDArray> arrays : state.values()) {
+            for (NDArray array : arrays.values()) {
+                array.close();
+            }
+        }
     }
 
     private static String encodeName(String stateName, String parameterId, Device device) {

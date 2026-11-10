@@ -30,6 +30,7 @@ import ai.djl.training.listener.EpochTrainingListener;
 import ai.djl.training.listener.EvaluatorTrainingListener;
 import ai.djl.training.listener.TrainingListener;
 import ai.djl.training.loss.Loss;
+import ai.djl.training.optimizer.Optimizer;
 import ai.djl.translate.TranslateException;
 
 import org.slf4j.Logger;
@@ -76,6 +77,7 @@ public class Trainer implements AutoCloseable {
     private Metrics metrics;
     private List<TrainingListener> listeners;
     private Device[] devices;
+    private Optimizer optimizer;
     private ParameterStore parameterStore;
     private List<Evaluator> evaluators;
     private Loss loss;
@@ -119,9 +121,9 @@ public class Trainer implements AutoCloseable {
             gradScaler = GradScaler.builder().build();
         }
 
+        optimizer = trainingConfig.getOptimizer();
         ParameterServer parameterServer =
-                manager.getEngine()
-                        .newParameterServer(trainingConfig.getOptimizer(), trainingConfig);
+                manager.getEngine().newParameterServer(optimizer, trainingConfig);
 
         parameterStore = new ParameterStore(manager, false);
         parameterStore.setParameterServer(parameterServer, devices);
@@ -507,7 +509,11 @@ public class Trainer implements AutoCloseable {
         super.finalize();
     }
 
-    /** {@inheritDoc} */
+    /**
+     * Closes the trainer and its optimizer, which releases the optimizer state.
+     *
+     * @see Optimizer#close()
+     */
     @Override
     public void close() {
         notifyListeners(listener -> listener.onTrainingEnd(this));
@@ -518,7 +524,13 @@ public class Trainer implements AutoCloseable {
             try {
                 parameterStore.close();
             } finally {
-                manager.close();
+                try {
+                    if (optimizer != null) {
+                        optimizer.close();
+                    }
+                } finally {
+                    manager.close();
+                }
             }
         }
     }
