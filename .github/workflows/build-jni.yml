@@ -20,9 +20,9 @@ jobs:
     name: Publish API + PyTorch Engine
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: ${{ env.JAVA_DISTRIBUTION }}
           java-version: ${{ env.JAVA_VERSION }}
@@ -74,14 +74,14 @@ jobs:
         if: runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           swap-storage: true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Prepare build mounts
         id: build-cache
@@ -101,7 +101,7 @@ jobs:
       # transitive headers. The prefix separates SDK/toolchain/target policies;
       # the final source revision lets later builds save additional cache hits.
       - name: Restore native compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.BUILD_CACHE }}/ccache
           key: native-v1-${{ matrix.flavor }}-${{ matrix.pt }}-${{ hashFiles('.github/workflows/build-jni.yml', '.github/workflows/scripts/build-in-container.sh', '.github/workflows/scripts/install-ccache.sh', 'engines/pytorch/pytorch-native/build.sh', 'engines/pytorch/pytorch-native/CMakeLists.txt') }}-${{ github.sha }}
@@ -109,7 +109,7 @@ jobs:
             native-v1-${{ matrix.flavor }}-${{ matrix.pt }}-${{ hashFiles('.github/workflows/build-jni.yml', '.github/workflows/scripts/build-in-container.sh', '.github/workflows/scripts/install-ccache.sh', 'engines/pytorch/pytorch-native/build.sh', 'engines/pytorch/pytorch-native/CMakeLists.txt') }}-
 
       - name: Restore container Gradle cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ${{ env.BUILD_CACHE }}/gradle/caches
@@ -121,7 +121,7 @@ jobs:
       # Cache only the small patched host runtime. SDK wheels and Tensile
       # device kernels are intentionally not duplicated in Actions caches.
       - name: Restore patched hipBLASLt runtime
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.BUILD_CACHE }}/hipblaslt/artifacts
           key: hipblaslt-host-v1-${{ matrix.flavor }}-${{ matrix.pt }}-${{ hashFiles('engines/pytorch/pytorch-native/rocm/hipblaslt/**', '.github/workflows/scripts/build-in-container.sh') }}-${{ github.sha }}
@@ -181,14 +181,14 @@ jobs:
         if: runner.environment == 'github-hosted' && matrix.flavor != 'cpu'
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
           large-packages: true
           swap-storage: true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Prepare build mounts
         id: build-cache
@@ -208,7 +208,7 @@ jobs:
       # transitive headers. The prefix separates SDK/toolchain/target policies;
       # the final source revision lets later builds save additional cache hits.
       - name: Restore native compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.BUILD_CACHE }}/ccache
           key: native-v1-${{ matrix.flavor }}-${{ matrix.pt }}-${{ hashFiles('.github/workflows/build-jni.yml', '.github/workflows/scripts/build-in-container.sh', '.github/workflows/scripts/install-ccache.sh', 'engines/pytorch/pytorch-native/build.sh', 'engines/pytorch/pytorch-native/CMakeLists.txt') }}-${{ github.sha }}
@@ -216,7 +216,7 @@ jobs:
             native-v1-${{ matrix.flavor }}-${{ matrix.pt }}-${{ hashFiles('.github/workflows/build-jni.yml', '.github/workflows/scripts/build-in-container.sh', '.github/workflows/scripts/install-ccache.sh', 'engines/pytorch/pytorch-native/build.sh', 'engines/pytorch/pytorch-native/CMakeLists.txt') }}-
 
       - name: Restore container Gradle cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ${{ env.BUILD_CACHE }}/gradle/caches
@@ -272,9 +272,9 @@ jobs:
             cuda: "13.0.0"
             cuda_components: '["cuda_cccl", "cuda_crt", "cuda_cudart", "cuda_nvcc", "cuda_nvrtc", "cuda_nvtx", "libcublas", "libcurand", "libcufft", "libcusparse", "libcusolver", "libnvjitlink", "libnvptxcompiler", "libnvvm"]'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: ${{ env.JAVA_DISTRIBUTION }}
           java-version: ${{ env.JAVA_VERSION }}
@@ -283,7 +283,6 @@ jobs:
       - uses: lukka/get-cmake@latest
         with:
           ninjaVersion: latest
-          useLocalCache: true
 
       # Use NVIDIA's redistrib zip archives instead of the Windows installer.
       # The zip archives extract into a normal CUDA root and do not require
@@ -342,9 +341,9 @@ jobs:
             pt: "2.11.0"
             arch: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: ${{ env.JAVA_DISTRIBUTION }}
           java-version: ${{ env.JAVA_VERSION }}
