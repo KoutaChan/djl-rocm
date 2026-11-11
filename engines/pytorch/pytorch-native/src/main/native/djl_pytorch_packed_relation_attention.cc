@@ -80,10 +80,11 @@ torch::Tensor relation_rows(const torch::Tensor& table, const std::vector<torch:
 }
 
 // Attends FP32 rows with the operations of the portable decomposition (NDArrayEx) in its order, so the output and
-// the gradients keep its bits. No operation mixes rows, so a block of rows gives the bits of the same rows of the
-// whole batch.
+// the gradients keep its bits. bias holds the relation biases [B,Q,K,H] of every triple and relative_values its
+// relative values [B,Q,K,A]; an undefined relative_values stands for relative values that are all +0. No operation
+// mixes rows, so a block of rows gives the bits of the same rows of the whole batch.
 torch::Tensor attend(const torch::Tensor& query, const torch::Tensor& key_value, const torch::Tensor& mask,
-    const torch::Tensor& relation, int64_t heads, double scale) {
+    const torch::Tensor& bias, const torch::Tensor& relative_values, int64_t heads, double scale) {
   const auto batch = query.size(0);
   const auto queries = query.size(1);
   const auto width = query.size(2);
@@ -95,8 +96,7 @@ torch::Tensor attend(const torch::Tensor& query, const torch::Tensor& key_value,
   auto q = query.reshape({batch, queries, heads, features}).transpose(1, 2);
   auto k = safe_memory.slice(2, 0, width).reshape({batch, keys, heads, features}).transpose(1, 2);
   auto v = safe_memory.slice(2, width).reshape({batch, keys, heads, features}).transpose(1, 2);
-  auto bias = relation.slice(3, 0, heads).permute({0, 3, 1, 2});
-  auto scores = q.matmul(k.transpose(2, 3)).mul(scale).add(bias);
+  auto scores = q.matmul(k.transpose(2, 3)).mul(scale).add(bias.permute({0, 3, 1, 2}));
   auto full_valid = valid.expand(scores.sizes());
   auto present = valid.sum(3, true).gt(0).expand(scores.sizes());
   auto safe_scores = torch::where(full_valid, scores, torch::zeros_like(scores));
@@ -104,11 +104,26 @@ torch::Tensor attend(const torch::Tensor& query, const torch::Tensor& key_value,
   auto excluded = torch::zeros_like(scores).add(-std::numeric_limits<double>::infinity());
   auto probabilities = torch::where(full_valid,
       torch::where(attention_valid, safe_scores, excluded).softmax(3, torch::kFloat32), torch::zeros_like(scores));
-  auto relative_values =
-      relation.slice(3, heads).reshape({batch, queries, keys, heads, features}).permute({0, 3, 1, 2, 4});
-  auto values = v.unsqueeze(2).add(relative_values);
-  values = torch::where(full_valid.unsqueeze(4).expand(values.sizes()), values, torch::zeros_like(values));
-  return probabilities.unsqueeze(4).mul(values).sum(3).transpose(1, 2).reshape({batch, queries, width});
+  torch::Tensor weighted;
+  if (relative_values.defined()) {
+    auto values = v.unsqueeze(2).add(
+        relative_values.reshape({batch, queries, keys, heads, features}).permute({0, 3, 1, 2, 4}));
+    values = torch::where(full_valid.unsqueeze(4).expand(values.sizes()), values, torch::zeros_like(values));
+    weighted = probabilities.unsqueeze(4).mul(values);
+  } else {
+    // Adding relative values of +0 only turns -0 into +0, so all the queries read the same values of a key.
+    auto shifted = v.add(0);
+    auto values =
+        torch::where(valid.reshape({batch, 1, keys, 1}).expand(shifted.sizes()), shifted, torch::zeros_like(shifted));
+    weighted = probabilities.unsqueeze(4).mul(values.unsqueeze(2));
+  }
+  return weighted.sum(3).transpose(1, 2).reshape({batch, queries, width});
+}
+
+// Attends with the relation [B,Q,K,H+A] of every triple, its biases first, as the decomposition records it.
+torch::Tensor attend_relation(const torch::Tensor& query, const torch::Tensor& key_value, const torch::Tensor& mask,
+    const torch::Tensor& relation, int64_t heads, double scale) {
+  return attend(query, key_value, mask, relation.slice(3, 0, heads), relation.slice(3, heads), heads, scale);
 }
 
 // Whole rows with at most block_triples (row, query, key) triples, and at least one row.
@@ -116,19 +131,25 @@ int64_t rows_per_block(const torch::Tensor& query, const torch::Tensor& key_valu
   return std::max<int64_t>(1, block_triples / (query.size(1) * key_value.size(1)));
 }
 
-// Attends FP32 inputs one block of rows at a time.
+// Attends FP32 inputs one block of rows at a time. The biases and the relative values of the table are gathered
+// separately, and a table whose relative values are all +0 gathers only its biases.
 torch::Tensor attend_blocks(const torch::Tensor& query, const torch::Tensor& key_value, const torch::Tensor& mask,
     const torch::Tensor& codes, const torch::Tensor& table, int64_t heads, int64_t entries, double scale,
     int64_t block_triples) {
   const auto batch = query.size(0);
   const auto step = rows_per_block(query, key_value, block_triples);
+  const auto biases = table.slice(1, 0, heads).contiguous();
+  const auto relatives = table.slice(1, heads);
+  const bool zero_relatives = !relatives.ne(0).logical_or(relatives.signbit()).any().item<bool>();
+  const auto relative_table = zero_relatives ? torch::Tensor() : relatives.contiguous();
   auto output = torch::empty(query.sizes(), query.options());
   for (int64_t start = 0; start < batch; start += step) {
     const auto length = std::min(step, batch - start);
-    auto relation = relation_rows(table, segment_rows(codes.narrow(0, start, length), table.size(0), entries));
+    const auto ids = segment_rows(codes.narrow(0, start, length), table.size(0), entries);
     output.narrow(0, start, length)
         .copy_(attend(query.narrow(0, start, length), key_value.narrow(0, start, length),
-            mask.narrow(0, start, length), relation, heads, scale));
+            mask.narrow(0, start, length), relation_rows(biases, ids),
+            zero_relatives ? torch::Tensor() : relation_rows(relative_table, ids), heads, scale));
   }
   return output;
 }
@@ -175,8 +196,8 @@ class PackedRelationCpuFunction : public torch::autograd::Function<PackedRelatio
     if (create_graph) {
       // Higher-order derivatives differentiate the graph of the whole batch.
       auto output = recompute(context, [&]() {
-        return attend(query, key_value, mask, relation_rows(table, segment_rows(codes, table.size(0), entries)),
-            heads, scale);
+        return attend_relation(query, key_value, mask,
+            relation_rows(table, segment_rows(codes, table.size(0), entries)), heads, scale);
       });
       torch::autograd::variable_list inputs;
       std::vector<size_t> input_indices;
@@ -217,8 +238,9 @@ class PackedRelationCpuFunction : public torch::autograd::Function<PackedRelatio
       block_query.requires_grad_(needs_query);
       block_memory.requires_grad_(needs_memory);
       relation.requires_grad_(needs_table);
-      auto output = recompute(context,
-          [&]() { return attend(block_query, block_memory, mask.narrow(0, start, length), relation, heads, scale); });
+      auto output = recompute(context, [&]() {
+        return attend_relation(block_query, block_memory, mask.narrow(0, start, length), relation, heads, scale);
+      });
       torch::autograd::variable_list inputs;
       if (needs_query) {
         inputs.push_back(block_query);
@@ -327,8 +349,8 @@ torch::Tensor packed_relation_attention(const torch::Tensor& q, const torch::Ten
       output = attend_blocks(query, memory, mask, codes, relations, heads, entries, scale, block_triples);
     } else if (rows_per_block(query, memory, block_triples) >= q.size(0)) {
       // A batch within one block records the decomposition itself, so its backward pass recomputes nothing.
-      output = attend(query, memory, mask, relation_rows(relations, segment_rows(codes, table.size(0), entries)),
-          heads, scale);
+      output = attend_relation(query, memory, mask,
+          relation_rows(relations, segment_rows(codes, table.size(0), entries)), heads, scale);
     } else {
       output =
           PackedRelationCpuFunction::apply(query, memory, mask, codes, relations, heads, entries, scale, block_triples);

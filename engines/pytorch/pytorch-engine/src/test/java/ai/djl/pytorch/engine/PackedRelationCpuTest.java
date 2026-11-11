@@ -75,16 +75,62 @@ public class PackedRelationCpuTest {
             DataType dataType) {
         Inputs inputs =
                 new Inputs(rows, queries, keys, heads, width, tableRows, entries, dataType, 31L);
-        long blockTriples = blockRows == 0 ? 0 : (long) blockRows * queries * keys;
+        assertMatchesDecomposition(inputs, blockRows, dataType + " block rows " + blockRows);
+    }
+
+    @DataProvider
+    public Object[][] zeroRelativeValues() {
+        // rows, queries, keys, heads, width, table rows, entries per segment, rows per block (0 for
+        // the default block), data type, the relative value of every table row
+        return new Object[][] {
+            {4, 23, 23, 8, 128, 112, 16, 3, DataType.FLOAT32, 0f},
+            {4, 23, 23, 8, 128, 112, 16, 0, DataType.FLOAT32, 0f},
+            {5, 7, 9, 2, 8, 76, 12, 2, DataType.BFLOAT16, 0f},
+            {5, 7, 9, 2, 8, 76, 12, 1, DataType.FLOAT16, 0f},
+            {4, 23, 23, 8, 128, 112, 16, 3, DataType.FLOAT32, -0f}
+        };
+    }
+
+    @Test(dataProvider = "zeroRelativeValues")
+    public void zeroRelativeValuesMatchDecompositionBitwise(
+            int rows,
+            int queries,
+            int keys,
+            int heads,
+            int width,
+            int tableRows,
+            int entries,
+            int blockRows,
+            DataType dataType,
+            float relative) {
+        Inputs inputs =
+                new Inputs(rows, queries, keys, heads, width, tableRows, entries, dataType, 47L);
+        for (int row = 0; row < tableRows; row++) {
+            for (int column = heads; column < heads + width; column++) {
+                inputs.table[row * (heads + width) + column] = relative;
+            }
+        }
+        // Values of -0 tell whether +0 relative values are added to them.
+        for (int i = 2 * width - 1; i < inputs.keyValue.length; i += 2 * width) {
+            if (!Float.isNaN(inputs.keyValue[i])) {
+                inputs.keyValue[i] = -0f;
+            }
+        }
+        String what = dataType + " relative " + relative + " block rows " + blockRows;
+        assertMatchesDecomposition(inputs, blockRows, what);
+    }
+
+    private static void assertMatchesDecomposition(Inputs inputs, int blockRows, String what) {
+        long blockTriples = blockRows == 0 ? 0 : (long) blockRows * inputs.queries * inputs.keys;
         for (Mode mode : Mode.values()) {
             Result expected = run(inputs, 0, mode, true);
             Result actual = run(inputs, blockTriples, mode, false);
-            String what = dataType + " " + mode + " block rows " + blockRows;
-            assertBits(actual.output, expected.output, what + " output");
+            String label = what + " " + mode;
+            assertBits(actual.output, expected.output, label + " output");
             if (mode != Mode.INFERENCE) {
-                assertBits(actual.query, expected.query, what + " query gradient");
-                assertBits(actual.keyValue, expected.keyValue, what + " key and value gradient");
-                assertBits(actual.table, expected.table, what + " table gradient");
+                assertBits(actual.query, expected.query, label + " query gradient");
+                assertBits(actual.keyValue, expected.keyValue, label + " key and value gradient");
+                assertBits(actual.table, expected.table, label + " table gradient");
             }
         }
     }
