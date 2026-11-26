@@ -18,6 +18,48 @@ if(BUILD_ANDROID AND NOT DEFINED ANDROID_ABI)
     message(FATAL_ERROR "Please specify ANDROID_ABI!")
 endif()
 
+# Without a GPU on the build machine, libtorch falls back to a short list of
+# CUDA architectures without PTX (for CUDA 12: 5.0 and 8.0 or newer), so the
+# DJL kernels would not load on Pascal, Volta or Turing GPUs. Unless the caller
+# chooses the architectures, build every discrete-GPU architecture that nvcc
+# can target, and PTX for the newest one so that later GPUs can still run them.
+if(USE_CUDA AND NOT USE_ROCM AND NOT BUILD_ANDROID
+        AND NOT DEFINED TORCH_CUDA_ARCH_LIST AND "$ENV{TORCH_CUDA_ARCH_LIST}" STREQUAL "")
+    if(NOT "$ENV{CUDACXX}" STREQUAL "")
+        set(DJL_NVCC "$ENV{CUDACXX}")
+    else()
+        find_program(DJL_NVCC nvcc HINTS ENV CUDA_HOME ENV CUDA_PATH PATH_SUFFIXES bin)
+    endif()
+    if(NOT DJL_NVCC)
+        message(FATAL_ERROR "nvcc was not found. Set CUDACXX, CUDA_HOME or TORCH_CUDA_ARCH_LIST.")
+    endif()
+    execute_process(COMMAND "${DJL_NVCC}" --list-gpu-code
+                    OUTPUT_VARIABLE DJL_NVCC_GPU_CODES
+                    RESULT_VARIABLE DJL_NVCC_RESULT
+                    ERROR_QUIET)
+    string(REGEX MATCHALL "sm_[0-9]+" DJL_NVCC_SM_CODES "${DJL_NVCC_GPU_CODES}")
+    if(NOT DJL_NVCC_RESULT EQUAL 0 OR NOT DJL_NVCC_SM_CODES)
+        message(FATAL_ERROR "${DJL_NVCC} --list-gpu-code failed. Set TORCH_CUDA_ARCH_LIST to choose the CUDA architectures.")
+    endif()
+    # Jetson, DRIVE and DGX Spark GPUs are integrated into Arm hosts.
+    if(NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        list(REMOVE_ITEM DJL_NVCC_SM_CODES sm_53 sm_62 sm_72 sm_87 sm_101 sm_110 sm_121)
+    endif()
+    set(TORCH_CUDA_ARCH_LIST "")
+    foreach(DJL_SM_CODE IN LISTS DJL_NVCC_SM_CODES)
+        string(SUBSTRING "${DJL_SM_CODE}" 3 -1 DJL_SM_NUMBER)
+        math(EXPR DJL_SM_MAJOR "${DJL_SM_NUMBER} / 10")
+        math(EXPR DJL_SM_MINOR "${DJL_SM_NUMBER} % 10")
+        list(APPEND TORCH_CUDA_ARCH_LIST "${DJL_SM_MAJOR}.${DJL_SM_MINOR}")
+    endforeach()
+    list(LENGTH TORCH_CUDA_ARCH_LIST DJL_SM_COUNT)
+    math(EXPR DJL_SM_LAST "${DJL_SM_COUNT} - 1")
+    list(GET TORCH_CUDA_ARCH_LIST ${DJL_SM_LAST} DJL_SM_NEWEST)
+    list(REMOVE_AT TORCH_CUDA_ARCH_LIST ${DJL_SM_LAST})
+    list(APPEND TORCH_CUDA_ARCH_LIST "${DJL_SM_NEWEST}+PTX")
+    message(STATUS "Building DJL CUDA kernels for GPU arch: ${TORCH_CUDA_ARCH_LIST}")
+endif()
+
 if(NOT BUILD_ANDROID)
     message("Building djl_torch with the host...")
     find_package(Torch REQUIRED)

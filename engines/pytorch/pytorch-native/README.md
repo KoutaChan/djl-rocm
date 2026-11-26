@@ -157,11 +157,10 @@ rounding between a fused SiLU and a separately rounded sigmoid product.
 ### NVIDIA CUDA
 
 Install a CUDA toolkit compatible with the selected libtorch flavor and make `nvcc` available to
-CMake. Set `TORCH_CUDA_ARCH_LIST` to the compute capabilities that the binary must support, then pass
-the libtorch flavor through the `cuda` Gradle property. For example, from this directory:
+CMake, then pass the libtorch flavor through the `cuda` Gradle property. For example, from this
+directory:
 
 ```sh
-export TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0"
 ./gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
 ```
 
@@ -169,9 +168,12 @@ On Windows, run the equivalent command from a Visual Studio developer environmen
 toolkit on `PATH`:
 
 ```cmd
-set "TORCH_CUDA_ARCH_LIST=8.0 8.6 8.9 9.0"
 gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
 ```
+
+By default the kernels are built for every discrete-GPU architecture that `nvcc --list-gpu-code`
+reports, with PTX for the newest one. Set `TORCH_CUDA_ARCH_LIST` to build only some compute
+capabilities, for example `TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0"`.
 
 The build scripts configure CMake with `USE_CUDA=1` and `USE_ROCM=0`. The resulting native library
 must be loaded with a CUDA PyTorch runtime of the same version and flavor.
@@ -310,8 +312,7 @@ To implement a simple pytorch feature, generally you can do the following steps.
     
     ```sh
     ./gradlew cleanJNI
-    TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0" \
-        ./gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
+    ./gradlew compileJNI -Pcuda=cu128 -Ppt_version=2.11.0
     ```
 
 3. Document the api and add the unit tests.
